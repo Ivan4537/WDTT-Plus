@@ -36,7 +36,8 @@
 ### 3. Платформы и поддерживаемые клиенты
 *Разделение по операционным системам и альтернативам.*
 
-- [Windows Linux IOS совместимые клиенты для WDTT](#windows-linux-ios-совместимые-клиенты-wdtt)
+- [WIN Linux IOS совместимые клиенты для WDTT](#win-linux-ios-совместимые-клиенты-wdtt)
+
 - [Другие рабочие решения: Ядра/APK](#другие-рабочие-решения)
 
 > [!NOTE]
@@ -67,11 +68,11 @@
 - **Темы и оформление:** Material 3, Jetpack Compose, Inter, светлая/тёмная тема, Dynamic Colors на Android 12+ и встроенные палитры.
 - **Автообновления:** приложение проверяет GitHub releases, показывает диалог обновления и периодически повторяет проверку в фоне.
 
-## Windows Linux IOS совместимые клиенты WDTT
+## WIN Linux IOS совместимые клиенты WDTT
 **Моё любимое**
-- [luminescq/PWDTT](https://github.com/luminescq/PWDTT) - Хороший форк(порт) WDTT на Windows & Linux
+- [luminescq/PWDTT](https://github.com/luminescq/PWDTT) - Хороший порт WDTT на Windows & Linux
 
-- [anton48/vk-turn-proxy-ios](https://github.com/anton48/vk-turn-proxy-ios) — Самодостаточный проект для IOS совместимый с WDTT (server core)
+- [anton48/vk-turn-proxy-ios](https://github.com/anton48/vk-turn-proxy-ios) — Самодостаточный проект для IOS совместимый с WDTT (server core)(высокий фактор доверия у репозитория)
 
 
 **Альтеративный форк под Windows**
