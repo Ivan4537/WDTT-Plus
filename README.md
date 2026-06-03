@@ -36,8 +36,8 @@
 ### 3. Платформы и поддерживаемые клиенты
 *Разделение по операционным системам и альтернативам.*
 
-- [Windows Linux совместимый клиент WDTT](#windows-linux-совместимый-клиент-wdtt)
-- [Другие рабочие решения Android IOS](#другие-рабочие-решения)
+- [Windows Linux IOS совместимые клиенты для WDTT](#windows-linux-ios-совместимые-клиенты-wdtt)
+- [Другие рабочие решения: Ядра/APK](#другие-рабочие-решения)
 
 > [!NOTE]
 > **Обратите внимание**
@@ -67,9 +67,12 @@
 - **Темы и оформление:** Material 3, Jetpack Compose, Inter, светлая/тёмная тема, Dynamic Colors на Android 12+ и встроенные палитры.
 - **Автообновления:** приложение проверяет GitHub releases, показывает диалог обновления и периодически повторяет проверку в фоне.
 
-## Windows Linux совместимый клиент WDTT
+## Windows Linux IOS совместимые клиенты WDTT
 **Моё любимое**
-- [luminescq/PWDTT](https://github.com/luminescq/PWDTT) - Хороший форк WDTT на Windows & Linux
+- [luminescq/PWDTT](https://github.com/luminescq/PWDTT) - Хороший форк(порт) WDTT на Windows & Linux
+
+- [anton48/vk-turn-proxy-ios](https://github.com/anton48/vk-turn-proxy-ios) — Самодостаточный проект для IOS совместимый с WDTT (server core)
+
 
 **Альтеративный форк под Windows**
 - [IGOR7276/proxy-turn-vk-windows](https://github.com/IGOR7276/proxy-turn-vk-windows)
@@ -104,9 +107,6 @@
 
 **Android**
 - [samosvalishe/turn-proxy-android](https://github.com/samosvalishe/turn-proxy-android) — альтернативная андроид версия
-
-**iOS**
-- [anton48/vk-turn-proxy-ios](https://github.com/anton48/vk-turn-proxy-ios) — версия под ios
 
 *(Я не несу ответвености за ваше использование указанных в ознакомительных целях мной - репозиториев)*
 
