@@ -994,15 +994,26 @@ fun HashesDialog(
     var h3 by remember { mutableStateOf(hash3) }
     var h4 by remember { mutableStateOf(hash4) }
 
-    Dialog(onDismissRequest = onDismiss) {
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
         Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .fillMaxHeight(0.95f)
+                .imePadding()
+                .padding(horizontal = 16.dp, vertical = 12.dp)
+                .widthIn(max = 560.dp),
             shape = RoundedCornerShape(24.dp),
             color = MaterialTheme.colorScheme.surface,
             contentColor = MaterialTheme.colorScheme.onSurface,
             tonalElevation = 8.dp
         ) {
             Column(
-                modifier = Modifier.padding(24.dp).fillMaxWidth(),
+                modifier = Modifier
+                    .padding(24.dp)
+                    .fillMaxWidth(),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 Row(
@@ -1027,29 +1038,37 @@ fun HashesDialog(
                     modifier = Modifier.padding(bottom = 4.dp)
                 )
 
-                listOf(
-                    Triple("VK Хеш 1 *", h1) { v: String -> h1 = v },
-                    Triple("VK Хеш 2", h2) { v: String -> h2 = v },
-                    Triple("VK Хеш 3", h3) { v: String -> h3 = v },
-                    Triple("VK Хеш 4", h4) { v: String -> h4 = v }
-                ).forEachIndexed { idx, (label, value, onChange) ->
-                    val isShort = value.isNotBlank() && value.length < 16
-                    OutlinedTextField(
-                        value = value,
-                        onValueChange = { raw ->
-                            val cleaned = raw.filter { c -> c != ' ' && c != '\n' }
-                            onChange(stripVkUrlStatic(cleaned))
-                        },
-                        label = { Text(label) },
-                        placeholder = { Text("Ссылка звонка или хеш") },
-                        singleLine = true,
-                        isError = isShort,
-                        supportingText = if (isShort) {
-                            { Text("Хеш ${idx + 1} — короткий (мин. 16)", color = MaterialTheme.colorScheme.error) }
-                        } else null,
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(16.dp),
-                    )
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f, fill = false)
+                        .verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    listOf(
+                        Triple("VK Хеш 1 *", h1) { v: String -> h1 = v },
+                        Triple("VK Хеш 2", h2) { v: String -> h2 = v },
+                        Triple("VK Хеш 3", h3) { v: String -> h3 = v },
+                        Triple("VK Хеш 4", h4) { v: String -> h4 = v }
+                    ).forEachIndexed { idx, (label, value, onChange) ->
+                        val isShort = value.isNotBlank() && value.length < 16
+                        OutlinedTextField(
+                            value = value,
+                            onValueChange = { raw ->
+                                val cleaned = raw.filter { c -> c != ' ' && c != '\n' }
+                                onChange(stripVkUrlStatic(cleaned))
+                            },
+                            label = { Text(label) },
+                            placeholder = { Text("Ссылка звонка или хеш") },
+                            singleLine = true,
+                            isError = isShort,
+                            supportingText = if (isShort) {
+                                { Text("Хеш ${idx + 1} — короткий (мин. 16)", color = MaterialTheme.colorScheme.error) }
+                            } else null,
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(16.dp),
+                        )
+                    }
                 }
 
                 Button(
