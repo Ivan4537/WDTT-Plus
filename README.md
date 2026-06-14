@@ -78,6 +78,9 @@
 **Альтеративный форк под Windows**
 - [IGOR7276/proxy-turn-vk-windows](https://github.com/IGOR7276/proxy-turn-vk-windows)
 
+**Улучшенный форк qWDTT на андроид**
+- [SpaceNeuroX/proxy-turn-vk-android](https://github.com/SpaceNeuroX/proxy-turn-vk-android)
+
 *(Я не несу ответвености за ваше использование сторонних клиентов совместимых с WDTT)*
 
 ## Что нового в версии 1.1.8
