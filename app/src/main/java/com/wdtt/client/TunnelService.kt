@@ -280,6 +280,12 @@ class TunnelService : Service() {
     private fun startStatsUpdater() {
         updateJob?.cancel()
         updateJob = TunnelManager.scope.launch(Dispatchers.Main) {
+            // Сторож следит за ПРОПАЖОЙ уже поднятого VPN-интерфейса, а не за его
+            // отсутствием во время подключения. Фаза установки туннеля (капча → VK-креды →
+            // WRAP → TURN/DTLS → выдача WireGuard-конфига) может занимать значительно больше
+            // времени, чем любое фиксированное окно, особенно при ручном обходе капчи, поэтому
+            // аварийно глушим туннель только если интерфейс был поднят и затем пропал/заменён.
+            var wasEverUp = false
             delay(1000)
             while (isActive) {
                 if (!TunnelManager.running.value && !isTunnelPaused) {
@@ -289,8 +295,9 @@ class TunnelService : Service() {
                 }
                 if (TunnelManager.running.value && !isTunnelPaused) {
                     val helper = WireGuardHelper(applicationContext)
-                    val startupWindow = System.currentTimeMillis() - TunnelManager.processStartedAtMs < 6000
-                    if (!startupWindow && !helper.isTunnelUp()) {
+                    if (helper.isTunnelUp()) {
+                        wasEverUp = true
+                    } else if (wasEverUp) {
                         Log.w("TunnelService", "Обнаружена пропажа или замена VPN-интерфейса! Экстренное выключение туннеля.")
                         stopTunnel()
                         break

@@ -584,7 +584,10 @@ private suspend fun performDeploy(
         val passArg = if (mainPass.isNotBlank()) "-password $mainPass " else ""
         val adminArg = if (adminId.isNotBlank()) "-admin $adminId " else ""
         val botArg = if (botToken.isNotBlank()) "-bot-token $botToken " else ""
-        val dnsArg = "-dns ${if(dns1.isNotBlank()) dns1 else "1.1.1.1"}${if(dns2.isNotBlank()) ",$dns2" else ""} "
+        // -dns поддерживается сервером (server.go, флаг -dns). Передаём только при заданном
+        // значении; несколько адресов — через запятую. Пустые поля -> сервер берёт свой default.
+        val dnsValue = listOf(dns1, dns2).map { it.trim() }.filter { it.isNotEmpty() }.joinToString(",")
+        val dnsArg = if (dnsValue.isNotEmpty()) "-dns $dnsValue " else ""
         val args = "$passArg$adminArg$botArg$dnsArg".trim()
 
         val scriptFile = File(context.cacheDir, "deploy.sh")

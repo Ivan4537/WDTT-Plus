@@ -49,10 +49,13 @@ const (
 	wgServerAddr          = "10.66.66.1"
 	wgServerCIDR          = wgServerAddr + "/24"
 	defaultInternalWGPort = 56001
-	dns                   = "1.1.1.1"
 	wgMTU                 = 1280
 	keepalive             = 25
 )
+
+// dns — DNS-серверы, прописываемые в WireGuard-конфиг клиента.
+// Значение по умолчанию переопределяется флагом -dns (несколько через запятую).
+var dns = "1.1.1.1"
 
 // ==================== База данных и Бот ====================
 
@@ -1311,7 +1314,12 @@ func main() {
 	mainPass := flag.String("password", "", "пароль владельца")
 	adminID := flag.String("admin", "", "Telegram Admin ID")
 	botToken := flag.String("bot-token", "", "Telegram Bot Token")
+	dnsFlag := flag.String("dns", dns, "DNS для клиента (можно несколько через запятую)")
 	flag.Parse()
+
+	if v := strings.TrimSpace(*dnsFlag); v != "" {
+		dns = v
+	}
 
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 	log.Println("══════════════════════════════════════════")
