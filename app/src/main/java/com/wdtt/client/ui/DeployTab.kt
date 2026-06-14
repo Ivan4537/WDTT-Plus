@@ -584,10 +584,11 @@ private suspend fun performDeploy(
         val passArg = if (mainPass.isNotBlank()) "-password $mainPass " else ""
         val adminArg = if (adminId.isNotBlank()) "-admin $adminId " else ""
         val botArg = if (botToken.isNotBlank()) "-bot-token $botToken " else ""
-        // ВНИМАНИЕ: wdtt-server не поддерживает флаг -dns (DNS захардкожен в server.go),
-        // передача -dns роняла сервис: "flag provided but not defined: -dns" → крах-луп.
-        // Не добавляем -dns в ExecStart, пока сервер не научится его принимать.
-        val args = "$passArg$adminArg$botArg".trim()
+        // -dns поддерживается сервером (server.go, флаг -dns). Передаём только при заданном
+        // значении; несколько адресов — через запятую. Пустые поля -> сервер берёт свой default.
+        val dnsValue = listOf(dns1, dns2).map { it.trim() }.filter { it.isNotEmpty() }.joinToString(",")
+        val dnsArg = if (dnsValue.isNotEmpty()) "-dns $dnsValue " else ""
+        val args = "$passArg$adminArg$botArg$dnsArg".trim()
 
         val scriptFile = File(context.cacheDir, "deploy.sh")
         val serverFile = File(context.cacheDir, "server")
