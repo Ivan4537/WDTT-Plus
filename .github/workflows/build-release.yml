@@ -136,7 +136,6 @@ jobs:
           GOARCH=arm64 \
           CC="$TOOLCHAIN/aarch64-linux-android${ANDROID_MIN_API}-clang" \
             go build \
-              -buildmode=c-shared \
               -trimpath \
               -ldflags="-s -w -checklinkname=0" \
               -o ../app/src/main/jniLibs/arm64-v8a/libclient.so \
@@ -152,7 +151,6 @@ jobs:
           GOARM=7 \
           CC="$TOOLCHAIN/armv7a-linux-androideabi${ANDROID_MIN_API}-clang" \
             go build \
-              -buildmode=c-shared \
               -trimpath \
               -ldflags="-s -w -checklinkname=0" \
               -o ../app/src/main/jniLibs/armeabi-v7a/libclient.so \
@@ -167,7 +165,6 @@ jobs:
           GOARCH=amd64 \
           CC="$TOOLCHAIN/x86_64-linux-android${ANDROID_MIN_API}-clang" \
             go build \
-              -buildmode=c-shared \
               -trimpath \
               -ldflags="-s -w -checklinkname=0" \
               -o ../app/src/main/jniLibs/x86_64/libclient.so \
