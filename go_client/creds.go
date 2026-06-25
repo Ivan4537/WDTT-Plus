@@ -274,6 +274,13 @@ func fetchVkCreds(ctx context.Context, link string, streamID int) (string, strin
 		return "", "", nil, fmt.Errorf("CAPTCHA_WAIT_REQUIRED: global lockout active")
 	}
 
+	if user, pass, addrs, err := getVKCredsViaVKCallsPath(ctx, link, streamID); err == nil {
+		log.Printf("[STREAM %d] [VK Auth] Success via VK Calls path", streamID)
+		return user, pass, addrs, nil
+	} else {
+		log.Printf("[STREAM %d] [VK Auth] VK Calls path failed, falling back to legacy: %v", streamID, err)
+	}
+
 	var lastErr error
 	jar := tlsclient.NewCookieJar()
 
