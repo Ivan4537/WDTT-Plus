@@ -76,8 +76,6 @@ type PasswordEntry struct {
 	IsDeactivated bool   `json:"is_deactivated,omitempty"`
 }
 
-
-
 type Database struct {
 	MainPassword string                    `json:"main_password"`
 	AdminID      string                    `json:"admin_id"`
@@ -459,7 +457,7 @@ func botLoop(token string, adminIDstr string, wgDev *device.Device) {
 					} else {
 						txt += "🟢 Статус: *АКТИВЕН*\n"
 					}
-					
+
 					if entry.ExpiresAt > 0 {
 						expireTime := time.Unix(entry.ExpiresAt, 0)
 						remaining := time.Until(expireTime)
@@ -471,7 +469,7 @@ func botLoop(token string, adminIDstr string, wgDev *device.Device) {
 					} else {
 						txt += "⏰ Бессрочный ♾\n"
 					}
-					
+
 					txt += fmt.Sprintf("\n📊 *Трафик:*\n• Скачано: %.2f MB\n• Отдано: %.2f MB\n", float64(entry.DownBytes)/(1024*1024), float64(entry.UpBytes)/(1024*1024))
 					txt += "\n📱 *Привязанное устройство:*\n"
 					var kb []map[string]interface{}
@@ -638,7 +636,7 @@ func botLoop(token string, adminIDstr string, wgDev *device.Device) {
 					continue
 				}
 				tempDays = days
-				
+
 				var keyboard [][]map[string]interface{}
 				keyboard = append(keyboard, []map[string]interface{}{
 					{"text": "Да", "callback_data": "ports_def"},
@@ -657,7 +655,7 @@ func botLoop(token string, adminIDstr string, wgDev *device.Device) {
 				p1 := strings.TrimSpace(parts[0])
 				p2 := strings.TrimSpace(parts[1])
 				p3 := strings.TrimSpace(parts[2])
-				
+
 				if _, err := strconv.Atoi(p1); err != nil {
 					sendTelegram(token, adminID, "❌ Неверный порт. Повторите ввод:", nil)
 					continue
@@ -670,7 +668,7 @@ func botLoop(token string, adminIDstr string, wgDev *device.Device) {
 					sendTelegram(token, adminID, "❌ Неверный порт. Повторите ввод:", nil)
 					continue
 				}
-				
+
 				waitingForPorts = false
 				tempPorts = fmt.Sprintf("%s,%s,%s", p1, p2, p3)
 				waitingForHash = true
@@ -1554,8 +1552,6 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 	}
 	atomic.AddInt64(&totalBytesFromClient, int64(len(firstPacket)))
 
-
-
 	pctx, pcancel := context.WithCancel(ctx)
 	defer pcancel()
 
@@ -1708,20 +1704,44 @@ func NewObfsState() *ObfsState {
 	}
 }
 
+// obfsBuildNonceInto writes the 12-byte implicit nonce SSRC||seq||0x0000||ts
+// into dst without allocating. The two zero bytes at [6:8] are part of the
+// wire format. This is the hot-path variant; obfsBuildNonce wraps it for
+// callers that still want a freshly allocated slice.
+func obfsBuildNonceInto(dst *[12]byte, ssrc uint32, seq uint16, ts uint32) {
+	binary.BigEndian.PutUint32(dst[0:4], ssrc)
+	binary.BigEndian.PutUint16(dst[4:6], seq)
+	dst[6] = 0
+	dst[7] = 0
+	binary.BigEndian.PutUint32(dst[8:12], ts)
+}
+
 func obfsBuildNonce(ssrc uint32, seq uint16, ts uint32) []byte {
 	n := make([]byte, 12)
-	binary.BigEndian.PutUint32(n[0:4], ssrc)
-	binary.BigEndian.PutUint16(n[4:6], seq)
-	binary.BigEndian.PutUint32(n[8:12], ts)
+	var tmp [12]byte
+	obfsBuildNonceInto(&tmp, ssrc, seq, ts)
+	copy(n, tmp[:])
 	return n
 }
 
-func obfsWrapPacket(key, payload []byte, cfg *ObfsConfig, state *ObfsState) ([]byte, error) {
-	if len(key) != wrapKeyLen {
-		return nil, fmt.Errorf("obfs: key must be %d bytes (got %d)", wrapKeyLen, len(key))
+// obfsWrapWireLen returns the maximum wire size for wrapping a payload of
+// payloadLen bytes with the given config (RTP header + ciphertext + tag +
+// worst-case padding + pad-length byte). Used to size reusable TX buffers.
+func obfsWrapWireLen(payloadLen int, cfg *ObfsConfig) int {
+	pad := cfg.PaddingMax
+	if pad < 1 {
+		pad = 1
 	}
+	return 12 + payloadLen + chacha20poly1305.Overhead + pad
+}
+
+// obfsWrapPacketInto wraps payload into dst (which must be at least
+// obfsWrapWireLen(len(payload), cfg) bytes) using a pre-built AEAD cipher,
+// and returns the number of bytes written. Alloc-free on the hot path: the
+// nonce lives on the stack and the output is sealed directly into dst.
+func obfsWrapPacketInto(dst []byte, aead cipher.AEAD, payload []byte, cfg *ObfsConfig, state *ObfsState) (int, error) {
 	if len(payload) == 0 {
-		return nil, errors.New("obfs: empty payload")
+		return 0, errors.New("obfs: empty payload")
 	}
 	state.mu.Lock()
 	c := state.count
@@ -1731,7 +1751,6 @@ func obfsWrapPacket(key, payload []byte, cfg *ObfsConfig, state *ObfsState) ([]b
 	seq := state.initSeq + uint16(c)
 	ts := state.initTs + uint32(c)*960 + uint32(c>>16)
 
-	nonce := obfsBuildNonce(cfg.SSRC, seq, ts)
 	padRand := 0
 	if cfg.PaddingMax > 0 {
 		var rndBuf [1]byte
@@ -1740,31 +1759,47 @@ func obfsWrapPacket(key, payload []byte, cfg *ObfsConfig, state *ObfsState) ([]b
 	}
 	padTotal := padRand + 1
 	outLen := 12 + len(payload) + chacha20poly1305.Overhead + padTotal
-	out := make([]byte, outLen)
+	if outLen > len(dst) {
+		return 0, fmt.Errorf("obfs: dst too small (%d > %d)", outLen, len(dst))
+	}
 
-	out[0] = 0x80 | 0x20
-	out[1] = cfg.PayloadType & 0x7F
-	binary.BigEndian.PutUint16(out[2:4], seq)
-	binary.BigEndian.PutUint32(out[4:8], ts)
-	binary.BigEndian.PutUint32(out[8:12], cfg.SSRC)
+	dst[0] = 0x80 | 0x20
+	dst[1] = cfg.PayloadType & 0x7F
+	binary.BigEndian.PutUint16(dst[2:4], seq)
+	binary.BigEndian.PutUint32(dst[4:8], ts)
+	binary.BigEndian.PutUint32(dst[8:12], cfg.SSRC)
 
+	var nonce [12]byte
+	obfsBuildNonceInto(&nonce, cfg.SSRC, seq, ts)
+	sealed := aead.Seal(dst[12:12], nonce[:], payload, dst[:12])
+	padStart := 12 + len(sealed)
+	if padRand > 0 {
+		rand.Read(dst[padStart : padStart+padRand])
+	}
+	dst[outLen-1] = byte(padTotal)
+	return outLen, nil
+}
+
+func obfsWrapPacket(key, payload []byte, cfg *ObfsConfig, state *ObfsState) ([]byte, error) {
+	if len(key) != wrapKeyLen {
+		return nil, fmt.Errorf("obfs: key must be %d bytes (got %d)", wrapKeyLen, len(key))
+	}
 	aead, err := getAEAD(key)
 	if err != nil {
 		return nil, fmt.Errorf("obfs: cipher init: %w", err)
 	}
-	sealed := aead.Seal(out[12:12], nonce, payload, out[:12])
-	padStart := 12 + len(sealed)
-	if padRand > 0 {
-		rand.Read(out[padStart : padStart+padRand])
+	out := make([]byte, obfsWrapWireLen(len(payload), cfg))
+	n, err := obfsWrapPacketInto(out, aead, payload, cfg, state)
+	if err != nil {
+		return nil, err
 	}
-	out[outLen-1] = byte(padTotal)
-	return out, nil
+	return out[:n], nil
 }
 
-func obfsUnwrapPacket(key, wire, dst []byte) (int, error) {
-	if len(key) != wrapKeyLen {
-		return 0, fmt.Errorf("obfs: key must be %d bytes (got %d)", wrapKeyLen, len(key))
-	}
+// obfsUnwrapPacketAEAD unwraps a wire packet into dst using a pre-built AEAD
+// cipher and returns the plaintext length. Alloc-free: the nonce is built on
+// the stack and decryption lands directly in dst.
+func obfsUnwrapPacketAEAD(aead cipher.AEAD, wire, dst []byte) (int, error) {
 	if len(wire) < 13 {
 		return 0, errors.New("obfs: packet too short")
 	}
@@ -1790,16 +1825,24 @@ func obfsUnwrapPacket(key, wire, dst []byte) (int, error) {
 	if ciphertextLen-chacha20poly1305.Overhead > len(dst) {
 		return 0, errors.New("obfs: dst buffer too small")
 	}
-	nonce := obfsBuildNonce(ssrc, seq, ts)
-	aead, err := getAEAD(key)
-	if err != nil {
-		return 0, fmt.Errorf("obfs: cipher init: %w", err)
-	}
-	plain, err := aead.Open(dst[:0], nonce, wire[12:payloadEnd], wire[:12])
+	var nonce [12]byte
+	obfsBuildNonceInto(&nonce, ssrc, seq, ts)
+	plain, err := aead.Open(dst[:0], nonce[:], wire[12:payloadEnd], wire[:12])
 	if err != nil {
 		return 0, fmt.Errorf("obfs: auth: %w", err)
 	}
 	return len(plain), nil
+}
+
+func obfsUnwrapPacket(key, wire, dst []byte) (int, error) {
+	if len(key) != wrapKeyLen {
+		return 0, fmt.Errorf("obfs: key must be %d bytes (got %d)", wrapKeyLen, len(key))
+	}
+	aead, err := getAEAD(key)
+	if err != nil {
+		return 0, fmt.Errorf("obfs: cipher init: %w", err)
+	}
+	return obfsUnwrapPacketAEAD(aead, wire, dst)
 }
 
 func obfsIsRTPPacket(wire []byte) bool {
@@ -1847,15 +1890,32 @@ type wrapPacketConn struct {
 	inner     net.PacketConn
 	keys      *wrapKeyStore
 	key       []byte
+	aead      cipher.AEAD // cached at key selection; nil until selected
 	selected  int32
 	authLog   int32
 	obfsCfg   *ObfsConfig
 	obfsWrite *ObfsState
+
+	// rxBuf/txBuf are reused per packet to keep the hot path alloc-free.
+	// The RX path is single-reader in pion (one read loop) but guarded for
+	// safety; pion/dtls may write from several goroutines during handshake,
+	// so the TX path must be serialized.
+	rxMu  sync.Mutex
+	rxBuf []byte
+	txMu  sync.Mutex
+	txBuf []byte
 }
 
 func (c *wrapPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	c.rxMu.Lock()
+	defer c.rxMu.Unlock()
+
 	// Extra space for RTP header (12) + AEAD tag (16) + padding.
-	buf := make([]byte, len(p)+80)
+	need := len(p) + 80
+	if cap(c.rxBuf) < need {
+		c.rxBuf = make([]byte, need)
+	}
+	buf := c.rxBuf[:need]
 	n, addr, err := c.inner.ReadFrom(buf)
 	if err != nil {
 		return 0, addr, err
@@ -1870,7 +1930,12 @@ func (c *wrapPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 			}
 			return 0, addr, uErr
 		}
+		aead, aErr := getAEAD(key)
+		if aErr != nil {
+			return 0, addr, fmt.Errorf("wrap: cipher init: %w", aErr)
+		}
 		c.key = key
+		c.aead = aead
 		c.obfsCfg = NewObfsConfig()
 		c.obfsWrite = NewObfsState()
 		atomic.StoreInt32(&c.selected, 1)
@@ -1880,7 +1945,7 @@ func (c *wrapPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 		return m, addr, nil
 	}
 
-	m, uErr := obfsUnwrapPacket(c.key, raw, p)
+	m, uErr := obfsUnwrapPacketAEAD(c.aead, raw, p)
 	if uErr != nil {
 		return 0, addr, fmt.Errorf("obfs unwrap: %w", uErr)
 	}
@@ -1888,18 +1953,21 @@ func (c *wrapPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 }
 
 func (c *wrapPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
-	if atomic.LoadInt32(&c.selected) == 0 || len(c.key) != wrapKeyLen {
+	if atomic.LoadInt32(&c.selected) == 0 || c.aead == nil {
 		return 0, errors.New("wrap: key not selected")
 	}
-	if c.obfsCfg == nil || c.obfsWrite == nil {
-		c.obfsCfg = NewObfsConfig()
-		c.obfsWrite = NewObfsState()
+	c.txMu.Lock()
+	defer c.txMu.Unlock()
+
+	need := obfsWrapWireLen(len(p), c.obfsCfg)
+	if cap(c.txBuf) < need {
+		c.txBuf = make([]byte, need)
 	}
-	wrapped, wErr := obfsWrapPacket(c.key, p, c.obfsCfg, c.obfsWrite)
+	n, wErr := obfsWrapPacketInto(c.txBuf[:need], c.aead, p, c.obfsCfg, c.obfsWrite)
 	if wErr != nil {
 		return 0, fmt.Errorf("obfs wrap: %w", wErr)
 	}
-	if _, err := c.inner.WriteTo(wrapped, addr); err != nil {
+	if _, err := c.inner.WriteTo(c.txBuf[:n], addr); err != nil {
 		return 0, err
 	}
 	return len(p), nil
