@@ -278,7 +278,7 @@ func fetchVkCreds(ctx context.Context, link string, streamID int) (string, strin
 		log.Printf("[STREAM %d] [VK Auth] Success via VK Calls path", streamID)
 		return user, pass, addrs, nil
 	} else {
-		log.Printf("[STREAM %d] [VK Auth] VK Calls path failed, falling back to legacy: %v", streamID, err)
+		log.Printf("[STREAM %d] [VK Auth] VK Calls path failed (%s), falling back to legacy", streamID, describeVKCallsFailure(err))
 	}
 
 	var lastErr error
