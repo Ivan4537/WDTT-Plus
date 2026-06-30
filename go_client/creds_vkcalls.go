@@ -101,8 +101,11 @@ func getVKCredsViaVKCallsPath(ctx context.Context, link string, streamID int) (s
 	if err != nil {
 		return "", "", nil, fmt.Errorf("vkcalls step2 messages.getCallPreview: %w", err)
 	}
-	if errText := vkCallsAPIError(resp2); errText != "" {
-		return "", "", nil, fmt.Errorf("vkcalls step2 API error: %s", errText)
+	if apiErr := vkCallsAPIError(resp2); apiErr != nil {
+		if captchaErr, ok := apiErr.(*VkCaptchaError); ok {
+			log.Printf("[STREAM %d] [VKCalls] step2 captcha gate appeared (sid=%q, redirect_uri=%t)", streamID, captchaErr.CaptchaSid, captchaErr.RedirectURI != "")
+		}
+		return "", "", nil, fmt.Errorf("vkcalls step2 API error: %w", apiErr)
 	}
 	userIDFloat, err := extractVKCallsFloat(resp2, "response", "user_id")
 	if err != nil {
@@ -124,8 +127,11 @@ func getVKCredsViaVKCallsPath(ctx context.Context, link string, streamID int) (s
 	if err != nil {
 		return "", "", nil, fmt.Errorf("vkcalls step3 messages.getAnonymCallToken: %w", err)
 	}
-	if errText := vkCallsAPIError(resp3); errText != "" {
-		return "", "", nil, fmt.Errorf("vkcalls step3 API error: %s", errText)
+	if apiErr := vkCallsAPIError(resp3); apiErr != nil {
+		if captchaErr, ok := apiErr.(*VkCaptchaError); ok {
+			log.Printf("[STREAM %d] [VKCalls] step3 captcha gate appeared (sid=%q, redirect_uri=%t)", streamID, captchaErr.CaptchaSid, captchaErr.RedirectURI != "")
+		}
+		return "", "", nil, fmt.Errorf("vkcalls step3 API error: %w", apiErr)
 	}
 	okAnonymToken, err := extractVKCallsStr(resp3, "response", "token")
 	if err != nil {
@@ -234,17 +240,23 @@ func parseVKCallsTURNAddresses(resp map[string]interface{}) []string {
 	return addrs
 }
 
-func vkCallsAPIError(resp map[string]interface{}) string {
+func vkCallsAPIError(resp map[string]interface{}) error {
 	errObj, ok := resp["error"].(map[string]interface{})
 	if !ok {
-		return ""
+		return nil
 	}
 	code, _ := errObj["error_code"].(float64)
 	msg, _ := errObj["error_msg"].(string)
 	if code == 0 && msg == "" {
-		return ""
+		return nil
 	}
-	return fmt.Sprintf("error_code=%.0f %s", code, msg)
+	if int(code) == 14 {
+		if errJSON, err := json.Marshal(errObj); err == nil {
+			log.Printf("[VKCalls] captcha error response: %s", truncateVKCallsLog(string(errJSON), 300))
+		}
+		return parseVkCaptchaError(errObj)
+	}
+	return fmt.Errorf("error_code=%.0f %s", code, msg)
 }
 
 func vkCallsOKError(resp map[string]interface{}) string {
