@@ -101,7 +101,7 @@ import kotlin.math.min
 import kotlin.math.sin
 
 private const val ReleasesUrl = "https://github.com/Ivan4537/WDTT-Plus/releases"
-private const val IssuesUrl = "https://github.com/Ivan4537/WDTT-Plus/issues/new"
+private const val IssuesUrl = "https://github.com/Ivan4537/WDTT-Plus/issues/new/choose"
 private const val DeveloperProfileUrl = "https://github.com/Ivan4537"
 private const val RepositoryUrl = "https://github.com/Ivan4537/WDTT-Plus"
 private const val DonateUrl = "https://yoomoney.ru/to/410012216336438"
@@ -248,7 +248,7 @@ fun InfoTab(
         ) {
             WideActionTile(
                 title = "Поднять вопрос",
-                subtitle = "Открыть GitHub issue",
+                subtitle = "Выбрать шаблон GitHub issue",
                 onClick = { openUrlInBrowser(context, IssuesUrl) },
                 icon = {
                     Icon(
@@ -684,7 +684,7 @@ private fun InfoHeroCard(
                         color = colors.onSurface
                     )
 				Text(
-					text = "Модифицированная версия оригинального проекта amurcanov: Android-клиент для TURN/VK туннеля с WireGuard, капчей и управлением сервером.",
+					text = "Android-клиент для TURN/VK туннеля с WireGuard, капчей, управлением сервером и удобными сценариями подключения.",
 					style = MaterialTheme.typography.bodyMedium,
 					color = colors.onSurfaceVariant,
 					lineHeight = 21.sp
