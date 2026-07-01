@@ -1,0 +1,119 @@
+name: Проблема подключения
+description: VPN, сервер, деплой, VKCalls, капча, DNS, WireGuard или пропал интернет.
+title: "[Подключение]: "
+labels:
+  - connection
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Эта форма для проблем с подключением. Чем больше логов и контекста, тем быстрее получится понять причину.
+
+  - type: input
+    id: app_version
+    attributes:
+      label: Версия WDTT Plus
+      placeholder: "Например: 1"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: apk_abi
+    attributes:
+      label: Какой APK установлен?
+      options:
+        - arm64-v8a
+        - armeabi-v7a
+        - x86_64
+        - universal
+        - Не знаю
+    validations:
+      required: true
+
+  - type: input
+    id: device
+    attributes:
+      label: Телефон и Android
+      placeholder: "Например: OnePlus 13, Android 15, OxygenOS"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: area
+    attributes:
+      label: Где проблема?
+      options:
+        - label: VPN не подключается
+        - label: VPN подключился, но нет интернета
+        - label: Проблема после сна телефона
+        - label: Проблема после смены Wi‑Fi/LTE
+        - label: VKCalls
+        - label: Капча
+        - label: Деплой сервера
+        - label: Подключение к готовому серверу
+        - label: Перенос сервера
+        - label: Выходной IP / прокси / WireGuard exit
+        - label: Другое
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: network
+    attributes:
+      label: Сеть
+      options:
+        - label: Wi‑Fi
+        - label: Мобильная сеть
+        - label: Проблема повторяется в разных сетях
+        - label: Проверялось только в одной сети
+        - label: Не знаю
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Что происходит?
+      description: Опишите проблему и когда она началась.
+      placeholder: "Что нажимаете, что пишет приложение, на каком этапе всё ломается?"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Логи WDTT Plus
+      description: Приложите скрин вкладки «Логи» или вставьте текст. Секреты, пароли и токены перед отправкой удалите.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: server
+    attributes:
+      label: Сервер
+      description: Что можно сообщить без секретов.
+      placeholder: |
+        Новый деплой или старый сервер?
+        ОС сервера, если знаете:
+        Используется ли прокси/WireGuard exit:
+        Менялись ли DNS/порты:
+    validations:
+      required: false
+
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Скриншоты
+      description: Приложите скриншоты вкладок «Туннель», «Логи», «Деплой» или ошибок Android.
+    validations:
+      required: false
+
+  - type: textarea
+    id: support_report
+    attributes:
+      label: Отчёт из «Инфо»
+      description: Вкладка «Инфо» → «Собрать отчёт».
+      render: text
+    validations:
+      required: false

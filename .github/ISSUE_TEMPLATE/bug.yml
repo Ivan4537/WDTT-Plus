@@ -1,0 +1,87 @@
+name: Баг приложения
+description: Ошибка интерфейса, обновлений, кнопок, настроек или поведения APK.
+title: "[Баг]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Спасибо, что помогаете улучшать WDTT Plus. Заполните поля ниже — так проблему получится разобрать быстрее.
+
+  - type: input
+    id: app_version
+    attributes:
+      label: Версия WDTT Plus
+      description: Посмотреть можно во вкладке «Инфо».
+      placeholder: "Например: 1"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: apk_abi
+    attributes:
+      label: Какой APK установлен?
+      options:
+        - arm64-v8a
+        - armeabi-v7a
+        - x86_64
+        - universal
+        - Не знаю
+    validations:
+      required: true
+
+  - type: input
+    id: device
+    attributes:
+      label: Телефон и Android
+      description: Модель телефона, версия Android, прошивка/ROM, если знаете.
+      placeholder: "Например: OnePlus 13, Android 15, OxygenOS"
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Что произошло?
+      description: Опишите баг простыми словами.
+      placeholder: "Что сломалось, где это видно, какая кнопка/экран/действие?"
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Что должно было произойти?
+      placeholder: "Какое поведение ожидалось?"
+    validations:
+      required: false
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Как повторить?
+      description: Если получается повторить баг, напишите шаги.
+      placeholder: |
+        1. Открыть ...
+        2. Нажать ...
+        3. Увидеть ...
+    validations:
+      required: false
+
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Скриншоты или видео
+      description: Перетащите сюда скриншоты/запись экрана, если они помогают понять проблему.
+    validations:
+      required: false
+
+  - type: textarea
+    id: support_report
+    attributes:
+      label: Отчёт из «Инфо»
+      description: Если проблема зависит от устройства, приложите отчёт из вкладки «Инфо» → «Собрать отчёт».
+      render: text
+    validations:
+      required: false

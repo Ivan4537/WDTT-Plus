@@ -1,0 +1,47 @@
+name: Предложение
+description: Идея, улучшение интерфейса, новая функция или изменение поведения.
+title: "[Предложение]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Опишите идею и зачем она нужна. Даже короткие предложения полезны, если понятен сценарий.
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: Что предлагаете?
+      placeholder: "Опишите идею или изменение."
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: Зачем это нужно?
+      description: Какая проблема решится или что станет удобнее?
+      placeholder: "Какой сценарий станет проще?"
+    validations:
+      required: true
+
+  - type: textarea
+    id: details
+    attributes:
+      label: Детали
+      description: Скриншоты, примеры интерфейса, похожие приложения, ограничения.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Насколько важно?
+      options:
+        - Было бы удобно
+        - Заметно улучшит использование
+        - Сейчас мешает пользоваться
+        - Не знаю
+    validations:
+      required: false
