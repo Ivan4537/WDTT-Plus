@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================================================
-#  WDTT VPN Server — Универсальный установщик для VPS
+#  WDTT Plus Server — Универсальный установщик для VPS
 #  Поддержка: Debian 11+, Ubuntu 20.04+, CentOS/RHEL/Fedora/AlmaLinux/Rocky
 #  Версия: 3.2  |  Дата: 2026-05-13
 #  NAT:  MASQUERADE через iptables
@@ -14,10 +14,12 @@ readonly LOG_FILE="/var/log/wdtt-install.log"
 readonly WG_PORT="${WDTT_WG_PORT:-56001}"
 readonly DTLS_PORT="${WDTT_DTLS_PORT:-56000}"
 readonly SSH_PORT="${WDTT_SSH_PORT:-22}"
+readonly MAX_PASSWORDS="${WDTT_MAX_PASSWORDS:-50}"
 readonly WDTT_ARGS="${WDTT_ARGS:-}"
 readonly WDTT_IFACE="wdtt0"
 readonly WDTT_CONFIG_DIR="/etc/wdtt"
 readonly WDTT_ACCESS_DB="passwords.json"
+readonly WDTT_WG_KEYS="wg-keys.dat"
 readonly IPT_COMMENT="WDTT_MANAGED"
 readonly IPT_MIRROR_COMMENT="WDTT_MIRRORED"
 
@@ -327,18 +329,19 @@ fw_cleanup_wdtt_rules() {
 
 cleanup_config_dir_keep_access_db() {
     [ -d "$WDTT_CONFIG_DIR" ] || return 0
-    find "$WDTT_CONFIG_DIR" -mindepth 1 -maxdepth 1 ! -name "$WDTT_ACCESS_DB" -exec rm -rf {} + 2>/dev/null || true
+    find "$WDTT_CONFIG_DIR" -mindepth 1 -maxdepth 1 ! -name "$WDTT_ACCESS_DB" ! -name "$WDTT_WG_KEYS" -exec rm -rf {} + 2>/dev/null || true
     [ -f "$WDTT_CONFIG_DIR/$WDTT_ACCESS_DB" ] && chmod 600 "$WDTT_CONFIG_DIR/$WDTT_ACCESS_DB" 2>/dev/null || true
+    [ -f "$WDTT_CONFIG_DIR/$WDTT_WG_KEYS" ] && chmod 600 "$WDTT_CONFIG_DIR/$WDTT_WG_KEYS" 2>/dev/null || true
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  WDTT VPN SERVER DEPLOYMENT
+#  WDTT PLUS SERVER DEPLOYMENT
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ─── Очистка старого WDTT ─────────────────────────────────────────────────────
 wdtt_cleanup() {
     prog 0.05 "Очистка..."
-    echo "🧹 Очистка старой установки WDTT..."
+    echo "🧹 Очистка старой установки WDTT Plus..."
 
     systemctl unmask wdtt 2>/dev/null || true
     systemctl stop wdtt 2>/dev/null || true
@@ -436,11 +439,11 @@ setup_wdtt_binary() {
 # ─── Systemd-сервис WDTT ─────────────────────────────────────────────────────
 setup_wdtt_service() {
     prog 0.75 "Сервис..."
-    echo "🔧 Создание systemd-сервиса WDTT..."
+    echo "🔧 Создание systemd-сервиса WDTT Plus..."
 
     cat > /etc/systemd/system/wdtt.service << WDTTSVC
 [Unit]
-Description=WDTT VPN Server
+Description=WDTT Plus Server
 After=network.target network-online.target
 Wants=network-online.target
 
@@ -448,7 +451,7 @@ Wants=network-online.target
 Type=simple
 ExecStartPre=-/usr/bin/env bash -c "ip link show ${WDTT_IFACE} >/dev/null 2>&1 && ip link del ${WDTT_IFACE} 2>/dev/null || true"
 ExecStartPre=-/usr/bin/env bash -c "if command -v iptables >/dev/null 2>&1; then iptables -C INPUT -p udp --dport ${DTLS_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport ${DTLS_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT; iptables -C INPUT -p udp --dport ${WG_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport ${WG_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT; iptables -C INPUT -p tcp --dport ${SSH_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport ${SSH_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT; fi"
-ExecStart=/usr/local/bin/wdtt-server -listen 0.0.0.0:${DTLS_PORT} -wg-port ${WG_PORT} -config-dir ${WDTT_CONFIG_DIR} ${WDTT_ARGS}
+ExecStart=/usr/local/bin/wdtt-server -listen 0.0.0.0:${DTLS_PORT} -wg-port ${WG_PORT} -config-dir ${WDTT_CONFIG_DIR} -max-passwords ${MAX_PASSWORDS} ${WDTT_ARGS}
 Restart=always
 RestartSec=5
 LimitNOFILE=65535
@@ -466,7 +469,7 @@ WDTTSVC
 # ─── Запуск WDTT ─────────────────────────────────────────────────────────────
 start_wdtt() {
     prog 0.90 "Запуск..."
-    echo "🚀 Запуск WDTT VPN Server..."
+    echo "🚀 Запуск WDTT Plus Server..."
 
     if [ ! -f /usr/local/bin/wdtt-server ]; then
         echo "⚠ wdtt-server не установлен — запуск пропущен"
@@ -504,7 +507,7 @@ start_wdtt() {
 
 # ─── Команда: uninstall ──────────────────────────────────────────────────────
 do_uninstall() {
-    log_step "Удаление WDTT..."
+    log_step "Удаление WDTT Plus..."
 
     systemctl stop wdtt 2>/dev/null || true
     systemctl disable wdtt 2>/dev/null || true
@@ -521,12 +524,12 @@ do_uninstall() {
     rm -f /etc/sysctl.d/99-wdtt.conf
     sysctl --system >/dev/null 2>&1 || true
 
-    log_info "WDTT удалён. База доступа сохранена: ${WDTT_CONFIG_DIR}/${WDTT_ACCESS_DB}"
+    log_info "WDTT Plus удалён. База доступа сохранена: ${WDTT_CONFIG_DIR}/${WDTT_ACCESS_DB}"
 }
 
 # ─── Команда: status ─────────────────────────────────────────────────────────
 do_status() {
-    echo "Статус WDTT:"
+    echo "Статус WDTT Plus:"
     echo ""
     if systemctl is-active wdtt &>/dev/null; then
         log_info "Сервис: АКТИВЕН"
@@ -539,9 +542,9 @@ do_status() {
         log_warn "Бинарник: НЕ найден"
     fi
     if ip link show "$WDTT_IFACE" &>/dev/null; then
-        log_info "WDTT интерфейс ($WDTT_IFACE): активен"
+        log_info "VPN-интерфейс ($WDTT_IFACE): активен"
     else
-        log_warn "WDTT интерфейс ($WDTT_IFACE): не активен"
+        log_warn "VPN-интерфейс ($WDTT_IFACE): не активен"
     fi
 }
 
@@ -550,7 +553,7 @@ do_status() {
 # ══════════════════════════════════════════════════════════════════════════════
 main() {
     echo "╔══════════════════════════════════════════════════════════════╗"
-    echo "║       WDTT VPN Server — Installer v${SCRIPT_VERSION}                    ║"
+    echo "║       WDTT Plus Server — Installer v${SCRIPT_VERSION}                    ║"
     echo "║       DTLS: ${DTLS_PORT}  |  WG: ${WG_PORT}  |  SSH: ${SSH_PORT}       ║"
     echo "╚══════════════════════════════════════════════════════════════╝"
 
@@ -561,7 +564,7 @@ main() {
     validate_port "WDTT_SSH_PORT" "$SSH_PORT"
 
     mkdir -p "$(dirname "$LOG_FILE")"
-    echo "=== WDTT Installer v${SCRIPT_VERSION} — $(date) ===" >> "$LOG_FILE"
+    echo "=== WDTT Plus Installer v${SCRIPT_VERSION} — $(date) ===" >> "$LOG_FILE"
 
     detect_os
     install_prerequisites

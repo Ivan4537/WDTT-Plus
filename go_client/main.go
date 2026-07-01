@@ -16,15 +16,29 @@ import (
 	"time"
 )
 
+type CaptchaResult struct {
+	RequestID string
+	Value     string
+}
+
 // CaptchaResultChan — канал для получения токена капчи из внешнего решателя (WebView)
-var CaptchaResultChan = make(chan string, 1)
+var CaptchaResultChan = make(chan CaptchaResult, 8)
+var captchaRequestSequence atomic.Uint64
+var captchaResultWaiters = struct {
+	sync.Mutex
+	byRequestID map[string]chan CaptchaResult
+}{
+	byRequestID: make(map[string]chan CaptchaResult),
+}
 
 var captchaModeValue atomic.Value
-var vkAuthModeValue atomic.Value
+var vkCallsPreflightEnabled atomic.Bool
+var vkCallsDeviceID atomic.Value
 
 func init() {
 	captchaModeValue.Store("auto")
-	vkAuthModeValue.Store("vkcalls")
+	vkCallsPreflightEnabled.Store(true)
+	vkCallsDeviceID.Store("unknown")
 }
 
 func normalizeCaptchaMode(mode string) string {
@@ -50,39 +64,167 @@ func getCaptchaMode() string {
 	return mode
 }
 
-func normalizeVKAuthMode(mode string) string {
-	switch strings.ToLower(strings.TrimSpace(mode)) {
-	case "legacy":
-		return "legacy"
+func setVKCallsPreflight(enabled bool, deviceID string) {
+	vkCallsPreflightEnabled.Store(enabled)
+	deviceID = strings.TrimSpace(deviceID)
+	if deviceID == "" {
+		deviceID = "unknown"
+	}
+	vkCallsDeviceID.Store(deviceID)
+}
+
+func getVKCallsDeviceID() string {
+	deviceID, _ := vkCallsDeviceID.Load().(string)
+	if deviceID == "" {
+		return "unknown"
+	}
+	return deviceID
+}
+
+func normalizeBooleanFlagArgs(args []string, flagName string) []string {
+	result := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		if args[i] == flagName && i+1 < len(args) {
+			value := strings.ToLower(strings.TrimSpace(args[i+1]))
+			if value == "true" || value == "false" {
+				result = append(result, flagName+"="+value)
+				i++
+				continue
+			}
+		}
+		result = append(result, args[i])
+	}
+	return result
+}
+
+func runHashChecks(ctx context.Context, hashes []string) {
+	log.Printf("[CHECK] Проверка VK-хешей: %d", len(hashes))
+	for i, hash := range hashes {
+		fmt.Printf("HASH_CHECK_START|%d|%s\n", i+1, hash)
+		checkCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+		_, _, turnURLs, err := GetCreds(checkCtx, hash, 9000+i)
+		cancel()
+
+		status, message := classifyHashCheckError(err)
+		if err == nil {
+			status = "ok"
+			message = fmt.Sprintf("TURN urls=%d", len(turnURLs))
+		}
+		fmt.Printf("HASH_CHECK|%d|%s|%s|%s\n", i+1, hash, status, sanitizeHashCheckMessage(message))
+	}
+}
+
+func classifyHashCheckError(err error) (string, string) {
+	if err == nil {
+		return "ok", ""
+	}
+	text := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(text, "captcha_required") || strings.Contains(text, "captcha_wait_required"):
+		return "captcha", "VK просит капчу"
+	case strings.Contains(text, "call not found") ||
+		strings.Contains(text, "joinconversationbylink") ||
+		strings.Contains(text, "missing turn_server") ||
+		strings.Contains(text, "9000"):
+		return "dead", "Звонок не найден или закрыт"
+	case strings.Contains(text, "flood") || strings.Contains(text, "rate limit") || strings.Contains(text, "error_code:29"):
+		return "limited", "VK временно ограничил запросы"
+	case strings.Contains(text, "timeout") || strings.Contains(text, "deadline") || strings.Contains(text, "lookup") || strings.Contains(text, "network"):
+		return "network", "Сетевая ошибка"
 	default:
-		return "vkcalls"
+		return "error", err.Error()
 	}
 }
 
-func setVKAuthMode(mode string) string {
-	normalized := normalizeVKAuthMode(mode)
-	vkAuthModeValue.Store(normalized)
-	return normalized
-}
-
-func getVKAuthMode() string {
-	mode, _ := vkAuthModeValue.Load().(string)
-	if mode == "" {
-		return "vkcalls"
+func sanitizeHashCheckMessage(message string) string {
+	message = strings.ReplaceAll(message, "\n", " ")
+	message = strings.ReplaceAll(message, "\r", " ")
+	message = strings.ReplaceAll(message, "|", "/")
+	if len(message) > 180 {
+		return message[:180]
 	}
-	return mode
+	return message
 }
 
-// drainCaptchaResult удаляет устаревший результат капчи из канала
-func drainCaptchaResult() {
+func nextCaptchaRequestID(streamID int) string {
+	return fmt.Sprintf("%d-%d", streamID, captchaRequestSequence.Add(1))
+}
+
+func parseCaptchaResultPayload(payload string) CaptchaResult {
+	parts := strings.SplitN(payload, "|", 2)
+	if len(parts) == 2 && strings.TrimSpace(parts[0]) != "" {
+		return CaptchaResult{RequestID: strings.TrimSpace(parts[0]), Value: strings.TrimSpace(parts[1])}
+	}
+	return CaptchaResult{Value: strings.TrimSpace(payload)}
+}
+
+func captchaResultMatchesRequest(result CaptchaResult, requestID string) bool {
+	return result.RequestID == "" || result.RequestID == requestID
+}
+
+func registerCaptchaResultWaiter(requestID string) (<-chan CaptchaResult, func()) {
+	requestID = strings.TrimSpace(requestID)
+	if requestID == "" {
+		return CaptchaResultChan, func() {}
+	}
+
+	ch := make(chan CaptchaResult, 1)
+	captchaResultWaiters.Lock()
+	captchaResultWaiters.byRequestID[requestID] = ch
+	captchaResultWaiters.Unlock()
+
+	cleanup := func() {
+		captchaResultWaiters.Lock()
+		if captchaResultWaiters.byRequestID[requestID] == ch {
+			delete(captchaResultWaiters.byRequestID, requestID)
+		}
+		captchaResultWaiters.Unlock()
+	}
+	return ch, cleanup
+}
+
+func deliverCaptchaResult(ch chan CaptchaResult, result CaptchaResult) bool {
+	select {
+	case ch <- result:
+		return true
+	default:
+		return false
+	}
+}
+
+func enqueueCaptchaResult(result CaptchaResult) {
+	if result.RequestID != "" {
+		captchaResultWaiters.Lock()
+		ch := captchaResultWaiters.byRequestID[result.RequestID]
+		captchaResultWaiters.Unlock()
+		if ch == nil {
+			log.Printf("[КАПЧА] Запоздалый результат без активного ожидателя request=%q", result.RequestID)
+			return
+		}
+		if !deliverCaptchaResult(ch, result) {
+			log.Printf("[КАПЧА] Очередь результата заполнена request=%q", result.RequestID)
+		}
+		return
+	}
+
+	select {
+	case CaptchaResultChan <- result:
+		return
+	default:
+	}
 	select {
 	case <-CaptchaResultChan:
+	default:
+	}
+	select {
+	case CaptchaResultChan <- result:
 	default:
 	}
 }
 
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
+	os.Args = normalizeBooleanFlagArgs(os.Args, "-vkcalls-preflight")
 
 	setupGlobalResolver()
 
@@ -127,10 +269,9 @@ func main() {
 				cancel()
 				return
 			case strings.HasPrefix(line, "CAPTCHA_RESULT|"):
-				result := strings.TrimPrefix(line, "CAPTCHA_RESULT|")
-				drainCaptchaResult()
-				CaptchaResultChan <- result
-				log.Printf("[КАПЧА] Результат от Kotlin записан в канал")
+				result := parseCaptchaResultPayload(strings.TrimPrefix(line, "CAPTCHA_RESULT|"))
+				enqueueCaptchaResult(result)
+				log.Printf("[КАПЧА] Результат от Kotlin принят (request=%q)", result.RequestID)
 			}
 		}
 	}()
@@ -150,21 +291,45 @@ func main() {
 	listen := flag.String("listen", "127.0.0.1:9000", "локальный адрес")
 	vkHash := flag.String("vk", "", "хеши VK-звонков (через запятую)")
 	peerAddr := flag.String("peer", "", "адрес:порт VPS сервера")
-	numW := flag.Int("n", 24, "количество воркеров (кратно 12)")
+	numW := flag.Int("n", 24, "количество воркеров (кратно 9)")
+	checkHashes := flag.Bool("check-hashes", false, "проверить VK-хеши и выйти")
 
 	deviceID := flag.String("device-id", "unknown", "уникальный ID устройства")
+	deviceInfo := flag.String("device-info", "", "JSON с безопасной информацией об устройстве")
 	connPassword := flag.String("password", "", "пароль подключения")
-	vkAuthMode := flag.String("vk-auth-mode", "vkcalls", "режим получения VK TURN-кредов (vkcalls/legacy)")
 	captchaMode := flag.String("captcha-mode", "auto", "режим обхода капчи (auto/wv/rjs)")
-	fingerprint := flag.String("fingerprint", "chrome", "браузерный фингерпринт (chrome, safari, ios, android, firefox)")
+	vkCallsPreflight := flag.Bool("vkcalls-preflight", true, "пробовать VKCalls до captcha-цепочки")
+	fingerprint := flag.String("fingerprint", "firefox", "браузерный фингерпринт (firefox, chrome, safari, ios, android)")
 	clientIdsFlag := flag.String("client-ids", "", "ID клиентов VK через запятую")
 
 	flag.Parse()
-	activeVKAuthMode := setVKAuthMode(*vkAuthMode)
 	activeCaptchaMode := setCaptchaMode(*captchaMode)
+	setVKCallsPreflight(*vkCallsPreflight, *deviceID)
 
-	if *peerAddr == "" || *vkHash == "" {
-		log.Fatal("[КЛИЕНТ] Нужны -peer и -vk")
+	if *vkHash == "" {
+		log.Fatal("[КЛИЕНТ] Нужен -vk")
+	}
+
+	if *fingerprint != "" {
+		SetActiveFingerprint(*fingerprint)
+	}
+	if *clientIdsFlag != "" {
+		SetActiveClientIds(*clientIdsFlag)
+	}
+
+	hashes := ParseHashes(*vkHash)
+	if len(hashes) == 0 {
+		log.Fatal("[КЛИЕНТ] Нет хешей VK")
+	}
+
+	if *checkHashes {
+		SetHashCheckMode(true)
+		runHashChecks(ctx, hashes)
+		return
+	}
+
+	if *peerAddr == "" {
+		log.Fatal("[КЛИЕНТ] Нужен -peer")
 	}
 
 	cleanPeerAddr := strings.TrimSpace(*peerAddr)
@@ -179,18 +344,6 @@ func main() {
 	}
 	if err != nil {
 		log.Fatalf("[КЛИЕНТ] Ошибка разбора пира: %v", err)
-	}
-
-	if *fingerprint != "" {
-		SetActiveFingerprint(*fingerprint)
-	}
-	if *clientIdsFlag != "" {
-		SetActiveClientIds(*clientIdsFlag)
-	}
-
-	hashes := ParseHashes(*vkHash)
-	if len(hashes) == 0 {
-		log.Fatal("[КЛИЕНТ] Нет хешей VK")
 	}
 
 	if *connPassword == "" {
@@ -259,17 +412,16 @@ func main() {
 		wrapStatus = "ON (password HKDF + RTP AEAD)"
 	}
 
-	captchaStatus := "AUTO: Go v2 x2 -> WBV Auto x2 -> Go v2 x1 -> Manual WBV"
+	captchaStatus := "AUTO: each fresh challenge starts with WBV Auto -> Go v2 -> Manual WBV"
 	switch activeCaptchaMode {
 	case "wv":
 		captchaStatus = "WBV selected in Android"
 	case "rjs":
-		captchaStatus = "RJS Go v2 with WBV Auto fallback"
+		captchaStatus = "RJS: each fresh challenge starts with WBV Auto -> Go v2 -> Manual WBV"
 	}
 
 	log.Println("[КЛИЕНТ] ═══════════════════════════════════════")
 	log.Printf("[КЛИЕНТ] VK Creds: Client IDs: %s", GetActiveClientIdsString())
-	log.Printf("[КЛИЕНТ] VK Auth: %s", activeVKAuthMode)
 	log.Printf("[КЛИЕНТ] TLS: %s fingerprint", GetActiveFingerprint())
 	log.Printf("[КЛИЕНТ] Воркеров: %d (групп: %d, по %d)", *numW, numGroups, workersPerGroup)
 	log.Printf("[КЛИЕНТ] Хешей: %d", len(hashes))
@@ -363,8 +515,8 @@ func main() {
 		wg.Add(1)
 		go func(groupID int, isFirstGroup bool, configChan chan<- string, workerIds []int, startHashIndex int, waitR <-chan struct{}, sigR chan<- struct{}) {
 			defer wg.Done()
-			WorkerGroup(ctx, groupID, startHashIndex, tp, peer, disp, localPort,
-				isFirstGroup, configChan, workerIds, &pauseFlag, *deviceID, *connPassword, stats, waitR, sigR)
+			WorkerGroup(ctx, cancel, groupID, startHashIndex, tp, peer, disp, localPort,
+				isFirstGroup, configChan, workerIds, &pauseFlag, *deviceID, *connPassword, *deviceInfo, stats, waitR, sigR)
 		}(gID, isFirst, cc, ids, g, myWaitReady, mySignalReady)
 	}
 

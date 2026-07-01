@@ -1,7 +1,11 @@
 # ===== Gradle =====
 .gradle/
+.kotlin/
 build/
 local.properties
+.env
+.env.*
+!.env.example
 
 # ===== Android =====
 *.apk
@@ -9,11 +13,17 @@ local.properties
 *.ap_
 *.dex
 *.class
+*.idsig
 app/build/
 app/release/
-
-# ===== Go =====
-go.sum
+captures/
+screenshots/
+*.hprof
+hs_err_pid*
+*.trace
+*.prof
+*.pcap
+*.pcapng
 
 # ===== Native Libraries (compiled) =====
 *.so
@@ -31,6 +41,16 @@ server
 *.jks
 *.key
 *.pem
+*.p12
+*.pfx
+*.mobileprovision
+google-services.json
+service-account*.json
+firebase-service-account*.json
+credentials*.json
+secrets*.json
+.codex-local/
+AGENTS.md
 
 # ===== IDE =====
 .idea/
@@ -49,5 +69,7 @@ Desktop.ini
 *.log
 *.tmp
 *.bak
+*.orig
+*.rej
 msg.txt
 *.bat

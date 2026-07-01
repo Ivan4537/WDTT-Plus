@@ -35,8 +35,6 @@ func LoadProfileFromDisk() (*SavedProfile, error) {
 	return &sp, nil
 }
 
-
-
 // profileList contains paired User-Agent and Client Hints strings.
 var profileList = []Profile{
 	// Windows Chrome
@@ -101,10 +99,7 @@ var profileList = []Profile{
 		SecChUaPlatform: `"Linux"`,
 	},
 	{
-		UserAgent:       "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0",
-		SecChUa:         `"Firefox";v="132", "Not-A.Brand";v="8", "Mozilla Firefox";v="132"`,
-		SecChUaMobile:   "?0",
-		SecChUaPlatform: `"Windows"`,
+		UserAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0",
 	},
 }
 
@@ -126,7 +121,7 @@ var iosProfiles = []Profile{
 	},
 }
 
-var activeFingerprint = "chrome"
+var activeFingerprint = "firefox"
 
 func SetActiveFingerprint(fp string) {
 	activeFingerprint = fp

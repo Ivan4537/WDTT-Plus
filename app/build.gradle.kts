@@ -5,16 +5,26 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+val appVersionName = "1"
+val releaseApkBaseName = "WDTT-Plus"
+
+val localProperties = Properties()
+val localPropertiesFile = rootProject.file("local.properties")
+if (localPropertiesFile.exists()) {
+    localProperties.load(localPropertiesFile.inputStream())
+}
+
 android {
-    namespace = "com.wdtt.client"
+    namespace = "com.wdtt.plus"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.wdtt.client"
+        applicationId = "com.wdtt.plus"
         minSdk = 28
         targetSdk = 35
-        versionCode = 122
-        versionName = "1.2.2"
+        versionCode = 1
+        versionName = appVersionName
+        buildConfigField("String", "MOD_RELEASE_DATE", "\"01.07.2026\"")
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -33,12 +43,6 @@ android {
             include("arm64-v8a", "armeabi-v7a", "x86_64")
             isUniversalApk = true
         }
-    }
-
-    val localProperties = Properties()
-    val localPropertiesFile = rootProject.file("local.properties")
-    if (localPropertiesFile.exists()) {
-        localProperties.load(localPropertiesFile.inputStream())
     }
 
     signingConfigs {
@@ -125,12 +129,154 @@ android {
     }
 }
 
+val goClientDir = rootProject.layout.projectDirectory.dir("go_client")
+val jniLibsDir = layout.projectDirectory.dir("src/main/jniLibs")
+val serverAssetFile = layout.projectDirectory.file("src/main/assets/server")
+val androidSdkDir = localProperties.getProperty("sdk.dir")
+    ?: System.getenv("ANDROID_HOME")
+    ?: System.getenv("ANDROID_SDK_ROOT")
+
+tasks.register<Exec>("buildNativeClient") {
+    group = "build"
+    description = "Builds Android libclient.so binaries from go_client sources."
+
+    inputs.files(fileTree(goClientDir.asFile) {
+        include("**/*.go", "go.mod", "go.sum")
+    })
+    outputs.files(
+        listOf("arm64-v8a", "armeabi-v7a", "x86_64").map { abi ->
+            jniLibsDir.file("$abi/libclient.so")
+        }
+    )
+
+    commandLine(
+        "bash",
+        "-lc",
+        """
+            set -euo pipefail
+            sdk_dir="${'$'}1"
+            go_dir="${'$'}2"
+            jni_dir="${'$'}3"
+            if [ -z "${'$'}sdk_dir" ]; then
+                echo "Android SDK not found. Set sdk.dir in local.properties or ANDROID_HOME." >&2
+                exit 1
+            fi
+            ndk_bin="$(ls -d "${'$'}sdk_dir"/ndk/*/toolchains/llvm/prebuilt/linux-x86_64/bin 2>/dev/null | sort -V | tail -n 1)"
+            if [ -z "${'$'}ndk_bin" ]; then
+                echo "Android NDK not found under ${'$'}sdk_dir/ndk." >&2
+                exit 1
+            fi
+            build_one() {
+                abi="${'$'}1"
+                goarch="${'$'}2"
+                cc="${'$'}3"
+                goarm="${'$'}4"
+                mkdir -p "${'$'}jni_dir/${'$'}abi"
+                if [ -n "${'$'}goarm" ]; then
+                    env GOOS=android GOARCH="${'$'}goarch" GOARM="${'$'}goarm" CGO_ENABLED=1 CC="${'$'}ndk_bin/${'$'}cc" \
+                        go build -trimpath -ldflags="-s -w -checklinkname=0" -buildmode=pie \
+                        -o "${'$'}jni_dir/${'$'}abi/libclient.so" .
+                else
+                    env GOOS=android GOARCH="${'$'}goarch" CGO_ENABLED=1 CC="${'$'}ndk_bin/${'$'}cc" \
+                        go build -trimpath -ldflags="-s -w -checklinkname=0" -buildmode=pie \
+                        -o "${'$'}jni_dir/${'$'}abi/libclient.so" .
+                fi
+            }
+            cd "${'$'}go_dir"
+            build_one arm64-v8a arm64 aarch64-linux-android29-clang ""
+            build_one armeabi-v7a arm armv7a-linux-androideabi29-clang 7
+            build_one x86_64 amd64 x86_64-linux-android29-clang ""
+        """.trimIndent(),
+        "bash",
+        androidSdkDir.orEmpty(),
+        goClientDir.asFile.absolutePath,
+        jniLibsDir.asFile.absolutePath
+    )
+}
+
+tasks.matching {
+    it.name.startsWith("merge") &&
+        (it.name.endsWith("NativeLibs") || it.name.endsWith("JniLibFolders"))
+}.configureEach {
+    dependsOn("buildNativeClient")
+}
+
+tasks.register<Exec>("buildServerAsset") {
+    group = "build"
+    description = "Builds the Linux wdtt-server binary embedded into Android deploy assets."
+    workingDir(rootProject.layout.projectDirectory.asFile)
+
+    inputs.files(fileTree(rootProject.layout.projectDirectory.asFile) {
+        include("*.go", "go.mod", "go.sum")
+        exclude("build/**", "app/**", "go_client/**")
+    })
+    outputs.file(serverAssetFile)
+
+    commandLine(
+        "bash",
+        "-lc",
+        """
+            set -euo pipefail
+            out="${'$'}1"
+            mkdir -p "$(dirname "${'$'}out")"
+            env GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
+                go build -trimpath -ldflags="-s -w" -o "${'$'}out" .
+        """.trimIndent(),
+        "bash",
+        serverAssetFile.asFile.absolutePath
+    )
+}
+
+tasks.matching {
+    it.name.startsWith("merge") && it.name.endsWith("Assets")
+}.configureEach {
+    dependsOn("buildServerAsset")
+}
+
+tasks.register<Exec>("nameReleaseApks") {
+    group = "build"
+    description = "Copies release APKs to filenames with app name and version."
+
+    val releaseDir = layout.buildDirectory.dir("outputs/apk/release")
+    val namedReleaseDir = layout.buildDirectory.dir("outputs/apk/release/named")
+    val variants = listOf("universal", "arm64-v8a", "armeabi-v7a", "x86_64")
+
+    inputs.files(variants.map { abi -> releaseDir.map { it.file("app-$abi-release.apk") } })
+    outputs.files(variants.map { abi -> namedReleaseDir.map { it.file("$releaseApkBaseName-v$appVersionName-$abi-release.apk") } })
+
+    commandLine(
+        "bash",
+        "-lc",
+        """
+            set -euo pipefail
+            release_dir="${'$'}1"
+            named_dir="${'$'}2"
+            app_name="${'$'}3"
+            version="${'$'}4"
+            mkdir -p "${'$'}named_dir"
+            for abi in universal arm64-v8a armeabi-v7a x86_64; do
+                cp "${'$'}release_dir/app-${'$'}abi-release.apk" "${'$'}named_dir/${'$'}app_name-v${'$'}version-${'$'}abi-release.apk"
+            done
+        """.trimIndent(),
+        "bash",
+        releaseDir.get().asFile.absolutePath,
+        namedReleaseDir.get().asFile.absolutePath,
+        releaseApkBaseName,
+        appVersionName
+    )
+}
+
+tasks.matching { it.name == "assembleRelease" }.configureEach {
+    finalizedBy("nameReleaseApks")
+}
+
 dependencies {
     implementation("androidx.core:core-ktx:1.15.0")
     implementation(platform("androidx.compose:compose-bom:2024.12.01"))
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.ui:ui-tooling-preview")
+    debugImplementation("androidx.compose.ui:ui-tooling")
     implementation("androidx.compose.foundation:foundation")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
@@ -140,4 +286,5 @@ dependencies {
     implementation("androidx.datastore:datastore-preferences:1.1.1")
     implementation("com.wireguard.android:tunnel:1.0.20230706")
     implementation("com.github.mwiede:jsch:0.2.16")
+    testImplementation("junit:junit:4.13.2")
 }

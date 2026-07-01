@@ -11,7 +11,6 @@ import (
 	"time"
 )
 
-
 const (
 	workersPerGroup  = 9
 	defaultCycleSecs = 36000
@@ -21,6 +20,7 @@ const (
 // Запускает 9 потоков с одними кредами. Ротации нет — работает до смерти воркеров.
 func WorkerGroup(
 	ctx context.Context,
+	cancel context.CancelFunc,
 	groupID int,
 	hashIndex int,
 	tp *TurnParams,
@@ -31,7 +31,7 @@ func WorkerGroup(
 	configCh chan<- string,
 	workerIDs []int,
 	pauseFlag *int32,
-	deviceID, password string,
+	deviceID, password, deviceInfo string,
 	stats *Stats,
 	waitReady <-chan struct{},
 	signalReady chan<- struct{},
@@ -51,6 +51,26 @@ func WorkerGroup(
 		configSent = 1
 	}
 
+	var signalReadyOnce sync.Once
+	signalNext := func(delay time.Duration, reason string) {
+		if signalReady == nil {
+			return
+		}
+		go func() {
+			if delay > 0 {
+				select {
+				case <-time.After(delay):
+				case <-ctx.Done():
+					return
+				}
+			}
+			signalReadyOnce.Do(func() {
+				close(signalReady)
+				log.Printf("[ГРУППА #%d] Передача запуска следующей группе: %s", groupID, reason)
+			})
+		}()
+	}
+
 	// Doze-mode пауза
 	for atomic.LoadInt32(pauseFlag) != 0 {
 		if ctx.Err() != nil {
@@ -68,13 +88,29 @@ func WorkerGroup(
 
 	credStreamID := groupID * 100
 	user, pass, turnURLs, err := GetCreds(ctx, hash, credStreamID)
-	var creds *Credentials
-	if err == nil {
-		creds = &Credentials{User: user, Pass: pass, TurnURLs: turnURLs, CacheStreamID: credStreamID}
-	} else {
-		log.Printf("[ГРУППА #%d] Ошибка кредов: %v", groupID, err)
+	if err != nil && getConfig {
+		log.Printf("[ГРУППА #%d] Стартовые креды не получены: %v; завершаем запуск для чистого повтора", groupID, err)
+		cancel()
 		return
 	}
+	if err != nil {
+		signalNext(0, "текущая группа ждёт повтор credentials")
+		for attempt := 2; err != nil; attempt++ {
+			if isTerminalGroupCredentialError(err) {
+				log.Printf("[ГРУППА #%d] Креды недоступны без восстановления: %v", groupID, err)
+				return
+			}
+			delay := groupCredentialRetryDelay(err)
+			log.Printf("[ГРУППА #%d] Креды пока не получены: повтор %d через %v", groupID, attempt, delay)
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return
+			}
+			user, pass, turnURLs, err = GetCreds(ctx, hash, credStreamID)
+		}
+	}
+	creds := &Credentials{User: user, Pass: pass, TurnURLs: turnURLs, CacheStreamID: credStreamID}
 
 	log.Printf("[ГРУППА #%d] Креды OK, TURN: %v, %d воркеров", groupID, creds.TurnURLs, len(workerIDs))
 
@@ -111,13 +147,7 @@ func WorkerGroup(
 	}
 
 	// Сигнализируем следующей группе, что мы успешно запустились (креды получены + 2 сек форы)
-	if signalReady != nil {
-		go func() {
-			time.Sleep(2000 * time.Millisecond)
-			close(signalReady)
-			log.Printf("[ГРУППА #%d] Успешный старт! Передача эстафеты следующей группе...", groupID)
-		}()
-	}
+	signalNext(2*time.Second, "credentials получены")
 
 	for i, wid := range workerIDs {
 		wg.Add(1)
@@ -159,7 +189,7 @@ func WorkerGroup(
 				credsMu.RUnlock()
 
 				configDelivered, sessErr := RunSession(ctx, tp, peer, d, localPort,
-					getConf, cc, wid, &credsSnapshot, deviceID, password, stats)
+					getConf, cc, wid, &credsSnapshot, deviceID, password, deviceInfo, stats)
 
 				if getConf {
 					if configDelivered {
@@ -239,6 +269,27 @@ func WorkerGroup(
 	log.Printf("[ГРУППА #%d] Все воркеры группы завершились.", groupID)
 }
 
+func isTerminalGroupCredentialError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToUpper(err.Error())
+	return strings.Contains(message, "INVALID_JOIN_LINK") ||
+		strings.Contains(message, "ANON_BLOCKED") ||
+		strings.Contains(message, "CALL_FULL") ||
+		strings.Contains(message, "FATAL_AUTH")
+}
+
+func groupCredentialRetryDelay(err error) time.Duration {
+	if err != nil {
+		message := strings.ToUpper(err.Error())
+		if strings.Contains(message, "CAPTCHA_WAIT_REQUIRED") || strings.Contains(message, "FATAL_CAPTCHA") {
+			return 90 * time.Second
+		}
+	}
+	return time.Duration(20+rand.Intn(21)) * time.Second
+}
+
 // ParseHashes — парсит строку хешей
 func ParseHashes(raw string) []string {
 	var result []string
@@ -292,5 +343,3 @@ type Credentials struct {
 	TurnURLs      []string
 	CacheStreamID int
 }
-
-

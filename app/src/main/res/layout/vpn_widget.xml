@@ -17,7 +17,7 @@
             android:id="@+id/widget_title"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="WDTT"
+            android:text="WDTT Plus"
             android:textColor="#FFFFFF"
             android:textSize="16sp"
             android:textStyle="bold" />
@@ -39,7 +39,7 @@
         android:layout_alignParentRight="true"
         android:layout_centerVertical="true"
         android:background="@drawable/bg_widget_button_inactive"
-        android:src="@drawable/ic_tile_logo_w"
+        android:src="@drawable/ic_tile_logo"
         android:contentDescription="Toggle VPN"
         android:padding="10dp"
         android:scaleType="fitCenter" />

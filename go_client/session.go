@@ -19,12 +19,14 @@ import (
 )
 
 const (
-	workerSendBuf      = 128
-	sessionReadTimeout = 30 * time.Minute // Increased from 60s to 30min
-	readBufSize        = 1600
-	socketBufSize      = 625 * 1024
-	keepaliveByte      = 0xFF // DTLS-level keepalive marker
-	keepaliveInterval  = 15 * time.Second
+	workerSendBuf                = 128
+	sessionReadTimeout           = 30 * time.Second
+	keepalivePongTimeout         = 75 * time.Second
+	unansweredUserTrafficTimeout = 45 * time.Second
+	readBufSize                  = 1600
+	socketBufSize                = 625 * 1024
+	keepaliveByte                = 0xFF // DTLS-level keepalive marker
+	keepaliveInterval            = 15 * time.Second
 )
 
 // Handshake semaphore: limit to 3 concurrent DTLS handshakes
@@ -63,7 +65,7 @@ func RunSession(
 	configCh chan<- string,
 	sessionID int,
 	creds *Credentials,
-	deviceID, password string,
+	deviceID, password, deviceInfo string,
 	stats *Stats,
 ) (bool, error) {
 	configDelivered := false
@@ -295,11 +297,15 @@ func RunSession(
 	log.Printf("[ВОРКЕР #%d] [DTLS] Соединение установлено ✓", sessionID)
 
 	atomic.AddInt32(&stats.ActiveConnections, 1)
-	defer atomic.AddInt32(&stats.ActiveConnections, -1)
+	globalActiveConnections.Add(1)
+	defer func() {
+		atomic.AddInt32(&stats.ActiveConnections, -1)
+		globalActiveConnections.Add(-1)
+	}()
 
 	// Запрос конфига
 	if getConfig && configCh != nil {
-		conf, confErr := RequestConfig(dtlsConn, localPort, deviceID, password)
+		conf, confErr := RequestConfig(dtlsConn, localPort, deviceID, password, deviceInfo)
 		if confErr != nil {
 			errStr := confErr.Error()
 			if strings.Contains(errStr, "FATAL_AUTH") {
@@ -330,9 +336,13 @@ func RunSession(
 	d.Register(slot)
 	defer d.Unregister(slot)
 
+	lastServerRxAt := time.Now().UnixNano()
+	var lastUserTrafficAt int64
+	var keepalivePongSeen int32
+
 	// Proxy DTLS ↔ Dispatcher
 	var proxyWg sync.WaitGroup
-	proxyWg.Add(3) // +1 for keepalive goroutine
+	proxyWg.Add(4) // writer + reader + keepalive + health monitor
 
 	stopDTLS := context.AfterFunc(sessCtx, func() {
 		_ = dtlsConn.SetDeadline(time.Now())
@@ -342,6 +352,7 @@ func RunSession(
 	// DTLS Keepalive: prevents TURN allocation timeout and DTLS idle disconnect
 	go func() {
 		defer proxyWg.Done()
+		defer sessCancel()
 		t := time.NewTicker(keepaliveInterval)
 		defer t.Stop()
 		ping := []byte{keepaliveByte}
@@ -352,6 +363,38 @@ func RunSession(
 			case <-t.C:
 				_ = dtlsConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 				if _, err := dtlsConn.Write(ping); err != nil {
+					return
+				}
+			}
+		}
+	}()
+
+	// Health monitor: UDP can fail silently, so expect keepalive pongs or user traffic responses.
+	go func() {
+		defer proxyWg.Done()
+		t := time.NewTicker(10 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-sessCtx.Done():
+				return
+			case <-t.C:
+				now := time.Now()
+				lastRxUnix := atomic.LoadInt64(&lastServerRxAt)
+				lastRx := time.Unix(0, lastRxUnix)
+
+				if atomic.LoadInt32(&keepalivePongSeen) != 0 && now.Sub(lastRx) > keepalivePongTimeout {
+					log.Printf("[ВОРКЕР #%d] [HEALTH] сервер не отвечает на keepalive %.0f сек, перезапуск воркера", sessionID, now.Sub(lastRx).Seconds())
+					sessCancel()
+					return
+				}
+
+				lastTxUnix := atomic.LoadInt64(&lastUserTrafficAt)
+				if lastTxUnix > lastRxUnix &&
+					now.Sub(time.Unix(0, lastTxUnix)) > unansweredUserTrafficTimeout &&
+					now.Sub(lastRx) > unansweredUserTrafficTimeout {
+					log.Printf("[ВОРКЕР #%d] [HEALTH] отправлен пользовательский трафик, но ответа сервера нет %.0f сек, перезапуск воркера", sessionID, now.Sub(lastRx).Seconds())
+					sessCancel()
 					return
 				}
 			}
@@ -377,6 +420,7 @@ func RunSession(
 					log.Printf("[ВОРКЕР #%d] Ошибка Writer: %v", sessionID, writeErr)
 					return
 				}
+				atomic.StoreInt64(&lastUserTrafficAt, time.Now().UnixNano())
 			}
 		}
 	}()
@@ -401,8 +445,11 @@ func RunSession(
 				return
 			}
 
+			atomic.StoreInt64(&lastServerRxAt, time.Now().UnixNano())
+
 			// Skip keepalive pong from server
 			if n == 1 && pkt[0] == keepaliveByte {
+				atomic.StoreInt32(&keepalivePongSeen, 1)
 				putPktBuf(pkt)
 				continue
 			}

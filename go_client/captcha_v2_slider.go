@@ -38,6 +38,8 @@ type sliderGuessV2 struct {
 
 func (s *captchaV2Session) solveSliderCaptcha(
 	sessionToken string,
+	domain string,
+	adFP string,
 	browserFP string,
 	hash string,
 	settings string,
@@ -45,8 +47,8 @@ func (s *captchaV2Session) solveSliderCaptcha(
 ) (string, error) {
 	values := [][2]string{
 		{"session_token", sessionToken},
-		{"domain", "vk.com"},
-		{"adFp", ""},
+		{"domain", domain},
+		{"adFp", adFP},
 		{"access_token", ""},
 		{"captcha_settings", settings},
 	}
@@ -56,6 +58,20 @@ func (s *captchaV2Session) solveSliderCaptcha(
 		return "", fmt.Errorf("slider getContent failed: %w", err)
 	}
 	puzzle, err := parseSliderPuzzleV2(resp)
+	if err != nil && settings != "" {
+		log.Printf("[КАПЧА] v2 slider getContent не принял captcha_settings, пробую без них")
+		values = [][2]string{
+			{"session_token", sessionToken},
+			{"domain", domain},
+			{"adFp", adFP},
+			{"access_token", ""},
+		}
+		resp, err = s.captchaRequest("captchaNotRobot.getContent", values)
+		if err != nil {
+			return "", fmt.Errorf("slider getContent fallback failed: %w", err)
+		}
+		puzzle, err = parseSliderPuzzleV2(resp)
+	}
 	if err != nil {
 		return "", err
 	}
@@ -75,19 +91,8 @@ func (s *captchaV2Session) solveSliderCaptcha(
 	}
 	log.Printf("[КАПЧА] v2 slider guesses ranked: total=%d limit=%d", len(guesses), limit)
 
-	deviceJSON := captchaV2DeviceInfo
-	if s.savedProfile != nil && strings.TrimSpace(s.savedProfile.DeviceJSON) != "" {
-		deviceJSON = s.savedProfile.DeviceJSON
-	}
-	if _, err := s.captchaRequest("captchaNotRobot.componentDone", [][2]string{
-		{"session_token", sessionToken},
-		{"domain", "vk.com"},
-		{"adFp", ""},
-		{"access_token", ""},
-		{"browser_fp", browserFP},
-		{"device", deviceJSON},
-	}); err != nil {
-		return "", fmt.Errorf("captcha componentDone failed: %w", err)
+	if err := s.ensureCaptchaComponentDone(sessionToken, domain, adFP, browserFP); err != nil {
+		return "", err
 	}
 
 	for i := 0; i < limit; i++ {
@@ -100,6 +105,8 @@ func (s *captchaV2Session) solveSliderCaptcha(
 		}
 		check, err := s.performCaptchaCheck(
 			sessionToken,
+			domain,
+			adFP,
 			browserFP,
 			hash,
 			string(answerData),
@@ -130,7 +137,7 @@ func parseSliderPuzzleV2(raw map[string]any) (*sliderPuzzleV2, error) {
 	}
 	status := captchaV2StringifyAny(resp["status"])
 	if !strings.EqualFold(status, "ok") {
-		return nil, fmt.Errorf("slider getContent status: %s", status)
+		return nil, errors.New("slider getContent status not_ok")
 	}
 	rawImage := captchaV2StringifyAny(resp["image"])
 	if rawImage == "" {
@@ -384,22 +391,17 @@ func sliderTileRect(bounds image.Rectangle, gridSize int, index int) image.Recta
 	)
 }
 
-func pixelDiff(a, b color.Color) int64 {
-	ar, ag, ab, _ := a.RGBA()
-	br, bg, bb, _ := b.RGBA()
-	dr := int64(ar>>8) - int64(br>>8)
-	dg := int64(ag>>8) - int64(bg>>8)
-	db := int64(ab>>8) - int64(bb>>8)
-	if dr < 0 {
-		dr = -dr
+func pixelDiff(left, right color.Color) int64 {
+	lr, lg, lb, _ := left.RGBA()
+	rr, rg, rb, _ := right.RGBA()
+	return absDiffV2(lr, rr) + absDiffV2(lg, rg) + absDiffV2(lb, rb)
+}
+
+func absDiffV2(left, right uint32) int64 {
+	if left > right {
+		return int64(left - right)
 	}
-	if dg < 0 {
-		dg = -dg
-	}
-	if db < 0 {
-		db = -db
-	}
-	return dr + dg + db
+	return int64(right - left)
 }
 
 func seamScoreLumaV2(img image.Image, gridSize int, mapping []int) int64 {
@@ -541,6 +543,9 @@ func sampleLumaMappedV2(img image.Image, dstRect image.Rectangle, srcRect image.
 	c := sampleColorMappedV2(img, dstRect, srcRect, dstX, dstY)
 	r, g, b, _ := c.RGBA()
 	y := (299*(r>>8) + 587*(g>>8) + 114*(b>>8)) / 1000
+	if y > 255 {
+		y = 255
+	}
 	return uint8(y)
 }
 
