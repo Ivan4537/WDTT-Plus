@@ -14,7 +14,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
 class QuickToggleTileService : TileService() {
@@ -63,7 +62,7 @@ class QuickToggleTileService : TileService() {
             // Запускаем старт туннеля в фоне
             scope.launch {
                 try {
-                    val intent = buildStartIntent()
+                    val intent = buildTunnelStartIntentFromSettings(this@QuickToggleTileService)
                     if (intent == null) {
                         Toast.makeText(this@QuickToggleTileService, "Заполните настройки подключения в WDTT Plus", Toast.LENGTH_LONG).show()
                         openMainActivity()
@@ -88,38 +87,6 @@ class QuickToggleTileService : TileService() {
     override fun onDestroy() {
         scope.cancel()
         super.onDestroy()
-    }
-
-    private suspend fun buildStartIntent(): Intent? {
-        return runCatching {
-            val store = SettingsStore(applicationContext)
-            val basePeer = store.peer.first()
-            val hashes = store.vkHashes.first()
-            val password = store.connectionPassword.first()
-            if (basePeer.isBlank() || hashes.isBlank() || password.isBlank()) return null
-
-            val manualPortsEnabled = store.manualPortsEnabled.first()
-            val serverDtlsPort = if (manualPortsEnabled) store.serverDtlsPort.first() else 56000
-            val localPort = if (manualPortsEnabled) store.listenPort.first() else 9000
-            val peerWithPort = if (basePeer.contains(":")) basePeer else "$basePeer:$serverDtlsPort"
-
-            Intent(this, TunnelService::class.java).apply {
-                action = "START"
-                putExtra("peer", peerWithPort)
-                putExtra("vk_hashes", hashes)
-                putExtra("secondary_vk_hash", store.secondaryVkHash.first())
-                putExtra("workers_per_hash", store.workersPerHash.first())
-                putExtra("port", localPort)
-                putExtra("sni", store.sni.first())
-                putExtra("connection_password", store.connectionPassword.first())
-                putExtra("protocol", store.protocol.first())
-                putExtra("vkcalls_preflight", store.vkCallsPreflight.first())
-                putExtra("captcha_mode", store.captchaMode.first())
-                putExtra("captcha_solve_method", store.captchaSolveMethod.first())
-                putExtra("fingerprint", store.selectedFingerprint.first())
-                putExtra("client_ids", store.activeClientIds.first())
-            }
-        }.getOrNull()
     }
 
     private fun updateTile(running: Boolean) {
@@ -160,12 +127,4 @@ class QuickToggleTileService : TileService() {
         }
     }
 
-    private fun sanitizeCaptchaMode(mode: String?): String {
-        return when (mode?.lowercase()) {
-            "auto" -> "auto"
-            "rjs" -> "rjs"
-            "wv" -> "wv"
-            else -> "auto"
-        }
-    }
 }

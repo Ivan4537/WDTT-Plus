@@ -24,7 +24,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
@@ -126,26 +125,8 @@ class TunnelService : Service() {
         val appContext = applicationContext
         TunnelManager.scope.launch {
             try {
-                val store = SettingsStore(appContext)
-                val basePeer = store.peer.first()
-                val manualPortsEnabled = store.manualPortsEnabled.first()
-                val serverDtlsPort = if (manualPortsEnabled) store.serverDtlsPort.first() else 56000
-                val peerWithPort = if (basePeer.isBlank() || basePeer.contains(":")) basePeer else "$basePeer:$serverDtlsPort"
-                val params = TunnelParams(
-                    peer = peerWithPort,
-                    vkHashes = store.vkHashes.first(),
-                    secondaryVkHash = store.secondaryVkHash.first(),
-                    workersPerHash = store.workersPerHash.first(),
-                    port = store.listenPort.first(),
-                    sni = store.sni.first(),
-                    connectionPassword = store.connectionPassword.first(),
-                    vkCallsPreflight = store.vkCallsPreflight.first(),
-                    captchaMode = sanitizeCaptchaMode(store.captchaMode.first()),
-                    captchaSolveMethod = store.captchaSolveMethod.first(),
-                    fingerprint = store.selectedFingerprint.first(),
-                    clientIds = store.activeClientIds.first()
-                )
-                if (params.peer.isNotEmpty() && params.vkHashes.isNotEmpty()) {
+                val params = buildTunnelParamsFromSettings(appContext)
+                if (params != null) {
                     launch(Dispatchers.Main) {
                         startTunnel(params)
                     }

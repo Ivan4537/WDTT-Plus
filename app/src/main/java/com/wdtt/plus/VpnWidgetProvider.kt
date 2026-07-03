@@ -14,7 +14,6 @@ import android.widget.Toast
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
 class VpnWidgetProvider : AppWidgetProvider() {
@@ -67,7 +66,7 @@ class VpnWidgetProvider : AppWidgetProvider() {
                 // Запуск туннеля в фоне
                 scope.launch {
                     try {
-                        val startIntent = buildStartIntent(context)
+                        val startIntent = buildTunnelStartIntentFromSettings(context)
                         if (startIntent == null) {
                             Toast.makeText(context, "Заполните настройки подключения в WDTT Plus", Toast.LENGTH_LONG).show()
                             openMainActivity(context)
@@ -136,36 +135,6 @@ class VpnWidgetProvider : AppWidgetProvider() {
         appWidgetManager.updateAppWidget(appWidgetId, views)
     }
 
-    private suspend fun buildStartIntent(context: Context): Intent? {
-        val store = SettingsStore(context.applicationContext)
-        val basePeer = store.peer.first()
-        val hashes = store.vkHashes.first()
-        val password = store.connectionPassword.first()
-        if (basePeer.isBlank() || hashes.isBlank() || password.isBlank()) return null
-
-        val manualPortsEnabled = store.manualPortsEnabled.first()
-        val serverDtlsPort = if (manualPortsEnabled) store.serverDtlsPort.first() else 56000
-        val localPort = if (manualPortsEnabled) store.listenPort.first() else 9000
-        val peerWithPort = if (basePeer.contains(":")) basePeer else "$basePeer:$serverDtlsPort"
-
-        return Intent(context, TunnelService::class.java).apply {
-            action = "START"
-            putExtra("peer", peerWithPort)
-            putExtra("vk_hashes", hashes)
-            putExtra("secondary_vk_hash", store.secondaryVkHash.first())
-            putExtra("workers_per_hash", store.workersPerHash.first())
-            putExtra("port", localPort)
-            putExtra("sni", store.sni.first())
-            putExtra("connection_password", store.connectionPassword.first())
-            putExtra("protocol", store.protocol.first())
-            putExtra("vkcalls_preflight", store.vkCallsPreflight.first())
-            putExtra("captcha_mode", store.captchaMode.first())
-            putExtra("captcha_solve_method", store.captchaSolveMethod.first())
-            putExtra("fingerprint", store.selectedFingerprint.first())
-            putExtra("client_ids", store.activeClientIds.first())
-        }
-    }
-
     private fun openMainActivity(context: Context) {
         val intent = Intent(context, MainActivity::class.java).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -183,12 +152,4 @@ class VpnWidgetProvider : AppWidgetProvider() {
         }
     }
 
-    private fun sanitizeCaptchaMode(mode: String?): String {
-        return when (mode?.lowercase()) {
-            "auto" -> "auto"
-            "rjs" -> "rjs"
-            "wv" -> "wv"
-            else -> "auto"
-        }
-    }
 }
