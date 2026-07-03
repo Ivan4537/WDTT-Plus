@@ -8,7 +8,10 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
+import android.provider.Settings
 import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.expandVertically
@@ -94,9 +97,16 @@ import com.wdtt.plus.SettingsStore
 import com.wdtt.plus.UPDATE_DIALOG_ACTION_POSTPONED
 import com.wdtt.plus.UPDATE_DIALOG_ACTION_UPDATE
 import com.wdtt.plus.WDTTColors
+import com.wdtt.plus.AppReleaseInfo
+import com.wdtt.plus.AppUpdateDownloadProgress
+import com.wdtt.plus.canRequestApkInstall
+import com.wdtt.plus.downloadUpdateApk
 import com.wdtt.plus.fetchLatestReleaseInfo
+import com.wdtt.plus.installUpdateApk
 import com.wdtt.plus.isNewerVersion
+import com.wdtt.plus.selectUpdateApkAsset
 import kotlinx.coroutines.launch
+import java.io.File
 import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.min
@@ -181,7 +191,11 @@ fun InfoTab(
     val currentVersion = remember { "v${BuildConfig.VERSION_NAME.removePrefix("v")}" }
     val releaseDate = remember { BuildConfig.MOD_RELEASE_DATE }
 	var isCheckingUpdates by remember { mutableStateOf(false) }
-	var pendingManualRelease by remember { mutableStateOf<com.wdtt.plus.AppReleaseInfo?>(null) }
+	var pendingManualRelease by remember { mutableStateOf<AppReleaseInfo?>(null) }
+    var updateDownloadProgress by remember { mutableStateOf<AppUpdateDownloadProgress?>(null) }
+    var updateDownloadStatus by rememberSaveable { mutableStateOf("") }
+    var updateDownloadBusy by remember { mutableStateOf(false) }
+    var pendingUpdateApkPath by rememberSaveable { mutableStateOf<String?>(null) }
 	var showHelpDialog by remember { mutableStateOf(false) }
 	var showSupportDialog by remember { mutableStateOf(false) }
 	var actionsExpanded by actionsExpandedState
@@ -196,6 +210,49 @@ fun InfoTab(
             updateLatestVersion.isNotBlank() -> "Последняя версия: $updateLatestVersion"
             updateLastError.isNotBlank() -> "Последняя проверка завершилась ошибкой"
             else -> "Проверить GitHub вручную"
+        }
+    }
+    val updateInstallPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) {
+        val apkFile = pendingUpdateApkPath?.let(::File)
+        if (apkFile != null && apkFile.exists() && canRequestApkInstall(context)) {
+            runCatching {
+                installUpdateApk(context, apkFile)
+                pendingManualRelease = null
+                updateDownloadStatus = ""
+                updateDownloadProgress = null
+            }.onFailure { error ->
+                updateDownloadStatus = error.message ?: "Не удалось открыть установку APK."
+                Toast.makeText(context, updateDownloadStatus, Toast.LENGTH_LONG).show()
+            }
+        } else if (apkFile != null) {
+            updateDownloadStatus = "Разрешение на установку из WDTT Plus не выдано."
+            Toast.makeText(context, updateDownloadStatus, Toast.LENGTH_LONG).show()
+        }
+    }
+
+    fun requestDownloadedUpdateInstall(apkFile: File) {
+        pendingUpdateApkPath = apkFile.absolutePath
+        if (!canRequestApkInstall(context)) {
+            updateDownloadStatus = "Разрешите установку из WDTT Plus в настройках Android."
+            updateInstallPermissionLauncher.launch(
+                Intent(
+                    Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                    Uri.parse("package:${context.packageName}")
+                )
+            )
+            return
+        }
+
+        runCatching {
+            installUpdateApk(context, apkFile)
+            pendingManualRelease = null
+            updateDownloadStatus = ""
+            updateDownloadProgress = null
+        }.onFailure { error ->
+            updateDownloadStatus = error.message ?: "Не удалось открыть установку APK."
+            Toast.makeText(context, updateDownloadStatus, Toast.LENGTH_LONG).show()
         }
     }
 
@@ -347,10 +404,17 @@ fun InfoTab(
         }
 
         pendingManualRelease?.let { release ->
+            val apkAsset = remember(release) { selectUpdateApkAsset(release) }
             AppUpdateDialog(
                 release = release,
+                apkAsset = apkAsset,
+                isDownloading = updateDownloadBusy,
+                downloadProgress = updateDownloadProgress,
+                downloadStatus = updateDownloadStatus,
                 onPostpone = {
                     pendingManualRelease = null
+                    updateDownloadStatus = ""
+                    updateDownloadProgress = null
                     Toast.makeText(context, "Обновление отложено на 24 часа.", Toast.LENGTH_SHORT).show()
                     scope.launch {
                         val now = System.currentTimeMillis()
@@ -366,15 +430,48 @@ fun InfoTab(
                     }
                 },
                 onUpdate = {
-                    pendingManualRelease = null
                     scope.launch {
                         settingsStore.saveUpdateDialogAction(
                             version = release.versionTag,
                             action = UPDATE_DIALOG_ACTION_UPDATE,
                             actedAt = System.currentTimeMillis()
                         )
-                        openUrlInBrowser(context, release.releaseUrl)
+                        if (apkAsset == null) {
+                            pendingManualRelease = null
+                            openUrlInBrowser(context, release.releaseUrl)
+                            return@launch
+                        }
+
+                        updateDownloadBusy = true
+                        updateDownloadStatus = "Подготовка скачивания..."
+                        updateDownloadProgress = null
+                        runCatching {
+                            val apkFile = downloadUpdateApk(context, apkAsset) { progress ->
+                                updateDownloadProgress = progress
+                                updateDownloadStatus = if (progress.percent != null) {
+                                    "Скачивание APK"
+                                } else {
+                                    "Скачивание APK..."
+                                }
+                            }
+                            updateDownloadStatus = if (apkAsset.sha256 != null) {
+                                "APK скачан и проверен. Открываю установку..."
+                            } else {
+                                "APK скачан. Открываю установку..."
+                            }
+                            requestDownloadedUpdateInstall(apkFile)
+                        }.onFailure { error ->
+                            updateDownloadStatus = error.message ?: "Не удалось скачать обновление."
+                            Toast.makeText(context, updateDownloadStatus, Toast.LENGTH_LONG).show()
+                        }
+                        updateDownloadBusy = false
                     }
+                },
+                onOpenRelease = {
+                    pendingManualRelease = null
+                    updateDownloadStatus = ""
+                    updateDownloadProgress = null
+                    openUrlInBrowser(context, release.releaseUrl)
                 }
             )
         }

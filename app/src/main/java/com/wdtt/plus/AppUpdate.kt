@@ -1,12 +1,20 @@
 package com.wdtt.plus
 
+import android.content.Context
+import android.content.Intent
+import android.os.Build
 import android.util.Log
+import androidx.core.content.FileProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
+import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
+import java.security.MessageDigest
+import java.util.Locale
 
 const val UPDATE_CHECK_NEVER = -1
 const val DEFAULT_UPDATE_CHECK_INTERVAL_HOURS = 12
@@ -34,8 +42,35 @@ fun updateIntervalHoursToMillis(hours: Int): Long? = when {
 data class AppReleaseInfo(
     val versionTag: String,
     val releaseUrl: String,
-    val source: RemoteVersionSource
+    val source: RemoteVersionSource,
+    val assets: List<AppReleaseAsset> = emptyList()
 )
+
+data class AppReleaseAsset(
+    val name: String,
+    val downloadUrl: String,
+    val sizeBytes: Long,
+    val digest: String = ""
+) {
+    val sha256: String?
+        get() = digest
+            .removePrefix("sha256:")
+            .trim()
+            .lowercase(Locale.US)
+            .takeIf { it.matches(Regex("^[0-9a-f]{64}$")) }
+}
+
+data class AppUpdateDownloadProgress(
+    val fileName: String,
+    val downloadedBytes: Long,
+    val totalBytes: Long
+) {
+    val fraction: Float?
+        get() = totalBytes.takeIf { it > 0L }?.let { (downloadedBytes.toFloat() / it).coerceIn(0f, 1f) }
+
+    val percent: Int?
+        get() = fraction?.let { (it * 100).toInt().coerceIn(0, 100) }
+}
 
 enum class RemoteVersionSource {
     Release,
@@ -43,9 +78,14 @@ enum class RemoteVersionSource {
 }
 
 suspend fun fetchLatestReleaseInfo(localVersion: String? = null): AppReleaseInfo? = withContext(Dispatchers.IO) {
-    val latestRelease = fetchReleaseFromLatestWebRedirect()
-        ?: fetchReleaseFromLatestEndpoint()
-        ?: fetchLatestStableReleaseFromList()
+    val webRelease = fetchReleaseFromLatestWebRedirect()
+    val apiRelease = fetchReleaseFromLatestEndpoint() ?: fetchLatestStableReleaseFromList()
+    val latestRelease = when {
+        webRelease == null -> apiRelease
+        apiRelease == null -> fetchReleaseByTag(webRelease.versionTag) ?: webRelease
+        isNewerVersion(apiRelease.versionTag, webRelease.versionTag) -> fetchReleaseByTag(webRelease.versionTag) ?: webRelease
+        else -> apiRelease
+    }
     val latestTag = fetchLatestTagFromList()
 
     when {
@@ -54,6 +94,117 @@ suspend fun fetchLatestReleaseInfo(localVersion: String? = null): AppReleaseInfo
         isNewerVersion(latestRelease.versionTag, latestTag.versionTag) -> latestTag
         else -> latestRelease
     }
+}
+
+fun selectUpdateApkAsset(release: AppReleaseInfo): AppReleaseAsset? {
+    val apkAssets = release.assets
+        .filter { it.name.endsWith(".apk", ignoreCase = true) && it.downloadUrl.isNotBlank() }
+    if (apkAssets.isEmpty()) return null
+
+    Build.SUPPORTED_ABIS.orEmpty().forEach { abi ->
+        apkAssets.firstOrNull { it.name.contains(abi, ignoreCase = true) }?.let { return it }
+    }
+
+    return apkAssets.firstOrNull { it.name.contains("universal", ignoreCase = true) }
+        ?: apkAssets.firstOrNull()
+}
+
+suspend fun downloadUpdateApk(
+    context: Context,
+    asset: AppReleaseAsset,
+    onProgress: suspend (AppUpdateDownloadProgress) -> Unit = {}
+): File = withContext(Dispatchers.IO) {
+    val appContext = context.applicationContext
+    val updatesDir = File(appContext.cacheDir, "updates").apply { mkdirs() }
+    updatesDir.listFiles()?.forEach { file ->
+        if (file.isFile && file.extension.equals("apk", ignoreCase = true)) file.delete()
+    }
+
+    val outputFile = File(updatesDir, asset.name.safeUpdateAssetName())
+    var conn: HttpURLConnection? = null
+
+    suspend fun emit(downloaded: Long, total: Long) {
+        withContext(Dispatchers.Main) {
+            onProgress(AppUpdateDownloadProgress(asset.name, downloaded, total))
+        }
+    }
+
+    try {
+        conn = URL(asset.downloadUrl).openConnection() as HttpURLConnection
+        applyNoCacheHeaders(conn)
+        conn.instanceFollowRedirects = true
+        conn.requestMethod = "GET"
+        conn.setRequestProperty("Accept", "application/vnd.android.package-archive,application/octet-stream,*/*")
+        conn.setRequestProperty("User-Agent", "WDTTAndroid/${BuildConfig.VERSION_NAME}")
+        conn.connectTimeout = 15_000
+        conn.readTimeout = 30_000
+
+        val responseCode = conn.responseCode
+        if (responseCode !in 200..299) {
+            throw IOException("GitHub вернул HTTP $responseCode при скачивании APK")
+        }
+
+        val total = asset.sizeBytes.takeIf { it > 0L }
+            ?: conn.contentLengthLong.takeIf { it > 0L }
+            ?: 0L
+        var downloaded = 0L
+        var lastEmitAt = 0L
+        emit(0L, total)
+
+        conn.inputStream.use { input ->
+            outputFile.outputStream().use { output ->
+                val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read < 0) break
+                    output.write(buffer, 0, read)
+                    downloaded += read
+                    val now = System.currentTimeMillis()
+                    if (now - lastEmitAt >= 250L || downloaded == total) {
+                        lastEmitAt = now
+                        emit(downloaded, total)
+                    }
+                }
+            }
+        }
+
+        if (asset.sizeBytes > 0L && outputFile.length() != asset.sizeBytes) {
+            outputFile.delete()
+            throw IOException("Размер APK не совпал с GitHub asset")
+        }
+
+        asset.sha256?.let { expected ->
+            val actual = outputFile.sha256Hex()
+            if (!actual.equals(expected, ignoreCase = true)) {
+                outputFile.delete()
+                throw SecurityException("SHA-256 скачанного APK не совпал с GitHub digest")
+            }
+        }
+
+        emit(outputFile.length(), total.takeIf { it > 0L } ?: outputFile.length())
+        outputFile
+    } catch (e: Exception) {
+        outputFile.delete()
+        throw e
+    } finally {
+        conn?.disconnect()
+    }
+}
+
+fun canRequestApkInstall(context: Context): Boolean {
+    return Build.VERSION.SDK_INT < Build.VERSION_CODES.O ||
+        context.packageManager.canRequestPackageInstalls()
+}
+
+fun installUpdateApk(context: Context, apkFile: File) {
+    val appContext = context.applicationContext
+    val uri = FileProvider.getUriForFile(appContext, "${appContext.packageName}.files", apkFile)
+    val intent = Intent(Intent.ACTION_VIEW).apply {
+        setDataAndType(uri, "application/vnd.android.package-archive")
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+    appContext.startActivity(intent)
 }
 
 fun isNewerVersion(local: String, remote: String): Boolean {
@@ -124,6 +275,20 @@ private fun fetchReleaseFromLatestEndpoint(): AppReleaseInfo? {
         JSONObject(response)
     } catch (e: Exception) {
         Log.w(UPDATE_LOG_TAG, "[WARN] Update check: failed to parse latest release", e)
+        return null
+    }
+    return json.toAppReleaseInfo()
+}
+
+private fun fetchReleaseByTag(tag: String): AppReleaseInfo? {
+    val normalizedTag = normalizeVersionTag(tag)
+    if (normalizedTag.isBlank()) return null
+    val response = fetchGitHubApi("https://api.github.com/repos/Ivan4537/WDTT-Plus/releases/tags/$normalizedTag")
+        ?: return null
+    val json = try {
+        JSONObject(response)
+    } catch (e: Exception) {
+        Log.w(UPDATE_LOG_TAG, "[WARN] Update check: failed to parse release by tag", e)
         return null
     }
     return json.toAppReleaseInfo()
@@ -249,7 +414,32 @@ private fun JSONObject.toAppReleaseInfo(): AppReleaseInfo? {
     val versionTag = normalizeVersionTag(optString("tag_name"))
     val releaseUrl = optString("html_url").trim()
     if (versionTag.isBlank() || releaseUrl.isBlank()) return null
-    return AppReleaseInfo(versionTag, releaseUrl, RemoteVersionSource.Release)
+    return AppReleaseInfo(
+        versionTag = versionTag,
+        releaseUrl = releaseUrl,
+        source = RemoteVersionSource.Release,
+        assets = optJSONArray("assets").toReleaseAssets()
+    )
+}
+
+private fun JSONArray?.toReleaseAssets(): List<AppReleaseAsset> {
+    if (this == null) return emptyList()
+    return buildList {
+        for (i in 0 until length()) {
+            val json = optJSONObject(i) ?: continue
+            val name = json.optString("name").trim()
+            val downloadUrl = json.optString("browser_download_url").trim()
+            if (name.isBlank() || downloadUrl.isBlank()) continue
+            add(
+                AppReleaseAsset(
+                    name = name,
+                    downloadUrl = downloadUrl,
+                    sizeBytes = json.optLong("size", 0L),
+                    digest = json.optString("digest").trim()
+                )
+            )
+        }
+    }
 }
 
 private fun versionParts(version: String): List<Int> {
@@ -276,4 +466,25 @@ private fun extractTagFromReleaseUrl(releaseUrl: String): String? {
         .substringBefore("/")
         .takeIf { it.isNotBlank() }
         ?.let(::normalizeVersionTag)
+}
+
+private fun String.safeUpdateAssetName(): String {
+    val cleaned = replace(Regex("[^A-Za-z0-9._-]+"), "-")
+        .trim('-', '.', '_')
+        .takeIf { it.isNotBlank() }
+        ?: "WDTT-Plus-update.apk"
+    return if (cleaned.endsWith(".apk", ignoreCase = true)) cleaned else "$cleaned.apk"
+}
+
+private fun File.sha256Hex(): String {
+    val digest = MessageDigest.getInstance("SHA-256")
+    inputStream().use { input ->
+        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+        while (true) {
+            val read = input.read(buffer)
+            if (read < 0) break
+            digest.update(buffer, 0, read)
+        }
+    }
+    return digest.digest().joinToString("") { "%02x".format(it) }
 }

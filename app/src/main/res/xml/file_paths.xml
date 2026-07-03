@@ -3,4 +3,7 @@
     <cache-path
         name="transfers"
         path="transfers/" />
+    <cache-path
+        name="updates"
+        path="updates/" />
 </paths>

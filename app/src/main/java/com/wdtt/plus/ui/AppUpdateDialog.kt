@@ -16,33 +16,52 @@ import androidx.compose.material.icons.filled.Update
 import androidx.compose.material3.Button
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.wdtt.plus.AppReleaseInfo
+import com.wdtt.plus.AppReleaseAsset
+import com.wdtt.plus.AppUpdateDownloadProgress
 import com.wdtt.plus.RemoteVersionSource
 
 @Composable
 fun AppUpdateDialog(
     release: AppReleaseInfo,
+    apkAsset: AppReleaseAsset?,
+    isDownloading: Boolean,
+    downloadProgress: AppUpdateDownloadProgress?,
+    downloadStatus: String,
     onPostpone: () -> Unit,
-    onUpdate: () -> Unit
+    onUpdate: () -> Unit,
+    onOpenRelease: () -> Unit
 ) {
     val isTagOnly = release.source == RemoteVersionSource.Tag
     val title = if (isTagOnly) "Найден новый tag" else "Доступно обновление"
-    val description = if (isTagOnly) {
-        "На GitHub обнаружен более новый tag ${release.versionTag}. Похоже, опубликованный release ещё не догнал его."
-    } else {
-        "Вышла новая версия приложения ${release.versionTag}. Можно открыть страницу релиза и обновиться вручную."
+    val canDownloadInApp = !isTagOnly && apkAsset != null
+    val description = when {
+        isTagOnly ->
+            "На GitHub обнаружен более новый tag ${release.versionTag}. Похоже, опубликованный release ещё не догнал его."
+        canDownloadInApp ->
+            "Вышла новая версия приложения ${release.versionTag}. WDTT Plus скачает подходящий APK и откроет системное окно установки Android."
+        else ->
+            "Вышла новая версия приложения ${release.versionTag}. Не удалось подобрать APK для этого устройства, можно открыть страницу релиза."
+    }
+    val primaryLabel = when {
+        isDownloading -> "Скачивается..."
+        canDownloadInApp -> "Скачать"
+        else -> "Открыть"
     }
 
     Dialog(
@@ -97,6 +116,48 @@ fun AppUpdateDialog(
                     lineHeight = 20.sp
                 )
 
+                if (canDownloadInApp) {
+                    Text(
+                        text = "Файл: ${apkAsset.name}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        lineHeight = 18.sp
+                    )
+                }
+
+                if (isDownloading || downloadProgress != null || downloadStatus.isNotBlank()) {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        if (isDownloading) {
+                            val fraction = downloadProgress?.fraction
+                            if (fraction != null) {
+                                LinearProgressIndicator(
+                                    progress = { fraction },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(8.dp)
+                                        .clip(RoundedCornerShape(4.dp))
+                                )
+                            } else {
+                                LinearProgressIndicator(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(8.dp)
+                                        .clip(RoundedCornerShape(4.dp))
+                                )
+                            }
+                        }
+                        val progressText = downloadProgress?.percent?.let { " $it%" }.orEmpty()
+                        if (downloadStatus.isNotBlank() || progressText.isNotBlank()) {
+                            Text(
+                                text = "${downloadStatus.ifBlank { "Скачивание..." }}$progressText",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                lineHeight = 18.sp
+                            )
+                        }
+                    }
+                }
+
                 HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f))
 
                 Row(
@@ -105,6 +166,7 @@ fun AppUpdateDialog(
                 ) {
                     OutlinedButton(
                         onClick = onPostpone,
+                        enabled = !isDownloading,
                         modifier = Modifier
                             .weight(1f)
                             .heightIn(min = 50.dp),
@@ -115,12 +177,23 @@ fun AppUpdateDialog(
 
                     Button(
                         onClick = onUpdate,
+                        enabled = !isDownloading,
                         modifier = Modifier
                             .weight(1f)
                             .heightIn(min = 50.dp),
                         shape = RoundedCornerShape(22.dp)
                     ) {
-                        Text("Обновить", fontWeight = FontWeight.Bold)
+                        Text(primaryLabel, fontWeight = FontWeight.Bold)
+                    }
+                }
+
+                if (!isTagOnly) {
+                    TextButton(
+                        onClick = onOpenRelease,
+                        enabled = !isDownloading,
+                        modifier = Modifier.align(Alignment.CenterHorizontally)
+                    ) {
+                        Text("Открыть GitHub вручную")
                     }
                 }
             }
