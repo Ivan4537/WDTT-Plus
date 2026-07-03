@@ -51,15 +51,20 @@ import com.jcraft.jsch.ChannelSftp
 import com.jcraft.jsch.JSch
 import com.jcraft.jsch.Session
 import com.wdtt.plus.DeployManager
+import com.wdtt.plus.ServerAdminClient
+import com.wdtt.plus.ServerAdminProfileInfo
+import com.wdtt.plus.ServerAdminTarget
 import com.wdtt.plus.SettingsStore
 import com.wdtt.plus.TunnelManager
 import com.wdtt.plus.WDTTColors
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
+import java.security.MessageDigest
 import java.security.SecureRandom
 import java.text.SimpleDateFormat
 import java.util.Base64
@@ -86,6 +91,11 @@ private enum class OutboundDialog {
     WireGuardVps,
     ImportedWireGuard,
     Diagnostics
+}
+
+private enum class OwnerProfileSource {
+    Server,
+    LocalOnly
 }
 
 private enum class ProxyKind(val label: String, val protocol: String) {
@@ -124,14 +134,26 @@ private data class ServerImportPlan(
 private data class ExistingServerConnection(
     val host: String,
     val password: String,
-    val vkHash: String,
     val ports: Triple<Int, Int, Int>,
     val adminId: String,
     val botToken: String,
     val dns1: String,
     val dns2: String,
-    val source: String,
-    val needsVkHash: Boolean
+    val adminProfile: ServerAdminProfileInfo
+)
+
+private data class PendingExistingConnectionApply(
+    val connection: ExistingServerConnection,
+    val effectiveLogin: String,
+    val localProfile: ServerAdminProfileInfo,
+    val serverProfile: ServerAdminProfileInfo,
+    val diffLines: List<String>
+)
+
+private data class DeployServerComparison(
+    val overwriteLines: List<String> = emptyList(),
+    val notes: List<String> = emptyList(),
+    val checkError: String? = null
 )
 
 private data class DeployRequest(
@@ -156,20 +178,87 @@ private data class ExistingInstallInfo(
     val accessDbExists: Boolean,
     val wgKeysExist: Boolean,
     val active: Boolean,
-    val checkError: String? = null
+    val checkError: String? = null,
+    val comparison: DeployServerComparison? = null
 ) {
     val hasAnyTrace: Boolean
         get() = serviceExists || binaryExists || configDirExists || accessDbExists || wgKeysExist
 }
 
+private data class OutboundProfileForms(
+    val localProxyPort: String,
+    val localProxyLogin: String,
+    val localProxyPassword: String,
+    val externalProxyKindName: String,
+    val externalProxyHost: String,
+    val externalProxyPort: String,
+    val externalProxyLogin: String,
+    val externalProxyPassword: String,
+    val wireGuardExitHost: String,
+    val wireGuardExitSshPort: String,
+    val wireGuardExitUser: String,
+    val wireGuardExitPassword: String,
+    val wireGuardExitPort: String,
+    val wireGuardExitDns: String,
+    val importedWireGuardConfig: String
+)
+
+private data class OutboundServerSnapshot(
+    val mode: String,
+    val detail: String,
+    val updatedAt: String,
+    val hasProfile: Boolean,
+    val localProxyPresent: Boolean,
+    val localProxyActive: Boolean,
+    val localProxyPort: String,
+    val localProxyLogin: String,
+    val localProxyPassword: String,
+    val externalProxyPresent: Boolean,
+    val externalProxyActive: Boolean,
+    val externalProxyKindName: String,
+    val externalProxyHost: String,
+    val externalProxyPort: String,
+    val externalProxyLogin: String,
+    val externalProxyPassword: String,
+    val wireGuardPresent: Boolean,
+    val wireGuardActive: Boolean,
+    val wireGuardExitHost: String,
+    val wireGuardExitSshPort: String,
+    val wireGuardExitUser: String,
+    val wireGuardExitPassword: String,
+    val wireGuardExitPort: String,
+    val wireGuardExitDns: String,
+    val importedWireGuardConfig: String
+) {
+    val modeLabel: String
+        get() = when (mode) {
+            "direct" -> "прямой выход"
+            "external_proxy" -> "внешний TCP-прокси"
+            "imported_wg" -> "VPN/WARP-файл"
+            "wireguard_vps" -> "выход через другой сервер"
+            else -> mode.ifBlank { "не указан" }
+        }
+
+    fun preferredDialog(): OutboundDialog? = when {
+        mode == "external_proxy" -> OutboundDialog.ExternalProxy
+        mode == "wireguard_vps" -> OutboundDialog.WireGuardVps
+        mode == "imported_wg" -> OutboundDialog.ImportedWireGuard
+        localProxyPresent -> OutboundDialog.LocalProxy
+        else -> null
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun DeployTab() {
+fun DeployTab(
+    scrollPosition: MutableIntState = rememberSaveable { mutableIntStateOf(0) }
+) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val settingsStore = remember { SettingsStore(context) }
-    val deployScrollState = rememberScrollState()
+    val deployScrollState = rememberRememberedScrollState(scrollPosition)
     val topRevealOffsetPx = with(LocalDensity.current) { 10.dp.toPx() }
+    var clientsSectionY by remember { mutableStateOf(0f) }
     var outboundSectionY by remember { mutableStateOf(0f) }
     var migrationSectionY by remember { mutableStateOf(0f) }
 
@@ -178,6 +267,14 @@ fun DeployTab() {
     val savedIp by settingsStore.deployIp.collectAsStateWithLifecycle(initialValue = "")
     val savedLogin by settingsStore.deployLogin.collectAsStateWithLifecycle(initialValue = "")
     val savedPassword by settingsStore.deployPassword.collectAsStateWithLifecycle(initialValue = "")
+    val savedPeer by settingsStore.peer.collectAsStateWithLifecycle(initialValue = "")
+    val savedConnectionPassword by settingsStore.connectionPassword.collectAsStateWithLifecycle(initialValue = "")
+    val savedVkHashes by settingsStore.vkHashes.collectAsStateWithLifecycle(initialValue = "")
+    val savedSecondaryVkHash by settingsStore.secondaryVkHash.collectAsStateWithLifecycle(initialValue = "")
+    val savedWorkersPerHash by settingsStore.workersPerHash.collectAsStateWithLifecycle(initialValue = 16)
+    val savedProtocol by settingsStore.protocol.collectAsStateWithLifecycle(initialValue = "udp")
+    val savedSni by settingsStore.sni.collectAsStateWithLifecycle(initialValue = "")
+    val savedNoDns by settingsStore.noDns.collectAsStateWithLifecycle(initialValue = false)
 
     var ip by remember { mutableStateOf("") }
     var login by remember { mutableStateOf("") }
@@ -198,6 +295,15 @@ fun DeployTab() {
     val savedServerDtlsPort by settingsStore.serverDtlsPort.collectAsStateWithLifecycle(initialValue = 56000)
     val savedServerWgPort by settingsStore.serverWgPort.collectAsStateWithLifecycle(initialValue = 56001)
     val savedListenPort by settingsStore.listenPort.collectAsStateWithLifecycle(initialValue = 9000)
+    val clientsSectionExpanded by remember(settingsStore) {
+        settingsStore.deployClientsSectionExpanded.map { it as Boolean? }
+    }.collectAsStateWithLifecycle(initialValue = null)
+    val outboundSectionExpanded by remember(settingsStore) {
+        settingsStore.deployOutboundSectionExpanded.map { it as Boolean? }
+    }.collectAsStateWithLifecycle(initialValue = null)
+    val migrationSectionExpanded by remember(settingsStore) {
+        settingsStore.deployMigrationSectionExpanded.map { it as Boolean? }
+    }.collectAsStateWithLifecycle(initialValue = null)
 
     var showSecretsDialog by remember { mutableStateOf(false) }
     var showUninstallDialog by remember { mutableStateOf(false) }
@@ -214,6 +320,7 @@ fun DeployTab() {
     var migrationStatus by rememberSaveable { mutableStateOf("") }
     var existingConnectBusy by remember { mutableStateOf(false) }
     var existingConnectStatus by rememberSaveable { mutableStateOf("") }
+    var pendingExistingConnectionApply by remember { mutableStateOf<PendingExistingConnectionApply?>(null) }
     var outboundDialog by remember { mutableStateOf<OutboundDialog?>(null) }
     var outboundBusy by remember { mutableStateOf(false) }
     var outboundProgressActive by remember { mutableStateOf(false) }
@@ -221,8 +328,6 @@ fun DeployTab() {
     var outboundStatus by rememberSaveable { mutableStateOf("") }
     var outboundStatusOwner by rememberSaveable { mutableStateOf<String?>(null) }
     var importedWgConfigText by rememberSaveable { mutableStateOf("") }
-    var outboundExpanded by rememberSaveable { mutableStateOf(false) }
-    var migrationExpanded by rememberSaveable { mutableStateOf(false) }
     val outboundPrefs = remember { context.getSharedPreferences("wdtt_outbound_forms", Context.MODE_PRIVATE) }
     var localProxyPortInput by rememberSaveable { mutableStateOf(outboundPrefs.getString("local_proxy_port", "1080") ?: "1080") }
     var localProxyLoginInput by rememberSaveable {
@@ -370,15 +475,105 @@ fun DeployTab() {
                 outboundStatus = ""
                 outboundStatusOwner = OutboundDialog.ImportedWireGuard.name
             } catch (e: Exception) {
-                outboundStatus = "Ошибка чтения WireGuard-файла: ${friendlyDeployError(e, "импорт WireGuard")}"
+                outboundStatus = "Ошибка чтения VPN/WARP-файла: ${friendlyDeployError(e, "импорт VPN/WARP")}"
                 outboundStatusOwner = OutboundDialog.ImportedWireGuard.name
             }
+        }
+    }
+
+    fun currentOwnerProfile(): ServerAdminProfileInfo = buildOwnerProfile(
+        vkHashes = savedVkHashes,
+        secondaryVkHash = savedSecondaryVkHash,
+        workersPerHash = savedWorkersPerHash,
+        protocol = savedProtocol,
+        listenPort = savedListenPort,
+        sni = savedSni,
+        noDns = savedNoDns,
+        dtlsPort = if (savedManualPorts) savedServerDtlsPort else 56000,
+        wgPort = if (savedManualPorts) savedServerWgPort else 56001
+    )
+
+    fun currentOutboundProfileForms(): OutboundProfileForms = OutboundProfileForms(
+        localProxyPort = localProxyPortInput,
+        localProxyLogin = localProxyLoginInput,
+        localProxyPassword = localProxyPasswordInput,
+        externalProxyKindName = externalProxyKindName,
+        externalProxyHost = externalProxyHostInput,
+        externalProxyPort = externalProxyPortInput,
+        externalProxyLogin = externalProxyLoginInput,
+        externalProxyPassword = externalProxyPasswordInput,
+        wireGuardExitHost = wireGuardExitHostInput,
+        wireGuardExitSshPort = wireGuardExitSshPortInput,
+        wireGuardExitUser = wireGuardExitUserInput,
+        wireGuardExitPassword = wireGuardExitPasswordInput,
+        wireGuardExitPort = wireGuardExitPortInput,
+        wireGuardExitDns = wireGuardExitDnsInput,
+        importedWireGuardConfig = importedWgConfigText
+    )
+
+    suspend fun syncOwnerProfileToServer(
+        requestHost: String,
+        requestUser: String,
+        requestPassword: String,
+        requestSshPort: Int,
+        requestMainPassword: String,
+        profile: ServerAdminProfileInfo
+    ): Result<Unit> = runCatching {
+        ServerAdminClient.updateAdminProfile(
+            ServerAdminTarget(
+                host = requestHost,
+                user = requestUser.ifBlank { "root" },
+                sshPassword = requestPassword,
+                sshPort = requestSshPort,
+                mainPassword = requestMainPassword
+            ),
+            profile
+        )
+    }.map { }
+
+    suspend fun applyExistingConnection(
+        connection: ExistingServerConnection,
+        effectiveLogin: String,
+        profile: ServerAdminProfileInfo,
+        source: OwnerProfileSource
+    ) {
+        val ports = profile.effectivePorts(connection.ports)
+        val normalizedProfile = profile.copy(
+            listenPort = ports.third,
+            ports = ports.asPortsSpec()
+        )
+        settingsStore.save(
+            peer = connection.host,
+            vkHashes = normalizedProfile.vkHashes,
+            secondaryVkHash = normalizedProfile.secondaryVkHash,
+            workersPerHash = normalizedProfile.workersPerHash,
+            protocol = normalizedProfile.protocol,
+            listenPort = normalizedProfile.listenPort,
+            sni = normalizedProfile.sni,
+            noDns = normalizedProfile.noDns
+        )
+        settingsStore.saveConnectionPassword(connection.password)
+        settingsStore.savePorts(ports.first, ports.second, ports.third)
+        settingsStore.saveManualPortsEnabled(ports != Triple(56000, 56001, 9000))
+        settingsStore.saveDeploySecrets(
+            mainPass = savedMainPass,
+            adminId = connection.adminId,
+            botToken = connection.botToken,
+            sshPort = savedSshPort.ifBlank { "22" }
+        )
+        settingsStore.saveDeploy(ip.trim(), effectiveLogin, password, savedSshPort.ifBlank { "22" }, connection.dns1, connection.dns2)
+        settingsStore.saveWdttLinkMode(false)
+
+        existingConnectStatus = when (source) {
+            OwnerProfileSource.Server -> "Готово: данные восстановлены с сервера в приложение. Сервер не изменялся. Адрес: ${connection.host}; порты: ${ports.first}, ${ports.second}, ${ports.third}."
+            OwnerProfileSource.LocalOnly -> "Готово: подключение настроено по данным сервера, но сохранённого профиля владельца на нём нет — локальные поля «Туннеля» оставлены без изменений. Сервер не изменялся."
         }
     }
 
     fun launchDeploy(request: DeployRequest, mode: DeployMode) {
         val appContext = context.applicationContext
         val importPlan = selectedImportBackup?.let { ServerImportPlan(it, selectedImportMode) }
+        val outboundProfile = currentOutboundProfileForms()
         DeployManager.scope.launch {
             try {
                 DeployManager.startDeploy()
@@ -405,6 +600,44 @@ fun DeployTab() {
                     onProgress = { p, s -> DeployManager.updateProgress(p, s) }
                 )
                 if (success) {
+                    val ownerProfile = currentOwnerProfile()
+                    DeployManager.updateProgress(0.97f, "Сохраняю профиль владельца на сервере...")
+                    val ownerProfileSaved = syncOwnerProfileToServer(
+                        requestHost = request.host,
+                        requestUser = request.user,
+                        requestPassword = request.pass,
+                        requestSshPort = request.sshPort,
+                        requestMainPassword = request.mainPass,
+                        profile = ownerProfile
+                    ).onFailure {
+                        DeployManager.writeError("Owner profile sync after deploy error: ${it.message}")
+                        TunnelManager.addDeployErrorLog("Профиль владельца после деплоя: ${friendlyDeployError(it, "сохранение")}")
+                    }
+                    DeployManager.updateProgress(0.985f, "Сохраняю профиль выходного IP на сервере...")
+                    val outboundProfileSaved = runCatching {
+                        writeOutboundProfileToServer(
+                            context = appContext,
+                            target = OutboundSshTarget(
+                                host = request.host,
+                                user = request.user.ifBlank { "root" },
+                                pass = request.pass,
+                                port = request.sshPort
+                            ),
+                            forms = outboundProfile
+                        )
+                    }.onFailure {
+                        DeployManager.writeError("Outbound profile sync after deploy error: ${it.message}")
+                        TunnelManager.addDeployErrorLog("Профиль выходного IP после деплоя: ${friendlyDeployError(it, "сохранение")}")
+                    }
+                    DeployManager.updateProgress(
+                        1f,
+                        when {
+                            ownerProfileSaved.isSuccess && outboundProfileSaved.isSuccess -> "Сервер обновлён, профили сохранены."
+                            ownerProfileSaved.isSuccess -> "Сервер обновлён, профиль владельца сохранён."
+                            outboundProfileSaved.isSuccess -> "Сервер обновлён, профиль выходного IP сохранён."
+                            else -> "Сервер обновлён. Дополнительные профили не сохранились автоматически."
+                        }
+                    )
                     successCountdown = 5
                     showSuccessBanner = true
                 }
@@ -415,16 +648,33 @@ fun DeployTab() {
     }
 
     fun startDeployCheck(request: DeployRequest) {
+        val localOwnerProfile = currentOwnerProfile()
+        val localOutboundProfile = currentOutboundProfileForms()
         scope.launch {
             isCheckingExistingInstall = true
             try {
-                val info = checkExistingInstall(
+                var info = checkExistingInstall(
                     host = request.host,
                     user = request.user,
                     pass = request.pass,
                     port = request.sshPort
                 )
                 if (info.hasAnyTrace) {
+                    val comparison = runCatching {
+                        compareDeployWithServer(
+                            context = context,
+                            request = request,
+                            localOwnerProfile = localOwnerProfile,
+                            localOutboundProfile = localOutboundProfile,
+                            inspectDatabase = info.accessDbExists
+                        )
+                    }.getOrElse {
+                        DeployManager.writeError("Pre-deploy data comparison error: ${it.message}")
+                        DeployServerComparison(
+                            checkError = friendlyDeployError(it, "сверка данных перед установкой")
+                        )
+                    }
+                    info = info.copy(comparison = comparison)
                     pendingDeployRequest = request
                     existingInstallInfo = info
                 } else {
@@ -482,6 +732,61 @@ fun DeployTab() {
                 outboundStatus = "$title: ${friendlyDeployError(e, "выходной IP")}"
                 outboundStatusOwner = owner
                 DeployManager.writeError("Outbound action failed: ${e.message}")
+            } finally {
+                outboundBusy = false
+                outboundProgressActive = false
+                outboundActionTitle = ""
+                DeployManager.updateProgress(0f, "")
+            }
+        }
+    }
+
+    fun applyOutboundSnapshot(snapshot: OutboundServerSnapshot) {
+        snapshot.localProxyPort.takeIf { it.isNotBlank() }?.let { localProxyPortInput = it }
+        snapshot.localProxyLogin.takeIf { it.isNotBlank() }?.let { localProxyLoginInput = it }
+        snapshot.localProxyPassword.takeIf { it.isNotBlank() }?.let { localProxyPasswordInput = it }
+
+        snapshot.externalProxyKindName.takeIf { name -> ProxyKind.entries.any { it.name == name } }?.let {
+            externalProxyKindName = it
+        }
+        snapshot.externalProxyHost.takeIf { it.isNotBlank() }?.let { externalProxyHostInput = it }
+        snapshot.externalProxyPort.takeIf { it.isNotBlank() }?.let { externalProxyPortInput = it }
+        snapshot.externalProxyLogin.takeIf { it.isNotBlank() }?.let { externalProxyLoginInput = it }
+        snapshot.externalProxyPassword.takeIf { it.isNotBlank() }?.let { externalProxyPasswordInput = it }
+
+        snapshot.wireGuardExitHost.takeIf { it.isNotBlank() }?.let { wireGuardExitHostInput = it }
+        snapshot.wireGuardExitSshPort.takeIf { it.isNotBlank() }?.let { wireGuardExitSshPortInput = it }
+        snapshot.wireGuardExitUser.takeIf { it.isNotBlank() }?.let { wireGuardExitUserInput = it }
+        snapshot.wireGuardExitPassword.takeIf { it.isNotBlank() }?.let { wireGuardExitPasswordInput = it }
+        snapshot.wireGuardExitPort.takeIf { it.isNotBlank() }?.let { wireGuardExitPortInput = it }
+        snapshot.wireGuardExitDns.takeIf { it.isNotBlank() }?.let { wireGuardExitDnsInput = it }
+
+        if (snapshot.importedWireGuardConfig.isNotBlank()) {
+            importedWgConfigText = snapshot.importedWireGuardConfig
+        }
+
+        val restoredDialog = snapshot.preferredDialog()
+        outboundDialog = restoredDialog
+        outboundStatusOwner = restoredDialog?.name
+    }
+
+    fun restoreOutboundFromServer() {
+        val target = currentOutboundTarget() ?: return
+        outboundBusy = true
+        outboundProgressActive = true
+        outboundActionTitle = "Читаю выходной IP с сервера"
+        outboundStatus = "Читаю настройки выходного IP и прокси с сервера..."
+        outboundStatusOwner = null
+        DeployManager.updateProgress(0.02f, "Читаю настройки выходного IP и прокси с сервера...")
+        scope.launch {
+            try {
+                val snapshot = readOutboundServerSnapshot(context, target)
+                applyOutboundSnapshot(snapshot)
+                outboundStatus = outboundRestoreSummary(snapshot)
+            } catch (e: Exception) {
+                outboundStatus = "Не удалось прочитать настройки выходного IP с сервера: ${friendlyDeployError(e, "выходной IP")}"
+                outboundStatusOwner = null
+                DeployManager.writeError("Outbound profile restore failed: ${e.message}")
             } finally {
                 outboundBusy = false
                 outboundProgressActive = false
@@ -739,7 +1044,7 @@ fun DeployTab() {
                 color = MaterialTheme.colorScheme.onSurface
             )
             Text(
-                "Если WDTT Plus уже установлен на сервере, приложение подключится по SSH, сверит главный пароль из «Секретов» и заполнит поля клиента данными сервера. Сервер при этом не переустанавливается, а пользовательские доступы не меняются.",
+                "Подключение без установки работает только в направлении сервер → приложение: WDTT Plus проверяет главный пароль, показывает отличия и после подтверждения заполняет локальные поля. На сервер ничего не записывается, пользовательские доступы не меняются.\n\nНаправление приложение → сервер используется при установке с сохранением данных или с нуля. Настройки выходного IP восстанавливаются отдельно кнопкой «Заполнить» в соответствующем блоке.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -762,31 +1067,31 @@ fun DeployTab() {
                                 port = savedSshPort.toIntOrNull() ?: 22,
                                 adminMainPassword = savedMainPass
                             )
-                            settingsStore.save(
-                                peer = connection.host,
-                                vkHashes = connection.vkHash,
-                                secondaryVkHash = "",
-                                workersPerHash = 16,
-                                protocol = "udp",
-                                listenPort = connection.ports.third,
-                                sni = "",
-                                noDns = false
+                            val localProfile = currentOwnerProfile()
+                            val serverProfile = connection.adminProfile
+                            val diffLines = existingConnectionDiffLines(
+                                connection = connection,
+                                localPeer = savedPeer,
+                                localConnectionPassword = savedConnectionPassword,
+                                localAdminId = savedAdminId,
+                                localBotToken = savedBotToken,
+                                localDns1 = dns1,
+                                localDns2 = dns2,
+                                localProfile = localProfile
                             )
-                            settingsStore.saveConnectionPassword(connection.password)
-                            settingsStore.savePorts(connection.ports.first, connection.ports.second, connection.ports.third)
-                            settingsStore.saveManualPortsEnabled(connection.ports != Triple(56000, 56001, 9000))
-                            settingsStore.saveDeploySecrets(
-                                mainPass = savedMainPass,
-                                adminId = connection.adminId,
-                                botToken = connection.botToken,
-                                sshPort = savedSshPort.ifBlank { "22" }
-                            )
-                            settingsStore.saveDeploy(ip.trim(), effectiveLogin, password, savedSshPort.ifBlank { "22" }, connection.dns1, connection.dns2)
-                            settingsStore.saveWdttLinkMode(false)
-                            existingConnectStatus = if (connection.needsVkHash) {
-                                "Готово: поля клиента заполнены. Сервер: ${connection.host}; порты: ${connection.ports.first}, ${connection.ports.second}, ${connection.ports.third}. VK-хеш на сервере не найден, добавьте его во вкладке «Туннель»."
+                            if (diffLines.isNotEmpty()) {
+                                pendingExistingConnectionApply = PendingExistingConnectionApply(
+                                    connection = connection,
+                                    effectiveLogin = effectiveLogin,
+                                    localProfile = localProfile,
+                                    serverProfile = serverProfile,
+                                    diffLines = diffLines
+                                )
+                                existingConnectStatus = "Данные сервера отличаются от локальных полей. Проверьте изменения перед восстановлением."
                             } else {
-                                "Готово: поля клиента заполнены. Сервер: ${connection.host}; порты: ${connection.ports.first}, ${connection.ports.second}, ${connection.ports.third}. ${connection.source}"
+                                val profile = if (serverProfile.hasSavedFields) serverProfile else localProfile
+                                val source = if (serverProfile.hasSavedFields) OwnerProfileSource.Server else OwnerProfileSource.LocalOnly
+                                applyExistingConnection(connection, effectiveLogin, profile, source)
                             }
                         } catch (e: Exception) {
                             existingConnectStatus = "Ошибка подключения к готовому серверу: ${friendlyDeployError(e, "подключение")}"
@@ -817,27 +1122,125 @@ fun DeployTab() {
             }
         }
 
-        OutboundRoutingSection(
-            busy = outboundBusy,
-            status = if (outboundDialog == null && outboundStatusOwner == null) outboundStatus else "",
-            actionTitle = outboundActionTitle,
-            enabled = !isDeploying && !migrationBusy && !outboundBusy,
-            expanded = outboundExpanded,
-            modifier = Modifier.onGloballyPositioned { outboundSectionY = it.positionInParent().y },
-            onToggleExpanded = {
-                val willExpand = !outboundExpanded
-                outboundExpanded = willExpand
-                if (willExpand) {
+        pendingExistingConnectionApply?.let { pending ->
+            AlertDialog(
+                onDismissRequest = {
+                    if (!existingConnectBusy) {
+                        pendingExistingConnectionApply = null
+                        existingConnectStatus = "Подключение без установки отменено: локальные данные не изменены. Сервер также не изменялся."
+                    }
+                },
+                title = { Text("Данные отличаются") },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text(
+                            "Подключение без установки заменит перечисленные локальные значения данными сервера. На сервер ничего записано не будет.",
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                        HorizontalDivider()
+                        pending.diffLines.forEach { line ->
+                            Text("• $line", style = MaterialTheme.typography.bodySmall)
+                        }
+                        if (!pending.serverProfile.hasSavedFields) {
+                            Text(
+                                "На сервере нет сохранённого профиля владельца: поля «Туннеля» останутся локальными и не будут отправлены на сервер.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            val selected = pending
+                            pendingExistingConnectionApply = null
+                            existingConnectBusy = true
+                            existingConnectStatus = "Восстанавливаю данные с сервера в приложение..."
+                            scope.launch {
+                                try {
+                                    val source = if (selected.serverProfile.hasSavedFields) {
+                                        OwnerProfileSource.Server
+                                    } else {
+                                        OwnerProfileSource.LocalOnly
+                                    }
+                                    applyExistingConnection(
+                                        connection = selected.connection,
+                                        effectiveLogin = selected.effectiveLogin,
+                                        profile = if (selected.serverProfile.hasSavedFields) selected.serverProfile else selected.localProfile,
+                                        source = source
+                                    )
+                                } catch (e: Exception) {
+                                    existingConnectStatus = "Ошибка восстановления данных: ${friendlyDeployError(e, "подключение")}"
+                                    DeployManager.writeError("Existing server owner profile apply error: ${e.message}")
+                                } finally {
+                                    existingConnectBusy = false
+                                }
+                            }
+                        },
+                        enabled = !existingConnectBusy
+                    ) { Text("Применить с сервера") }
+                },
+                dismissButton = {
+                    TextButton(
+                        onClick = {
+                            pendingExistingConnectionApply = null
+                            existingConnectStatus = "Подключение без установки отменено: локальные данные и сервер не изменены."
+                        },
+                        enabled = !existingConnectBusy
+                    ) { Text("Отмена") }
+                }
+            )
+        }
+
+        clientsSectionExpanded?.let { clientsExpanded ->
+            ServerClientsSection(
+                host = ip.trim(),
+                user = if (login.isBlank()) "root" else login,
+                sshPassword = password,
+                sshPort = savedSshPort.toIntOrNull() ?: 22,
+                mainPassword = savedMainPass,
+                defaultPorts = "${if (savedManualPorts) savedServerDtlsPort else 56000},${if (savedManualPorts) savedServerWgPort else 56001},${if (savedManualPorts) savedListenPort else 9000}",
+                adminProfile = currentOwnerProfile(),
+                enabled = !isDeploying && !isCheckingExistingInstall && !migrationBusy && !outboundBusy && isServerAddressValid,
+                expanded = clientsExpanded,
+                modifier = Modifier.onGloballyPositioned { clientsSectionY = it.positionInParent().y },
+                onExpandedChange = { expanded ->
+                    scope.launch { settingsStore.saveDeployClientsSectionExpanded(expanded) }
+                },
+                onExpanded = {
                     scope.launch {
                         kotlinx.coroutines.delay(80)
-                        deployScrollState.animateScrollTo((outboundSectionY - topRevealOffsetPx).toInt().coerceAtLeast(0))
+                        deployScrollState.animateScrollTo((clientsSectionY - topRevealOffsetPx).toInt().coerceAtLeast(0))
                     }
                 }
-            },
-            onOpen = { openOutboundDialog(it) },
-            onStatus = { runOutboundAction("Проверяю текущий выход WDTT") { readOutboundStatus(it) } },
-            onDirect = { runOutboundAction("Возвращаю прямой выход WDTT") { disableOutboundExit(it) } }
-        )
+            )
+        }
+
+        outboundSectionExpanded?.let { outboundExpanded ->
+            OutboundRoutingSection(
+                busy = outboundBusy,
+                status = if (outboundDialog == null && outboundStatusOwner == null) outboundStatus else "",
+                actionTitle = outboundActionTitle,
+                enabled = !isDeploying && !migrationBusy && !outboundBusy,
+                expanded = outboundExpanded,
+                modifier = Modifier.onGloballyPositioned { outboundSectionY = it.positionInParent().y },
+                onToggleExpanded = {
+                    val willExpand = !outboundExpanded
+                    scope.launch { settingsStore.saveDeployOutboundSectionExpanded(willExpand) }
+                    if (willExpand) {
+                        scope.launch {
+                            kotlinx.coroutines.delay(80)
+                            deployScrollState.animateScrollTo((outboundSectionY - topRevealOffsetPx).toInt().coerceAtLeast(0))
+                        }
+                    }
+                },
+                onOpen = { openOutboundDialog(it) },
+                onRestore = { restoreOutboundFromServer() },
+                onStatus = { runOutboundAction("Проверяю текущий выход WDTT") { readOutboundStatus(it) } },
+                onDirect = { runOutboundAction("Возвращаю прямой выход WDTT") { disableOutboundExit(it) } }
+            )
+        }
 
         outboundDialog?.let { dialog ->
             when (dialog) {
@@ -855,8 +1258,15 @@ fun DeployTab() {
                     onPasswordChanged = { localProxyPasswordInput = it },
                     onDismiss = { outboundDialog = null },
                     onInstall = { proxyPort, loginValue, passwordValue ->
+                        val forms = currentOutboundProfileForms().copy(
+                            localProxyPort = proxyPort.toString(),
+                            localProxyLogin = loginValue,
+                            localProxyPassword = passwordValue
+                        )
                         runOutboundAction("Устанавливаю прокси на этом сервере") {
-                            installLocalProxy(context, it, proxyPort, loginValue, passwordValue)
+                            val result = installLocalProxy(context, it, proxyPort, loginValue, passwordValue)
+                            val saveMessage = saveOutboundProfileMessage(context, it, forms, "Поля прокси сохранены на сервере для восстановления.")
+                            "$result\n$saveMessage"
                         }
                     },
                     onCheck = { proxyPort, loginValue, passwordValue ->
@@ -898,13 +1308,22 @@ fun DeployTab() {
                     onPasswordChanged = { externalProxyPasswordInput = it },
                     onDismiss = { outboundDialog = null },
                     onCheck = { kind, hostValue, proxyPort, loginValue, passwordValue ->
-                        runOutboundAction("Проверяю доступность внешнего прокси") {
+                        runOutboundAction("Проверяю доступность внешнего TCP-прокси") {
                             checkExternalProxy(context, it, kind, hostValue, proxyPort, loginValue, passwordValue)
                         }
                     },
                     onEnable = { kind, hostValue, proxyPort, loginValue, passwordValue ->
-                        runOutboundAction("Проверяю и включаю внешний прокси") {
-                            enableExternalProxy(context, it, kind, hostValue, proxyPort, loginValue, passwordValue)
+                        val forms = currentOutboundProfileForms().copy(
+                            externalProxyKindName = kind.name,
+                            externalProxyHost = hostValue,
+                            externalProxyPort = proxyPort.toString(),
+                            externalProxyLogin = loginValue,
+                            externalProxyPassword = passwordValue
+                        )
+                        runOutboundAction("Проверяю и включаю внешний TCP-прокси") {
+                            val result = enableExternalProxy(context, it, kind, hostValue, proxyPort, loginValue, passwordValue)
+                            val saveMessage = saveOutboundProfileMessage(context, it, forms, "Поля внешнего прокси сохранены на сервере для восстановления.")
+                            "$result\n$saveMessage"
                         }
                     },
                     onDisable = {
@@ -931,8 +1350,16 @@ fun DeployTab() {
                     onDnsChanged = { wireGuardExitDnsInput = it },
                     onDismiss = { outboundDialog = null },
                     onInstall = { foreignHost, foreignPort, foreignUser, foreignPassword, wgPort, dns ->
+                        val forms = currentOutboundProfileForms().copy(
+                            wireGuardExitHost = foreignHost,
+                            wireGuardExitSshPort = foreignPort.toString(),
+                            wireGuardExitUser = foreignUser,
+                            wireGuardExitPassword = foreignPassword,
+                            wireGuardExitPort = wgPort.toString(),
+                            wireGuardExitDns = dns
+                        )
                         runOutboundAction("Настраиваю WireGuard-выход через другой сервер") {
-                            installWireGuardExitVps(
+                            val result = installWireGuardExitVps(
                                 context = context,
                                 current = it,
                                 foreignHost = foreignHost,
@@ -942,6 +1369,13 @@ fun DeployTab() {
                                 wgPort = wgPort,
                                 dns = dns
                             )
+                            val saveMessage = saveOutboundProfileMessage(context, it, forms, "Поля выхода через другой сервер сохранены на сервере для восстановления.")
+                            "$result\n$saveMessage"
+                        }
+                    },
+                    onCheck = {
+                        runOutboundAction("Проверяю выход через другой сервер") {
+                            checkWireGuardExit(it, expectedMode = "wireguard_vps")
                         }
                     },
                     onDisable = {
@@ -960,23 +1394,31 @@ fun DeployTab() {
                     onDismiss = { outboundDialog = null },
                     onValidate = { config ->
                         outboundStatus = validateWireGuardConfigText(config).fold(
-                            onSuccess = { "Файл подходит: WireGuard-выход будет применён только к WDTT-пользователям, обычный интернет сервера не изменится." },
-                            onFailure = { "Ошибка WireGuard-файла: ${it.message}" }
+                            onSuccess = { "Файл подходит: это обычный WireGuard-конфиг. Если он выдан WARP, WDTT Plus применит его как WARP/VPN-выход только для WDTT-пользователей; обычный интернет сервера не изменится." },
+                            onFailure = { "Ошибка VPN/WARP-файла: ${it.message}" }
                         )
                         outboundStatusOwner = OutboundDialog.ImportedWireGuard.name
                     },
                     onEnable = { config ->
                         importedWgConfigText = config
-                        runOutboundAction("Включаю WireGuard-выход из файла") {
-                            enableImportedWireGuardExit(context, it, config)
+                        val forms = currentOutboundProfileForms().copy(importedWireGuardConfig = config)
+                        runOutboundAction("Включаю VPN/WARP-выход из файла") {
+                            val result = enableImportedWireGuardExit(context, it, config)
+                            val saveMessage = saveOutboundProfileMessage(context, it, forms, "VPN/WARP-файл сохранён на сервере для восстановления.")
+                            "$result\n$saveMessage"
                         }
                     },
                     onDisable = {
                         runOutboundAction("Возвращаю прямой выход WDTT") { disableOutboundExit(it) }
                     },
+                    onServerCheck = {
+                        runOutboundAction("Проверяю установленный VPN/WARP-выход") {
+                            checkWireGuardExit(it, expectedMode = "imported_wg")
+                        }
+                    },
                     onDelete = {
                         importedWgConfigText = ""
-                        runOutboundAction("Удаляю WireGuard-файл и возвращаю прямой выход") { deleteImportedWireGuardExit(it) }
+                        runOutboundAction("Удаляю VPN/WARP-файл и возвращаю прямой выход") { deleteImportedWireGuardExit(it) }
                     }
                 )
                 OutboundDialog.Diagnostics -> OutboundDiagnosticsDialog(
@@ -1012,60 +1454,61 @@ fun DeployTab() {
             )
         }
 
-        val migrationArrowRotation by animateFloatAsState(
-            targetValue = if (migrationExpanded) 180f else 0f,
-            label = "migration_arrow_rotation"
-        )
+        migrationSectionExpanded?.let { migrationExpanded ->
+            val migrationArrowRotation by animateFloatAsState(
+                targetValue = if (migrationExpanded) 180f else 0f,
+                label = "migration_arrow_rotation"
+            )
 
-        AppSectionCard(
-            modifier = Modifier.onGloballyPositioned { migrationSectionY = it.positionInParent().y },
-            contentPadding = PaddingValues(16.dp),
-            verticalArrangement = Arrangement.spacedBy(0.dp)
-        ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(24.dp))
-                    .clickable {
-                        val willExpand = !migrationExpanded
-                        migrationExpanded = willExpand
-                        if (willExpand) {
-                            scope.launch {
-                                kotlinx.coroutines.delay(80)
-                                deployScrollState.animateScrollTo((migrationSectionY - topRevealOffsetPx).toInt().coerceAtLeast(0))
+            AppSectionCard(
+                modifier = Modifier.onGloballyPositioned { migrationSectionY = it.positionInParent().y },
+                contentPadding = PaddingValues(16.dp),
+                verticalArrangement = Arrangement.spacedBy(0.dp)
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(24.dp))
+                        .clickable {
+                            val willExpand = !migrationExpanded
+                            scope.launch { settingsStore.saveDeployMigrationSectionExpanded(willExpand) }
+                            if (willExpand) {
+                                scope.launch {
+                                    kotlinx.coroutines.delay(80)
+                                    deployScrollState.animateScrollTo((migrationSectionY - topRevealOffsetPx).toInt().coerceAtLeast(0))
+                                }
                             }
                         }
+                        .padding(vertical = 2.dp),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Surface(shape = RoundedCornerShape(18.dp), color = MaterialTheme.colorScheme.primaryContainer) {
+                        Box(modifier = Modifier.size(40.dp), contentAlignment = Alignment.Center) {
+                            Icon(
+                                imageVector = Icons.Default.CloudUpload,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
                     }
-                    .padding(vertical = 2.dp),
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Surface(shape = RoundedCornerShape(18.dp), color = MaterialTheme.colorScheme.primaryContainer) {
-                    Box(modifier = Modifier.size(40.dp), contentAlignment = Alignment.Center) {
-                        Icon(
-                            imageVector = Icons.Default.CloudUpload,
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.size(18.dp)
-                        )
-                    }
+                    Text(
+                        "Перенос сервера",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Icon(
+                        imageVector = Icons.Default.KeyboardArrowDown,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier
+                            .size(24.dp)
+                            .rotate(migrationArrowRotation)
+                    )
                 }
-                Text(
-                    "Перенос сервера",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.onSurface,
-                    modifier = Modifier.weight(1f)
-                )
-                Icon(
-                    imageVector = Icons.Default.KeyboardArrowDown,
-                    contentDescription = null,
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier
-                        .size(24.dp)
-                        .rotate(migrationArrowRotation)
-                )
-            }
 
             AnimatedVisibility(
                 visible = migrationExpanded,
@@ -1084,6 +1527,11 @@ fun DeployTab() {
             )
             Text(
                 "Старые ссылки пользователей останутся рабочими только если в них был домен и после переноса DNS этого домена указывает на новый сервер. Если ссылки выдавались с IP, после переноса сгенерируйте и отправьте пользователям новые ссылки; пароли и привязки при полном переносе сохранятся.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text(
+                "Настройки выходного IP, прокси и VPN/WARP-файлы этим экспортом не переносятся. После переезда включите нужный режим выхода на новом сервере заново.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -1274,6 +1722,7 @@ fun DeployTab() {
             }
                 }
             }
+        }
         }
 
         if (showUninstallDialog) {
@@ -1519,6 +1968,7 @@ private fun OutboundRoutingSection(
     modifier: Modifier = Modifier,
     onToggleExpanded: () -> Unit,
     onOpen: (OutboundDialog) -> Unit,
+    onRestore: () -> Unit,
     onStatus: () -> Unit,
     onDirect: () -> Unit
 ) {
@@ -1584,33 +2034,52 @@ private fun OutboundRoutingSection(
             ) {
                 HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.30f))
                 Text(
-                    "Помогает выбрать, с какого IP будут выходить пользователи WDTT. Настройки обычного интернета на самом сервере не меняются.",
+                    "Выбирает IP, который видят сайты и сервисы у пользователей WDTT. Сам адрес WDTT-сервера, входящие DTLS/SSH и ссылка подключения этим не скрываются.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 Text(
-                    "Раздел ещё обкатывается. При возникновении ошибок пишите в «Поднять вопрос» на вкладке «Инфо» и прикладывайте логи вместе с диагностикой выхода.",
+                    "Обычная сеть самого сервера не меняется. Для маскировки выходного IP используйте внешний TCP-прокси, другой сервер или VPN/WARP-файл.",
                     style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.error
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutboundModeButton("Прокси на этом сервере", "Создать прокси с логином и паролем на текущем сервере.", enabled) {
+                    OutboundModeButton("Прокси VPS", "Создаёт SOCKS5/HTTP на этом сервере. IP не скрывает: выход будет через тот же VPS.", enabled) {
                         onOpen(OutboundDialog.LocalProxy)
                     }
-                    OutboundModeButton("Внешний прокси", "Пустить обычные подключения WDTT через внешний прокси. Звонки могут использовать отдельный трафик и пройти напрямую.", enabled) {
+                    OutboundModeButton("Внешний TCP-прокси", "Скрывает IP для обычного TCP-трафика. UDP, QUIC и часть звонков могут пройти напрямую.", enabled) {
                         onOpen(OutboundDialog.ExternalProxy)
                     }
-                    OutboundModeButton("Выход через другой сервер", "Сделать другой сервер отдельной точкой выхода для пользователей WDTT.", enabled) {
+                    OutboundModeButton("Другой сервер", "Надёжно выносит выходной IP на отдельный VPS через WireGuard.", enabled) {
                         onOpen(OutboundDialog.WireGuardVps)
                     }
-                    OutboundModeButton("Готовый WireGuard-файл", "Подключить готовый WireGuard-профиль как отдельный выход для пользователей WDTT.", enabled) {
+                    OutboundModeButton("VPN/WARP-файл", "Принимает WireGuard .conf, в том числе WARP, если он сохранён именно как WireGuard-конфиг.", enabled) {
                         onOpen(OutboundDialog.ImportedWireGuard)
                     }
                 }
+                Text(
+                    "«Заполнить» читает сохранённые настройки с сервера и заменяет ими только локальные поля этого блока. На сервер ничего не записывается; активный режим выхода не переключается.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
+                    OutlinedButton(
+                        onClick = onRestore,
+                        enabled = enabled,
+                        modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+                        shape = RoundedCornerShape(16.dp),
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp)
+                    ) {
+                        val restoring = busy && actionTitle.contains("Читаю выходной IP", ignoreCase = true)
+                        if (restoring) {
+                            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                            Spacer(Modifier.width(6.dp))
+                        }
+                        Text(if (restoring) "Читаю..." else "Заполнить", fontWeight = FontWeight.SemiBold, textAlign = TextAlign.Center)
+                    }
                     OutlinedButton(
                         onClick = onStatus,
                         enabled = enabled,
@@ -1624,14 +2093,14 @@ private fun OutboundRoutingSection(
                         }
                         Text(if (readingStatus) "Читаю..." else "Статус", fontWeight = FontWeight.SemiBold)
                     }
-                    OutlinedButton(
-                        onClick = { onOpen(OutboundDialog.Diagnostics) },
-                        enabled = enabled,
-                        modifier = Modifier.weight(1f).heightIn(min = 48.dp),
-                        shape = RoundedCornerShape(16.dp)
-                    ) {
-                        Text("Диагностика", fontWeight = FontWeight.SemiBold)
-                    }
+                }
+                OutlinedButton(
+                    onClick = { onOpen(OutboundDialog.Diagnostics) },
+                    enabled = enabled,
+                    modifier = Modifier.align(Alignment.CenterHorizontally).heightIn(min = 48.dp),
+                    shape = RoundedCornerShape(16.dp)
+                ) {
+                    Text("Диагностика", fontWeight = FontWeight.SemiBold)
                 }
                 Button(
                     onClick = onDirect,
@@ -1725,9 +2194,9 @@ private fun LocalProxyDialog(
 ) {
     var passwordFocused by rememberSaveable { mutableStateOf(false) }
     val port = portInput.toIntOrNull()?.takeIf { it in 1..65533 }
-    OutboundDialogFrame("Прокси на этом сервере", status, progressTitle, progress, onDismiss) {
+    OutboundDialogFrame("Прокси VPS", status, progressTitle, progress, onDismiss) {
         Text(
-            "На этом сервере будут созданы два входа с одним логином и паролем: SOCKS5 и HTTP. Их можно выдать тем, кому нужен прокси-адрес этого сервера.",
+            "На этом же VPS будут созданы два входа с одним логином и паролем: SOCKS5 и HTTP. Это удобно как прокси, но IP не маскирует: наружу будет виден текущий сервер.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
@@ -1848,9 +2317,9 @@ private fun ExternalProxyDialog(
     var passwordFocused by rememberSaveable { mutableStateOf(false) }
     val port = portInput.toIntOrNull()?.takeIf { it in 1..65535 }
     val hostValid = hostInput.isValidPublicHost()
-    OutboundDialogFrame("Внешний прокси", status, progressTitle, progress, onDismiss) {
+    OutboundDialogFrame("Внешний TCP-прокси", status, progressTitle, progress, onDismiss) {
         Text(
-            "WDTT будет отправлять обычные подключения пользователей через выбранный прокси. Если звонок использует отдельный голосовой трафик, он может идти напрямую.",
+            "WDTT будет отправлять обычные TCP-подключения пользователей через выбранный прокси. UDP, QUIC и часть голосового/звонкового трафика могут идти напрямую.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
@@ -1902,13 +2371,13 @@ private fun ExternalProxyDialog(
             shape = RoundedCornerShape(16.dp)
         )
         Text(
-            "При включении прежний внешний выход WDTT будет выключен, затем начнёт работать этот прокси. Обычный интернет самого сервера не меняется.",
+            "При включении прежний внешний выход WDTT будет выключен, затем начнёт работать этот прокси. Это маскирует только поддерживаемый TCP-трафик пользователей; обычный интернет самого сервера не меняется.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.error
         )
         DialogButtons(
             busy = busy,
-            primaryBusy = actionTitle.contains("включаю внешний прокси", ignoreCase = true),
+            primaryBusy = actionTitle.contains("включаю внешний TCP-прокси", ignoreCase = true),
             secondaryBusy = actionTitle.contains("Проверяю доступность", ignoreCase = true),
             primaryText = "Включить",
             primaryBusyText = "Включение...",
@@ -1950,15 +2419,16 @@ private fun WireGuardExitVpsDialog(
     onDnsChanged: (String) -> Unit,
     onDismiss: () -> Unit,
     onInstall: (String, Int, String, String, Int, String) -> Unit,
+    onCheck: () -> Unit,
     onDisable: () -> Unit
 ) {
     var passwordFocused by rememberSaveable { mutableStateOf(false) }
     val hostValid = hostInput.isValidPublicHost()
     val sshPort = sshPortInput.toIntOrNull()?.takeIf { it in 1..65535 }
     val wgPort = wgPortInput.toIntOrNull()?.takeIf { it in 1..65535 }
-    OutboundDialogFrame("Другой сервер через WireGuard", status, progressTitle, progress, onDismiss) {
+    OutboundDialogFrame("Выход через другой сервер", status, progressTitle, progress, onDismiss) {
         Text(
-            "WDTT Plus подключится к другому серверу, настроит WireGuard и будет выпускать пользователей WDTT в интернет через этот второй сервер.",
+            "WDTT Plus подключит текущий сервер к другому VPS по WireGuard и будет выпускать пользователей WDTT в интернет через этот второй сервер. Это самый понятный вариант для отдельного выходного IP.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
@@ -2027,15 +2497,23 @@ private fun WireGuardExitVpsDialog(
         DialogButtons(
             busy = busy,
             primaryBusy = actionTitle.contains("Настраиваю WireGuard", ignoreCase = true),
-            secondaryBusy = actionTitle.contains("Возвращаю", ignoreCase = true),
+            secondaryBusy = actionTitle.contains("Проверяю выход", ignoreCase = true),
             primaryText = "Настроить выход",
             primaryBusyText = "Настройка...",
             primaryEnabled = hostValid && sshPort != null && wgPort != null && userInput.isNotBlank() && passwordInput.isNotBlank(),
             onPrimary = { onInstall(hostInput.trim(), sshPort ?: 22, userInput, passwordInput, wgPort ?: 51820, dnsInput) },
-            secondaryText = "Отключить",
-            secondaryBusyText = "Отключение...",
-            onSecondary = onDisable
+            secondaryText = "Проверить",
+            secondaryBusyText = "Проверка...",
+            onSecondary = onCheck
         )
+        OutlinedButton(onClick = onDisable, enabled = !busy, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp)) {
+            val disabling = actionTitle.contains("Возвращаю", ignoreCase = true)
+            if (disabling) {
+                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                Spacer(Modifier.width(6.dp))
+            }
+            Text(if (disabling) "Отключение..." else "Отключить")
+        }
     }
 }
 
@@ -2053,18 +2531,24 @@ private fun ImportedWireGuardDialog(
     onValidate: (String) -> Unit,
     onEnable: (String) -> Unit,
     onDisable: () -> Unit,
+    onServerCheck: () -> Unit,
     onDelete: () -> Unit
 ) {
     var configText by rememberSaveable(initialConfig) { mutableStateOf(initialConfig) }
     val valid = configText.isNotBlank() && validateWireGuardConfigText(configText).isSuccess
-    OutboundDialogFrame("Готовый WireGuard-файл", status, progressTitle, progress, onDismiss) {
+    OutboundDialogFrame("VPN/WARP-файл", status, progressTitle, progress, onDismiss) {
         Text(
-            "Можно выбрать обычный WireGuard-профиль, даже если он рассчитан на весь интернет. WDTT Plus применит его только к пользователям WDTT и не поменяет обычный интернет самого сервера.",
+            "Можно выбрать обычный WireGuard .conf от VPN-провайдера или WARP. Важно: WARP подходит только как WireGuard-конфиг с [Interface] и [Peer]; профиль warp-cli напрямую сюда не вставляется.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Text(
+            "WDTT Plus применит файл только к пользователям WDTT и не поменяет обычный интернет самого сервера.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
         OutlinedButton(onClick = onPickFile, enabled = !busy, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp)) {
-            Text("Выбрать файл WireGuard")
+            Text("Выбрать VPN/WARP-файл")
         }
         OutlinedTextField(
             value = configText,
@@ -2072,7 +2556,7 @@ private fun ImportedWireGuardDialog(
                 configText = it
                 onConfigChanged(it)
             },
-            label = { Text("Содержимое WireGuard-файла") },
+            label = { Text("Содержимое WireGuard/WARP .conf") },
             minLines = 8,
             maxLines = 14,
             modifier = Modifier.fillMaxWidth(),
@@ -2085,16 +2569,29 @@ private fun ImportedWireGuardDialog(
         )
         DialogButtons(
             busy = busy,
-            primaryBusy = actionTitle.contains("Включаю WireGuard", ignoreCase = true),
+            primaryBusy = actionTitle.contains("Включаю VPN/WARP", ignoreCase = true),
             secondaryBusy = false,
             primaryText = "Включить",
             primaryBusyText = "Включение...",
             primaryEnabled = valid,
             onPrimary = { onEnable(configText) },
-            secondaryText = "Проверить",
+            secondaryText = "Проверить файл",
             secondaryBusyText = "Проверка...",
             onSecondary = { onValidate(configText) }
         )
+        OutlinedButton(
+            onClick = onServerCheck,
+            enabled = !busy,
+            modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+            shape = RoundedCornerShape(16.dp)
+        ) {
+            val checkingServer = actionTitle.contains("Проверяю установленный", ignoreCase = true)
+            if (checkingServer) {
+                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                Spacer(Modifier.width(6.dp))
+            }
+            Text(if (checkingServer) "Проверка..." else "Проверить на сервере", fontWeight = FontWeight.SemiBold)
+        }
         Row(
             modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Min),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -2610,7 +3107,7 @@ private fun outboundShellPrelude(): String = """
       test_ip="${'$'}(curl -4fsS --connect-timeout 5 --max-time 18 https://api.ipify.org 2>/tmp/wdtt-redsocks-test.err || true)"
       wdtt_cleanup_proxy_test
       [ -n "${'$'}test_ip" ] || { echo WDTT_ERROR=external_proxy_apply_failed; tail -n 20 /var/log/wdtt-redsocks.log 2>/dev/null || true; cat /tmp/wdtt-redsocks-test.err 2>/dev/null || true; return 1; }
-      echo "Проверка пути через внешний прокси успешна. IP через прокси: ${'$'}test_ip"
+      echo "Проверка пути через внешний TCP-прокси успешна. IP через прокси: ${'$'}test_ip"
       return 0
     }
     wdtt_write_mode() {
@@ -2629,6 +3126,11 @@ private fun outboundShellPrelude(): String = """
     }
 """.trimIndent()
 
+private fun outboundReadPrelude(): String = """
+    set -e
+    WDTT_WG_IFACE="wg-wdtt-exit"
+""".trimIndent()
+
 private fun outboundStatusScript(): String = shellScript(
     outboundShellPrelude(),
     """
@@ -2639,9 +3141,9 @@ private fun outboundStatusScript(): String = shellScript(
     fi
     case "${'$'}MODE" in
       direct) MODE_LABEL="прямой выход";;
-      external_proxy) MODE_LABEL="внешний прокси";;
-      imported_wg) MODE_LABEL="готовый WireGuard-файл";;
-      wireguard_vps) MODE_LABEL="другой сервер через WireGuard";;
+      external_proxy) MODE_LABEL="внешний TCP-прокси";;
+      imported_wg) MODE_LABEL="VPN/WARP-файл";;
+      wireguard_vps) MODE_LABEL="выход через другой сервер";;
       *) MODE_LABEL="${'$'}MODE";;
     esac
     SERVER_IP="${'$'}(curl -4fsS --max-time 8 https://api.ipify.org 2>/dev/null || echo 'не удалось определить')"
@@ -2649,8 +3151,27 @@ private fun outboundStatusScript(): String = shellScript(
     echo "Подсеть клиентов WDTT: ${'$'}WDTT_SUBNET"
     echo "Интерфейс клиентов: ${'$'}WDTT_IFACE"
     echo "Внешний IP самого сервера: ${'$'}SERVER_IP"
-    if systemctl is-active wdtt-3proxy >/dev/null 2>&1; then echo "Прокси на этом сервере: служба запущена"; else echo "Прокси на этом сервере: служба остановлена"; fi
-    if systemctl is-active wdtt-redsocks >/dev/null 2>&1; then echo "Внешний прокси для WDTT: включён"; else echo "Внешний прокси для WDTT: выключен"; fi
+    case "${'$'}MODE" in
+      direct)
+        echo "Проверочный выход WDTT: ${'$'}SERVER_IP (прямой выход)"
+        ;;
+      imported_wg|wireguard_vps)
+        WDTT_EXIT_IP="${'$'}(curl -4fsS --interface "${'$'}WDTT_WG_IFACE" --max-time 12 https://api.ipify.org 2>/dev/null || true)"
+        if [ -n "${'$'}WDTT_EXIT_IP" ]; then
+          echo "Проверочный выход WDTT: ${'$'}WDTT_EXIT_IP"
+        else
+          echo "Проверочный выход WDTT: не удалось проверить через ${'$'}WDTT_WG_IFACE"
+        fi
+        ;;
+      external_proxy)
+        echo "Проверочный выход WDTT: через внешний TCP-прокси; точный IP смотрите при проверке/диагностике прокси"
+        ;;
+      *)
+        echo "Проверочный выход WDTT: режим не распознан"
+        ;;
+    esac
+    if systemctl is-active wdtt-3proxy >/dev/null 2>&1; then echo "Прокси VPS: служба запущена"; else echo "Прокси VPS: служба остановлена"; fi
+    if systemctl is-active wdtt-redsocks >/dev/null 2>&1; then echo "Внешний TCP-прокси для WDTT: включён"; else echo "Внешний TCP-прокси для WDTT: выключен"; fi
     if command -v wg >/dev/null 2>&1 && wg show "${'$'}WDTT_WG_IFACE" >/dev/null 2>&1; then
       echo "WireGuard ${'$'}WDTT_WG_IFACE:"
       wg show "${'$'}WDTT_WG_IFACE" | sed -E 's/(private key: ).*/\1(скрыт)/'
@@ -2669,6 +3190,401 @@ private suspend fun readOutboundStatus(target: OutboundSshTarget): String = with
         DeployManager.updateProgress(0.70f, "Проверяю службы прокси и WireGuard...")
         val output = ssh.exec(rootCommand(outboundStatusScript()), timeout = 30000L).trim()
         DeployManager.updateProgress(1f, "Статус выхода получен.")
+        output
+    } finally {
+        try { session?.disconnect() } catch (_: Exception) {}
+    }
+}
+
+private fun outboundProfileSaveScript(forms: OutboundProfileForms): String {
+    val kindName = ProxyKind.entries.firstOrNull { it.name == forms.externalProxyKindName }?.name.orEmpty()
+    fun port(value: String): String = value.filter(Char::isDigit).take(5)
+    fun line(name: String, value: String): String = "$name=$value"
+    fun b64Line(name: String, value: String): String = "$name=${encodeBase64Text(value)}"
+    val profileLines = listOf(
+        line("VERSION", "1"),
+        line("LOCAL_PROXY_PORT", port(forms.localProxyPort)),
+        b64Line("LOCAL_PROXY_LOGIN_B64", forms.localProxyLogin),
+        b64Line("LOCAL_PROXY_PASSWORD_B64", forms.localProxyPassword),
+        line("EXTERNAL_PROXY_KIND", kindName),
+        b64Line("EXTERNAL_PROXY_HOST_B64", forms.externalProxyHost),
+        line("EXTERNAL_PROXY_PORT", port(forms.externalProxyPort)),
+        b64Line("EXTERNAL_PROXY_LOGIN_B64", forms.externalProxyLogin),
+        b64Line("EXTERNAL_PROXY_PASSWORD_B64", forms.externalProxyPassword),
+        b64Line("WG_VPS_HOST_B64", forms.wireGuardExitHost),
+        line("WG_VPS_SSH_PORT", port(forms.wireGuardExitSshPort)),
+        b64Line("WG_VPS_USER_B64", forms.wireGuardExitUser),
+        b64Line("WG_VPS_PASSWORD_B64", forms.wireGuardExitPassword),
+        line("WG_VPS_PORT", port(forms.wireGuardExitPort)),
+        b64Line("WG_VPS_DNS_B64", forms.wireGuardExitDns),
+        b64Line("IMPORTED_WG_CONFIG_B64", forms.importedWireGuardConfig)
+    ).joinToString("\n")
+    val profileScript = """
+        PROFILE_FILE=/etc/wdtt/outbound-profile.env
+        TMP_FILE="${'$'}PROFILE_FILE.tmp"
+        cat >"${'$'}TMP_FILE" <<'WDTT_OUTBOUND_PROFILE'
+    """.trimIndent() + "\n" + profileLines + "\n" + """
+        WDTT_OUTBOUND_PROFILE
+        printf 'UPDATED_AT=%s\n' "$(date -Is)" >>"${'$'}TMP_FILE"
+        chmod 600 "${'$'}TMP_FILE"
+        mv "${'$'}TMP_FILE" "${'$'}PROFILE_FILE"
+        echo "Профиль полей выходного IP сохранён на сервере."
+    """.trimIndent()
+    return shellScript(outboundShellPrelude(), profileScript)
+}
+
+private suspend fun writeOutboundProfileToServer(
+    context: Context,
+    target: OutboundSshTarget,
+    forms: OutboundProfileForms
+): String = runRootScript(
+    context = context,
+    target = target,
+    script = outboundProfileSaveScript(forms),
+    timeout = 30000L
+)
+
+private suspend fun saveOutboundProfileMessage(
+    context: Context,
+    target: OutboundSshTarget,
+    forms: OutboundProfileForms,
+    successMessage: String
+): String = runCatching {
+    writeOutboundProfileToServer(context, target, forms)
+}.fold(
+    onSuccess = { successMessage },
+    onFailure = {
+        DeployManager.writeError("Outbound profile save failed: ${it.message}")
+        "Режим включён, но профиль полей не сохранился на сервере: ${friendlyDeployError(it, "сохранение")}."
+    }
+)
+
+private fun outboundSnapshotScript(): String = shellScript(
+    outboundReadPrelude(),
+    """
+    PROFILE_FILE=/etc/wdtt/outbound-profile.env
+    wdtt_profile_value() {
+      key="${'$'}1"
+      [ -f "${'$'}PROFILE_FILE" ] || return 0
+      grep -E "^${'$'}key=" "${'$'}PROFILE_FILE" 2>/dev/null | tail -n 1 | sed 's/^[^=]*=//'
+    }
+    wdtt_b64() {
+      command -v base64 >/dev/null 2>&1 || return 0
+      printf '%s' "${'$'}1" | base64 | tr -d '\n'
+    }
+    wdtt_file_b64() {
+      file="${'$'}1"
+      [ -f "${'$'}file" ] || return 0
+      command -v base64 >/dev/null 2>&1 || return 0
+      base64 "${'$'}file" 2>/dev/null | tr -d '\n'
+    }
+    wdtt_json_string() {
+      file="${'$'}1"
+      key="${'$'}2"
+      [ -f "${'$'}file" ] || return 0
+      grep -o "\"${'$'}key\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "${'$'}file" 2>/dev/null | sed "s/.*\"${'$'}key\"[[:space:]]*:[[:space:]]*\"//;s/\".*//" | head -n 1
+    }
+    wdtt_json_number() {
+      file="${'$'}1"
+      key="${'$'}2"
+      [ -f "${'$'}file" ] || return 0
+      grep -o "\"${'$'}key\"[[:space:]]*:[[:space:]]*[0-9][0-9]*" "${'$'}file" 2>/dev/null | sed "s/.*\"${'$'}key\"[[:space:]]*:[[:space:]]*//" | head -n 1
+    }
+    wdtt_redsocks_value() {
+      key="${'$'}1"
+      [ -f /etc/wdtt/redsocks.conf ] || return 0
+      sed -n "s/^[[:space:]]*${'$'}key[[:space:]]*=[[:space:]]*//Ip" /etc/wdtt/redsocks.conf 2>/dev/null | head -n 1 | sed 's/[;[:space:]]*$//;s/^"//;s/"$//'
+    }
+    wdtt_3proxy_login() {
+      [ -f /etc/wdtt/3proxy.cfg ] || return 0
+      grep -E '^[[:space:]]*users[[:space:]]+' /etc/wdtt/3proxy.cfg 2>/dev/null | head -n 1 | sed -E 's/^[[:space:]]*users[[:space:]]+([^:]+):CL:.*/\1/'
+    }
+    wdtt_3proxy_password() {
+      [ -f /etc/wdtt/3proxy.cfg ] || return 0
+      grep -E '^[[:space:]]*users[[:space:]]+' /etc/wdtt/3proxy.cfg 2>/dev/null | head -n 1 | sed -E 's/^[[:space:]]*users[[:space:]]+[^:]+:CL:(.*)$/\1/'
+    }
+    wdtt_3proxy_port() {
+      [ -f /etc/wdtt/3proxy.cfg ] || return 0
+      grep -E '^[[:space:]]*socks[[:space:]].*-p[0-9]+' /etc/wdtt/3proxy.cfg 2>/dev/null | head -n 1 | sed -E 's/.*-p([0-9]+).*/\1/'
+    }
+
+    MODE="${'$'}(wdtt_json_string /etc/wdtt/outbound.json outboundMode)"
+    [ -n "${'$'}MODE" ] || MODE="direct"
+    DETAIL="${'$'}(wdtt_json_string /etc/wdtt/outbound.json detail)"
+    UPDATED_AT="${'$'}(wdtt_json_string /etc/wdtt/outbound.json updatedAt)"
+    HAS_PROFILE=0
+    [ -f "${'$'}PROFILE_FILE" ] && HAS_PROFILE=1
+    PROFILE_UPDATED_AT="${'$'}(wdtt_profile_value UPDATED_AT)"
+    [ -n "${'$'}UPDATED_AT" ] || UPDATED_AT="${'$'}PROFILE_UPDATED_AT"
+
+    LOCAL_PRESENT=0
+    if [ -f /etc/wdtt/local-proxy.json ] || [ -f /etc/wdtt/3proxy.cfg ]; then
+      LOCAL_PRESENT=1
+    fi
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet wdtt-3proxy 2>/dev/null; then
+      LOCAL_ACTIVE=1
+      LOCAL_PRESENT=1
+    else
+      LOCAL_ACTIVE=0
+    fi
+    LOCAL_PORT="${'$'}(wdtt_profile_value LOCAL_PROXY_PORT)"
+    [ -n "${'$'}LOCAL_PORT" ] || LOCAL_PORT="${'$'}(wdtt_json_number /etc/wdtt/local-proxy.json socks5Port)"
+    [ -n "${'$'}LOCAL_PORT" ] || LOCAL_PORT="${'$'}(wdtt_3proxy_port)"
+    LOCAL_LOGIN_B64="${'$'}(wdtt_profile_value LOCAL_PROXY_LOGIN_B64)"
+    if [ -z "${'$'}LOCAL_LOGIN_B64" ]; then
+      LOCAL_LOGIN="${'$'}(wdtt_json_string /etc/wdtt/local-proxy.json login)"
+      [ -n "${'$'}LOCAL_LOGIN" ] || LOCAL_LOGIN="${'$'}(wdtt_3proxy_login)"
+      LOCAL_LOGIN_B64="${'$'}(wdtt_b64 "${'$'}LOCAL_LOGIN")"
+    fi
+    LOCAL_PASSWORD_B64="${'$'}(wdtt_profile_value LOCAL_PROXY_PASSWORD_B64)"
+    if [ -z "${'$'}LOCAL_PASSWORD_B64" ]; then
+      LOCAL_PASSWORD="${'$'}(wdtt_json_string /etc/wdtt/local-proxy.json password)"
+      [ -n "${'$'}LOCAL_PASSWORD" ] || LOCAL_PASSWORD="${'$'}(wdtt_3proxy_password)"
+      LOCAL_PASSWORD_B64="${'$'}(wdtt_b64 "${'$'}LOCAL_PASSWORD")"
+    fi
+
+    DETAIL_KIND=""
+    DETAIL_HOST=""
+    DETAIL_PORT=""
+    case "${'$'}DETAIL" in
+      socks5://*|http://*)
+        DETAIL_KIND="${'$'}{DETAIL%%://*}"
+        DETAIL_REST="${'$'}{DETAIL#*://}"
+        DETAIL_HOST="${'$'}{DETAIL_REST%:*}"
+        DETAIL_PORT="${'$'}{DETAIL_REST##*:}"
+        ;;
+    esac
+    REDSOCKS_TYPE="${'$'}(wdtt_redsocks_value type)"
+    REDSOCKS_KIND=""
+    case "${'$'}REDSOCKS_TYPE" in
+      socks5) REDSOCKS_KIND="Socks5";;
+      http|http-connect) REDSOCKS_KIND="Http";;
+    esac
+    EXTERNAL_KIND="${'$'}(wdtt_profile_value EXTERNAL_PROXY_KIND)"
+    if [ -z "${'$'}EXTERNAL_KIND" ]; then
+      case "${'$'}DETAIL_KIND" in
+        socks5) EXTERNAL_KIND="Socks5";;
+        http) EXTERNAL_KIND="Http";;
+        *) EXTERNAL_KIND="${'$'}REDSOCKS_KIND";;
+      esac
+    fi
+    EXTERNAL_HOST_B64="${'$'}(wdtt_profile_value EXTERNAL_PROXY_HOST_B64)"
+    if [ -z "${'$'}EXTERNAL_HOST_B64" ]; then
+      EXTERNAL_HOST="${'$'}DETAIL_HOST"
+      [ -n "${'$'}EXTERNAL_HOST" ] || EXTERNAL_HOST="${'$'}(wdtt_redsocks_value ip)"
+      EXTERNAL_HOST_B64="${'$'}(wdtt_b64 "${'$'}EXTERNAL_HOST")"
+    fi
+    EXTERNAL_PORT="${'$'}(wdtt_profile_value EXTERNAL_PROXY_PORT)"
+    [ -n "${'$'}EXTERNAL_PORT" ] || EXTERNAL_PORT="${'$'}DETAIL_PORT"
+    [ -n "${'$'}EXTERNAL_PORT" ] || EXTERNAL_PORT="${'$'}(wdtt_redsocks_value port)"
+    EXTERNAL_LOGIN_B64="${'$'}(wdtt_profile_value EXTERNAL_PROXY_LOGIN_B64)"
+    [ -n "${'$'}EXTERNAL_LOGIN_B64" ] || EXTERNAL_LOGIN_B64="${'$'}(wdtt_b64 "$(wdtt_redsocks_value login)")"
+    EXTERNAL_PASSWORD_B64="${'$'}(wdtt_profile_value EXTERNAL_PROXY_PASSWORD_B64)"
+    [ -n "${'$'}EXTERNAL_PASSWORD_B64" ] || EXTERNAL_PASSWORD_B64="${'$'}(wdtt_b64 "$(wdtt_redsocks_value password)")"
+    EXTERNAL_PRESENT=0
+    if [ -f /etc/wdtt/redsocks.conf ] || [ "${'$'}MODE" = "external_proxy" ] || [ -n "${'$'}EXTERNAL_HOST_B64" ] || [ -n "${'$'}EXTERNAL_PORT" ]; then
+      EXTERNAL_PRESENT=1
+    fi
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet wdtt-redsocks 2>/dev/null; then
+      EXTERNAL_ACTIVE=1
+      EXTERNAL_PRESENT=1
+    else
+      EXTERNAL_ACTIVE=0
+    fi
+
+    WG_CONF=""
+    [ -f /etc/wireguard/wg-wdtt-exit.conf ] && WG_CONF=/etc/wireguard/wg-wdtt-exit.conf
+    [ -z "${'$'}WG_CONF" ] && [ -f /etc/wdtt-plus/wg-exit/wg-wdtt-exit.conf ] && WG_CONF=/etc/wdtt-plus/wg-exit/wg-wdtt-exit.conf
+    WG_PRESENT=0
+    [ -n "${'$'}WG_CONF" ] && WG_PRESENT=1
+    if command -v wg >/dev/null 2>&1 && wg show "${'$'}WDTT_WG_IFACE" >/dev/null 2>&1; then
+      WG_ACTIVE=1
+      WG_PRESENT=1
+    else
+      WG_ACTIVE=0
+    fi
+    WG_ENDPOINT=""
+    WG_DNS=""
+    if [ -n "${'$'}WG_CONF" ]; then
+      WG_ENDPOINT="${'$'}(sed -n 's/^[[:space:]]*Endpoint[[:space:]]*=[[:space:]]*//Ip' "${'$'}WG_CONF" 2>/dev/null | head -n 1 | tr -d ' ')"
+      WG_DNS="${'$'}(sed -n 's/^[[:space:]]*DNS[[:space:]]*=[[:space:]]*//Ip' "${'$'}WG_CONF" 2>/dev/null | head -n 1 | tr -d ' ')"
+    fi
+    WG_ENDPOINT_HOST=""
+    WG_ENDPOINT_PORT=""
+    if [ -n "${'$'}WG_ENDPOINT" ]; then
+      WG_ENDPOINT_HOST="${'$'}{WG_ENDPOINT%:*}"
+      WG_ENDPOINT_PORT="${'$'}{WG_ENDPOINT##*:}"
+      WG_ENDPOINT_HOST="${'$'}{WG_ENDPOINT_HOST#[}"
+      WG_ENDPOINT_HOST="${'$'}{WG_ENDPOINT_HOST%]}"
+    fi
+    WG_VPS_HOST_B64="${'$'}(wdtt_profile_value WG_VPS_HOST_B64)"
+    [ -n "${'$'}WG_VPS_HOST_B64" ] || WG_VPS_HOST_B64="${'$'}(wdtt_b64 "${'$'}WG_ENDPOINT_HOST")"
+    WG_VPS_SSH_PORT="${'$'}(wdtt_profile_value WG_VPS_SSH_PORT)"
+    WG_VPS_USER_B64="${'$'}(wdtt_profile_value WG_VPS_USER_B64)"
+    WG_VPS_PASSWORD_B64="${'$'}(wdtt_profile_value WG_VPS_PASSWORD_B64)"
+    WG_VPS_PORT="${'$'}(wdtt_profile_value WG_VPS_PORT)"
+    [ -n "${'$'}WG_VPS_PORT" ] || WG_VPS_PORT="${'$'}WG_ENDPOINT_PORT"
+    WG_VPS_DNS_B64="${'$'}(wdtt_profile_value WG_VPS_DNS_B64)"
+    [ -n "${'$'}WG_VPS_DNS_B64" ] || WG_VPS_DNS_B64="${'$'}(wdtt_b64 "${'$'}WG_DNS")"
+    if [ -n "${'$'}WG_VPS_HOST_B64" ] || [ -n "${'$'}WG_VPS_PORT" ]; then
+      WG_PRESENT=1
+    fi
+    IMPORTED_WG_CONFIG_B64="${'$'}(wdtt_profile_value IMPORTED_WG_CONFIG_B64)"
+    if [ "${'$'}MODE" = "imported_wg" ] && [ -z "${'$'}IMPORTED_WG_CONFIG_B64" ] && [ -n "${'$'}WG_CONF" ]; then
+      IMPORTED_WG_CONFIG_B64="${'$'}(wdtt_file_b64 "${'$'}WG_CONF")"
+    fi
+    [ -n "${'$'}IMPORTED_WG_CONFIG_B64" ] && WG_PRESENT=1
+
+    printf 'WDTT_OUTBOUND_MODE=%s\n' "${'$'}MODE"
+    printf 'WDTT_OUTBOUND_DETAIL_B64=%s\n' "$(wdtt_b64 "${'$'}DETAIL")"
+    printf 'WDTT_OUTBOUND_UPDATED_AT=%s\n' "${'$'}UPDATED_AT"
+    printf 'WDTT_HAS_PROFILE=%s\n' "${'$'}HAS_PROFILE"
+    printf 'WDTT_LOCAL_PROXY_PRESENT=%s\n' "${'$'}LOCAL_PRESENT"
+    printf 'WDTT_LOCAL_PROXY_ACTIVE=%s\n' "${'$'}LOCAL_ACTIVE"
+    printf 'WDTT_LOCAL_PROXY_PORT=%s\n' "${'$'}LOCAL_PORT"
+    printf 'WDTT_LOCAL_PROXY_LOGIN_B64=%s\n' "${'$'}LOCAL_LOGIN_B64"
+    printf 'WDTT_LOCAL_PROXY_PASSWORD_B64=%s\n' "${'$'}LOCAL_PASSWORD_B64"
+    printf 'WDTT_EXTERNAL_PROXY_PRESENT=%s\n' "${'$'}EXTERNAL_PRESENT"
+    printf 'WDTT_EXTERNAL_PROXY_ACTIVE=%s\n' "${'$'}EXTERNAL_ACTIVE"
+    printf 'WDTT_EXTERNAL_PROXY_KIND_NAME=%s\n' "${'$'}EXTERNAL_KIND"
+    printf 'WDTT_EXTERNAL_PROXY_HOST_B64=%s\n' "${'$'}EXTERNAL_HOST_B64"
+    printf 'WDTT_EXTERNAL_PROXY_PORT=%s\n' "${'$'}EXTERNAL_PORT"
+    printf 'WDTT_EXTERNAL_PROXY_LOGIN_B64=%s\n' "${'$'}EXTERNAL_LOGIN_B64"
+    printf 'WDTT_EXTERNAL_PROXY_PASSWORD_B64=%s\n' "${'$'}EXTERNAL_PASSWORD_B64"
+    printf 'WDTT_WG_PRESENT=%s\n' "${'$'}WG_PRESENT"
+    printf 'WDTT_WG_ACTIVE=%s\n' "${'$'}WG_ACTIVE"
+    printf 'WDTT_WG_VPS_HOST_B64=%s\n' "${'$'}WG_VPS_HOST_B64"
+    printf 'WDTT_WG_VPS_SSH_PORT=%s\n' "${'$'}WG_VPS_SSH_PORT"
+    printf 'WDTT_WG_VPS_USER_B64=%s\n' "${'$'}WG_VPS_USER_B64"
+    printf 'WDTT_WG_VPS_PASSWORD_B64=%s\n' "${'$'}WG_VPS_PASSWORD_B64"
+    printf 'WDTT_WG_VPS_PORT=%s\n' "${'$'}WG_VPS_PORT"
+    printf 'WDTT_WG_VPS_DNS_B64=%s\n' "${'$'}WG_VPS_DNS_B64"
+    printf 'WDTT_IMPORTED_WG_CONFIG_B64=%s\n' "${'$'}IMPORTED_WG_CONFIG_B64"
+    """
+)
+
+private suspend fun readOutboundServerSnapshot(
+    context: Context,
+    target: OutboundSshTarget
+): OutboundServerSnapshot {
+    DeployManager.updateProgress(0.25f, "Подключаюсь к серверу и ищу профиль выходного IP...")
+    val output = runRootScript(
+        context = context,
+        target = target,
+        script = outboundSnapshotScript(),
+        timeout = 30000L
+    )
+    DeployManager.updateProgress(1f, "Настройки выходного IP прочитаны.")
+    return parseOutboundServerSnapshot(output)
+}
+
+private fun parseOutboundServerSnapshot(output: String): OutboundServerSnapshot {
+    fun value(name: String): String = markerValue(output, name).orEmpty()
+    fun decoded(name: String): String {
+        val raw = value(name)
+        if (raw.isBlank()) return ""
+        return runCatching { decodeBase64Text(raw) }.getOrDefault("")
+    }
+    fun flag(name: String): Boolean = value(name) == "1"
+    return OutboundServerSnapshot(
+        mode = value("WDTT_OUTBOUND_MODE").ifBlank { "direct" },
+        detail = decoded("WDTT_OUTBOUND_DETAIL_B64"),
+        updatedAt = value("WDTT_OUTBOUND_UPDATED_AT"),
+        hasProfile = flag("WDTT_HAS_PROFILE"),
+        localProxyPresent = flag("WDTT_LOCAL_PROXY_PRESENT"),
+        localProxyActive = flag("WDTT_LOCAL_PROXY_ACTIVE"),
+        localProxyPort = value("WDTT_LOCAL_PROXY_PORT"),
+        localProxyLogin = decoded("WDTT_LOCAL_PROXY_LOGIN_B64"),
+        localProxyPassword = decoded("WDTT_LOCAL_PROXY_PASSWORD_B64"),
+        externalProxyPresent = flag("WDTT_EXTERNAL_PROXY_PRESENT"),
+        externalProxyActive = flag("WDTT_EXTERNAL_PROXY_ACTIVE"),
+        externalProxyKindName = value("WDTT_EXTERNAL_PROXY_KIND_NAME").takeIf { name -> ProxyKind.entries.any { it.name == name } }.orEmpty(),
+        externalProxyHost = decoded("WDTT_EXTERNAL_PROXY_HOST_B64"),
+        externalProxyPort = value("WDTT_EXTERNAL_PROXY_PORT"),
+        externalProxyLogin = decoded("WDTT_EXTERNAL_PROXY_LOGIN_B64"),
+        externalProxyPassword = decoded("WDTT_EXTERNAL_PROXY_PASSWORD_B64"),
+        wireGuardPresent = flag("WDTT_WG_PRESENT"),
+        wireGuardActive = flag("WDTT_WG_ACTIVE"),
+        wireGuardExitHost = decoded("WDTT_WG_VPS_HOST_B64"),
+        wireGuardExitSshPort = value("WDTT_WG_VPS_SSH_PORT"),
+        wireGuardExitUser = decoded("WDTT_WG_VPS_USER_B64"),
+        wireGuardExitPassword = decoded("WDTT_WG_VPS_PASSWORD_B64"),
+        wireGuardExitPort = value("WDTT_WG_VPS_PORT"),
+        wireGuardExitDns = decoded("WDTT_WG_VPS_DNS_B64"),
+        importedWireGuardConfig = decoded("WDTT_IMPORTED_WG_CONFIG_B64")
+    )
+}
+
+private fun outboundRestoreSummary(snapshot: OutboundServerSnapshot): String {
+    val parts = mutableListOf<String>()
+    parts += "Поля выходного IP прочитаны с сервера."
+    parts += "Активный режим: ${snapshot.modeLabel}."
+    if (snapshot.hasProfile) parts += "Сохранённый профиль найден."
+    if (snapshot.localProxyPresent) {
+        parts += if (snapshot.localProxyActive) "Прокси VPS найден и запущен." else "Прокси VPS найден, служба не запущена."
+    }
+    if (snapshot.externalProxyPresent) {
+        parts += if (snapshot.externalProxyActive) "Внешний TCP-прокси включён." else "Поля внешнего TCP-прокси заполнены."
+    }
+    if (snapshot.wireGuardPresent) {
+        parts += if (snapshot.wireGuardActive) "WireGuard-выход найден и запущен." else "Поля WireGuard-выхода заполнены."
+    }
+    if (snapshot.localProxyPresent && snapshot.localProxyPassword.isBlank()) {
+        parts += "Пароль прокси не найден в старом серверном конфиге; введите его вручную."
+    }
+    if (snapshot.mode == "wireguard_vps" && snapshot.wireGuardExitPassword.isBlank()) {
+        parts += "SSH-пароль второго сервера можно восстановить только из сохранённого профиля; если его нет, введите пароль вручную."
+    }
+    return parts.joinToString(" ")
+}
+
+private suspend fun checkWireGuardExit(
+    target: OutboundSshTarget,
+    expectedMode: String
+): String = withContext(Dispatchers.IO) {
+    var session: Session? = null
+    try {
+        DeployManager.updateProgress(0.25f, "Подключаюсь к серверу и проверяю WireGuard-выход...")
+        session = createSSHSession(target.host, target.user, target.pass, target.port)
+        val ssh = SSHClient(session, target.pass)
+        val expectedLabel = when (expectedMode) {
+            "wireguard_vps" -> "выход через другой сервер"
+            "imported_wg" -> "VPN/WARP-файл"
+            else -> expectedMode
+        }
+        val script = shellScript(
+            outboundShellPrelude(),
+            """
+            MODE="${'$'}(grep -o '"outboundMode"[[:space:]]*:[[:space:]]*"[^"]*"' /etc/wdtt/outbound.json 2>/dev/null | sed 's/.*"outboundMode"[[:space:]]*:[[:space:]]*"//;s/".*//' | head -n 1)"
+            [ -n "${'$'}MODE" ] || MODE="direct"
+            case "${'$'}MODE" in
+              imported_wg) MODE_LABEL="VPN/WARP-файл";;
+              wireguard_vps) MODE_LABEL="выход через другой сервер";;
+              external_proxy) MODE_LABEL="внешний TCP-прокси";;
+              direct) MODE_LABEL="прямой выход";;
+              *) MODE_LABEL="${'$'}MODE";;
+            esac
+            echo "Активный режим WDTT: ${'$'}MODE_LABEL"
+            if [ "${'$'}MODE" != ${shellQuote(expectedMode)} ]; then
+              echo "Предупреждение: сейчас включён не режим «$expectedLabel»."
+            fi
+            command -v wg >/dev/null 2>&1 || { echo WDTT_ERROR=wireguard_tools_required; exit 2; }
+            wg show "${'$'}WDTT_WG_IFACE" >/dev/null 2>&1 || { echo WDTT_ERROR=wireguard_not_active; exit 3; }
+            echo "WireGuard ${'$'}WDTT_WG_IFACE запущен."
+            EXIT_IP="${'$'}(curl -4fsS --interface "${'$'}WDTT_WG_IFACE" --max-time 12 https://api.ipify.org 2>/dev/null || true)"
+            if [ -n "${'$'}EXIT_IP" ]; then
+              echo "Проверка успешна: WDTT-пользователи выходят через WireGuard. Проверочный IP: ${'$'}EXIT_IP"
+            else
+              echo WDTT_ERROR=wireguard_exit_check_failed
+              exit 3
+            fi
+            wg show "${'$'}WDTT_WG_IFACE" | sed -E 's/(private key: ).*/\1(скрыт)/' || true
+            """
+        )
+        DeployManager.updateProgress(0.70f, "Проверяю внешний IP через WireGuard-интерфейс...")
+        val output = ssh.exec(rootCommand(script), timeout = 30000L).trim()
+        markerValue(output, "WDTT_ERROR")?.let { throw IllegalStateException(it) }
+        DeployManager.updateProgress(1f, "WireGuard-выход проверен.")
         output
     } finally {
         try { session?.disconnect() } catch (_: Exception) {}
@@ -2710,7 +3626,7 @@ private suspend fun readOutboundDiagnostics(target: OutboundSshTarget): String =
               echo "Правил перенаправления WDTT через прокси или WireGuard сейчас нет."
             fi
             echo
-            echo "Служба внешнего прокси WDTT:"
+            echo "Служба внешнего TCP-прокси WDTT:"
             systemctl status wdtt-redsocks --no-pager -l 2>/dev/null | sed -n '1,12p' || echo "Служба wdtt-redsocks не найдена или systemctl недоступен."
             echo
             echo "Локальный порт redsocks:"
@@ -2749,12 +3665,12 @@ private suspend fun disableOutboundExit(target: OutboundSshTarget): String = wit
         val script = shellScript(
             outboundShellPrelude(),
             """
-            echo "WDTT_PROGRESS|0.25|Останавливаю внешний прокси и WireGuard-выход, если они включены..."
+            echo "WDTT_PROGRESS|0.25|Останавливаю внешний TCP-прокси и WireGuard-выход, если они включены..."
             wdtt_clear_external_out
             echo "WDTT_PROGRESS|0.75|Сохраняю режим прямого выхода через текущий сервер..."
             wdtt_write_mode "direct" "прямой выход"
             echo "WDTT_PROGRESS|1.0|Прямой выход включён."
-            echo "Внешний прокси или WireGuard-выход отключён. WDTT-пользователи снова идут напрямую через текущий сервер."
+            echo "Внешний TCP-прокси или WireGuard-выход отключён. WDTT-пользователи снова идут напрямую через текущий сервер."
             """
         )
         ssh.exec(rootCommand(script), timeout = 30000L).trim()
@@ -2904,11 +3820,13 @@ private suspend fun installLocalProxy(
           "socks5Port": ${'$'}PROXY_PORT,
           "httpPort": ${'$'}HTTP_PORT,
           "webPort": ${'$'}ADMIN_PORT,
-          "login": "${'$'}PROXY_LOGIN"
+          "login": "${'$'}PROXY_LOGIN",
+          "password": "${'$'}PROXY_PASSWORD"
         }
         EOF
+        chmod 600 /etc/wdtt/local-proxy.json
         wdtt_progress 1.0 "Прокси установлен и проверен."
-        echo "Прокси на сервере включён."
+        echo "Прокси VPS включён."
         echo "SOCKS5-прокси: socks5://${'$'}PROXY_LOGIN:********@${'$'}SERVER_IP:${'$'}PROXY_PORT"
         echo "HTTP-прокси: http://${'$'}PROXY_LOGIN:********@${'$'}SERVER_IP:${'$'}HTTP_PORT"
         echo "Веб-страница 3proxy: http://${'$'}SERVER_IP:${'$'}ADMIN_PORT/"
@@ -2957,7 +3875,7 @@ private suspend fun stopLocalProxy(target: OutboundSshTarget): String = withCont
               exit 3
             fi
             echo "WDTT_PROGRESS|1.0|Прокси остановлен."
-            echo "Прокси на этом сервере остановлен. Настройки сохранены, его можно снова включить кнопкой «Установить»."
+            echo "Прокси VPS остановлен. Настройки сохранены, его можно снова включить кнопкой «Установить»."
         """.trimIndent()
         ssh.exec(rootCommand(script), timeout = 20000L).trim()
     } finally {
@@ -2982,7 +3900,7 @@ private suspend fun removeLocalProxy(target: OutboundSshTarget): String = withCo
               iptables -S INPUT 2>/dev/null | grep WDTT_LOCAL_PROXY | sed 's/^-A /iptables -D /' | while read -r cmd; do ${'$'}cmd 2>/dev/null || true; done
             fi
             echo "WDTT_PROGRESS|1.0|Прокси удалён."
-            echo "Прокси на этом сервере удалён: служба, настройки и правила доступа к портам очищены."
+            echo "Прокси VPS удалён: служба, настройки и правила доступа к портам очищены."
             """
         )
         ssh.exec(rootCommand(script), timeout = 30000L).trim()
@@ -3010,7 +3928,7 @@ private suspend fun checkExternalProxy(
         PROXY_URI=${shellQuote(proxyUri)}
         IP="${'$'}(curl --proxy "${'$'}PROXY_URI" -4fsS --max-time 15 https://api.ipify.org 2>/dev/null || true)"
         [ -n "${'$'}IP" ] || { echo WDTT_ERROR=external_proxy_check_failed; exit 3; }
-        echo "WDTT_PROGRESS|1.0|Внешний прокси отвечает."
+        echo "WDTT_PROGRESS|1.0|Внешний TCP-прокси отвечает."
         echo "Проверка успешна: ${kind.label} отвечает, сервер смог открыть проверочный сайт через него. IP через прокси: ${'$'}IP"
     """.trimIndent()
     return runRootScript(context, target, script, timeout = 30000L)
@@ -3036,7 +3954,7 @@ private suspend fun enableExternalProxy(
         PROXY_LOGIN=${shellQuote(login)}
         PROXY_PASSWORD=${shellQuote(proxyPassword)}
         wdtt_progress() { echo "WDTT_PROGRESS|${'$'}1|${'$'}2"; }
-        wdtt_progress 0.12 "Готовлю компонент перенаправления через внешний прокси..."
+        wdtt_progress 0.12 "Готовлю компонент перенаправления через внешний TCP-прокси..."
         wdtt_install_redsocks_tools || true
         REDSOCKS_BIN="${'$'}(command -v redsocks || true)"
         [ -n "${'$'}REDSOCKS_BIN" ] || { echo WDTT_ERROR=redsocks_not_installed; exit 2; }
@@ -3089,24 +4007,24 @@ private suspend fun enableExternalProxy(
         WantedBy=multi-user.target
         EOF
         systemctl daemon-reload
-        wdtt_progress 0.84 "Запускаю службу внешнего прокси..."
+        wdtt_progress 0.84 "Запускаю службу внешнего TCP-прокси..."
         systemctl enable --now wdtt-redsocks >/dev/null
         systemctl is-active --quiet wdtt-redsocks || { echo WDTT_ERROR=external_proxy_service_inactive; journalctl -u wdtt-redsocks -n 30 --no-pager 2>/dev/null || true; exit 3; }
-        wdtt_progress 0.92 "Направляю обычные подключения WDTT через внешний прокси..."
+        wdtt_progress 0.92 "Направляю обычные TCP-подключения WDTT через внешний TCP-прокси..."
         iptables -t nat -N WDTT_PROXY_OUT 2>/dev/null || true
         iptables -t nat -F WDTT_PROXY_OUT
         wdtt_proxy_reserved_returns WDTT_PROXY_OUT "${'$'}PROXY_IP"
         iptables -t nat -A WDTT_PROXY_OUT -p tcp -j REDIRECT --to-ports 12345
         iptables -t nat -C PREROUTING -i "${'$'}WDTT_IFACE" -p tcp -j WDTT_PROXY_OUT 2>/dev/null || iptables -t nat -A PREROUTING -i "${'$'}WDTT_IFACE" -p tcp -j WDTT_PROXY_OUT
-        wdtt_progress 0.96 "Проверяю путь WDTT через внешний прокси..."
+        wdtt_progress 0.96 "Проверяю путь WDTT через внешний TCP-прокси..."
         if ! wdtt_test_redsocks_path "${'$'}PROXY_IP"; then
           wdtt_clear_external_out
           wdtt_write_mode "direct" "rollback after external proxy error"
           exit 3
         fi
         wdtt_write_mode "external_proxy" "${'$'}PROXY_KIND://${'$'}PROXY_HOST:${'$'}PROXY_PORT"
-        wdtt_progress 1.0 "Внешний прокси включён."
-        echo "Внешний прокси включён для обычных подключений WDTT-пользователей. Голосовой UDP-трафик через него не перенаправляется."
+        wdtt_progress 1.0 "Внешний TCP-прокси включён."
+        echo "Внешний TCP-прокси включён для обычных TCP-подключений WDTT-пользователей. UDP, QUIC и голосовой трафик через него не перенаправляются."
         echo "Подсеть клиентов WDTT: ${'$'}WDTT_SUBNET"
         echo "Прокси: ${'$'}PROXY_KIND://${'$'}PROXY_HOST:${'$'}PROXY_PORT"
         """
@@ -3205,13 +4123,13 @@ private suspend fun enableImportedWireGuardExit(
             """
             echo "WDTT_PROGRESS|0.18|Готовлю инструменты WireGuard на текущем сервере..."
             wdtt_install_wireguard_tools || true
-            echo "WDTT_PROGRESS|0.45|Сохраняю выбранный WireGuard-файл без опасных команд..."
+            echo "WDTT_PROGRESS|0.45|Сохраняю выбранный VPN/WARP-файл без опасных команд..."
             mkdir -p /etc/wdtt-plus/wg-exit /etc/wireguard
             install -m 600 /tmp/wdtt-imported-wg.conf /etc/wdtt-plus/wg-exit/wg-wdtt-exit.conf
             install -m 600 /tmp/wdtt-imported-wg.conf /etc/wireguard/wg-wdtt-exit.conf
             rm -f /tmp/wdtt-imported-wg.conf
             """,
-            wireGuardPolicyScript("imported_wg", "готовый WireGuard-файл")
+            wireGuardPolicyScript("imported_wg", "VPN/WARP-файл")
         )
         val output = ssh.exec(rootCommand(script), timeout = CMD_TIMEOUT)
         markerValue(output, "WDTT_ERROR")?.let { throw IllegalStateException(it) }
@@ -3232,12 +4150,12 @@ private suspend fun deleteImportedWireGuardExit(target: OutboundSshTarget): Stri
             """
             echo "WDTT_PROGRESS|0.25|Отключаю WireGuard-выход, если он запущен..."
             wdtt_clear_external_out
-            echo "WDTT_PROGRESS|0.60|Удаляю сохранённый WireGuard-файл..."
+            echo "WDTT_PROGRESS|0.60|Удаляю сохранённый VPN/WARP-файл..."
             rm -f /etc/wdtt-plus/wg-exit/wg-wdtt-exit.conf /etc/wireguard/wg-wdtt-exit.conf
             echo "WDTT_PROGRESS|0.85|Возвращаю прямой выход через текущий сервер..."
             wdtt_write_mode "direct" "прямой выход"
-            echo "WDTT_PROGRESS|1.0|WireGuard-файл удалён."
-            echo "Готовый WireGuard-файл удалён, выход WDTT возвращён напрямую через текущий сервер."
+            echo "WDTT_PROGRESS|1.0|VPN/WARP-файл удалён."
+            echo "VPN/WARP-файл удалён, выход WDTT возвращён напрямую через текущий сервер."
             """
         )
         ssh.exec(rootCommand(script), timeout = 30000L).trim()
@@ -3489,19 +4407,23 @@ private fun friendlyDeployError(error: Throwable, operation: String): String {
         "local_proxy_service_still_active" in lower ->
             "приложение отправило команду остановки, но служба wdtt-3proxy всё ещё запущена. Проверьте права пользователя SSH или остановите службу вручную."
         "external_proxy_check_failed" in lower ->
-            "внешний прокси не ответил на проверку. Проверьте адрес, порт, логин и пароль."
+            "внешний TCP-прокси не ответил на проверку. Проверьте адрес, порт, логин и пароль."
         "external_proxy_service_inactive" in lower ->
-            "служба перенаправления через внешний прокси не запустилась. Приложение откатило правила и вернуло прямой выход, чтобы интернет через VPN не остался сломанным."
+            "служба перенаправления через внешний TCP-прокси не запустилась. Приложение откатило правила и вернуло прямой выход, чтобы интернет через VPN не остался сломанным."
         "external_proxy_apply_failed" in lower ->
-            withTail("внешний прокси отвечает напрямую, но путь WDTT через redsocks не заработал. Приложение откатило правила и вернуло прямой выход, чтобы VPN-интернет не пропал.")
+            withTail("внешний TCP-прокси отвечает напрямую, но путь WDTT через redsocks не заработал. Приложение откатило правила и вернуло прямой выход, чтобы VPN-интернет не пропал.")
         "redsocks_not_installed" in lower ->
-            "не удалось установить компонент перенаправления через внешний прокси. Проверьте пакетный менеджер и доступ сервера к интернету."
+            "не удалось установить компонент перенаправления через внешний TCP-прокси. Проверьте пакетный менеджер и доступ сервера к интернету."
         "iptables_required" in lower ->
             "на сервере не найдены правила межсетевого экрана iptables, без них этот режим не включить."
         "wdtt_iface_not_found" in lower ->
             "на сервере не найден интерфейс WDTT. Сначала запустите сервер WDTT Plus и проверьте подключение."
         "wireguard_tools_required" in lower ->
             "на сервере не найдены инструменты WireGuard, без них этот режим не включить."
+        "wireguard_not_active" in lower ->
+            "WireGuard-выход wdtt сейчас не запущен. Включите режим «Другой сервер» или «VPN/WARP-файл», затем повторите проверку."
+        "wireguard_exit_check_failed" in lower ->
+            "WireGuard-интерфейс запущен, но проверочный сайт через него не открылся. Проверьте конфиг, endpoint, NAT и доступ второго сервера/VPN к интернету."
         "foreign_ext_iface_not_found" in lower ->
             "на другом сервере не удалось определить основной сетевой интерфейс."
         "root privileges required" in lower ||
@@ -3828,6 +4750,306 @@ private fun parsePortsTriple(value: String): Triple<Int, Int, Int> {
     return Triple(parts[0] ?: 56000, parts[1] ?: 56001, parts[2] ?: 9000)
 }
 
+private fun parsePortsTripleOrNull(value: String): Triple<Int, Int, Int>? {
+    val parts = value.split(",").map { it.trim().toIntOrNull() }
+    if (parts.size != 3 || parts.any { it == null || it !in 1..65535 }) return null
+    return Triple(parts[0] ?: return null, parts[1] ?: return null, parts[2] ?: return null)
+}
+
+private fun Triple<Int, Int, Int>.asPortsSpec(): String = "$first,$second,$third"
+
+private fun buildOwnerProfile(
+    vkHashes: String,
+    secondaryVkHash: String,
+    workersPerHash: Int,
+    protocol: String,
+    listenPort: Int,
+    sni: String,
+    noDns: Boolean,
+    dtlsPort: Int,
+    wgPort: Int
+): ServerAdminProfileInfo {
+    val safeListenPort = listenPort.coerceIn(1, 65535)
+    val ports = Triple(
+        dtlsPort.coerceIn(1, 65535),
+        wgPort.coerceIn(1, 65535),
+        safeListenPort
+    )
+    return ServerAdminProfileInfo(
+        vkHashes = vkHashes.trim(),
+        secondaryVkHash = secondaryVkHash.trim(),
+        workersPerHash = workersPerHash.coerceIn(1, 128),
+        protocol = protocol.trim().lowercase().takeIf { it == "udp" || it == "tcp" } ?: "udp",
+        listenPort = safeListenPort,
+        sni = sni.trim(),
+        noDns = noDns,
+        ports = ports.asPortsSpec()
+    )
+}
+
+private fun parseOwnerProfileFromDb(json: JSONObject?, defaultPorts: String): ServerAdminProfileInfo {
+    val fallbackPorts = parsePortsTripleOrNull(defaultPorts) ?: Triple(56000, 56001, 9000)
+    val ports = parsePortsTripleOrNull(json?.optString("ports", defaultPorts).orEmpty())
+        ?: fallbackPorts
+    val listenPort = json?.optInt("listen_port", 0)
+        ?.takeIf { it in 1..65535 }
+        ?: ports.third
+    val deviceIds = buildList {
+        val raw = json?.optJSONArray("device_ids") ?: return@buildList
+        for (i in 0 until raw.length()) {
+            raw.optString(i).trim().takeIf { it.isNotBlank() }?.let(::add)
+        }
+    }
+    return ServerAdminProfileInfo(
+        vkHashes = json?.optString("vk_hashes", "").orEmpty().trim(),
+        secondaryVkHash = json?.optString("secondary_vk_hash", "").orEmpty().trim(),
+        workersPerHash = (json?.optInt("workers_per_hash", 16) ?: 16).coerceIn(1, 128),
+        protocol = json?.optString("protocol", "udp").orEmpty().lowercase().takeIf { it == "udp" || it == "tcp" } ?: "udp",
+        listenPort = listenPort,
+        sni = json?.optString("sni", "").orEmpty().trim(),
+        noDns = json?.optBoolean("no_dns", false) ?: false,
+        ports = Triple(ports.first, ports.second, listenPort).asPortsSpec(),
+        deviceIds = deviceIds,
+        updatedAt = json?.optLong("updated_at", 0L) ?: 0L
+    )
+}
+
+private fun ServerAdminProfileInfo.effectivePorts(fallback: Triple<Int, Int, Int>): Triple<Int, Int, Int> {
+    val parsed = parsePortsTripleOrNull(ports) ?: fallback
+    val safeListenPort = listenPort.takeIf { it in 1..65535 } ?: parsed.third
+    return Triple(parsed.first, parsed.second, safeListenPort)
+}
+
+private data class OwnerProfileComparable(
+    val vkHashes: String,
+    val secondaryVkHash: String,
+    val workersPerHash: Int,
+    val protocol: String,
+    val listenPort: Int,
+    val sni: String,
+    val noDns: Boolean,
+    val ports: String
+)
+
+private fun ServerAdminProfileInfo.comparableOwnerProfile(): OwnerProfileComparable {
+    val ports = effectivePorts(Triple(56000, 56001, 9000))
+    return OwnerProfileComparable(
+        vkHashes = vkHashes.trim(),
+        secondaryVkHash = secondaryVkHash.trim(),
+        workersPerHash = workersPerHash.coerceIn(1, 128),
+        protocol = protocol.trim().lowercase().takeIf { it == "udp" || it == "tcp" } ?: "udp",
+        listenPort = ports.third,
+        sni = sni.trim(),
+        noDns = noDns,
+        ports = ports.asPortsSpec()
+    )
+}
+
+private fun ownerProfilesDiffer(server: ServerAdminProfileInfo, local: ServerAdminProfileInfo): Boolean =
+    server.comparableOwnerProfile() != local.comparableOwnerProfile()
+
+private fun ownerProfileDiffLines(server: ServerAdminProfileInfo, local: ServerAdminProfileInfo): List<String> {
+    val serverComparable = server.comparableOwnerProfile()
+    val localComparable = local.comparableOwnerProfile()
+    val lines = mutableListOf<String>()
+    if (serverComparable.vkHashes != localComparable.vkHashes) {
+        lines += "VK-хеши: сервер — ${secretPresenceLabel(serverComparable.vkHashes)}, приложение — ${secretPresenceLabel(localComparable.vkHashes)}"
+    }
+    if (serverComparable.secondaryVkHash != localComparable.secondaryVkHash) {
+        lines += "Резервный VK-хеш: сервер — ${secretPresenceLabel(serverComparable.secondaryVkHash)}, приложение — ${secretPresenceLabel(localComparable.secondaryVkHash)}"
+    }
+    if (serverComparable.workersPerHash != localComparable.workersPerHash) {
+        lines += "Потоки на хеш: сервер — ${serverComparable.workersPerHash}, приложение — ${localComparable.workersPerHash}"
+    }
+    if (serverComparable.protocol != localComparable.protocol) {
+        lines += "Протокол: сервер — ${serverComparable.protocol}, приложение — ${localComparable.protocol}"
+    }
+    if (serverComparable.listenPort != localComparable.listenPort) {
+        lines += "Локальный порт: сервер — ${serverComparable.listenPort}, приложение — ${localComparable.listenPort}"
+    }
+    if (serverComparable.ports != localComparable.ports) {
+        lines += "Порты ссылки: сервер — ${serverComparable.ports}, приложение — ${localComparable.ports}"
+    }
+    if (serverComparable.sni != localComparable.sni) {
+        lines += "SNI: сервер — ${serverComparable.sni.ifBlank { "не задан" }}, приложение — ${localComparable.sni.ifBlank { "не задан" }}"
+    }
+    if (serverComparable.noDns != localComparable.noDns) {
+        lines += "No DNS: сервер — ${if (serverComparable.noDns) "включено" else "выключено"}, приложение — ${if (localComparable.noDns) "включено" else "выключено"}"
+    }
+    return lines.ifEmpty { listOf("Отличия есть только в служебных данных профиля.") }
+}
+
+private fun existingConnectionDiffLines(
+    connection: ExistingServerConnection,
+    localPeer: String,
+    localConnectionPassword: String,
+    localAdminId: String,
+    localBotToken: String,
+    localDns1: String,
+    localDns2: String,
+    localProfile: ServerAdminProfileInfo
+): List<String> = buildList {
+    if (!connection.host.equals(localPeer.trim(), ignoreCase = true)) {
+        add("Адрес подключения: локальное значение будет заменено адресом сервера ${connection.host}")
+    }
+    if (connection.password != localConnectionPassword) {
+        add("Пароль VPN-подключения будет заменён главным паролем владельца с сервера")
+    }
+    if (connection.adminId != localAdminId.trim()) {
+        add("Telegram Admin ID отличается")
+    }
+    if (connection.botToken != localBotToken.trim()) {
+        add("Telegram Bot Token отличается")
+    }
+    if (normalizeDnsValues(connection.dns1, connection.dns2) != normalizeDnsValues(localDns1, localDns2)) {
+        add("DNS: сервер — ${normalizeDnsValues(connection.dns1, connection.dns2)}, приложение — ${normalizeDnsValues(localDns1, localDns2)}")
+    }
+    if (connection.adminProfile.hasSavedFields && ownerProfilesDiffer(connection.adminProfile, localProfile)) {
+        addAll(ownerProfileDiffLines(connection.adminProfile, localProfile))
+    }
+}
+
+private fun normalizeDnsValues(first: String, second: String = ""): String =
+    listOf(first, second)
+        .flatMap { it.split(',') }
+        .map { it.trim() }
+        .filter { it.isNotBlank() }
+        .joinToString(",")
+
+private fun outboundProfilesDiffer(server: OutboundServerSnapshot, local: OutboundProfileForms): Boolean {
+    fun value(raw: String): String = raw.trim().replace("\r\n", "\n")
+    val serverValues = listOf(
+        server.localProxyPort,
+        server.localProxyLogin,
+        server.localProxyPassword,
+        server.externalProxyKindName,
+        server.externalProxyHost,
+        server.externalProxyPort,
+        server.externalProxyLogin,
+        server.externalProxyPassword,
+        server.wireGuardExitHost,
+        server.wireGuardExitSshPort,
+        server.wireGuardExitUser,
+        server.wireGuardExitPassword,
+        server.wireGuardExitPort,
+        server.wireGuardExitDns,
+        server.importedWireGuardConfig
+    ).map(::value)
+    val localValues = listOf(
+        local.localProxyPort,
+        local.localProxyLogin,
+        local.localProxyPassword,
+        local.externalProxyKindName,
+        local.externalProxyHost,
+        local.externalProxyPort,
+        local.externalProxyLogin,
+        local.externalProxyPassword,
+        local.wireGuardExitHost,
+        local.wireGuardExitSshPort,
+        local.wireGuardExitUser,
+        local.wireGuardExitPassword,
+        local.wireGuardExitPort,
+        local.wireGuardExitDns,
+        local.importedWireGuardConfig
+    ).map(::value)
+    return serverValues != localValues
+}
+
+private suspend fun compareDeployWithServer(
+    context: Context,
+    request: DeployRequest,
+    localOwnerProfile: ServerAdminProfileInfo,
+    localOutboundProfile: OutboundProfileForms,
+    inspectDatabase: Boolean
+): DeployServerComparison {
+    val overwriteLines = mutableListOf<String>()
+    val notes = mutableListOf<String>()
+    val errors = mutableListOf<String>()
+
+    if (inspectDatabase) {
+        runCatching {
+            withContext(Dispatchers.IO) {
+                var session: Session? = null
+                try {
+                    session = createSSHSession(request.host, request.user, request.pass, request.sshPort)
+                    val ssh = SSHClient(session, request.pass)
+                    val raw = readRemotePasswordsJson(ssh)
+                        ?: throw IllegalStateException("на сервере не найдена база доступа")
+                    val db = JSONObject(raw)
+                    validatePasswordsDbStructure(db)
+
+                    if (db.optString("main_password") != request.mainPass) {
+                        overwriteLines += "Главный пароль владельца"
+                    }
+                    if (request.adminId.isNotBlank() && db.optString("admin_id") != request.adminId) {
+                        overwriteLines += "Telegram Admin ID"
+                    }
+                    if (request.botToken.isNotBlank() && db.optString("bot_token") != request.botToken) {
+                        overwriteLines += "Telegram Bot Token"
+                    }
+                    val serverDns = normalizeDnsValues(db.optString("dns"))
+                    val localDns = normalizeDnsValues(
+                        request.dns1.ifBlank { "1.1.1.1" },
+                        request.dns2
+                    )
+                    if (serverDns != localDns) {
+                        overwriteLines += "DNS: сервер — ${serverDns.ifBlank { "не задан" }}, приложение — $localDns"
+                    }
+
+                    val defaultPorts = db.optString("default_ports").ifBlank { "56000,56001,9000" }
+                    val serverProfile = parseOwnerProfileFromDb(db.optJSONObject("admin_profile"), defaultPorts)
+                    if (serverProfile.hasSavedFields && ownerProfilesDiffer(serverProfile, localOwnerProfile)) {
+                        overwriteLines += "Профиль владельца («Туннель» и порты)"
+                        overwriteLines += ownerProfileDiffLines(serverProfile, localOwnerProfile).map { "  $it" }
+                    } else if (!serverProfile.hasSavedFields) {
+                        notes += "На сервере ещё нет профиля владельца; установка создаст его из текущих полей приложения."
+                    }
+                } finally {
+                    try { session?.disconnect() } catch (_: Exception) {}
+                }
+            }
+        }.onFailure {
+            errors += friendlyDeployError(it, "сверка профиля сервера")
+        }
+    }
+
+    runCatching {
+        val target = OutboundSshTarget(
+            host = request.host,
+            user = request.user.ifBlank { "root" },
+            pass = request.pass,
+            port = request.sshPort
+        )
+        val output = runRootScript(
+            context = context,
+            target = target,
+            script = outboundSnapshotScript(),
+            timeout = 30000L
+        )
+        val snapshot = parseOutboundServerSnapshot(output)
+        if (snapshot.hasProfile && outboundProfilesDiffer(snapshot, localOutboundProfile)) {
+            overwriteLines += "Сохранённые поля «Выходной IP и прокси»"
+        } else if (!snapshot.hasProfile) {
+            notes += "На сервере нет профиля полей выходного IP; установка создаст его из текущих полей приложения."
+        }
+    }.onFailure {
+        errors += friendlyDeployError(it, "сверка выходного IP")
+    }
+
+    return DeployServerComparison(
+        overwriteLines = overwriteLines.distinct(),
+        notes = notes.distinct(),
+        checkError = errors.takeIf { it.isNotEmpty() }?.joinToString(" ")
+    )
+}
+
+private fun secretPresenceLabel(value: String): String {
+    val count = value.split(',', ' ', '\n', '\t')
+        .map { it.trim() }
+        .count { it.isNotBlank() }
+    return if (count == 0) "не заданы" else "заданы ($count)"
+}
+
 private fun selectExistingServerConnection(
     dbJson: String,
     fallbackHost: String,
@@ -3849,61 +5071,15 @@ private fun selectExistingServerConnection(
     val serverDns2 = dnsParts.getOrNull(1) ?: "1.0.0.1"
     val publicHost = db.optString("public_ip").ifBlank { fallbackHost }
     val defaultPorts = db.optString("default_ports").ifBlank { "56000,56001,9000" }
-    val passwords = db.optJSONObject("passwords") ?: JSONObject()
-    val now = System.currentTimeMillis() / 1000L
-
-    data class Candidate(
-        val entry: JSONObject,
-        val label: String,
-        val hasVkHash: Boolean
-    )
-
-    val candidates = mutableListOf<Candidate>()
-    passwords.keys().forEach { pass ->
-        val entry = passwords.optJSONObject(pass) ?: return@forEach
-        val expiresAt = entry.optLong("expires_at", 0)
-        val active = !entry.optBoolean("is_deactivated", false) && (expiresAt == 0L || expiresAt > now)
-        if (active) {
-            val label = entry.optString("label").ifBlank { "пользовательский пароль" }
-            candidates += Candidate(
-                entry = entry,
-                label = label,
-                hasVkHash = entry.optString("vk_hash").isNotBlank()
-            )
-        }
-    }
-
-    val selected = candidates
-        .sortedWith(compareByDescending<Candidate> { it.hasVkHash }.thenBy { it.label.lowercase() })
-        .firstOrNull()
-
-    if (selected != null) {
-        val ports = selected.entry.optString("ports").ifBlank { defaultPorts }
-        return ExistingServerConnection(
-            host = publicHost,
-            password = mainPassword,
-            vkHash = selected.entry.optString("vk_hash"),
-            ports = parsePortsTriple(ports),
-            adminId = serverAdminId,
-            botToken = serverBotToken,
-            dns1 = serverDns1,
-            dns2 = serverDns2,
-            source = "VK-хеш взят из пароля «${selected.label}».",
-            needsVkHash = selected.entry.optString("vk_hash").isBlank()
-        )
-    }
-
     return ExistingServerConnection(
         host = publicHost,
         password = mainPassword,
-        vkHash = "",
         ports = parsePortsTriple(defaultPorts),
         adminId = serverAdminId,
         botToken = serverBotToken,
         dns1 = serverDns1,
         dns2 = serverDns2,
-        source = "Используется главный пароль администратора.",
-        needsVkHash = true
+        adminProfile = parseOwnerProfileFromDb(db.optJSONObject("admin_profile"), defaultPorts)
     )
 }
 
@@ -4060,6 +5236,95 @@ private suspend fun performServerImportNow(
 
 // ==================== Deploy ====================
 
+private const val SERVER_UPDATE_BACKUP_DIR = "/var/tmp/wdtt-plus-update-backup"
+
+private fun sha256File(file: File): String {
+    val digest = MessageDigest.getInstance("SHA-256")
+    file.inputStream().use { input ->
+        val buffer = ByteArray(64 * 1024)
+        while (true) {
+            val read = input.read(buffer)
+            if (read <= 0) break
+            digest.update(buffer, 0, read)
+        }
+    }
+    return digest.digest().joinToString("") { "%02x".format(it) }
+}
+
+private fun prepareServerUpdateRollback(ssh: SSHClient) {
+    val command = """
+        set -e
+        BACKUP=${shellQuote(SERVER_UPDATE_BACKUP_DIR)}
+        rm -rf "${'$'}BACKUP"
+        install -d -m 700 "${'$'}BACKUP"
+        if [ -d /etc/wdtt ]; then cp -a /etc/wdtt "${'$'}BACKUP/config"; touch "${'$'}BACKUP/had_config"; fi
+        if [ -f /usr/local/bin/wdtt-server ]; then cp -a /usr/local/bin/wdtt-server "${'$'}BACKUP/wdtt-server"; touch "${'$'}BACKUP/had_binary"; fi
+        if [ -f /etc/systemd/system/wdtt.service ]; then cp -a /etc/systemd/system/wdtt.service "${'$'}BACKUP/wdtt.service"; touch "${'$'}BACKUP/had_service"; fi
+        if systemctl is-active --quiet wdtt; then touch "${'$'}BACKUP/was_active"; fi
+        echo WDTT_UPDATE_BACKUP=ready
+    """.trimIndent()
+    val output = ssh.exec(rootCommand(command), timeout = 30000L)
+    require(Regex("^WDTT_UPDATE_BACKUP=ready$", RegexOption.MULTILINE).containsMatchIn(output)) {
+        "не удалось подготовить страховочную копию обновления"
+    }
+}
+
+private fun cleanupServerUpdateRollback(ssh: SSHClient) {
+    ssh.exec(rootCommand("rm -rf ${shellQuote(SERVER_UPDATE_BACKUP_DIR)}"), timeout = 10000L)
+}
+
+private fun rollbackServerUpdate(ssh: SSHClient) {
+    val command = """
+        set -e
+        BACKUP=${shellQuote(SERVER_UPDATE_BACKUP_DIR)}
+        [ -d "${'$'}BACKUP" ] || { echo WDTT_ROLLBACK=missing; exit 2; }
+        systemctl stop wdtt 2>/dev/null || true
+        if [ -f "${'$'}BACKUP/had_binary" ]; then install -m 755 "${'$'}BACKUP/wdtt-server" /usr/local/bin/wdtt-server; else rm -f /usr/local/bin/wdtt-server; fi
+        if [ -f "${'$'}BACKUP/had_service" ]; then install -m 644 "${'$'}BACKUP/wdtt.service" /etc/systemd/system/wdtt.service; else rm -f /etc/systemd/system/wdtt.service; fi
+        if [ -f "${'$'}BACKUP/had_config" ]; then rm -rf /etc/wdtt; cp -a "${'$'}BACKUP/config" /etc/wdtt; else rm -rf /etc/wdtt; fi
+        systemctl daemon-reload
+        if [ -f "${'$'}BACKUP/was_active" ]; then systemctl restart wdtt; sleep 2; systemctl is-active --quiet wdtt; fi
+        rm -rf "${'$'}BACKUP"
+        echo WDTT_ROLLBACK=ok
+    """.trimIndent()
+    val output = ssh.exec(rootCommand(command), timeout = 60000L)
+    require(Regex("^WDTT_ROLLBACK=ok$", RegexOption.MULTILINE).containsMatchIn(output)) {
+        "сервер не подтвердил откат обновления"
+    }
+}
+
+private fun validatePreservedServerState(beforeJson: String, afterJson: String) {
+    val before = JSONObject(beforeJson)
+    val after = JSONObject(afterJson)
+    validatePasswordsDbStructure(after)
+    val beforePasswords = before.optJSONObject("passwords") ?: JSONObject()
+    val afterPasswords = after.optJSONObject("passwords") ?: JSONObject()
+    val afterDevices = after.optJSONObject("devices") ?: JSONObject()
+    val safeExpiryCutoff = System.currentTimeMillis() / 1000L + 300L
+    beforePasswords.keys().forEach { password ->
+        val oldEntry = beforePasswords.optJSONObject(password) ?: return@forEach
+        val expiresAt = oldEntry.optLong("expires_at", 0)
+        if (expiresAt != 0L && expiresAt <= safeExpiryCutoff) return@forEach
+        val newEntry = afterPasswords.optJSONObject(password)
+            ?: throw IllegalStateException("после обновления пропал действующий клиент ${password.take(4)}…")
+        listOf("device_id", "label", "vk_hash", "ports").forEach { field ->
+            require(oldEntry.optString(field, "") == newEntry.optString(field, "")) {
+                "после обновления изменилось поле $field у клиента ${password.take(4)}…"
+            }
+        }
+        require(oldEntry.optLong("expires_at", 0) == newEntry.optLong("expires_at", 0)) {
+            "после обновления изменился срок клиента ${password.take(4)}…"
+        }
+        require(oldEntry.optBoolean("is_deactivated", false) == newEntry.optBoolean("is_deactivated", false)) {
+            "после обновления изменился статус клиента ${password.take(4)}…"
+        }
+        val deviceId = oldEntry.optString("device_id", "")
+        if (deviceId.isNotBlank()) {
+            require(afterDevices.has(deviceId)) { "после обновления пропала привязка устройства клиента ${password.take(4)}…" }
+        }
+    }
+}
+
 private suspend fun performDeploy(
 	context: Context,
 	host: String, user: String, pass: String, port: Int,
@@ -4070,11 +5335,15 @@ private suspend fun performDeploy(
 	onProgress: (Float, String) -> Unit
 ): Boolean = withContext(Dispatchers.IO) {
     var session: Session? = null
+    var sshClient: SSHClient? = null
+    var rollbackPrepared = false
+    var preservedDbJson: String? = null
     try {
         onProgress(0.02f, "Подключение...")
         session = createSSHSession(host, user, pass, port)
         DeployManager.activeSession = session
         val ssh = SSHClient(session, pass)
+        sshClient = ssh
 
         onProgress(0.05f, "Подготовка файлов...")
         val passArg = if (mainPass.isNotBlank()) "-password $mainPass " else ""
@@ -4099,6 +5368,16 @@ private suspend fun performDeploy(
             DeployManager.writeError("Unsafe legacy server asset: найдено wg0 или /etc/wireguard. Нужна пересборка server под wdtt0 и /etc/wdtt.")
             DeployManager.failDeploy("server asset выглядит устаревшим. Соберите APK заново.")
             return@withContext false
+        }
+        val expectedServerSha256 = sha256File(serverFile)
+        if (mode == DeployMode.PreserveData) {
+            onProgress(0.055f, "Проверка сохранённых данных...")
+            val currentDbJson = readRemotePasswordsJson(ssh)?.also {
+                validatePasswordsDbStructure(JSONObject(it))
+            }
+            if (importPlan == null) preservedDbJson = currentDbJson
+            prepareServerUpdateRollback(ssh)
+            rollbackPrepared = true
         }
 
         onProgress(0.06f, "Загрузка на сервер...")
@@ -4146,47 +5425,65 @@ private suspend fun performDeploy(
             )
         }
 		val output = ssh.exec(
-			rootCommand("env WDTT_ARGS=${shellQuote(args)} WDTT_DTLS_PORT=$dtlsPort WDTT_WG_PORT=$wgPort WDTT_SSH_PORT=$port bash /tmp/deploy.sh"),
+			rootCommand("env WDTT_ARGS=${shellQuote(args)} WDTT_DTLS_PORT=$dtlsPort WDTT_WG_PORT=$wgPort WDTT_SSH_PORT=$port WDTT_PRESERVE_DATA=${if (mode == DeployMode.PreserveData) 1 else 0} bash /tmp/deploy.sh"),
 			timeout = CMD_TIMEOUT
         )
 
         if (output.contains("✅") || output.contains("Деплой успешно") || output.contains("active")) {
-            val verifyOutput = ssh.exec(
-                rootCommand(
-                    "printf 'BINARY=%s\\n' \"$([ -x /usr/local/bin/wdtt-server ] && echo 1 || echo 0)\"; " +
-                        "printf 'CONFIG=%s\\n' \"$([ -d /etc/wdtt ] && echo 1 || echo 0)\"; " +
-                        "printf 'SERVICE=%s\\n' \"$(systemctl is-active wdtt 2>/dev/null || true)\""
-                ),
+			val verifyOutput = ssh.exec(
+				rootCommand(
+					"sleep 2; printf 'BINARY=%s\\n' \"$([ -x /usr/local/bin/wdtt-server ] && echo 1 || echo 0)\"; " +
+						"printf 'CONFIG=%s\\n' \"$([ -d /etc/wdtt ] && echo 1 || echo 0)\"; " +
+						"printf 'SERVICE=%s\\n' \"$(systemctl is-active wdtt 2>/dev/null || true)\"; " +
+						"printf 'ADMIN_SOCKET=%s\\n' \"$([ -S /run/wdtt/admin.sock ] && echo 1 || echo 0)\"; " +
+						"printf 'SERVER_SHA256=%s\\n' \"$(sha256sum /usr/local/bin/wdtt-server 2>/dev/null | awk '{print ${'$'}1}')\""
+				),
                 timeout = 20000L
             )
             val binaryOk = Regex("^BINARY=1$", RegexOption.MULTILINE).containsMatchIn(verifyOutput)
-            val configOk = Regex("^CONFIG=1$", RegexOption.MULTILINE).containsMatchIn(verifyOutput)
-            val serviceActive = Regex("^SERVICE=active$", RegexOption.MULTILINE).containsMatchIn(verifyOutput)
-            if (!binaryOk || !configOk || !serviceActive) {
-                DeployManager.writeError("Deploy verify failed: ${verifyOutput.take(500)}")
-                val missing = buildList {
-                    if (!binaryOk) add("бинарник")
-                    if (!configOk) add("конфиг /etc/wdtt")
-                    if (!serviceActive) add("служба wdtt")
-                }.joinToString(", ")
-                DeployManager.failDeploy("скрипт завершился, но проверка не прошла: $missing")
-                return@withContext false
-            }
+			val configOk = Regex("^CONFIG=1$", RegexOption.MULTILINE).containsMatchIn(verifyOutput)
+			val serviceActive = Regex("^SERVICE=active$", RegexOption.MULTILINE).containsMatchIn(verifyOutput)
+			val adminSocketOk = Regex("^ADMIN_SOCKET=1$", RegexOption.MULTILINE).containsMatchIn(verifyOutput)
+			val installedSha256 = Regex("^SERVER_SHA256=([0-9a-fA-F]{64})$", RegexOption.MULTILINE)
+				.find(verifyOutput)?.groupValues?.getOrNull(1)?.lowercase()
+			val binaryCurrent = installedSha256 == expectedServerSha256
+			if (!binaryOk || !configOk || !serviceActive || !adminSocketOk || !binaryCurrent) {
+				DeployManager.writeError("Deploy verify failed: ${verifyOutput.take(500)}")
+				val missing = buildList {
+					if (!binaryOk) add("бинарник")
+					if (!configOk) add("конфиг /etc/wdtt")
+					if (!serviceActive) add("служба wdtt")
+					if (!adminSocketOk) add("admin-сокет новой версии")
+					if (!binaryCurrent) add("актуальная версия бинарника")
+				}.joinToString(", ")
+				throw IllegalStateException("скрипт завершился, но проверка не прошла: $missing")
+			}
+			val updatedDbJson = readRemotePasswordsJson(ssh)
+				?: throw IllegalStateException("после обновления не найдена база passwords.json")
+			validatePasswordsDbStructure(JSONObject(updatedDbJson))
+			preservedDbJson?.let { validatePreservedServerState(it, updatedDbJson) }
+			if (rollbackPrepared) {
+				cleanupServerUpdateRollback(ssh)
+				rollbackPrepared = false
+			}
             DeployManager.stopDeploy("success")
             TunnelManager.addDeploySuccessLog("Деплой успешно завершён. Сервис активен.")
             return@withContext true
         } else if (output.contains("error:")) {
             DeployManager.writeError("Deploy script output contains error")
-            DeployManager.failDeploy("скрипт установки вернул ошибку. Подробности сохранены в errors.log.")
-            return@withContext false
+            throw IllegalStateException("скрипт установки вернул ошибку; подробности сохранены в errors.log")
         } else {
             DeployManager.writeError("Deploy unclear output: ${output.take(500)}")
-            DeployManager.failDeploy("не удалось подтвердить установку: нет признака active/успеха от скрипта.")
-            return@withContext false
+            throw IllegalStateException("не удалось подтвердить установку: нет признака active/успеха от скрипта")
         }
 
-    } catch (e: Exception) {
-        DeployManager.writeError("Deploy critical: ${e.message}\n${e.stackTraceToString().take(500)}")
+	} catch (e: Exception) {
+		if (rollbackPrepared) {
+			runCatching { sshClient?.let(::rollbackServerUpdate) }
+				.onFailure { rollbackError -> DeployManager.writeError("Update rollback failed: ${rollbackError.message}") }
+			rollbackPrepared = false
+		}
+		DeployManager.writeError("Deploy critical: ${e.message}\n${e.stackTraceToString().take(500)}")
         DeployManager.failDeploy(e.message?.take(120) ?: "неизвестная ошибка")
         return@withContext false
     } finally {
@@ -4358,7 +5655,7 @@ private fun ServerImportConfirmDialog(
                         ConfirmLine("Режим", modeText)
                         ConfirmLine("Бэкап", "${backup.sourceHost}, ${backup.createdAt}")
                         ConfirmLine("Данные", "${backup.passwordCount} паролей, ${backup.deviceCount} устройств")
-                        ConfirmLine("Публичный адрес ссылок", request.host)
+                        ConfirmLine("Адрес сервера для ссылок", request.host)
                         ConfirmLine("Порты быстрых ссылок", portsSpec)
                         ConfirmLine("Главный пароль", mainPasswordText)
                         ConfirmLine("Telegram-админ/бот", adminText)
@@ -4811,8 +6108,61 @@ private fun ExistingInstallDialog(
 						InstallTraceLine("Сервис активен", info.active)
 					}
 				}
+				Surface(
+					shape = RoundedCornerShape(14.dp),
+					color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f),
+					border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.25f))
+				) {
+					Text(
+						"Направление установки: приложение → сервер. После подтверждения текущие поля приложения будут записаны на сервер; подключение без установки действует в обратном направлении и здесь не выполняется.",
+						modifier = Modifier.fillMaxWidth().padding(12.dp),
+						style = MaterialTheme.typography.bodySmall,
+						color = MaterialTheme.colorScheme.onPrimaryContainer
+					)
+				}
+				info.comparison?.let { comparison ->
+					when {
+						comparison.checkError != null -> Surface(
+							shape = RoundedCornerShape(14.dp),
+							color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.55f),
+							border = BorderStroke(1.dp, MaterialTheme.colorScheme.error.copy(alpha = 0.35f))
+						) {
+							Text(
+								"Не удалось сравнить сохранённые поля сервера с приложением. При продолжении они могут быть заменены локальными значениями: ${comparison.checkError.take(180)}",
+								modifier = Modifier.fillMaxWidth().padding(12.dp),
+								style = MaterialTheme.typography.bodySmall,
+								color = MaterialTheme.colorScheme.onErrorContainer
+							)
+						}
+						comparison.overwriteLines.isNotEmpty() -> Surface(
+							shape = RoundedCornerShape(14.dp),
+							color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.55f),
+							border = BorderStroke(1.dp, MaterialTheme.colorScheme.error.copy(alpha = 0.35f))
+						) {
+							Column(
+								modifier = Modifier.fillMaxWidth().padding(12.dp),
+								verticalArrangement = Arrangement.spacedBy(6.dp)
+							) {
+								Text("Будут заменены серверные значения:", fontWeight = FontWeight.SemiBold)
+								comparison.overwriteLines.forEach { Text("• $it", style = MaterialTheme.typography.bodySmall) }
+								Text(
+									"Если нужны значения сервера, отмените установку и сначала выполните «Подключиться (без установки)». Для выходного IP используйте «Заполнить».",
+									style = MaterialTheme.typography.bodySmall
+								)
+							}
+						}
+						else -> Text(
+							"Сверка завершена: конфликтующих сохранённых значений не найдено.",
+							style = MaterialTheme.typography.bodySmall,
+							color = MaterialTheme.colorScheme.onSurfaceVariant
+						)
+					}
+					comparison.notes.forEach {
+						Text("• $it", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+					}
+				}
 				Text(
-					"С сохранением данных: обновится бинарник и настройки из текущих полей деплоя. Существующие пользовательские пароли, привязки устройств, история и ключи сохранятся.\n\nС нуля: данные WDTT Plus на сервере будут удалены, все выданные ссылки и привязки пропадут.",
+					"С сохранением данных: обновится бинарник, серверные настройки будут взяты из приложения, а клиентские пароли, привязки устройств, история и ключи сохранятся. Перед изменением создаётся страховочная копия.\n\nС нуля: данные WDTT Plus на сервере будут удалены, все выданные ссылки и привязки пропадут; затем сервер получит текущие поля приложения.",
 					style = MaterialTheme.typography.bodySmall,
 					color = MaterialTheme.colorScheme.onSurfaceVariant
 				)

@@ -59,13 +59,17 @@ import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
@@ -77,6 +81,8 @@ import com.wdtt.plus.ui.SettingsTab
 import com.wdtt.plus.ui.DeployTab
 import com.wdtt.plus.ui.ExceptionsTab
 import com.wdtt.plus.ui.InfoTab
+import com.wdtt.plus.ui.AdminImportDialog
+import com.wdtt.plus.ui.TransferCenterDialog
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.first
@@ -91,6 +97,7 @@ class MainActivity : ComponentActivity() {
     private var sharedVkHashError by mutableStateOf<String?>(null)
     private var wdttDeepLinkMessage by mutableStateOf<String?>(null)
     private var pendingWdttDeepLinkPlan by mutableStateOf<WdttDeepLinkApplyPlan?>(null)
+    private var pendingAdminTransfer by mutableStateOf<String?>(null)
 
     companion object {
         var activeActivities = 0
@@ -138,6 +145,16 @@ class MainActivity : ComponentActivity() {
                     wdttDeepLinkMessage = wdttDeepLinkMessage,
                     onWdttDeepLinkMessageShown = { wdttDeepLinkMessage = null },
                     pendingWdttDeepLinkPlan = pendingWdttDeepLinkPlan,
+                    pendingAdminTransfer = pendingAdminTransfer,
+                    onIncomingTransferContent = ::handleIncomingTransferText,
+                    onAdminTransferDismissed = { pendingAdminTransfer = null },
+                    onAdminTransferFinished = { message ->
+                        pendingAdminTransfer = null
+                        wdttDeepLinkMessage = message
+                    },
+                    onSelectWdttDeepLinkOverwriteProfile = { profile ->
+                        pendingWdttDeepLinkPlan = pendingWdttDeepLinkPlan?.copy(targetProfile = profile)
+                    },
                     onConfirmWdttDeepLinkOverwrite = { plan ->
                         pendingWdttDeepLinkPlan = null
                         applyWdttDeepLinkPlan(plan)
@@ -171,21 +188,82 @@ class MainActivity : ComponentActivity() {
                 )
             }
         }
-        handleIncomingShareIntent(intent)
-        handleIncomingWdttDeepLink(intent)
+        handleIncomingIntent(intent)
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        handleIncomingShareIntent(intent)
-        handleIncomingWdttDeepLink(intent)
+        handleIncomingIntent(intent)
     }
 
-    private fun handleIncomingWdttDeepLink(intent: Intent?) {
-        if (intent?.action != Intent.ACTION_VIEW) return
-        val link = intent.dataString?.trim().orEmpty()
-        if (!link.startsWith("wdtt://", ignoreCase = true)) return
+    private fun handleIncomingIntent(intent: Intent?) {
+        when (intent?.action) {
+            Intent.ACTION_VIEW -> {
+                val data = intent.data ?: return
+                if (data.scheme.equals("wdtt", ignoreCase = true)) {
+                    handleIncomingTransferText(data.toString())
+                } else {
+                    handleIncomingUri(data, intent.type)
+                }
+            }
+            Intent.ACTION_SEND -> {
+                val streamUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra(Intent.EXTRA_STREAM) as? Uri
+                } ?: intent.clipData?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.uri
+                val streamFirst = intent.type?.let { type ->
+                    type.startsWith("image/") || type == "application/json" ||
+                        type == "application/vnd.wdtt.plus.transfer" || type == "application/octet-stream"
+                } == true
+                if (streamFirst && streamUri != null) {
+                    handleIncomingUri(streamUri, intent.type)
+                    return
+                }
+                val sharedText = intent.getStringExtra(Intent.EXTRA_TEXT)
+                    ?: intent.clipData?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.text?.toString()
+                if (!sharedText.isNullOrBlank()) {
+                    handleIncomingTransferText(sharedText)
+                    return
+                }
+                if (streamUri != null) handleIncomingUri(streamUri, intent.type)
+            }
+        }
+    }
+
+    private fun handleIncomingUri(uri: Uri, mimeType: String?) {
+        lifecycleScope.launch {
+            runCatching {
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    if (mimeType?.startsWith("image/") == true) {
+                        TransferFiles.decodeQrImage(this@MainActivity, uri)
+                    } else {
+                        TransferFiles.readText(this@MainActivity, uri)
+                    }
+                }
+            }.onSuccess(::handleIncomingTransferText)
+                .onFailure { wdttDeepLinkMessage = it.message ?: "Не удалось прочитать переданные данные." }
+        }
+    }
+
+    private fun handleIncomingTransferText(value: String) {
+        val link = WdttTransferCodec.extractWdttLink(value)
+        when {
+            link != null -> handleIncomingWdttLink(link)
+            WdttTransferCodec.isAdminTransfer(value) -> pendingAdminTransfer = value.trim()
+            WdttTransferCodec.documentFormat(value) == "wdtt-server-backup" -> {
+                wdttDeepLinkMessage = "Распознана резервная копия сервера. Она применяется к выбранному серверу во вкладке «Деплой» → «Перенос сервера» → «Импорт»."
+            }
+            WdttTransferCodec.documentFormat(value) == "wdtt-plus-admin-settings" -> {
+                wdttDeepLinkMessage = "Распознаны незашифрованные настройки администратора. В целях безопасности импортируется только защищённый файл, созданный через раздел «Передача»."
+            }
+            else -> handleIncomingVkShare(value)
+        }
+    }
+
+    private fun handleIncomingWdttLink(link: String) {
         lifecycleScope.launch {
             val store = SettingsStore(this@MainActivity)
             runCatching {
@@ -224,11 +302,14 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun handleIncomingShareIntent(intent: Intent?) {
-        if (intent?.action != Intent.ACTION_SEND) return
-        val sharedText = intent.getStringExtra(Intent.EXTRA_TEXT)
-            ?: intent.clipData?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(this)?.toString()
-            ?: return
+    private fun handleIncomingVkShare(sharedText: String) {
+        val trimmed = sharedText.trim().trim('<', '>', '"', '\'')
+        val looksLikeJoinLink = trimmed.contains("/call/join/", ignoreCase = true)
+        val looksLikeRawHash = Regex("^[A-Za-z0-9_-]{16,512}$").matches(trimmed)
+        if (!looksLikeJoinLink && !looksLikeRawHash) {
+            sharedVkHashError = "Данные не распознаны. Поддерживаются ссылка подключения wdtt://, файл или QR WDTT Plus и ссылка VK-звонка."
+            return
+        }
         val hash = VkJoinLink.extractHash(sharedText)
         if (hash.length < 16) {
             sharedVkHashError = "В переданной ссылке не найден VK-хеш звонка."
@@ -533,6 +614,11 @@ fun MainScreen(
     wdttDeepLinkMessage: String? = null,
     onWdttDeepLinkMessageShown: () -> Unit = {},
     pendingWdttDeepLinkPlan: WdttDeepLinkApplyPlan? = null,
+    pendingAdminTransfer: String? = null,
+    onIncomingTransferContent: (String) -> Unit = {},
+    onAdminTransferDismissed: () -> Unit = {},
+    onAdminTransferFinished: (String) -> Unit = {},
+    onSelectWdttDeepLinkOverwriteProfile: (Int) -> Unit = {},
     onConfirmWdttDeepLinkOverwrite: (WdttDeepLinkApplyPlan) -> Unit = {},
     onCancelWdttDeepLinkOverwrite: () -> Unit = {},
     themeMode: String = "system",
@@ -551,13 +637,29 @@ fun MainScreen(
     val view = LocalView.current
     val context = LocalContext.current
     val density = LocalDensity.current
+    val focusManager = LocalFocusManager.current
     val scope = rememberCoroutineScope()
     val activeProfile by settingsStore.activeProfile.collectAsStateWithLifecycle(initialValue = 0)
     val wdttLinkMode by settingsStore.wdttLinkMode.collectAsStateWithLifecycle(initialValue = false)
     val interfaceRole by settingsStore.interfaceRole.collectAsStateWithLifecycle(initialValue = "")
     val permissionOnboardingComplete by settingsStore.permissionOnboardingComplete.collectAsStateWithLifecycle(initialValue = false)
+    val migrationNoticeV2Shown by settingsStore.migrationNoticeV2Shown.collectAsStateWithLifecycle(initialValue = true)
     val isAdminInterface = interfaceRole == "admin"
+    val isUpdatedInstall = remember(context) {
+        runCatching {
+            context.packageManager.getPackageInfo(context.packageName, 0).let { info ->
+                info.lastUpdateTime > info.firstInstallTime
+            }
+        }.getOrDefault(false)
+    }
     var selectedTab by rememberSaveable { mutableIntStateOf(0) }
+    val tunnelScrollPosition = rememberSaveable { mutableIntStateOf(0) }
+    val deployScrollPosition = rememberSaveable { mutableIntStateOf(0) }
+    val exceptionsFirstVisibleItemIndex = rememberSaveable { mutableIntStateOf(0) }
+    val exceptionsFirstVisibleItemScrollOffset = rememberSaveable { mutableIntStateOf(0) }
+    val logsFirstVisibleItemIndex = rememberSaveable { mutableIntStateOf(0) }
+    val logsFirstVisibleItemScrollOffset = rememberSaveable { mutableIntStateOf(0) }
+    val infoScrollPosition = rememberSaveable { mutableIntStateOf(0) }
     var dragTargetIndex by remember { mutableIntStateOf(-1) }
     var dragProgress by remember { mutableFloatStateOf(0f) }
     val updateCheckIntervalHours by settingsStore.updateCheckIntervalHours.collectAsStateWithLifecycle(
@@ -567,6 +669,7 @@ fun MainScreen(
     val currentVersion = remember { "v${BuildConfig.VERSION_NAME.removePrefix("v")}" }
     val safeBottomInset = with(density) { WindowInsets.safeDrawing.getBottom(density).toDp() }
     val navOverlayReserve = safeBottomInset + 96.dp
+    var showTransferCenter by rememberSaveable { mutableStateOf(false) }
 
     if (interfaceRole.isBlank()) {
         RoleSelectionScreen(
@@ -688,6 +791,16 @@ fun MainScreen(
                     .fillMaxSize()
                     .padding(padding)
                     .consumeWindowInsets(padding)
+                    .pointerInput(focusManager) {
+                        awaitPointerEventScope {
+                            while (true) {
+                                val event = awaitPointerEvent(PointerEventPass.Initial)
+                                if (event.type == PointerEventType.Press) {
+                                    focusManager.clearFocus()
+                                }
+                            }
+                        }
+                    }
                     .pointerInput(selectedTab, wdttLinkMode) {
                         var totalDrag = 0f
                         detectHorizontalDragGestures(
@@ -709,6 +822,7 @@ fun MainScreen(
                                 dragProgress = 0f
                             }
                         ) { change, dragAmount ->
+                            if (change.isConsumed) return@detectHorizontalDragGestures
                             change.consume()
                             totalDrag += dragAmount
                             if (abs(totalDrag) < 12f) {
@@ -741,11 +855,21 @@ fun MainScreen(
                     label = "tab_content"
                 ) { tab ->
                     when (tab) {
-                        0 -> SettingsTab()
-                        1 -> if (!wdttLinkMode) DeployTab() else Spacer(modifier = Modifier.fillMaxSize())
-                        2 -> ExceptionsTab()
-                        3 -> LogsTab()
-                        4 -> InfoTab(actionsExpandedState = actionsExpanded, projectExpandedState = projectExpanded)
+                        0 -> SettingsTab(scrollPosition = tunnelScrollPosition)
+                        1 -> if (!wdttLinkMode) DeployTab(scrollPosition = deployScrollPosition) else Spacer(modifier = Modifier.fillMaxSize())
+                        2 -> ExceptionsTab(
+                            firstVisibleItemIndex = exceptionsFirstVisibleItemIndex,
+                            firstVisibleItemScrollOffset = exceptionsFirstVisibleItemScrollOffset
+                        )
+                        3 -> LogsTab(
+                            firstVisibleItemIndex = logsFirstVisibleItemIndex,
+                            firstVisibleItemScrollOffset = logsFirstVisibleItemScrollOffset
+                        )
+                        4 -> InfoTab(
+                            actionsExpandedState = actionsExpanded,
+                            projectExpandedState = projectExpanded,
+                            scrollPosition = infoScrollPosition
+                        )
                     }
                 }
 
@@ -789,7 +913,62 @@ fun MainScreen(
             activeFingerprint = activeFingerprint,
             onFingerprintChange = onFingerprintChange,
             activeClientIds = activeClientIds,
-            onClientIdsChange = onClientIdsChange
+            onClientIdsChange = onClientIdsChange,
+            onTransferRequested = { showTransferCenter = true }
+        )
+    }
+
+    if (
+        BuildConfig.VERSION_CODE == 2 &&
+        isAdminInterface &&
+        isUpdatedInstall &&
+        !migrationNoticeV2Shown
+    ) {
+        AlertDialog(
+            onDismissRequest = {},
+            properties = DialogProperties(
+                dismissOnBackPress = false,
+                dismissOnClickOutside = false
+            ),
+            title = { Text("Требуется обновление сервера") },
+            text = {
+                Text(
+                    "Это крупное обновление WDTT Plus. Для корректной работы новых функций необходимо выполнить установку сервера во вкладке «Деплой».\n\n" +
+                        "Выберите установку с сохранением данных. Настройки, клиенты и выданные доступы сохранятся — будет обновлена только серверная часть.\n\n" +
+                        "Установку с нуля выполнять не нужно."
+                )
+            },
+            confirmButton = {
+                Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                    Button(
+                        onClick = { scope.launch { settingsStore.saveMigrationNoticeV2Shown() } }
+                    ) {
+                        Text("Хорошо")
+                    }
+                }
+            }
+        )
+    }
+
+    if (showTransferCenter) {
+        TransferCenterDialog(
+            settingsStore = settingsStore,
+            activeProfile = activeProfile,
+            isAdmin = isAdminInterface,
+            onIncomingContent = {
+                showTransferCenter = false
+                onIncomingTransferContent(it)
+            },
+            onDismiss = { showTransferCenter = false }
+        )
+    }
+
+    pendingAdminTransfer?.let { document ->
+        AdminImportDialog(
+            settingsStore = settingsStore,
+            encryptedDocument = document,
+            onFinished = onAdminTransferFinished,
+            onDismiss = onAdminTransferDismissed
         )
     }
 
@@ -836,7 +1015,7 @@ fun MainScreen(
     sharedVkHashError?.let { error ->
         AlertDialog(
             onDismissRequest = onSharedVkHashMessageShown,
-            title = { Text("VK-хеш не добавлен") },
+            title = { Text("Данные не импортированы") },
             text = { Text(error) },
             confirmButton = {
                 TextButton(onClick = onSharedVkHashMessageShown) {
@@ -849,7 +1028,7 @@ fun MainScreen(
     wdttDeepLinkMessage?.let { message ->
         AlertDialog(
             onDismissRequest = onWdttDeepLinkMessageShown,
-            title = { Text("Ссылка WDTT") },
+            title = { Text("Передача WDTT") },
             text = { Text(message) },
             confirmButton = {
                 TextButton(onClick = onWdttDeepLinkMessageShown) {
@@ -865,9 +1044,19 @@ fun MainScreen(
             onDismissRequest = onCancelWdttDeepLinkOverwrite,
             title = { Text("Профили VPN заполнены") },
             text = {
-                Text(
-                    "Свободных профилей VPN нет. Ссылка перезапишет профиль $profileLabel. Выполнить действие?"
-                )
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text("Свободных профилей VPN нет. Выберите профиль, который можно перезаписать:")
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        repeat(3) { profile ->
+                            FilterChip(
+                                selected = plan.targetProfile == profile,
+                                onClick = { onSelectWdttDeepLinkOverwriteProfile(profile) },
+                                label = { Text("VPN ${profile + 1}") }
+                            )
+                        }
+                    }
+                    Text("Будет полностью заменено подключение в профиле $profileLabel.")
+                }
             },
             confirmButton = {
                 TextButton(onClick = { onConfirmWdttDeepLinkOverwrite(plan) }) {

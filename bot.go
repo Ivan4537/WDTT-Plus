@@ -97,7 +97,7 @@ func normalizePublicAddressInput(input string) (string, error) {
 		return "", nil
 	}
 	if !isValidPublicHost(value) {
-		return "", errors.New("укажите домен, IPv4 или `auto` без `http://` и без порта")
+		return "", errors.New("укажите домен или IPv4 без `http://` и без порта либо выберите автоматическое определение")
 	}
 	return value, nil
 }
@@ -1092,10 +1092,12 @@ func sendMainMenu(token string, adminID int64, messageID int) int {
 		defaultPorts = defaultPortsSpec()
 	}
 	if publicIPValue == "" {
-		publicIPValue = "auto"
+		publicIPValue = "автоматически: " + getPublicIP()
+	} else {
+		publicIPValue = "задан вручную: " + publicIPValue
 	}
 	text := fmt.Sprintf(
-		"🤖 *WDTT VPN Manager*\n\nПароли: %d/%d\nУстройства: %d\nDNS: `%s`\nПорты ссылок: `%s`\nПубличный адрес: `%s`",
+		"🤖 *WDTT VPN Manager*\n\nПароли: %d/%d\nУстройства: %d\nDNS: `%s`\nПорты ссылок: `%s`\nАдрес сервера для ссылок: `%s`",
 		passwords, maxGeneratedPasswords, devices, mdCode(dnsValue), mdCode(defaultPorts), mdCode(publicIPValue),
 	)
 	return sendOrEditTelegram(token, adminID, messageID, text, inlineKeyboard(
@@ -1126,6 +1128,9 @@ func sendSettingsMenu(token string, adminID int64, messageID int) int {
 			usedDevices[entry.DeviceID] = struct{}{}
 		}
 	}
+	for deviceID := range adminDeviceIDSet(db) {
+		usedDevices[deviceID] = struct{}{}
+	}
 	totalTraffic := databaseTrafficTotals(0)
 	for devID := range db.Devices {
 		if _, ok := usedDevices[devID]; !ok {
@@ -1141,10 +1146,12 @@ func sendSettingsMenu(token string, adminID int64, messageID int) int {
 	}
 	publicIPLabel := publicIPValue
 	if publicIPLabel == "" {
-		publicIPLabel = "auto: " + getPublicIP()
+		publicIPLabel = "определён автоматически: " + getPublicIP()
+	} else {
+		publicIPLabel = "задан вручную: " + publicIPLabel
 	}
 	text := fmt.Sprintf(
-		"⚙️ *Настройки сервера*\n\nDNS WG-клиентов: `%s`\nЛимит ключей: `%d`\nПорты быстрых ссылок: `%s`\nПубличный адрес ссылок: `%s`\n\nПароли: %d/%d\nУстройства: %d\nИстёкших ключей: %d\nЗабытых устройств: %d\nТрафик всего: %.2f MB ↓ / %.2f MB ↑\n\nИзменения DNS применятся к новым конфигам клиентов. Сетевые порты самого сервера меняются через systemd/флаги и требуют перезапуска.",
+		"⚙️ *Настройки сервера*\n\nDNS WG-клиентов: `%s`\nЛимит ключей: `%d`\nПорты быстрых ссылок: `%s`\nАдрес сервера для ссылок: `%s`\n\nПароли: %d/%d\nУстройства: %d\nИстёкших ключей: %d\nЗабытых устройств: %d\nТрафик всего: %.2f MB ↓ / %.2f MB ↑\n\nИзменения DNS применятся к новым конфигам клиентов. Сетевые порты самого сервера меняются через systemd/флаги и требуют перезапуска.",
 		mdCode(dnsValue), maxGeneratedPasswords, mdCode(defaultPorts), mdCode(publicIPLabel),
 		passwords, maxGeneratedPasswords, devices, expired, orphanDevices,
 		float64(totalTraffic.Down)/(1024*1024), float64(totalTraffic.Up)/(1024*1024),
@@ -1156,7 +1163,10 @@ func sendSettingsMenu(token string, adminID int64, messageID int) int {
 		},
 		[]map[string]interface{}{
 			inlineButton("⚙️ Порты ссылок", "settings_ports"),
-			inlineButton("📍 Адрес ссылок", "settings_ip"),
+			inlineButton("📍 Адрес сервера для ссылок", "settings_ip"),
+		},
+		[]map[string]interface{}{
+			inlineButton("👤 Профиль владельца", "settings_owner_profile"),
 		},
 		[]map[string]interface{}{
 			inlineButton("🧹 Очистить истёкшие", "settings_cleanup_expired"),
@@ -1169,9 +1179,6 @@ func sendSettingsMenu(token string, adminID int64, messageID int) int {
 		[]map[string]interface{}{
 			inlineButton("🌐 Выходной IP и прокси", "settings_outbound"),
 		},
-		[]map[string]interface{}{
-			inlineButton("🔎 Обновить auto", "settings_refresh_ip"),
-		},
 		[]map[string]interface{}{inlineButton("🔄 Перезапустить WDTT", "restart_server")},
 		[]map[string]interface{}{inlineButton("◀️ Главное меню", "mainmenu")},
 	))
@@ -1183,6 +1190,9 @@ func collectOrphanDevicesLocked() []*ClientDevice {
 		if entry != nil && entry.DeviceID != "" {
 			usedDevices[entry.DeviceID] = struct{}{}
 		}
+	}
+	for deviceID := range adminDeviceIDSet(db) {
+		usedDevices[deviceID] = struct{}{}
 	}
 	orphanDevices := make([]*ClientDevice, 0)
 	for devID, dev := range db.Devices {
@@ -1319,21 +1329,114 @@ func sendDefaultPortsSettingsMenu(token string, adminID int64, messageID int) in
 	))
 }
 
+func sendOwnerProfileMenu(token string, adminID int64, messageID int) int {
+	dbMutex.Lock()
+	profile := normalizeAdminProfileForView(db.AdminProfile, db.DefaultPorts)
+	dbMutex.Unlock()
+
+	text := fmt.Sprintf(
+		"👤 *Профиль владельца*\n\nЭтот профиль принадлежит главному паролю и хранится отдельно от клиентов. Он не виден в списке доступов, не занимает лимит клиентов и используется для восстановления полей владельца в Android-приложении.\n\nVK-хеши: `%s`\nРезервный VK-хеш: `%s`\nПорты ссылки: `%s`\nПотоки на хеш: `%d`\nПротокол: `%s`\nSNI: `%s`\nNo DNS: `%s`\nОбновлён: `%s`",
+		mdCode(ownerSecretPresenceLabel(profile.VkHashes)),
+		mdCode(ownerSecretPresenceLabel(profile.SecondaryVkHash)),
+		mdCode(profile.Ports),
+		profile.WorkersPerHash,
+		mdCode(profile.Protocol),
+		mdCode(emptyLabel(profile.SNI, "не задан")),
+		mdCode(boolOnOff(profile.NoDNS)),
+		mdCode(formatOwnerUpdatedAt(profile.UpdatedAt)),
+	)
+	rows := [][]map[string]interface{}{
+		{inlineButton("🔗 Ссылка владельца", "owner_link")},
+		{inlineButton("🔑 Обновить VK-хеши", "owner_hash_edit")},
+		{inlineButton("⚙️ Порты владельца", "owner_ports_edit")},
+	}
+	if strings.TrimSpace(profile.VkHashes) != "" || strings.TrimSpace(profile.SecondaryVkHash) != "" {
+		rows = append(rows, []map[string]interface{}{inlineButton("🧹 Очистить VK-хеши", "owner_hash_clear")})
+	}
+	rows = append(rows, []map[string]interface{}{inlineButton("◀️ Назад", "settings")})
+	return sendOrEditTelegram(token, adminID, messageID, text, inlineKeyboard(rows...))
+}
+
+func ownerSecretPresenceLabel(value string) string {
+	count := 0
+	for _, item := range strings.FieldsFunc(value, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\n' || r == '\r' || r == '\t'
+	}) {
+		if strings.TrimSpace(item) != "" {
+			count++
+		}
+	}
+	if count == 0 {
+		return "не заданы"
+	}
+	return fmt.Sprintf("заданы (%d)", count)
+}
+
+func emptyLabel(value, fallback string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fallback
+	}
+	return value
+}
+
+func boolOnOff(value bool) string {
+	if value {
+		return "включено"
+	}
+	return "выключено"
+}
+
+func formatOwnerUpdatedAt(ts int64) string {
+	if ts <= 0 {
+		return "неизвестно"
+	}
+	return time.Unix(ts, 0).Format("02.01.2006 15:04")
+}
+
+func ownerProfileLink() (string, error) {
+	dbMutex.Lock()
+	profile := normalizeAdminProfileForView(db.AdminProfile, db.DefaultPorts)
+	mainPassword := db.MainPassword
+	publicHost := db.PublicIP
+	dbMutex.Unlock()
+	if strings.TrimSpace(profile.VkHashes) == "" {
+		return "", errors.New("в профиле владельца не задан VK-хеш")
+	}
+	if strings.TrimSpace(mainPassword) == "" {
+		return "", errors.New("главный пароль не задан")
+	}
+	if strings.TrimSpace(publicHost) == "" {
+		publicHost = getPublicIP()
+	}
+	pts := strings.Split(profile.Ports, ",")
+	if len(pts) != 3 {
+		return "", errors.New("порты владельца повреждены")
+	}
+	return fmt.Sprintf("wdtt://%s:%s:%s:%s:%s:%s", publicHost, pts[0], pts[1], pts[2], mainPassword, profile.VkHashes), nil
+}
+
 func sendPublicIPSettingsMenu(token string, adminID int64, messageID int) int {
 	dbMutex.Lock()
 	ip := db.PublicIP
 	dbMutex.Unlock()
 	label := ip
 	if label == "" {
-		label = "auto: " + getPublicIP()
+		label = "определён автоматически: " + getPublicIP()
+	} else {
+		label = "задан вручную: " + label
 	}
 	text := fmt.Sprintf(
-		"📍 *Публичный адрес быстрых ссылок*\n\nТекущее значение: `%s`\n\nИспользуется только в новых `wdtt://` ссылках. Можно указать домен или IP. Для бесшовного переезда лучше использовать домен: при смене сервера достаточно обновить DNS-запись.",
+		"📍 *Адрес сервера для ссылок*\n\nТекущее значение: `%s`\n\nЭтот адрес добавляется в новые `wdtt://` ссылки. Можно задать домен или IP вручную либо разрешить серверу автоматически определять свой публичный IP. Для бесшовного переезда лучше использовать домен: при смене сервера достаточно обновить DNS-запись.",
 		mdCode(label),
 	)
+	modeButton := inlineButton("🔎 Определять автоматически", "set_public_ip_auto")
+	if ip == "" {
+		modeButton = inlineButton("🔎 Проверить текущий IP", "settings_refresh_ip")
+	}
 	return sendOrEditTelegram(token, adminID, messageID, text, inlineKeyboard(
 		[]map[string]interface{}{inlineButton("✏️ Ввести адрес", "settings_ip_edit")},
-		[]map[string]interface{}{inlineButton("Вернуть auto", "set_public_ip_auto")},
+		[]map[string]interface{}{modeButton},
 		[]map[string]interface{}{inlineButton("◀️ Назад", "settings")},
 	))
 }
@@ -1343,16 +1446,16 @@ func sendRefreshIPMenu(token string, adminID int64, messageID int) int {
 	manualIP := db.PublicIP
 	dbMutex.Unlock()
 	current := getPublicIP()
-	mode := "auto"
+	mode := "автоматическое определение"
 	if manualIP != "" {
-		mode = "ручной"
+		mode = "задан вручную"
 	}
 	text := fmt.Sprintf(
-		"🔎 *Обновить auto адрес*\n\nТекущий адрес для ссылок: `%s`\nРежим: `%s`\n\nДействие сбросит кэш автоопределения и заново запросит публичный IP. Если задан ручной домен или IP, он останется приоритетным.",
+		"🔎 *Определить публичный IP заново*\n\nСейчас определён IP: `%s`\nРежим адреса для ссылок: `%s`\n\nСервер повторно запросит свой публичный IP. Если домен или IP задан вручную, он останется приоритетным.",
 		mdCode(current), mdCode(mode),
 	)
 	return sendOrEditTelegram(token, adminID, messageID, text, inlineKeyboard(
-		[]map[string]interface{}{inlineButton("🔎 Обновить", "confirm_refresh_ip")},
+		[]map[string]interface{}{inlineButton("🔎 Определить IP", "confirm_refresh_ip")},
 		[]map[string]interface{}{inlineButton("◀️ Назад", "settings")},
 	))
 }
@@ -2076,6 +2179,49 @@ func botLoop(token string, adminIDstr string, wgDev *device.Device) {
 					))
 				} else if data == "settings_dns" {
 					promptMessageID = sendDNSSettingsMenu(token, adminID, menuMessageID)
+				} else if data == "settings_owner_profile" {
+					promptMessageID = sendOwnerProfileMenu(token, adminID, menuMessageID)
+				} else if data == "owner_link" {
+					link, err := ownerProfileLink()
+					if err != nil {
+						promptMessageID = sendOrEditTelegram(token, adminID, menuMessageID, fmt.Sprintf("❌ %s.\n\nСначала обновите VK-хеши владельца в этом меню.", err.Error()), inlineKeyboard(
+							[]map[string]interface{}{inlineButton("🔑 Обновить VK-хеши", "owner_hash_edit")},
+							[]map[string]interface{}{inlineButton("◀️ Назад", "settings_owner_profile")},
+						))
+						continue
+					}
+					promptMessageID = sendOrEditTelegram(token, adminID, menuMessageID, fmt.Sprintf("🔗 *Ссылка владельца:*\n`%s`\n\nЭта ссылка использует главный пароль и профиль владельца. Не пересылайте её как клиентский доступ.", mdCode(link)), inlineKeyboard(
+						[]map[string]interface{}{inlineButton("◀️ Профиль владельца", "settings_owner_profile")},
+						[]map[string]interface{}{inlineButton("◀️ Главное меню", "mainmenu")},
+					))
+				} else if data == "owner_hash_edit" {
+					waitingForSetting = "owner_hash"
+					promptMessageID = sendOrEditTelegram(token, adminID, menuMessageID, "🔑 Отправьте VK-хеши владельца или ссылки приглашения.\n\nМожно несколько значений через пробел, запятую или новую строку.", inlineKeyboard(
+						[]map[string]interface{}{inlineButton("◀️ Назад", "settings_owner_profile")},
+					))
+				} else if data == "owner_hash_clear" {
+					dbMutex.Lock()
+					db.AdminProfile.VkHashes = ""
+					db.AdminProfile.SecondaryVkHash = ""
+					db.AdminProfile.UpdatedAt = time.Now().Unix()
+					saveDB()
+					dbMutex.Unlock()
+					promptMessageID = sendOwnerProfileMenu(token, adminID, menuMessageID)
+				} else if data == "owner_ports_edit" {
+					waitingForSetting = "owner_ports"
+					promptMessageID = sendOrEditTelegram(token, adminID, menuMessageID, "⚙️ Укажите порты ссылки владельца.\n\nФормат: `DTLS,WG,TUN`, например `56000,56001,9000`.", inlineKeyboard(
+						[]map[string]interface{}{inlineButton("Стандартные", "owner_ports_default")},
+						[]map[string]interface{}{inlineButton("◀️ Назад", "settings_owner_profile")},
+					))
+				} else if data == "owner_ports_default" {
+					ports := defaultPortsSpec()
+					dbMutex.Lock()
+					db.AdminProfile.Ports = ports
+					db.AdminProfile.ListenPort = adminProfileDefaultListenPort(ports)
+					db.AdminProfile.UpdatedAt = time.Now().Unix()
+					saveDB()
+					dbMutex.Unlock()
+					promptMessageID = sendOwnerProfileMenu(token, adminID, menuMessageID)
 				} else if data == "settings_dns_edit" {
 					waitingForSetting = "dns"
 					promptMessageID = sendOrEditTelegram(token, adminID, menuMessageID, "🌐 Введите DNS для WireGuard-клиентов.\n\nМожно несколько через запятую, например: `1.1.1.1,8.8.8.8`.", inlineKeyboard(
@@ -2142,8 +2288,8 @@ func botLoop(token string, adminIDstr string, wgDev *device.Device) {
 					promptMessageID = sendPublicIPSettingsMenu(token, adminID, menuMessageID)
 				} else if data == "settings_ip_edit" {
 					waitingForSetting = "public_ip"
-					promptMessageID = sendOrEditTelegram(token, adminID, menuMessageID, "📍 Введите публичный адрес для быстрых ссылок.\n\nМожно домен или IP без `http://` и без порта, например `site.ru`.\n\n`auto` или `-` — автоопределение IP через ipify.", inlineKeyboard(
-						[]map[string]interface{}{inlineButton("Auto", "set_public_ip_auto")},
+					promptMessageID = sendOrEditTelegram(token, adminID, menuMessageID, "📍 Введите адрес сервера для новых ссылок.\n\nМожно указать домен или IP без `http://` и без порта, например `site.ru`. Либо нажмите кнопку автоматического определения ниже.", inlineKeyboard(
+						[]map[string]interface{}{inlineButton("Определять автоматически", "set_public_ip_auto")},
 						[]map[string]interface{}{inlineButton("◀️ Назад", "settings")},
 					))
 				} else if data == "set_public_ip_auto" {
@@ -2159,7 +2305,7 @@ func botLoop(token string, adminIDstr string, wgDev *device.Device) {
 				} else if data == "confirm_refresh_ip" {
 					publicIP = ""
 					ip := getPublicIP()
-					promptMessageID = sendOrEditTelegram(token, adminID, menuMessageID, fmt.Sprintf("🔎 Auto адрес обновлён: `%s`", mdCode(ip)), inlineKeyboard(
+					promptMessageID = sendOrEditTelegram(token, adminID, menuMessageID, fmt.Sprintf("🔎 Публичный IP сервера определён: `%s`", mdCode(ip)), inlineKeyboard(
 						[]map[string]interface{}{inlineButton("◀️ Назад", "settings")},
 						[]map[string]interface{}{inlineButton("◀️ Главное меню", "mainmenu")},
 					))
@@ -2379,6 +2525,9 @@ func botLoop(token string, adminIDstr string, wgDev *device.Device) {
 						continue
 					}
 					entry.IsDeactivated = false
+					if entry.DeviceID != "" {
+						upsertPeerInWG(wgDev, db.Devices[entry.DeviceID])
+					}
 					saveDB()
 					dbMutex.Unlock()
 					promptMessageID = sendOrEditTelegram(token, adminID, menuMessageID, fmt.Sprintf("✅ Пароль `%s` активирован", mdCode(pass)), inlineKeyboard(
@@ -2600,7 +2749,7 @@ func botLoop(token string, adminIDstr string, wgDev *device.Device) {
 					if err != nil {
 						waitingForSetting = "public_ip"
 						promptMessageID = sendOrEditTelegram(token, adminID, promptMessageID, fmt.Sprintf("❌ %s.", err.Error()), inlineKeyboard(
-							[]map[string]interface{}{inlineButton("Auto", "set_public_ip_auto")},
+							[]map[string]interface{}{inlineButton("Определять автоматически", "set_public_ip_auto")},
 							[]map[string]interface{}{inlineButton("◀️ Назад", "settings")},
 						))
 						continue
@@ -2612,6 +2761,40 @@ func botLoop(token string, adminIDstr string, wgDev *device.Device) {
 					saveDB()
 					dbMutex.Unlock()
 					promptMessageID = sendSettingsMenu(token, adminID, promptMessageID)
+					continue
+				case "owner_hash":
+					hash, err := normalizeVKHashesInput(cmd)
+					if err != nil {
+						waitingForSetting = "owner_hash"
+						promptMessageID = sendOrEditTelegram(token, adminID, promptMessageID, fmt.Sprintf("❌ %s\n\nОтправьте VK-хеши владельца ещё раз.", err.Error()), inlineKeyboard(
+							[]map[string]interface{}{inlineButton("◀️ Назад", "settings_owner_profile")},
+						))
+						continue
+					}
+					dbMutex.Lock()
+					db.AdminProfile.VkHashes = hash
+					db.AdminProfile.UpdatedAt = time.Now().Unix()
+					saveDB()
+					dbMutex.Unlock()
+					promptMessageID = sendOwnerProfileMenu(token, adminID, promptMessageID)
+					continue
+				case "owner_ports":
+					ports, err := parsePortsSpec(cmd)
+					if err != nil {
+						waitingForSetting = "owner_ports"
+						promptMessageID = sendOrEditTelegram(token, adminID, promptMessageID, fmt.Sprintf("❌ %s.\n\nУкажите 3 порта через запятую, например: `56000,56001,9000`.", err.Error()), inlineKeyboard(
+							[]map[string]interface{}{inlineButton("Стандартные", "owner_ports_default")},
+							[]map[string]interface{}{inlineButton("◀️ Назад", "settings_owner_profile")},
+						))
+						continue
+					}
+					dbMutex.Lock()
+					db.AdminProfile.Ports = ports
+					db.AdminProfile.ListenPort = adminProfileDefaultListenPort(ports)
+					db.AdminProfile.UpdatedAt = time.Now().Unix()
+					saveDB()
+					dbMutex.Unlock()
+					promptMessageID = sendOwnerProfileMenu(token, adminID, promptMessageID)
 					continue
 				case "outbound_external_check", "outbound_external_enable":
 					kind, host, port, login, password, err := parseExternalProxyInput(cmd)
@@ -2793,9 +2976,17 @@ func botLoop(token string, adminIDstr string, wgDev *device.Device) {
 					targetPassword = ""
 					srvIP := getPublicIP()
 					pts := strings.Split(tempPorts, ",")
-					link := fmt.Sprintf("wdtt://%s:%s:%s:%s:%s:%s", srvIP, pts[0], pts[1], pts[2], db.MainPassword, hash)
+					dbMutex.Lock()
+					db.AdminProfile.VkHashes = hash
+					db.AdminProfile.Ports = tempPorts
+					db.AdminProfile.ListenPort = adminProfileDefaultListenPort(tempPorts)
+					db.AdminProfile.UpdatedAt = time.Now().Unix()
+					mainPassword := db.MainPassword
+					saveDB()
+					dbMutex.Unlock()
+					link := fmt.Sprintf("wdtt://%s:%s:%s:%s:%s:%s", srvIP, pts[0], pts[1], pts[2], mainPassword, hash)
 					promptMessageID = sendOrEditTelegram(token, adminID, promptMessageID, fmt.Sprintf("🔗 *Ссылка для главного пароля:*\n`%s`", mdCode(link)), inlineKeyboard(
-						[]map[string]interface{}{inlineButton("🔐 К списку", "backlist")},
+						[]map[string]interface{}{inlineButton("👤 Профиль владельца", "settings_owner_profile")},
 						[]map[string]interface{}{inlineButton("◀️ Главное меню", "mainmenu")},
 					))
 					continue
@@ -2883,14 +3074,9 @@ func sendPasswordList(token string, adminID int64, wgDev *device.Device, message
 		saveDB()
 	}
 
-	txt := "🔐 *Пароли:*\n\n"
-	txt += fmt.Sprintf("🔒 Главный: `%s` (владелец)\n\n", mdCode(db.MainPassword))
+	txt := "🔐 *Клиентские доступы:*\n\n"
 
 	var inlineKb []map[string]interface{}
-	inlineKb = append(inlineKb, map[string]interface{}{
-		"text":          "🔗 Ссылка на главный пароль",
-		"callback_data": "mainlink",
-	})
 
 	if len(db.Passwords) == 0 {
 		txt += "_Нет сгенерированных паролей._\n"
@@ -2928,16 +3114,15 @@ func sendPasswordList(token string, adminID int64, wgDev *device.Device, message
 
 	txt += "\n🟢 = свободен | 🔗 = привязан"
 
-	var replyMarkup interface{}
+	var keyboard [][]map[string]interface{}
 	if len(inlineKb) > 0 {
-		var keyboard [][]map[string]interface{}
 		for _, btn := range inlineKb {
 			keyboard = append(keyboard, []map[string]interface{}{btn})
 		}
-		keyboard = append(keyboard, []map[string]interface{}{inlineButton("➕ Новый пароль", "menu_new")})
-		keyboard = append(keyboard, []map[string]interface{}{inlineButton("◀️ Главное меню", "mainmenu")})
-		replyMarkup = map[string]interface{}{"inline_keyboard": keyboard}
 	}
+	keyboard = append(keyboard, []map[string]interface{}{inlineButton("➕ Новый пароль", "menu_new")})
+	keyboard = append(keyboard, []map[string]interface{}{inlineButton("◀️ Главное меню", "mainmenu")})
+	replyMarkup := map[string]interface{}{"inline_keyboard": keyboard}
 	return sendOrEditTelegram(token, adminID, messageID, txt, replyMarkup)
 }
 

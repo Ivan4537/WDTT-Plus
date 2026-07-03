@@ -1,13 +1,16 @@
 package com.wdtt.plus.ui
 
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
+import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -45,6 +48,7 @@ import kotlin.math.roundToInt
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 
@@ -65,6 +69,7 @@ fun FloatingToolbar(
     onFingerprintChange: (String) -> Unit,
     activeClientIds: String,
     onClientIdsChange: (String) -> Unit,
+    onTransferRequested: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val configuration = LocalConfiguration.current
@@ -185,6 +190,7 @@ fun FloatingToolbar(
                         modifier = Modifier
                             .padding(16.dp)
                             .fillMaxWidth()
+                            .animateContentSize(animationSpec = spring(stiffness = Spring.StiffnessMediumLow))
                             .verticalScroll(rememberScrollState()),
                         verticalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
@@ -239,6 +245,17 @@ fun FloatingToolbar(
                                 }
                             }
                         }
+                    }
+
+                    OutlinedButton(
+                        onClick = {
+                            onTransferRequested()
+                        },
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Icon(Icons.Filled.Share, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Text(" Передать или получить", fontSize = 12.sp)
                     }
 
                     HorizontalDivider(
@@ -339,8 +356,12 @@ fun FloatingToolbar(
                         )
                     }
 
-                    AnimatedVisibility(visible = showPalettes) {
-                        Column {
+                    AnimatedVisibility(
+                        visible = showPalettes,
+                        enter = expandVertically(animationSpec = spring(stiffness = Spring.StiffnessMediumLow)) + fadeIn(),
+                        exit = shrinkVertically(animationSpec = spring(stiffness = Spring.StiffnessMediumLow)) + fadeOut()
+                    ) {
+                        Column(modifier = Modifier.fillMaxWidth()) {
                             HorizontalDivider(
                                 modifier = Modifier.padding(vertical = 4.dp),
                                 color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)

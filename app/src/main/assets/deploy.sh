@@ -2,20 +2,21 @@
 # ==============================================================================
 #  WDTT Plus Server — Универсальный установщик для VPS
 #  Поддержка: Debian 11+, Ubuntu 20.04+, CentOS/RHEL/Fedora/AlmaLinux/Rocky
-#  Версия: 3.2  |  Дата: 2026-05-13
+#  Версия: 3.3  |  Дата: 2026-07-02
 #  NAT:  MASQUERADE через iptables
 #  WG:   порт 56001 (не конфликтует с существующим WG на 51820)
 #  DTLS: порт 56000
 # ==============================================================================
 set -uo pipefail
 
-readonly SCRIPT_VERSION="3.2"
+readonly SCRIPT_VERSION="3.3"
 readonly LOG_FILE="/var/log/wdtt-install.log"
 readonly WG_PORT="${WDTT_WG_PORT:-56001}"
 readonly DTLS_PORT="${WDTT_DTLS_PORT:-56000}"
 readonly SSH_PORT="${WDTT_SSH_PORT:-22}"
 readonly MAX_PASSWORDS="${WDTT_MAX_PASSWORDS:-50}"
 readonly WDTT_ARGS="${WDTT_ARGS:-}"
+readonly WDTT_PRESERVE_DATA="${WDTT_PRESERVE_DATA:-0}"
 readonly WDTT_IFACE="wdtt0"
 readonly WDTT_CONFIG_DIR="/etc/wdtt"
 readonly WDTT_ACCESS_DB="passwords.json"
@@ -356,8 +357,14 @@ wdtt_cleanup() {
     # Удаляем старые правила NAT для WDTT подсети
     fw_cleanup_wdtt_rules "$(detect_wan_interface)"
 
-    rm -f /usr/local/bin/wdtt-server 2>/dev/null || true
-    cleanup_config_dir_keep_access_db
+    if [ "$WDTT_PRESERVE_DATA" = "1" ]; then
+        [ -f "$WDTT_CONFIG_DIR/$WDTT_ACCESS_DB" ] && chmod 600 "$WDTT_CONFIG_DIR/$WDTT_ACCESS_DB" 2>/dev/null || true
+        [ -f "$WDTT_CONFIG_DIR/$WDTT_WG_KEYS" ] && chmod 600 "$WDTT_CONFIG_DIR/$WDTT_WG_KEYS" 2>/dev/null || true
+        echo "✓ Режим обновления: конфигурация и данные сохранены"
+    else
+        rm -f /usr/local/bin/wdtt-server 2>/dev/null || true
+        cleanup_config_dir_keep_access_db
+    fi
 
     echo "✓ Очистка завершена (база доступа сохранена)"
 }
@@ -424,7 +431,10 @@ setup_wdtt_binary() {
 
     if [ -f /tmp/wdtt-server ]; then
         chmod +x /tmp/wdtt-server
-        install -m 0755 /tmp/wdtt-server /usr/local/bin/wdtt-server 2>/dev/null || mv /tmp/wdtt-server /usr/local/bin/wdtt-server
+        rm -f /usr/local/bin/.wdtt-server.new
+        install -m 0755 /tmp/wdtt-server /usr/local/bin/.wdtt-server.new || die "Не удалось подготовить новый wdtt-server"
+        mv -f /usr/local/bin/.wdtt-server.new /usr/local/bin/wdtt-server || die "Не удалось атомарно заменить wdtt-server"
+        rm -f /tmp/wdtt-server
         echo "✓ wdtt-server установлен"
     elif [ -f /usr/local/bin/wdtt-server ]; then
         echo "✓ wdtt-server уже установлен"

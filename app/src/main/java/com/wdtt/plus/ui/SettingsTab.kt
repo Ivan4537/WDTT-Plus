@@ -90,7 +90,9 @@ private fun isValidTunnelHost(value: String): Boolean {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun SettingsTab() {
+fun SettingsTab(
+    scrollPosition: MutableIntState = rememberSaveable { mutableIntStateOf(0) }
+) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val settingsStore = remember { SettingsStore(context) }
@@ -99,13 +101,18 @@ fun SettingsTab() {
     CompositionLocalProvider(
         LocalDensity provides Density(currentDensity.density, fontScale = 1f)
     ) {
-        SettingsTabContent(context, scope, settingsStore)
+        SettingsTabContent(context, scope, settingsStore, scrollPosition)
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun SettingsTabContent(context: android.content.Context, scope: kotlinx.coroutines.CoroutineScope, settingsStore: SettingsStore) {
+fun SettingsTabContent(
+    context: android.content.Context,
+    scope: kotlinx.coroutines.CoroutineScope,
+    settingsStore: SettingsStore,
+    scrollPosition: MutableIntState
+) {
     val savedConnectionPassword by settingsStore.connectionPassword.collectAsStateWithLifecycle(initialValue = "")
     val savedManualPortsEnabled by settingsStore.manualPortsEnabled.collectAsStateWithLifecycle(initialValue = false)
     val savedServerDtlsPort by settingsStore.serverDtlsPort.collectAsStateWithLifecycle(initialValue = 56000)
@@ -288,7 +295,7 @@ fun SettingsTabContent(context: android.content.Context, scope: kotlinx.coroutin
         }
     }
 
-    val scrollState = rememberScrollState()
+    val scrollState = rememberRememberedScrollState(scrollPosition)
 
     val isPeerValid = isValidTunnelHost(peerInput)
     val isHashesValid = combinedHashes.isNotBlank()

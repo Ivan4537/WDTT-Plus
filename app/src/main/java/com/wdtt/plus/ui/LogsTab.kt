@@ -9,7 +9,6 @@ import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -17,6 +16,7 @@ import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.graphicsLayer
@@ -34,13 +34,19 @@ import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun LogsTab() {
+fun LogsTab(
+    firstVisibleItemIndex: MutableIntState = rememberSaveable { mutableIntStateOf(0) },
+    firstVisibleItemScrollOffset: MutableIntState = rememberSaveable { mutableIntStateOf(0) }
+) {
     val context = LocalContext.current
     val settingsStore = remember { SettingsStore(context) }
     val loggingEnabled by settingsStore.loggingEnabled.collectAsStateWithLifecycle(initialValue = true)
     val scope = rememberCoroutineScope()
     val currentLogs by TunnelManager.logs.collectAsStateWithLifecycle()
-    val listState = rememberLazyListState()
+    val listState = rememberRememberedLazyListState(
+        firstVisibleItemIndex,
+        firstVisibleItemScrollOffset
+    )
 
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
         // Toolbar

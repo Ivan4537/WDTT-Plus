@@ -979,6 +979,19 @@ object TunnelManager {
                             updateLog("dtls_ok", "[DTLS] Соединение установлено ✓", 1, false)
                         lineTrim.contains("Активна ✓") ->
                             updateLog("ready", "[READY] Туннель готов к работе ✓", 2, false)
+                        lineTrim.contains("Ошибка конфига", true) &&
+                            lineTrim.contains("чтение ответа конфига", true) &&
+                            (lineTrim.contains("timeout", true) || lineTrim.contains("context deadline exceeded", true)) ->
+                            updateLog(
+                                "worker_config_timeout_active",
+                                if (activeWorkers.value > 0) {
+                                    "[ПОТОК] Один канал не получил конфигурацию вовремя; активных=${activeWorkers.value}, работа продолжается"
+                                } else {
+                                    "[ПОТОК] Один канал не получил конфигурацию вовремя; пробуем через другие каналы"
+                                },
+                                3,
+                                false
+                            )
                         
                         isError -> {
                             val errorKey = when {

@@ -16,6 +16,8 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
+import org.json.JSONArray
+import org.json.JSONObject
 
 import android.os.Build
 
@@ -81,7 +83,7 @@ object WdttDeepLink {
     }
 
     fun validate(value: String): WdttDeepLinkValidation {
-        val clean = value.trim()
+        val clean = WdttTransferCodec.extractWdttLink(value) ?: value.trim()
         val errors = mutableListOf<String>()
         val warnings = mutableListOf<String>()
 
@@ -99,8 +101,18 @@ object WdttDeepLink {
             )
         }
 
-        val parts = clean.substringAfter("://").split(":")
-        if (parts.size != 6) {
+        val modernParts = if (clean.startsWith("wdtt://connect?", ignoreCase = true)) {
+            WdttTransferCodec.parseConnectionLink(clean)
+        } else null
+        if (clean.startsWith("wdtt://connect?", ignoreCase = true) && modernParts == null) {
+            return WdttDeepLinkValidation(
+                parts = null,
+                errors = listOf("Новая ссылка повреждена, содержит неподдерживаемую версию или не все поля.")
+            )
+        }
+
+        val parts = if (modernParts == null) clean.substringAfter("://").split(":") else emptyList()
+        if (modernParts == null && parts.size != 6) {
             val found = parts.size
             val detail = when {
                 found < 6 -> "не хватает ${6 - found} ${fieldWord(6 - found)}"
@@ -112,21 +124,21 @@ object WdttDeepLink {
             )
         }
 
-        val host = parts[0].trim()
+        val host = modernParts?.host?.trim() ?: parts[0].trim()
         if (!isValidTunnelHost(host)) {
             errors += "Адрес сервера пустой или неверный. Нужен домен или IPv4 без https://, порта и пути."
         }
 
-        val dtlsPort = validatePort(parts[1], "DTLS-порт", errors)
-        val wgPort = validatePort(parts[2], "WG-порт", errors)
-        val localPort = validatePort(parts[3], "локальный порт", errors)
+        val dtlsPort = validatePort((modernParts?.dtlsPort ?: parts[1]).toString(), "DTLS-порт", errors)
+        val wgPort = validatePort((modernParts?.wgPort ?: parts[2]).toString(), "WG-порт", errors)
+        val localPort = validatePort((modernParts?.localPort ?: parts[3]).toString(), "локальный порт", errors)
 
-        val password = parts[4].trim()
+        val password = modernParts?.password?.trim() ?: parts[4].trim()
         if (password.isBlank()) {
             errors += "Не указан пароль туннеля."
         }
 
-        val rawHashes = parts[5].split(",")
+        val rawHashes = (modernParts?.hashes ?: parts[5]).split(",")
         val hashes = rawHashes
             .map { VkJoinLink.extractHash(it) }
             .filter { it.isNotBlank() && it.length >= 16 }
@@ -284,6 +296,10 @@ class SettingsStore(context: Context) {
         private val UPDATE_DIALOG_LAST_ACTION_VERSION = stringPreferencesKey("update_dialog_last_action_version")
         private val UPDATE_DIALOG_LAST_ACTION = stringPreferencesKey("update_dialog_last_action")
         private val UPDATE_DIALOG_LAST_ACTION_AT = longPreferencesKey("update_dialog_last_action_at")
+        private val MIGRATION_NOTICE_V2_SHOWN = booleanPreferencesKey("migration_notice_v2_shown")
+        private val DEPLOY_CLIENTS_SECTION_EXPANDED = booleanPreferencesKey("deploy_clients_section_expanded")
+        private val DEPLOY_OUTBOUND_SECTION_EXPANDED = booleanPreferencesKey("deploy_outbound_section_expanded")
+        private val DEPLOY_MIGRATION_SECTION_EXPANDED = booleanPreferencesKey("deploy_migration_section_expanded")
 
         private val CLIENT_ID_CHECK_RESULTS = stringPreferencesKey("client_id_check_results")
         private val INTERFACE_ROLE = stringPreferencesKey("interface_role")
@@ -297,7 +313,7 @@ class SettingsStore(context: Context) {
             return when (baseKey) {
                 PEER, VK_HASHES, SECONDARY_VK_HASH, PROTOCOL, SNI, USER_AGENT, DEPLOY_IP, DEPLOY_LOGIN, DEPLOY_PASSWORD, DEPLOY_PASSWORD_ENCRYPTED, DEPLOY_SSH_PORT, DEPLOY_DNS1, DEPLOY_DNS2, EXCLUDED_APPS, BLACKLIST_APPS, WHITELIST_APPS, CONNECTION_PASSWORD, CONNECTION_PASSWORD_ENCRYPTED, DEPLOY_MAIN_PASSWORD, DEPLOY_MAIN_PASSWORD_ENCRYPTED, DEPLOY_ADMIN_ID, DEPLOY_ADMIN_ID_ENCRYPTED, DEPLOY_BOT_TOKEN, DEPLOY_BOT_TOKEN_ENCRYPTED, PROXY_MODE, PROXY_HOST, CAPTCHA_MODE, CAPTCHA_SOLVE_METHOD, CAPTCHA_WBV_SOLVE_METHOD, WDTT_LINK, SELECTED_FINGERPRINT, ACTIVE_CLIENT_IDS -> stringPreferencesKey(newName) as Preferences.Key<T>
                 WORKERS_PER_HASH, VK_HASH_NEXT_SLOT, LISTEN_PORT, SERVER_DTLS_PORT, SERVER_WG_PORT, PROXY_PORT -> intPreferencesKey(newName) as Preferences.Key<T>
-                MANUAL_PORTS_ENABLED, NO_DTLS, NO_DNS, IS_WHITELIST, WDTT_LINK_MODE, VKCALLS_PREFLIGHT -> booleanPreferencesKey(newName) as Preferences.Key<T>
+                MANUAL_PORTS_ENABLED, NO_DTLS, NO_DNS, IS_WHITELIST, WDTT_LINK_MODE, VKCALLS_PREFLIGHT, DETAILED_LOGS -> booleanPreferencesKey(newName) as Preferences.Key<T>
                 else -> throw IllegalArgumentException("Unsupported key type: ${baseKey.name}")
             }
         }
@@ -408,7 +424,10 @@ class SettingsStore(context: Context) {
         prefs[getProfileKey(baseKey, profile)] ?: ""
     }
     
-    val detailedLogs: Flow<Boolean> = dataStore.data.map { it[DETAILED_LOGS] ?: false }
+    val detailedLogs: Flow<Boolean> = dataStore.data.map { prefs ->
+        val profile = prefs[ACTIVE_PROFILE] ?: 0
+        prefs[getProfileKey(DETAILED_LOGS, profile)] ?: false
+    }
     
     // ═══ Пароли и Управление ═══
     val connectionPassword: Flow<String> = dataStore.data.map { prefs ->
@@ -495,6 +514,10 @@ class SettingsStore(context: Context) {
     val updateDialogLastActionVersion: Flow<String> = dataStore.data.map { it[UPDATE_DIALOG_LAST_ACTION_VERSION] ?: "" }
     val updateDialogLastAction: Flow<String> = dataStore.data.map { it[UPDATE_DIALOG_LAST_ACTION] ?: "" }
     val updateDialogLastActionAt: Flow<Long> = dataStore.data.map { it[UPDATE_DIALOG_LAST_ACTION_AT] ?: 0L }
+    val migrationNoticeV2Shown: Flow<Boolean> = dataStore.data.map { it[MIGRATION_NOTICE_V2_SHOWN] ?: false }
+    val deployClientsSectionExpanded: Flow<Boolean> = dataStore.data.map { it[DEPLOY_CLIENTS_SECTION_EXPANDED] ?: true }
+    val deployOutboundSectionExpanded: Flow<Boolean> = dataStore.data.map { it[DEPLOY_OUTBOUND_SECTION_EXPANDED] ?: false }
+    val deployMigrationSectionExpanded: Flow<Boolean> = dataStore.data.map { it[DEPLOY_MIGRATION_SECTION_EXPANDED] ?: false }
     val interfaceRole: Flow<String> = dataStore.data.map { it[INTERFACE_ROLE] ?: "" }
     val permissionOnboardingComplete: Flow<Boolean> = dataStore.data.map { prefs ->
         prefs[PERMISSION_ONBOARDING_COMPLETE] ?: !prefs[INTERFACE_ROLE].isNullOrBlank()
@@ -592,6 +615,30 @@ class SettingsStore(context: Context) {
         }
     }
 
+    suspend fun saveMigrationNoticeV2Shown() {
+        dataStore.edit { prefs ->
+            prefs[MIGRATION_NOTICE_V2_SHOWN] = true
+        }
+    }
+
+    suspend fun saveDeployClientsSectionExpanded(expanded: Boolean) {
+        dataStore.edit { prefs ->
+            prefs[DEPLOY_CLIENTS_SECTION_EXPANDED] = expanded
+        }
+    }
+
+    suspend fun saveDeployOutboundSectionExpanded(expanded: Boolean) {
+        dataStore.edit { prefs ->
+            prefs[DEPLOY_OUTBOUND_SECTION_EXPANDED] = expanded
+        }
+    }
+
+    suspend fun saveDeployMigrationSectionExpanded(expanded: Boolean) {
+        dataStore.edit { prefs ->
+            prefs[DEPLOY_MIGRATION_SECTION_EXPANDED] = expanded
+        }
+    }
+
     suspend fun saveActiveProfile(profile: Int) {
         dataStore.edit { prefs ->
             prefs[ACTIVE_PROFILE] = profile
@@ -629,9 +676,156 @@ class SettingsStore(context: Context) {
                 link = cleanLink,
                 targetProfile = freeProfile ?: activeProfile,
                 requiresConfirmation = freeProfile == null,
-                storeAsLink = prefs[getProfileKey(WDTT_LINK_MODE, activeProfile)] == true
+                storeAsLink = false
             )
         }.first()
+    }
+
+    suspend fun connectionLinkForProfile(profileIndex: Int): String {
+        val profile = profileIndex.coerceIn(0, VPN_PROFILE_COUNT - 1)
+        return dataStore.data.map { prefs ->
+            val storedLink = prefs[getProfileKey(WDTT_LINK, profile)].orEmpty()
+            val storedParts = WdttDeepLink.parse(storedLink)
+            val parts = storedParts ?: WdttLinkParts(
+                host = prefs[getProfileKey(PEER, profile)].orEmpty().trim(),
+                dtlsPort = prefs[getProfileKey(SERVER_DTLS_PORT, profile)] ?: 56000,
+                wgPort = prefs[getProfileKey(SERVER_WG_PORT, profile)] ?: 56001,
+                localPort = prefs[getProfileKey(LISTEN_PORT, profile)] ?: 9000,
+                password = readSecret(prefs, CONNECTION_PASSWORD_ENCRYPTED, CONNECTION_PASSWORD, profile),
+                hashes = prefs[getProfileKey(VK_HASHES, profile)].orEmpty()
+            )
+            val link = WdttTransferCodec.buildConnectionLink(parts)
+            val validation = WdttDeepLink.validate(link)
+            require(validation.canStartVpn) {
+                "Профиль VPN ${profile + 1} заполнен не полностью. Проверьте адрес, порты, пароль и VK-хеши."
+            }
+            link
+        }.first()
+    }
+
+    suspend fun exportAdminSettings(): String = dataStore.data.map { prefs ->
+        val profiles = JSONArray()
+        repeat(VPN_PROFILE_COUNT) { profile ->
+            profiles.put(JSONObject().apply {
+                put("wdttLink", prefs[getProfileKey(WDTT_LINK, profile)].orEmpty())
+                put("wdttLinkMode", prefs[getProfileKey(WDTT_LINK_MODE, profile)] ?: false)
+                put("peer", prefs[getProfileKey(PEER, profile)].orEmpty())
+                put("vkHashes", prefs[getProfileKey(VK_HASHES, profile)].orEmpty())
+                put("secondaryVkHash", prefs[getProfileKey(SECONDARY_VK_HASH, profile)].orEmpty())
+                put("workersPerHash", prefs[getProfileKey(WORKERS_PER_HASH, profile)] ?: 16)
+                put("protocol", prefs[getProfileKey(PROTOCOL, profile)] ?: "udp")
+                put("listenPort", prefs[getProfileKey(LISTEN_PORT, profile)] ?: 9000)
+                put("manualPortsEnabled", prefs[getProfileKey(MANUAL_PORTS_ENABLED, profile)] ?: false)
+                put("serverDtlsPort", prefs[getProfileKey(SERVER_DTLS_PORT, profile)] ?: 56000)
+                put("serverWgPort", prefs[getProfileKey(SERVER_WG_PORT, profile)] ?: 56001)
+                put("sni", prefs[getProfileKey(SNI, profile)].orEmpty())
+                put("noDtls", prefs[getProfileKey(NO_DTLS, profile)] ?: false)
+                put("noDns", prefs[getProfileKey(NO_DNS, profile)] ?: false)
+                put("userAgent", prefs[getProfileKey(USER_AGENT, profile)].orEmpty())
+                put("connectionPassword", readSecret(prefs, CONNECTION_PASSWORD_ENCRYPTED, CONNECTION_PASSWORD, profile))
+                put("deployIp", prefs[getProfileKey(DEPLOY_IP, profile)].orEmpty())
+                put("deployLogin", prefs[getProfileKey(DEPLOY_LOGIN, profile)].orEmpty())
+                put("deployPassword", readSecret(prefs, DEPLOY_PASSWORD_ENCRYPTED, DEPLOY_PASSWORD, profile))
+                put("deploySshPort", prefs[getProfileKey(DEPLOY_SSH_PORT, profile)].orEmpty())
+                put("deployDns1", prefs[getProfileKey(DEPLOY_DNS1, profile)] ?: "1.1.1.1")
+                put("deployDns2", prefs[getProfileKey(DEPLOY_DNS2, profile)] ?: "1.0.0.1")
+                put("deployMainPassword", readSecret(prefs, DEPLOY_MAIN_PASSWORD_ENCRYPTED, DEPLOY_MAIN_PASSWORD, profile))
+                put("deployAdminId", readSecret(prefs, DEPLOY_ADMIN_ID_ENCRYPTED, DEPLOY_ADMIN_ID, profile))
+                put("deployBotToken", readSecret(prefs, DEPLOY_BOT_TOKEN_ENCRYPTED, DEPLOY_BOT_TOKEN, profile))
+                put("proxyMode", prefs[getProfileKey(PROXY_MODE, profile)] ?: "tun")
+                put("proxyHost", prefs[getProfileKey(PROXY_HOST, profile)] ?: "127.0.0.1")
+                put("proxyPort", prefs[getProfileKey(PROXY_PORT, profile)] ?: 1080)
+                put("vkCallsPreflight", prefs[getProfileKey(VKCALLS_PREFLIGHT, profile)] ?: true)
+                put("captchaMode", prefs[getProfileKey(CAPTCHA_MODE, profile)] ?: "auto")
+                put("captchaSolveMethod", prefs[getProfileKey(CAPTCHA_SOLVE_METHOD, profile)] ?: "auto")
+                put("captchaWbvSolveMethod", prefs[getProfileKey(CAPTCHA_WBV_SOLVE_METHOD, profile)] ?: "auto")
+                put("isWhitelist", prefs[getProfileKey(IS_WHITELIST, profile)] ?: false)
+                put("blacklistApps", prefs[getProfileKey(BLACKLIST_APPS, profile)].orEmpty())
+                put("whitelistApps", prefs[getProfileKey(WHITELIST_APPS, profile)].orEmpty())
+                put("detailedLogs", prefs[getProfileKey(DETAILED_LOGS, profile)] ?: false)
+                put("selectedFingerprint", prefs[getProfileKey(SELECTED_FINGERPRINT, profile)] ?: "firefox")
+                put("activeClientIds", prefs[getProfileKey(ACTIVE_CLIENT_IDS, profile)] ?: "6287487,8202606")
+            })
+        }
+        JSONObject().apply {
+            put("format", "wdtt-plus-admin-settings")
+            put("version", 1)
+            put("activeProfile", (prefs[ACTIVE_PROFILE] ?: 0).coerceIn(0, VPN_PROFILE_COUNT - 1))
+            put("themeMode", prefs[THEME_MODE] ?: "system")
+            put("dynamicColor", prefs[IS_DYNAMIC_COLOR] ?: false)
+            put("themePalette", prefs[THEME_PALETTE] ?: "indigo")
+            put("showSystemApps", prefs[SHOW_SYSTEM_APPS] ?: false)
+            put("loggingEnabled", prefs[LOGGING_ENABLED] ?: true)
+            put("updateCheckIntervalHours", prefs[UPDATE_CHECK_INTERVAL_HOURS] ?: 12)
+            put("profiles", profiles)
+            put("outbound", exportSharedPreferences("wdtt_outbound_forms"))
+        }.toString()
+    }.first()
+
+    suspend fun importAdminSettings(settingsJson: String) {
+        val root = runCatching { JSONObject(settingsJson) }
+            .getOrElse { throw IllegalArgumentException("Расшифрованные настройки повреждены.") }
+        require(root.optString("format") == "wdtt-plus-admin-settings" && root.optInt("version") == 1) {
+            "Версия настроек не поддерживается."
+        }
+        val profiles = root.optJSONArray("profiles")
+            ?: throw IllegalArgumentException("В файле нет профилей VPN.")
+        require(profiles.length() == VPN_PROFILE_COUNT) { "Файл должен содержать три профиля VPN." }
+
+        dataStore.edit { prefs ->
+            repeat(VPN_PROFILE_COUNT) { profile ->
+                val item = profiles.getJSONObject(profile)
+                prefs[getProfileKey(WDTT_LINK, profile)] = item.optString("wdttLink")
+                prefs[getProfileKey(WDTT_LINK_MODE, profile)] = item.optBoolean("wdttLinkMode")
+                prefs[getProfileKey(PEER, profile)] = item.optString("peer")
+                prefs[getProfileKey(VK_HASHES, profile)] = item.optString("vkHashes")
+                prefs[getProfileKey(SECONDARY_VK_HASH, profile)] = item.optString("secondaryVkHash")
+                prefs[getProfileKey(VK_HASH_NEXT_SLOT, profile)] = 0
+                prefs.remove(getProfileKey(EXCLUDED_APPS, profile))
+                prefs[getProfileKey(WORKERS_PER_HASH, profile)] = item.optInt("workersPerHash", 16).coerceIn(1, 128)
+                prefs[getProfileKey(PROTOCOL, profile)] = item.optString("protocol", "udp").takeIf { it in setOf("udp", "tcp") } ?: "udp"
+                prefs[getProfileKey(LISTEN_PORT, profile)] = item.safePort("listenPort", 9000)
+                prefs[getProfileKey(MANUAL_PORTS_ENABLED, profile)] = item.optBoolean("manualPortsEnabled")
+                prefs[getProfileKey(SERVER_DTLS_PORT, profile)] = item.safePort("serverDtlsPort", 56000)
+                prefs[getProfileKey(SERVER_WG_PORT, profile)] = item.safePort("serverWgPort", 56001)
+                prefs[getProfileKey(SNI, profile)] = item.optString("sni")
+                prefs[getProfileKey(NO_DTLS, profile)] = item.optBoolean("noDtls")
+                prefs[getProfileKey(NO_DNS, profile)] = item.optBoolean("noDns")
+                prefs[getProfileKey(USER_AGENT, profile)] = item.optString("userAgent")
+                prefs.putSecret(CONNECTION_PASSWORD_ENCRYPTED, CONNECTION_PASSWORD, item.optString("connectionPassword"), profile)
+                prefs[getProfileKey(DEPLOY_IP, profile)] = item.optString("deployIp")
+                prefs[getProfileKey(DEPLOY_LOGIN, profile)] = item.optString("deployLogin")
+                prefs.putSecret(DEPLOY_PASSWORD_ENCRYPTED, DEPLOY_PASSWORD, item.optString("deployPassword"), profile)
+                prefs[getProfileKey(DEPLOY_SSH_PORT, profile)] = item.optString("deploySshPort")
+                prefs[getProfileKey(DEPLOY_DNS1, profile)] = item.optString("deployDns1", "1.1.1.1")
+                prefs[getProfileKey(DEPLOY_DNS2, profile)] = item.optString("deployDns2", "1.0.0.1")
+                prefs.putSecret(DEPLOY_MAIN_PASSWORD_ENCRYPTED, DEPLOY_MAIN_PASSWORD, item.optString("deployMainPassword"), profile)
+                prefs.putSecret(DEPLOY_ADMIN_ID_ENCRYPTED, DEPLOY_ADMIN_ID, item.optString("deployAdminId"), profile)
+                prefs.putSecret(DEPLOY_BOT_TOKEN_ENCRYPTED, DEPLOY_BOT_TOKEN, item.optString("deployBotToken"), profile)
+                prefs[getProfileKey(PROXY_MODE, profile)] = item.optString("proxyMode", "tun")
+                prefs[getProfileKey(PROXY_HOST, profile)] = item.optString("proxyHost", "127.0.0.1")
+                prefs[getProfileKey(PROXY_PORT, profile)] = item.safePort("proxyPort", 1080)
+                prefs[getProfileKey(VKCALLS_PREFLIGHT, profile)] = item.optBoolean("vkCallsPreflight", true)
+                prefs[getProfileKey(CAPTCHA_MODE, profile)] = item.optString("captchaMode", "auto")
+                prefs[getProfileKey(CAPTCHA_SOLVE_METHOD, profile)] = item.optString("captchaSolveMethod", "auto")
+                prefs[getProfileKey(CAPTCHA_WBV_SOLVE_METHOD, profile)] = item.optString("captchaWbvSolveMethod", "auto")
+                prefs[getProfileKey(IS_WHITELIST, profile)] = item.optBoolean("isWhitelist")
+                prefs[getProfileKey(BLACKLIST_APPS, profile)] = item.optString("blacklistApps")
+                prefs[getProfileKey(WHITELIST_APPS, profile)] = item.optString("whitelistApps")
+                prefs[getProfileKey(DETAILED_LOGS, profile)] = item.optBoolean("detailedLogs")
+                prefs[getProfileKey(SELECTED_FINGERPRINT, profile)] = item.optString("selectedFingerprint", "firefox")
+                prefs[getProfileKey(ACTIVE_CLIENT_IDS, profile)] = item.optString("activeClientIds", "6287487,8202606")
+            }
+            prefs[ACTIVE_PROFILE] = root.optInt("activeProfile", 0).coerceIn(0, VPN_PROFILE_COUNT - 1)
+            prefs[THEME_MODE] = root.optString("themeMode", "system")
+            prefs[IS_DYNAMIC_COLOR] = root.optBoolean("dynamicColor")
+            prefs[THEME_PALETTE] = root.optString("themePalette", "indigo")
+            prefs[SHOW_SYSTEM_APPS] = root.optBoolean("showSystemApps")
+            prefs[LOGGING_ENABLED] = root.optBoolean("loggingEnabled", true)
+            prefs[UPDATE_CHECK_INTERVAL_HOURS] = root.optInt("updateCheckIntervalHours", 12)
+            prefs[INTERFACE_ROLE] = "admin"
+        }
+        importSharedPreferences("wdtt_outbound_forms", root.optJSONObject("outbound") ?: JSONObject())
     }
 
     suspend fun applyWdttDeepLink(plan: WdttDeepLinkApplyPlan): WdttDeepLinkApplyResult? {
@@ -942,10 +1136,15 @@ class SettingsStore(context: Context) {
 
     private fun Preferences.isTunnelProfileEmpty(profile: Int): Boolean {
         val hasLink = (this[getProfileKey(WDTT_LINK, profile)] ?: "").isNotBlank()
-        val hasManualTunnel = (this[getProfileKey(PEER, profile)] ?: "").isNotBlank() &&
-            (this[getProfileKey(VK_HASHES, profile)] ?: "").split(",").any { it.isNotBlank() } &&
-            readSecret(this, CONNECTION_PASSWORD_ENCRYPTED, CONNECTION_PASSWORD, profile).isNotBlank()
-        return !hasLink && !hasManualTunnel
+        val hasManualData = (this[getProfileKey(PEER, profile)] ?: "").isNotBlank() ||
+            (this[getProfileKey(VK_HASHES, profile)] ?: "").split(",").any { it.isNotBlank() } ||
+            (this[getProfileKey(SECONDARY_VK_HASH, profile)] ?: "").isNotBlank() ||
+            readSecret(this, CONNECTION_PASSWORD_ENCRYPTED, CONNECTION_PASSWORD, profile).isNotBlank() ||
+            (this[getProfileKey(MANUAL_PORTS_ENABLED, profile)] == true &&
+                ((this[getProfileKey(SERVER_DTLS_PORT, profile)] ?: 56000) != 56000 ||
+                    (this[getProfileKey(SERVER_WG_PORT, profile)] ?: 56001) != 56001 ||
+                    (this[getProfileKey(LISTEN_PORT, profile)] ?: 9000) != 9000))
+        return !hasLink && !hasManualData
     }
 
     private fun MutablePreferences.clearManualTunnelFields(profile: Int) {
@@ -973,4 +1172,38 @@ class SettingsStore(context: Context) {
             }
         }
     }
+
+    private fun exportSharedPreferences(name: String): JSONObject {
+        val result = JSONObject()
+        appContext.getSharedPreferences(name, Context.MODE_PRIVATE).all.forEach { (key, value) ->
+            when (value) {
+                is String, is Boolean, is Int, is Long, is Float -> result.put(key, value)
+                is Set<*> -> result.put(key, JSONArray(value.filterIsInstance<String>()))
+            }
+        }
+        return result
+    }
+
+    private fun importSharedPreferences(name: String, json: JSONObject) {
+        val editor = appContext.getSharedPreferences(name, Context.MODE_PRIVATE).edit().clear()
+        val keys = json.keys()
+        while (keys.hasNext()) {
+            val key = keys.next()
+            when (val value = json.get(key)) {
+                is String -> editor.putString(key, value)
+                is Boolean -> editor.putBoolean(key, value)
+                is Int -> editor.putInt(key, value)
+                is Long -> editor.putLong(key, value)
+                is Double -> editor.putFloat(key, value.toFloat())
+                is JSONArray -> editor.putStringSet(
+                    key,
+                    (0 until value.length()).mapNotNull { value.optString(it).takeIf(String::isNotBlank) }.toSet()
+                )
+            }
+        }
+        editor.apply()
+    }
+
+    private fun JSONObject.safePort(name: String, fallback: Int): Int =
+        optInt(name, fallback).takeIf { it in 1..65535 } ?: fallback
 }

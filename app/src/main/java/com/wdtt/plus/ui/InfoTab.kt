@@ -60,7 +60,9 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.MutableIntState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -104,6 +106,7 @@ private const val ReleasesUrl = "https://github.com/Ivan4537/WDTT-Plus/releases"
 private const val IssuesUrl = "https://github.com/Ivan4537/WDTT-Plus/issues/new/choose"
 private const val DeveloperProfileUrl = "https://github.com/Ivan4537"
 private const val RepositoryUrl = "https://github.com/Ivan4537/WDTT-Plus"
+private const val ChangelogUrl = "$RepositoryUrl/blob/main/CHANGELOG.md"
 private const val DonateUrl = "https://yoomoney.ru/to/410012216336438"
 private const val OriginalDonateUrl = "https://yoomoney.ru/to/4100119505530465/"
 private val DonateActionButtonColor = Color(0xFF00AEA5)
@@ -165,12 +168,13 @@ private fun openUrlInBrowser(context: Context, url: String) {
 @Composable
 fun InfoTab(
     actionsExpandedState: MutableState<Boolean> = rememberSaveable { mutableStateOf(true) },
-    projectExpandedState: MutableState<Boolean> = rememberSaveable { mutableStateOf(true) }
+    projectExpandedState: MutableState<Boolean> = rememberSaveable { mutableStateOf(true) },
+    scrollPosition: MutableIntState = rememberSaveable { mutableIntStateOf(0) }
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val settingsStore = remember { SettingsStore(context) }
-    val infoScrollState = rememberScrollState()
+    val infoScrollState = rememberRememberedScrollState(scrollPosition)
     val topRevealOffsetPx = with(LocalDensity.current) { 10.dp.toPx() }
     var actionsSectionY by remember { mutableStateOf(0f) }
     var projectSectionY by remember { mutableStateOf(0f) }
@@ -377,7 +381,7 @@ fun InfoTab(
 
         ExpandableSectionCard(
             title = "О проекте",
-            itemCount = "3 ссылки",
+            itemCount = "4 ссылки",
             expanded = projectExpanded,
             modifier = Modifier.onGloballyPositioned { projectSectionY = it.positionInParent().y },
             onToggle = {
@@ -431,6 +435,20 @@ fun InfoTab(
                 title = "Актуальные релизы",
                 subtitle = "Страница загрузки APK",
                 onClick = { openUrlInBrowser(context, ReleasesUrl) },
+                icon = {
+                    Icon(
+                        imageVector = Icons.Default.Update,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+            )
+
+            ProjectLinkRow(
+                title = "История изменений",
+                subtitle = "Что менялось в версиях WDTT Plus",
+                onClick = { openUrlInBrowser(context, ChangelogUrl) },
                 icon = {
                     Icon(
                         imageVector = Icons.Default.Update,

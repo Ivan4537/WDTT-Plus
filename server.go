@@ -90,6 +90,19 @@ type PasswordEntry struct {
 	BindHistory   []BindHistoryEntry `json:"bind_history,omitempty"`
 }
 
+type AdminProfileEntry struct {
+	VkHashes        string   `json:"vk_hashes,omitempty"`
+	SecondaryVkHash string   `json:"secondary_vk_hash,omitempty"`
+	WorkersPerHash  int      `json:"workers_per_hash,omitempty"`
+	Protocol        string   `json:"protocol,omitempty"`
+	ListenPort      int      `json:"listen_port,omitempty"`
+	SNI             string   `json:"sni,omitempty"`
+	NoDNS           bool     `json:"no_dns,omitempty"`
+	Ports           string   `json:"ports,omitempty"`      // "dtls,wg,tun"
+	DeviceIDs       []string `json:"device_ids,omitempty"` // устройства, подключавшиеся по main_password
+	UpdatedAt       int64    `json:"updated_at,omitempty"`
+}
+
 type TrafficBucket struct {
 	Date      string `json:"date"`
 	DownBytes int64  `json:"down_bytes"`
@@ -117,6 +130,7 @@ type Database struct {
 	MaxPasswords   int                       `json:"max_passwords,omitempty"`
 	DefaultPorts   string                    `json:"default_ports,omitempty"`
 	PublicIP       string                    `json:"public_ip,omitempty"`
+	AdminProfile   AdminProfileEntry         `json:"admin_profile,omitempty"`
 	AdminDownBytes int64                     `json:"admin_down_bytes,omitempty"`
 	AdminUpBytes   int64                     `json:"admin_up_bytes,omitempty"`
 	AdminTraffic   []TrafficBucket           `json:"admin_traffic,omitempty"`
@@ -407,6 +421,31 @@ func refreshWrapKeysFromDBLocked() error {
 	return serverWrapKeys.SetPasswords(db.MainPassword, passwords)
 }
 
+func rememberAdminDeviceID(profile *AdminProfileEntry, deviceID string) bool {
+	deviceID = strings.TrimSpace(deviceID)
+	if deviceID == "" {
+		return false
+	}
+	for _, existing := range profile.DeviceIDs {
+		if existing == deviceID {
+			return false
+		}
+	}
+	profile.DeviceIDs = append(profile.DeviceIDs, deviceID)
+	return true
+}
+
+func adminDeviceIDSet(loaded *Database) map[string]struct{} {
+	result := make(map[string]struct{}, len(loaded.AdminProfile.DeviceIDs))
+	for _, deviceID := range loaded.AdminProfile.DeviceIDs {
+		deviceID = strings.TrimSpace(deviceID)
+		if deviceID != "" {
+			result[deviceID] = struct{}{}
+		}
+	}
+	return result
+}
+
 func initDB(dir, mainPass, adminID, botToken, dnsValue string) {
 	dbFile = filepath.Join(dir, "passwords.json")
 	db = &Database{
@@ -451,6 +490,7 @@ func initDB(dir, mainPass, adminID, botToken, dnsValue string) {
 	if strings.TrimSpace(db.DefaultPorts) == "" {
 		db.DefaultPorts = "56000,56001,9000"
 	}
+	db.AdminProfile = normalizeAdminProfileForStorage(db.AdminProfile, db.DefaultPorts)
 	setServerDefaultPorts(db.DefaultPorts)
 	setServerPublicIPOverride(db.PublicIP)
 	saveDB()
@@ -528,12 +568,15 @@ func upsertPeerInWG(wgDev *device.Device, dev *ClientDevice) {
 func cleanupExpiredPasswordsLocked(wgDev *device.Device) int {
 	removed := 0
 	nowUnix := time.Now().Unix()
+	adminDevices := adminDeviceIDSet(db)
 	for p, entry := range db.Passwords {
 		if isPasswordExpired(entry) {
 			if entry != nil && entry.DeviceID != "" {
 				markActiveBindUnbound(entry, entry.DeviceID, nowUnix)
-				removePeerFromWG(wgDev, db.Devices[entry.DeviceID])
-				delete(db.Devices, entry.DeviceID)
+				if _, isAdminDevice := adminDevices[entry.DeviceID]; !isAdminDevice {
+					removePeerFromWG(wgDev, db.Devices[entry.DeviceID])
+					delete(db.Devices, entry.DeviceID)
+				}
 			}
 			delete(db.Passwords, p)
 			serverWrapKeys.RemovePassword(p)
@@ -1183,6 +1226,10 @@ PersistentKeepalive = %d`,
 // ==================== Main ====================
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "admin" {
+		os.Exit(runAdminCLI(os.Args[2:]))
+	}
+
 	listen := flag.String("listen", "0.0.0.0:56000", "DTLS адрес")
 	wgPort := flag.Int("wg-port", defaultInternalWGPort, "WireGuard UDP порт")
 	configDir := flag.String("config-dir", "/etc/wdtt", "директория конфигурации")
@@ -1237,6 +1284,9 @@ func main() {
 		log.Printf("[DB] Удалено истёкших паролей при старте: %d", removed)
 	}
 	syncPersistedPeersToWG(wgDev)
+	if err := startAdminSocket(ctx, *configDir, wgDev); err != nil {
+		log.Fatalf("[ADMIN] Локальное управление: %v", err)
+	}
 	defer func() {
 		wgDev.Close()
 		runCmdSilent("ip", "link", "del", wgIfaceName)
@@ -1382,6 +1432,9 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 				entry.DeviceID = deviceID
 				newlyBound = true
 				log.Printf("[WG] Пароль %s привязан к устройству %s", maskPassword(password), deviceID)
+			}
+			if isMainPass {
+				rememberAdminDeviceID(&db.AdminProfile, deviceID)
 			}
 
 			dev, exists := db.Devices[deviceID]
