@@ -124,7 +124,10 @@ data class ServerClientCreateRequest(
     val days: Int,
     val label: String,
     val vkHash: String,
-    val ports: String
+    val ports: String,
+    val password: String? = null,
+    val expiresAt: Long? = null,
+    val deactivated: Boolean = false
 )
 
 data class ServerAdminActionResult(
@@ -162,9 +165,29 @@ object ServerAdminClient {
                 if (request.label.isNotBlank()) args += listOf("--label", request.label.trim())
                 if (request.vkHash.isNotBlank()) args += listOf("--vk-hash", request.vkHash.trim())
                 if (request.ports.isNotBlank()) args += listOf("--ports", request.ports.trim())
+                request.password?.takeIf { it.isNotBlank() }?.let { args += listOf("--client-password", it) }
+                request.expiresAt?.let { args += listOf("--expires-at", it.coerceAtLeast(0).toString()) }
+                if (request.deactivated) args += "--deactivated"
                 actionFromResponse(callAdmin(ssh, target, args))
             }
         }
+
+    suspend fun importClient(
+        target: ServerAdminTarget,
+        payload: ClientTransferPayload,
+        targetPorts: String
+    ): ServerAdminActionResult = create(
+        target,
+        ServerClientCreateRequest(
+            days = 0,
+            label = payload.label,
+            vkHash = payload.vkHash,
+            ports = targetPorts,
+            password = payload.password,
+            expiresAt = payload.expiresAt,
+            deactivated = payload.deactivated
+        )
+    )
 
     suspend fun delete(target: ServerAdminTarget, password: String): ServerAdminActionResult =
         runPasswordAction(target, "delete", password)
@@ -207,6 +230,9 @@ object ServerAdminClient {
 
     suspend fun setPorts(target: ServerAdminTarget, password: String, ports: String): ServerAdminActionResult =
         runArgsAction(target, listOf("set-ports", "--password", password, "--ports", ports))
+
+    suspend fun setPassword(target: ServerAdminTarget, password: String, newPassword: String): ServerAdminActionResult =
+        runArgsAction(target, listOf("set-password", "--password", password, "--new-password", newPassword))
 
     suspend fun updateClient(target: ServerAdminTarget, password: String, label: String, hash: String, ports: String): ServerAdminActionResult =
         withContext(Dispatchers.IO) {
@@ -509,6 +535,8 @@ object ServerAdminClient {
                 "на сервере не найдена база WDTT Plus. Сначала выполните деплой."
             "admin_socket_unavailable" in lower ->
                 "сервер ещё не поддерживает управление без перезапуска. Переустановите сервер из этой версии WDTT Plus."
+            "неизвестная admin-команда" in lower || "flag provided but not defined" in lower ->
+                "сервер ещё не поддерживает перенос или смену пароля клиента. Выполните установку сервера с сохранением данных из этой версии WDTT Plus."
             "главный пароль" in lower ->
                 "главный пароль администратора не совпадает с сервером."
             "no such file" in lower || "not found" in lower && "wdtt-server" in lower ->

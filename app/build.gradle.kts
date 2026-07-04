@@ -5,7 +5,7 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
-val appVersionName = "2"
+val appVersionName = "3"
 val releaseApkBaseName = "WDTT-Plus"
 
 val localProperties = Properties()
@@ -22,9 +22,9 @@ android {
         applicationId = "com.wdtt.plus"
         minSdk = 28
         targetSdk = 35
-        versionCode = 2
+        versionCode = 3
         versionName = appVersionName
-        buildConfigField("String", "MOD_RELEASE_DATE", "\"03.07.2026\"")
+        buildConfigField("String", "MOD_RELEASE_DATE", "\"04.07.2026\"")
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {

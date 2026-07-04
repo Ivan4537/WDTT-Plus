@@ -14,6 +14,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
 
 class QuickToggleTileService : TileService() {
@@ -27,8 +28,15 @@ class QuickToggleTileService : TileService() {
         stateJob?.cancel()
         stateJob = scope.launch {
             try {
-                TunnelManager.running.collect { running ->
-                    updateTile(running)
+                val settingsStore = SettingsStore(this@QuickToggleTileService)
+                combine(
+                    TunnelManager.running,
+                    settingsStore.activeProfile,
+                    settingsStore.profileNames
+                ) { running, activeProfile, profileNames ->
+                    Triple(running, activeProfile, profileNames)
+                }.collect { (running, activeProfile, profileNames) ->
+                    updateTile(running, activeProfile, profileNames)
                 }
             } catch (e: Exception) {
                 Log.e("QuickToggleTile", "Error collecting running state", e)
@@ -89,14 +97,22 @@ class QuickToggleTileService : TileService() {
         super.onDestroy()
     }
 
-    private fun updateTile(running: Boolean) {
+    private fun updateTile(running: Boolean, activeProfile: Int, profileNames: List<String>) {
         runCatching {
+            val profile = activeProfile.coerceIn(0, 2)
+            val profileLabel = vpnProfileDisplayName(profile, profileNames)
+            val defaultProfileLabel = vpnProfileDefaultName(profile)
+            val profileIsDefault = profileLabel == defaultProfileLabel
             qsTile?.apply {
-                label = "WDTT Plus"
+                label = when {
+                    !running -> "WDTT Plus"
+                    profileIsDefault -> "WDTT Plus $profileLabel"
+                    else -> profileLabel
+                }
                 icon = Icon.createWithResource(this@QuickToggleTileService, R.drawable.ic_tile_logo)
                 state = if (running) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
                 if (Build.VERSION.SDK_INT >= 29) {
-                    subtitle = if (running) "Подключено" else "Отключено"
+                    subtitle = if (running) "" else "Отключено"
                 }
                 updateTile()
             }

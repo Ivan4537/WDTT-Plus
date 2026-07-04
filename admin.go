@@ -188,6 +188,8 @@ func executeAdminCommand(configDir string, loaded *Database, rest []string, wgDe
 		response, err = adminSetPasswordExpiry(configDir, loaded, rest[1:])
 	case "set-ports":
 		response, err = adminSetPasswordPorts(configDir, loaded, rest[1:])
+	case "set-password":
+		response, err = adminSetPassword(configDir, loaded, rest[1:])
 	case "update-client":
 		response, err = adminUpdateClient(configDir, loaded, rest[1:])
 	case "set-dns":
@@ -245,6 +247,22 @@ func captureAdminLiveSnapshot(loaded *Database, args []string) adminLiveSnapshot
 			}
 		}
 		return snapshot
+	case "set-password":
+		fs := flag.NewFlagSet("set-password", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		password := fs.String("password", "", "текущий пароль клиента")
+		_ = fs.String("new-password", "", "новый пароль клиента")
+		if err := fs.Parse(args[1:]); err != nil || strings.TrimSpace(*password) == "" {
+			return adminLiveSnapshot{}
+		}
+		snapshot := adminLiveSnapshot{password: strings.TrimSpace(*password)}
+		if entry := loaded.Passwords[snapshot.password]; entry != nil && entry.DeviceID != "" {
+			if dev := loaded.Devices[entry.DeviceID]; dev != nil {
+				copyOfDevice := *dev
+				snapshot.device = &copyOfDevice
+			}
+		}
+		return snapshot
 	default:
 		return adminLiveSnapshot{}
 	}
@@ -258,6 +276,9 @@ func applyLiveAdminEffects(configDir string, loaded *Database, args []string, re
 	case "create":
 		if response.Password == nil {
 			return errors.New("сервер создал клиента без пароля")
+		}
+		if response.Password.Status != "active" {
+			break
 		}
 		password := response.Password.Password
 		if err := serverWrapKeys.AddPassword(password); err != nil {
@@ -288,6 +309,25 @@ func applyLiveAdminEffects(configDir string, loaded *Database, args []string, re
 			return fmt.Errorf("не удалось вернуть WRAP-ключ: %w", err)
 		}
 		upsertPeerInWG(wgDev, snapshot.device)
+	case "set-password":
+		if response.Password == nil {
+			return errors.New("сервер изменил пароль клиента без нового значения")
+		}
+		newPassword := response.Password.Password
+		if response.Password.Status == "active" {
+			if err := serverWrapKeys.AddPassword(newPassword); err != nil {
+				if entry := loaded.Passwords[newPassword]; entry != nil {
+					delete(loaded.Passwords, newPassword)
+					loaded.Passwords[snapshot.password] = entry
+					_ = saveAdminDB(configDir, loaded)
+				}
+				return fmt.Errorf("не удалось заменить WRAP-ключ: %w", err)
+			}
+		}
+		serverWrapKeys.RemovePassword(snapshot.password)
+		if !isAdminSnapshotDevice(loaded, snapshot) {
+			removePeerFromWG(wgDev, snapshot.device)
+		}
 	case "set-dns", "update-settings":
 		setServerDNS(loaded.DNS)
 		setServerDefaultPorts(loaded.DefaultPorts)
@@ -745,6 +785,9 @@ func adminCreatePassword(configDir string, loaded *Database, args []string) (adm
 	label := fs.String("label", "", "название клиента")
 	vkHash := fs.String("vk-hash", "", "VK-хеш или ссылка")
 	ports := fs.String("ports", "", "DTLS,WG,TUN")
+	clientPassword := fs.String("client-password", "", "заданный пароль клиента")
+	expiresAt := fs.Int64("expires-at", -1, "точная дата окончания unix, 0 = бессрочно")
+	deactivated := fs.Bool("deactivated", false, "создать клиента отключённым")
 	if err := fs.Parse(args); err != nil {
 		return adminResponse{}, err
 	}
@@ -772,22 +815,45 @@ func adminCreatePassword(configDir string, loaded *Database, args []string) (adm
 		normalizedHash = value
 	}
 	password := ""
-	for i := 0; i < 64; i++ {
-		candidate := generatePassword()
-		if _, exists := loaded.Passwords[candidate]; !exists {
-			password = candidate
-			break
+	if strings.TrimSpace(*clientPassword) != "" {
+		value, err := normalizeClientPassword(*clientPassword)
+		if err != nil {
+			return adminResponse{}, err
+		}
+		if value == loaded.MainPassword {
+			return adminResponse{}, errors.New("пароль клиента не должен совпадать с главным паролем")
+		}
+		if _, exists := loaded.Passwords[value]; exists {
+			return adminResponse{}, errors.New("клиент с таким паролем уже существует")
+		}
+		password = value
+	} else {
+		for i := 0; i < 64; i++ {
+			candidate := generatePassword()
+			if candidate == loaded.MainPassword {
+				continue
+			}
+			if _, exists := loaded.Passwords[candidate]; !exists {
+				password = candidate
+				break
+			}
 		}
 	}
 	if password == "" {
 		return adminResponse{}, errors.New("не удалось создать уникальный пароль")
 	}
 	entry := &PasswordEntry{
-		Label:  normalizePasswordLabel(*label),
-		VkHash: normalizedHash,
-		Ports:  normalizedPorts,
+		Label:         normalizePasswordLabel(*label),
+		VkHash:        normalizedHash,
+		Ports:         normalizedPorts,
+		IsDeactivated: *deactivated,
 	}
-	if *days > 0 {
+	if *expiresAt >= 0 {
+		if *expiresAt > 0 && *expiresAt <= time.Now().Unix() {
+			return adminResponse{}, errors.New("срок импортируемого клиента уже истёк")
+		}
+		entry.ExpiresAt = *expiresAt
+	} else if *days > 0 {
 		entry.ExpiresAt = time.Now().Add(time.Duration(*days) * 24 * time.Hour).Unix()
 	}
 	loaded.Passwords[password] = entry
@@ -800,6 +866,48 @@ func adminCreatePassword(configDir string, loaded *Database, args []string) (adm
 		RestartRequired: true,
 		Server:          buildAdminServerInfo(configDir, loaded),
 		Password:        ptrAdminPasswordInfo(buildAdminPasswordInfo(loaded, password, entry)),
+	}, nil
+}
+
+func adminSetPassword(configDir string, loaded *Database, args []string) (adminResponse, error) {
+	fs := flag.NewFlagSet("set-password", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	oldPassword := fs.String("password", "", "текущий пароль клиента")
+	newPasswordRaw := fs.String("new-password", "", "новый пароль клиента")
+	if err := fs.Parse(args); err != nil {
+		return adminResponse{}, err
+	}
+	oldValue := strings.TrimSpace(*oldPassword)
+	entry, err := requireAdminPassword(loaded, oldValue)
+	if err != nil {
+		return adminResponse{}, err
+	}
+	newValue, err := normalizeClientPassword(*newPasswordRaw)
+	if err != nil {
+		return adminResponse{}, err
+	}
+	if newValue == oldValue {
+		return adminResponse{}, errors.New("новый пароль совпадает с текущим")
+	}
+	if newValue == loaded.MainPassword {
+		return adminResponse{}, errors.New("пароль клиента не должен совпадать с главным паролем")
+	}
+	if _, exists := loaded.Passwords[newValue]; exists {
+		return adminResponse{}, errors.New("клиент с таким паролем уже существует")
+	}
+	delete(loaded.Passwords, oldValue)
+	loaded.Passwords[newValue] = entry
+	if err := saveAdminDB(configDir, loaded); err != nil {
+		delete(loaded.Passwords, newValue)
+		loaded.Passwords[oldValue] = entry
+		return adminResponse{}, err
+	}
+	return adminResponse{
+		OK:              true,
+		Message:         "Пароль клиента изменён",
+		RestartRequired: true,
+		Server:          buildAdminServerInfo(configDir, loaded),
+		Password:        ptrAdminPasswordInfo(buildAdminPasswordInfo(loaded, newValue, entry)),
 	}, nil
 }
 

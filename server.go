@@ -230,6 +230,19 @@ func generatePassword() string {
 	return string(b)
 }
 
+func normalizeClientPassword(input string) (string, error) {
+	password := strings.TrimSpace(input)
+	if len(password) != generatedPasswordLen {
+		return "", fmt.Errorf("пароль клиента должен содержать ровно %d символов", generatedPasswordLen)
+	}
+	for _, ch := range password {
+		if !strings.ContainsRune(passChars, ch) {
+			return "", errors.New("пароль клиента содержит недопустимые символы")
+		}
+	}
+	return password, nil
+}
+
 var publicIP string = ""
 
 func getPublicIP() string {

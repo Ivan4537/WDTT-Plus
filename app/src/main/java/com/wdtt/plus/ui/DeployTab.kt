@@ -57,6 +57,7 @@ import com.wdtt.plus.ServerAdminTarget
 import com.wdtt.plus.SettingsStore
 import com.wdtt.plus.TunnelManager
 import com.wdtt.plus.WDTTColors
+import com.wdtt.plus.vpnProfileDisplayName
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
@@ -265,6 +266,8 @@ fun DeployTab(
     LaunchedEffect(Unit) { DeployManager.init(context) }
 
     val savedIp by settingsStore.deployIp.collectAsStateWithLifecycle(initialValue = "")
+    val activeProfile by settingsStore.activeProfile.collectAsStateWithLifecycle(initialValue = 0)
+    val profileNames by settingsStore.profileNames.collectAsStateWithLifecycle(initialValue = emptyList())
     val savedLogin by settingsStore.deployLogin.collectAsStateWithLifecycle(initialValue = "")
     val savedPassword by settingsStore.deployPassword.collectAsStateWithLifecycle(initialValue = "")
     val savedPeer by settingsStore.peer.collectAsStateWithLifecycle(initialValue = "")
@@ -812,11 +815,18 @@ fun DeployTab(
             .verticalScroll(deployScrollState),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        Text(
-            "Настройки сервера",
-            style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-            color = MaterialTheme.colorScheme.onSurface
-        )
+        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text(
+                "Настройки сервера",
+                style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                color = MaterialTheme.colorScheme.onSurface
+            )
+            Text(
+                "(${vpnProfileDisplayName(activeProfile, profileNames)})",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
 
         val importCanProvideMainPassword = selectedImportMode == ServerImportMode.Replace &&
             selectedImportBackup?.mainPassword?.isNotBlank() == true

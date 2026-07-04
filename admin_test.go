@@ -167,4 +167,76 @@ func TestAdminSocketAppliesClientChangesWithoutRestart(t *testing.T) {
 	if serverWrapKeys.Count() != 0 {
 		t.Fatalf("expected deletion to remove live WRAP key, got %d", serverWrapKeys.Count())
 	}
+
+	custom := "ABCDEFGHJKLMNPQR"
+	createdCustom := request(
+		"create", "--client-password", custom, "--expires-at", "0", "--deactivated",
+		"--label", "Перенос", "--vk-hash", "abcdefghijklmnop", "--ports", "56000,56001,9000",
+	)
+	if createdCustom.Password == nil || createdCustom.Password.Password != custom || createdCustom.Password.Status != "deactivated" {
+		t.Fatalf("custom client was not created intact: %#v", createdCustom.Password)
+	}
+	if serverWrapKeys.Count() != 0 {
+		t.Fatalf("deactivated custom client must not add a live WRAP key, got %d", serverWrapKeys.Count())
+	}
+	deactivatedPassword := "RSTUVWXYZ2345678"
+	changedDeactivated := request("set-password", "--password", custom, "--new-password", deactivatedPassword)
+	if changedDeactivated.Password == nil || changedDeactivated.Password.Status != "deactivated" || serverWrapKeys.Count() != 0 {
+		t.Fatalf("deactivated password change enabled access: %#v keys=%d", changedDeactivated.Password, serverWrapKeys.Count())
+	}
+	custom = deactivatedPassword
+	request("activate", "--password", custom)
+	newPassword := "23456789ABCDEFGH"
+	changed := request("set-password", "--password", custom, "--new-password", newPassword)
+	if changed.Password == nil || changed.Password.Password != newPassword || changed.Password.Label != "Перенос" {
+		t.Fatalf("password change lost client data: %#v", changed.Password)
+	}
+	if db.Passwords[custom] != nil || db.Passwords[newPassword] == nil {
+		t.Fatal("password map key was not replaced")
+	}
+	if serverWrapKeys.Count() != 1 {
+		t.Fatalf("password change must replace one live WRAP key, got %d", serverWrapKeys.Count())
+	}
+	request("delete", "--password", newPassword)
+}
+
+func TestClientPasswordValidation(t *testing.T) {
+	valid := []string{"ABCDEFGHJKLMNPQR", "abcdefghjkmnpqrs", "23456789ABCDEFGH"}
+	for _, value := range valid {
+		if normalized, err := normalizeClientPassword(value); err != nil || normalized != value {
+			t.Fatalf("valid password %q rejected: %v", value, err)
+		}
+	}
+	invalid := []string{"short", "ABCDEFGHJKLMNPQ0", "ABCDEFGHJKLMNPQ_", "ABCDEFGHJKLMNPQRS"}
+	for _, value := range invalid {
+		if _, err := normalizeClientPassword(value); err == nil {
+			t.Fatalf("invalid password %q accepted", value)
+		}
+	}
+}
+
+func TestAdminCreateRejectsPasswordConflicts(t *testing.T) {
+	configDir := t.TempDir()
+	loaded := &Database{
+		MainPassword: "ABCDEFGHJKLMNPQR",
+		DefaultPorts: "56000,56001,9000",
+		MaxPasswords: 10,
+		Passwords: map[string]*PasswordEntry{
+			"RSTUVWXYZ2345678": {},
+		},
+		Devices: make(map[string]*ClientDevice),
+	}
+	if _, err := adminCreatePassword(configDir, loaded, []string{"--client-password", loaded.MainPassword}); err == nil {
+		t.Fatal("main password was accepted as a client password")
+	}
+	if _, err := adminCreatePassword(configDir, loaded, []string{"--client-password", "RSTUVWXYZ2345678"}); err == nil {
+		t.Fatal("duplicate client password was accepted")
+	}
+	if _, err := adminCreatePassword(configDir, loaded, []string{"--client-password", "23456789ABCDEFGH", "--expires-at", "1"}); err == nil {
+		t.Fatal("expired imported client was accepted")
+	}
+	loaded.MaxPasswords = len(loaded.Passwords)
+	if _, err := adminCreatePassword(configDir, loaded, []string{"--client-password", "23456789ABCDEFGH"}); err == nil {
+		t.Fatal("client limit was ignored")
+	}
 }

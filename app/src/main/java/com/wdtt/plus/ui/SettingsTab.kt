@@ -1,5 +1,7 @@
 package com.wdtt.plus.ui
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.spring
@@ -19,6 +21,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.HelpOutline
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.PowerSettingsNew
 import androidx.compose.material.icons.filled.Stop
@@ -54,6 +57,7 @@ import com.wdtt.plus.TunnelService
 import com.wdtt.plus.VkJoinLink
 import com.wdtt.plus.WDTTColors
 import com.wdtt.plus.WdttDeepLink
+import com.wdtt.plus.vpnProfileDisplayName
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -120,6 +124,7 @@ fun SettingsTabContent(
     val savedListenPort by settingsStore.listenPort.collectAsStateWithLifecycle(initialValue = 9000)
 
     val activeProfile by settingsStore.activeProfile.collectAsStateWithLifecycle(initialValue = 0)
+    val profileNames by settingsStore.profileNames.collectAsStateWithLifecycle(initialValue = emptyList())
     val wdttLinkMode by settingsStore.wdttLinkMode.collectAsStateWithLifecycle(initialValue = false)
     val wdttLink by settingsStore.wdttLink.collectAsStateWithLifecycle(initialValue = "")
     val savedVkHashes by settingsStore.vkHashes.collectAsStateWithLifecycle(initialValue = "")
@@ -439,11 +444,18 @@ fun SettingsTabContent(
             if (!wdttLinkMode) {
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     // ═══ Заголовок раздела ═══
-                    Text(
-                        "Настройки туннеля",
-                        style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-                        color = MaterialTheme.colorScheme.onSurface
-                    )
+                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text(
+                            "Настройки туннеля",
+                            style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        Text(
+                            "(${vpnProfileDisplayName(activeProfile, profileNames)})",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
 
                     // ═══ Настройки туннеля ═══
                     AppSectionCard(
@@ -1171,17 +1183,29 @@ fun ImportantInfoDialog(onDismiss: () -> Unit) {
 
                     Spacer(Modifier.height(16.dp))
 
-                    InfoSection("Капча VK",
-                        "Авто-режим старается пройти капчу сам, но иногда VK всё равно показывает проверку. Если появилось окно капчи, чаще всего достаточно поставить галочку в квадрате."
+                    InfoSection(
+                        "Профили VPN",
+                        "В боковых настройках доступны VPN 1, VPN 2 и VPN 3. Короткое нажатие переключает профиль, долгое нажатие позволяет переименовать его."
                     )
-                    InfoSection("Сетевое окружение",
-                        "Перед подключением выключите другие VPN, системные прокси и «Приватный DNS», чтобы они не перехватывали трафик WDTT Plus."
+                    InfoSection(
+                        "VK-хеши",
+                        "VK-хеш нужен для работы туннеля. В настройке VK-хешей можно проверить каждый слот, скопировать отдельный хеш или все заполненные хеши сразу."
                     )
-                    InfoSection("VK-хеши и мощность",
-                        "VK-хеш нужен для работы туннеля. Несколько хешей позволяют распределять нагрузку, а мощность лучше держать в умеренном диапазоне 12-36 потоков."
+                    InfoSection(
+                        "Клиенты и сервер",
+                        "В режиме «Я — админ» блок «Деплой» → «Клиенты и сервер» управляет клиентами без Telegram-бота: создание, продление, отключение, смена пароля, экспорт и импорт отдельного клиента."
                     )
-                    InfoSection("Связь потоков и капч",
-                        "Чем выше мощность, тем больше нагрузка, расход батареи и шанс чаще видеть капчу. Повышайте её только если сеть нестабильная и сервер справляется."
+                    InfoSection(
+                        "Передача подключения",
+                        "Обычное подключение передаётся через «Настройки» → «Передать или получить». Перенос отдельного клиента выполняется именно в блоке «Клиенты и сервер»."
+                    )
+                    InfoSection(
+                        "После новых серверных функций",
+                        "Если приложение пишет, что сервер не поддерживает действие, выполните во вкладке «Деплой» установку сервера с сохранением данных."
+                    )
+                    InfoSection(
+                        "Капча и мощность",
+                        "Авто-режим старается пройти капчу сам. Несколько VK-хешей распределяют нагрузку, а мощность лучше держать умеренной: чем она выше, тем больше расход батареи и шанс чаще видеть капчу."
                     )
 
                     Spacer(Modifier.height(20.dp))
@@ -1246,6 +1270,13 @@ private fun encodeVkHashSlots(vararg hashes: String): String {
     return slots.joinToString(",")
 }
 
+private fun copyVkHashesToClipboard(context: android.content.Context, label: String, value: String) {
+    if (value.isBlank()) return
+    val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as ClipboardManager
+    clipboard.setPrimaryClip(ClipData.newPlainText(label, value))
+    Toast.makeText(context, "Скопировано", Toast.LENGTH_SHORT).show()
+}
+
 // ═══ Модальное окно хешей ═══
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -1275,6 +1306,11 @@ fun HashesDialog(
     val dialogScrollState = rememberScrollState()
     val currentHashes = remember(h1, h2, h3, h4) {
         listOf(h1, h2, h3, h4).map { stripVkUrlStatic(it) }
+    }
+    val copiedHashesText = remember(currentHashes) {
+        currentHashes
+            .filter { it.isNotBlank() }
+            .joinToString(",")
     }
     val checkableHashes = remember(currentHashes) {
         currentHashes.mapIndexedNotNull { index, hash ->
@@ -1395,6 +1431,7 @@ fun HashesDialog(
                     Triple("VK Хеш 4", h4) { v: String -> h4 = v }
                 ).forEachIndexed { idx, (label, value, onChange) ->
                     val slot = idx + 1
+                    val cleanedValue = stripVkUrlStatic(value)
                     HashInputField(
                         slot = slot,
                         label = label,
@@ -1404,8 +1441,22 @@ fun HashesDialog(
                             onChange(stripVkUrlStatic(cleaned))
                         },
                         result = checkResults[slot],
-                        onInfoClick = { detailSlot = slot }
+                        onInfoClick = { detailSlot = slot },
+                        canCopy = cleanedValue.isNotBlank(),
+                        onCopyClick = { copyVkHashesToClipboard(context, "VK Хеш $slot", cleanedValue) }
                     )
+                }
+
+                OutlinedButton(
+                    onClick = { copyVkHashesToClipboard(context, "VK Хеши WDTT Plus", copiedHashesText) },
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                    shape = RoundedCornerShape(16.dp),
+                    enabled = copiedHashesText.isNotBlank(),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp)
+                ) {
+                    Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    FlexibleButtonText("Скопировать все хеши", fontWeight = FontWeight.SemiBold)
                 }
 
                 OutlinedButton(
@@ -1506,7 +1557,9 @@ private fun HashInputField(
     value: String,
     onValueChange: (String) -> Unit,
     result: HashCheckResult?,
-    onInfoClick: () -> Unit
+    onInfoClick: () -> Unit,
+    canCopy: Boolean,
+    onCopyClick: () -> Unit
 ) {
     val isShort = value.isNotBlank() && value.length < 16
     val visibleResult = result?.takeIf { it.status != "pending" }
@@ -1536,30 +1589,47 @@ private fun HashInputField(
             }
             else -> null
         },
-        trailingIcon = if (visibleResult != null) {
-            {
+        trailingIcon = {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(2.dp)
+            ) {
                 IconButton(
-                    onClick = onInfoClick,
+                    onClick = onCopyClick,
+                    enabled = canCopy,
                     modifier = Modifier.size(34.dp)
                 ) {
-                    Surface(
-                        shape = CircleShape,
-                        color = borderColor.copy(alpha = 0.14f),
-                        border = BorderStroke(1.dp, borderColor.copy(alpha = 0.7f)),
-                        modifier = Modifier.size(22.dp)
+                    Icon(
+                        Icons.Default.ContentCopy,
+                        contentDescription = "Скопировать VK Хеш $slot",
+                        modifier = Modifier.size(18.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = if (canCopy) 1f else 0.38f)
+                    )
+                }
+                if (visibleResult != null) {
+                    IconButton(
+                        onClick = onInfoClick,
+                        modifier = Modifier.size(34.dp)
                     ) {
-                        Box(contentAlignment = Alignment.Center) {
-                            Text(
-                                "?",
-                                color = borderColor,
-                                style = MaterialTheme.typography.labelSmall,
-                                fontWeight = FontWeight.Bold
-                            )
+                        Surface(
+                            shape = CircleShape,
+                            color = borderColor.copy(alpha = 0.14f),
+                            border = BorderStroke(1.dp, borderColor.copy(alpha = 0.7f)),
+                            modifier = Modifier.size(22.dp)
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Text(
+                                    "?",
+                                    color = borderColor,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
                         }
                     }
                 }
             }
-        } else null,
+        },
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(16.dp),
         colors = OutlinedTextFieldDefaults.colors(

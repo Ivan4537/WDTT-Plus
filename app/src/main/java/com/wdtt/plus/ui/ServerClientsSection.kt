@@ -49,6 +49,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.ChevronLeft
 import androidx.compose.material.icons.filled.ChevronRight
@@ -57,6 +58,9 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.FilterList
+import androidx.compose.material.icons.filled.FileOpen
+import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.PauseCircle
@@ -106,6 +110,14 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
+import com.wdtt.plus.ClientPasswordRules
+import com.wdtt.plus.ClientTransferCodec
+import com.wdtt.plus.ClientTransferInbox
+import com.wdtt.plus.ClientTransferPayload
+import com.wdtt.plus.QrCaptureActivity
 import com.wdtt.plus.ServerAdminActionResult
 import com.wdtt.plus.ServerAdminClient
 import com.wdtt.plus.ServerAdminProfileInfo
@@ -129,6 +141,7 @@ private enum class ClientWizardStep {
     Label,
     Hash,
     Ports,
+    Password,
     Confirm
 }
 
@@ -178,12 +191,18 @@ fun ServerClientsSection(
     var busy by remember { mutableStateOf(false) }
     var status by rememberSaveable { mutableStateOf("") }
     var showCreateWizard by rememberSaveable { mutableStateOf(false) }
+    var showImportMethods by rememberSaveable { mutableStateOf(false) }
+    var pendingImport by remember { mutableStateOf<ClientTransferPayload?>(null) }
+    var exportClient by remember { mutableStateOf<ServerClientInfo?>(null) }
+    var passwordClient by remember { mutableStateOf<ServerClientInfo?>(null) }
+    var changedPasswordClient by remember { mutableStateOf<ServerClientInfo?>(null) }
     var pendingAction by remember { mutableStateOf<PendingClientAction?>(null) }
     var expiryClient by remember { mutableStateOf<ServerClientInfo?>(null) }
     var qrData by remember { mutableStateOf<Pair<String, Bitmap>?>(null) }
     var detailsClient by remember { mutableStateOf<ServerClientInfo?>(null) }
     var showServerTools by rememberSaveable { mutableStateOf(false) }
     var createdClient by remember { mutableStateOf<ServerClientInfo?>(null) }
+    var importedClient by remember { mutableStateOf<ServerClientInfo?>(null) }
     var filtersExpanded by rememberSaveable { mutableStateOf(false) }
     var statusFilter by rememberSaveable { mutableStateOf(ClientStatusFilter.All) }
     var bindingFilter by rememberSaveable { mutableStateOf(ClientBindingFilter.All) }
@@ -192,6 +211,7 @@ fun ServerClientsSection(
     var clientSearchFocused by remember { mutableStateOf(false) }
     var clientSearch by clientsViewModel.clientSearch
     var selectedClientIndex by clientsViewModel.selectedClientIndex
+    val inboxTransfer by ClientTransferInbox.pending.collectAsStateWithLifecycle()
     val arrowRotation by animateFloatAsState(
         targetValue = if (expanded) 180f else 0f,
         label = "server_clients_arrow_rotation"
@@ -228,6 +248,40 @@ fun ServerClientsSection(
         sshPort = sshPort,
         mainPassword = mainPassword
     )
+
+    fun acceptClientTransfer(raw: String) {
+        runCatching { ClientTransferCodec.decode(raw) }
+            .onSuccess {
+                pendingImport = it
+                showImportMethods = false
+            }
+            .onFailure { status = "Ошибка: ${it.message ?: "данные клиента не распознаны"}" }
+    }
+
+    val importCameraLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
+        result.contents?.takeIf { it.isNotBlank() }?.let(::acceptClientTransfer)
+    }
+    val importGalleryLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        if (uri != null) scope.launch {
+            runCatching { withContext(Dispatchers.IO) { TransferFiles.decodeQrImage(context, uri) } }
+                .onSuccess(::acceptClientTransfer)
+                .onFailure { status = "Ошибка: ${it.message ?: "QR-код не прочитан"}" }
+        }
+    }
+    val importFileLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        if (uri != null) scope.launch {
+            runCatching { withContext(Dispatchers.IO) { TransferFiles.readText(context, uri) } }
+                .onSuccess(::acceptClientTransfer)
+                .onFailure { status = "Ошибка: ${it.message ?: "файл клиента не прочитан"}" }
+        }
+    }
+
+    LaunchedEffect(inboxTransfer) {
+        inboxTransfer?.let { raw ->
+            acceptClientTransfer(raw)
+            ClientTransferInbox.clear(raw)
+        }
+    }
 
     fun refreshClients() {
         if (!targetReady || busy) return
@@ -355,12 +409,15 @@ fun ServerClientsSection(
                         Icon(Icons.Default.Add, null, Modifier.size(18.dp))
                         Text(" Создать")
                     }
+                    OutlinedButton(onClick = { showImportMethods = true }, enabled = canUse && state != null) {
+                        Text("Импорт")
+                    }
                     OutlinedButton(onClick = { showServerTools = true }, enabled = canUse && state != null) {
                         Text("Сервер")
                     }
                 }
 
-                if (status.isNotBlank() && state == null) {
+                if (status.isNotBlank()) {
                     ClientStatusBanner(status = status, busy = busy)
                 }
 
@@ -507,6 +564,7 @@ fun ServerClientsSection(
                                     }
                                 },
                                 onExtend = { expiryClient = selectedClient },
+                                onExport = { exportClient = selectedClient },
                                 onDetails = {
                                     busy = true
                                     status = "Читаю данные клиента..."
@@ -529,6 +587,7 @@ fun ServerClientsSection(
                                         run = { ServerAdminClient.unbind(target, selectedClient.password) }
                                     )
                                 },
+                                onChangePassword = { passwordClient = selectedClient },
                                 onToggle = {
                                     pendingAction = if (selectedClient.status == "deactivated") {
                                         PendingClientAction(
@@ -558,9 +617,6 @@ fun ServerClientsSection(
                                     )
                                 }
                             )
-                    }
-                    if (status.isNotBlank()) {
-                        ClientStatusBanner(status = status, busy = busy)
                     }
                     }
                 }
@@ -593,6 +649,8 @@ fun ServerClientsSection(
     if (showCreateWizard) {
         CreateClientWizardDialog(
             defaultPorts = state?.defaultPorts ?: defaultPorts.ifBlank { "56000,56001,9000" },
+            existingPasswords = state?.clients?.map { it.password }.orEmpty().toSet(),
+            mainPassword = mainPassword,
             busy = busy,
             onDismiss = { if (!busy) showCreateWizard = false },
             onCreate = { request ->
@@ -610,6 +668,142 @@ fun ServerClientsSection(
                             runCatching { ServerAdminClient.list(target) }.onSuccess { state = it }
                         }
                         .onFailure { status = "Ошибка: ${it.message ?: "клиент не создан"}" }
+                    busy = false
+                }
+            }
+        )
+    }
+
+    if (showImportMethods) {
+        ClientImportMethodsDialog(
+            onDismiss = { showImportMethods = false },
+            onCamera = {
+                importCameraLauncher.launch(
+                    ScanOptions()
+                        .setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                        .setPrompt("Наведите камеру на QR переноса клиента")
+                        .setBeepEnabled(false)
+                        .setCaptureActivity(QrCaptureActivity::class.java)
+                        .setOrientationLocked(false)
+                )
+            },
+            onGallery = { importGalleryLauncher.launch("image/*") },
+            onFile = { importFileLauncher.launch("*/*") },
+            onPaste = {
+                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                val value = clipboard.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(context)?.toString()
+                if (value.isNullOrBlank()) status = "Ошибка: в буфере обмена нет данных клиента"
+                else acceptClientTransfer(value)
+            }
+        )
+    }
+
+    pendingImport?.let { payload ->
+        val current = state
+        ClientImportConfirmDialog(
+            payload = payload,
+            targetHost = current?.let { it.publicHost.ifBlank { it.effectivePublicHost.ifBlank { host } } }.orEmpty(),
+            targetPorts = current?.defaultPorts ?: defaultPorts,
+            passwordConflict = current?.clients?.any { it.password == payload.password } == true,
+            mainPasswordConflict = payload.password == mainPassword,
+            limitReached = current != null && current.passwordCount >= current.maxPasswords && current.expiredCount == 0,
+            onDismiss = { pendingImport = null },
+            onConfirm = {
+                pendingImport = null
+                busy = true
+                status = "Импорт: отправляю данные клиента на сервер..."
+                scope.launch {
+                    try {
+                        val result = ServerAdminClient.importClient(
+                            target,
+                            payload,
+                            current?.defaultPorts ?: defaultPorts.ifBlank { "56000,56001,9000" }
+                        )
+                        status = "Импорт: клиент записан, проверяю список на сервере..."
+                        val refreshed = ServerAdminClient.list(target)
+                        val imported = refreshed.clients.firstOrNull { it.password == payload.password }
+                            ?: result.createdClient?.takeIf { created -> created.password == payload.password }
+                            ?: throw IllegalStateException("сервер принял импорт, но клиент не найден в свежем списке. Нажмите «Обновить» и проверьте, не достигнут ли лимит клиентов.")
+                        state = refreshed
+                        clientSearch = ""
+                        statusFilter = ClientStatusFilter.All
+                        bindingFilter = ClientBindingFilter.All
+                        expiryFilter = ClientExpiryFilter.All
+                        vkHashFilter = ClientVkHashFilter.All
+                        selectedClientIndex = refreshed.clients.indexOfFirst { it.password == payload.password }
+                            .coerceAtLeast(0)
+                        importedClient = imported
+                        status = "Клиент импортирован и найден в списке без перезапуска сервера."
+                    } catch (error: Throwable) {
+                        status = "Ошибка: ${error.message ?: "клиент не импортирован"}"
+                    }
+                    busy = false
+                }
+            }
+        )
+    }
+
+    exportClient?.let { client ->
+        val transferResult = remember(client) { runCatching { ClientTransferCodec.encode(ClientTransferCodec.fromClient(client)) } }
+        val transfer = transferResult.getOrNull()
+        if (transfer == null) {
+            AlertDialog(
+                onDismissRequest = { exportClient = null },
+                title = { DialogTitle("Экспорт невозможен", { exportClient = null }) },
+                text = {
+                    Text(
+                        transferResult.exceptionOrNull()?.message ?: "Проверьте пароль и VK-хеши клиента.",
+                        color = MaterialTheme.colorScheme.error
+                    )
+                },
+                confirmButton = { Button(onClick = { exportClient = null }) { Text("Хорошо") } }
+            )
+        } else {
+            ClientTransferExportDialog(
+                client = client,
+                onDismiss = { exportClient = null },
+                onCopy = { copyText(context, "Перенос клиента WDTT Plus", transfer) },
+                onShare = { shareText(context, transfer, "Передать клиента WDTT Plus") },
+                onQr = {
+                    scope.launch {
+                        runCatching { withContext(Dispatchers.Default) { TransferFiles.createQrBitmap(context, transfer) } }
+                            .onSuccess { qrData = "Перенос: ${client.displayName()}" to it }
+                            .onFailure { status = "Ошибка: ${it.message ?: "QR-код не создан"}" }
+                    }
+                },
+                onFile = {
+                    scope.launch {
+                        runCatching {
+                            withContext(Dispatchers.IO) {
+                                TransferFiles.writeTransferText(context, "WDTT-Plus-${client.safeFileName()}.wdtt-client", transfer)
+                            }
+                        }.onSuccess {
+                            shareUri(context, it, "application/vnd.wdtt.plus.client", "Передать клиента WDTT Plus")
+                        }.onFailure { status = "Ошибка: ${it.message ?: "файл клиента не создан"}" }
+                    }
+                }
+            )
+        }
+    }
+
+    passwordClient?.let { client ->
+        ChangeClientPasswordDialog(
+            client = client,
+            existingPasswords = state?.clients?.map { it.password }.orEmpty().toSet(),
+            mainPassword = mainPassword,
+            onDismiss = { passwordClient = null },
+            onConfirm = { newPassword ->
+                passwordClient = null
+                busy = true
+                status = "Изменяю пароль клиента..."
+                scope.launch {
+                    runCatching { ServerAdminClient.setPassword(target, client.password, newPassword) }
+                        .onSuccess { result ->
+                            status = result.message
+                            changedPasswordClient = result.createdClient
+                            runCatching { ServerAdminClient.list(target) }.onSuccess { state = it }
+                        }
+                        .onFailure { status = "Ошибка: ${it.message ?: "пароль не изменён"}" }
                     busy = false
                 }
             }
@@ -654,7 +848,6 @@ fun ServerClientsSection(
             onShare = { link?.let { shareText(context, it) } },
             onQr = {
                 link?.let { value ->
-                    createdClient = null
                     scope.launch {
                         runCatching { withContext(Dispatchers.Default) { TransferFiles.createQrBitmap(context, value) } }
                             .onSuccess { qrData = client.displayName() to it }
@@ -669,6 +862,73 @@ fun ServerClientsSection(
                             withContext(Dispatchers.IO) { TransferFiles.writeTransferText(context, "WDTT-Plus-${client.safeFileName()}.wdtt", value) }
                         }.onSuccess { shareUri(context, it, "application/vnd.wdtt.plus.transfer", "Передать подключение WDTT Plus") }
                             .onFailure { Toast.makeText(context, it.message ?: "Не удалось создать файл.", Toast.LENGTH_LONG).show() }
+                    }
+                }
+            }
+        )
+    }
+
+    importedClient?.let { client ->
+        val link = client.connectionLink(host, state?.publicHost?.ifBlank { state?.effectivePublicHost.orEmpty() }.orEmpty())
+        AccessResultDialog(
+            title = "Импорт готов",
+            statusText = "Клиент импортирован и найден в списке.",
+            password = client.password,
+            link = link,
+            noLinkText = "VK-хеш не задан. Клиент добавлен; хеш можно указать в «Подробнее».",
+            onDismiss = { importedClient = null },
+            onCopyPassword = { copyText(context, "Пароль импортированного клиента", client.password) },
+            onCopyLink = { link?.let { copyText(context, "Ссылка WDTT", it) } },
+            onShare = { link?.let { shareText(context, it) } },
+            onQr = {
+                link?.let { value ->
+                    scope.launch {
+                        runCatching { withContext(Dispatchers.Default) { TransferFiles.createQrBitmap(context, value) } }
+                            .onSuccess { qrData = client.displayName() to it }
+                            .onFailure { status = "Ошибка: ${it.message ?: "QR-код не создан"}" }
+                    }
+                }
+            },
+            onFile = {
+                link?.let { value ->
+                    scope.launch {
+                        runCatching {
+                            withContext(Dispatchers.IO) { TransferFiles.writeTransferText(context, "WDTT-Plus-${client.safeFileName()}.wdtt", value) }
+                        }.onSuccess { shareUri(context, it, "application/vnd.wdtt.plus.transfer", "Передать подключение WDTT Plus") }
+                            .onFailure { status = "Ошибка: ${it.message ?: "файл не создан"}" }
+                    }
+                }
+            }
+        )
+    }
+
+    changedPasswordClient?.let { client ->
+        val link = client.connectionLink(host, state?.publicHost?.ifBlank { state?.effectivePublicHost.orEmpty() }.orEmpty())
+        AccessResultDialog(
+            title = "Пароль изменён",
+            password = client.password,
+            link = link,
+            noLinkText = "VK-хеш не задан. Новый пароль уже работает; добавьте хеш в «Подробнее», чтобы сформировать ссылку.",
+            onDismiss = { changedPasswordClient = null },
+            onCopyPassword = { copyText(context, "Новый пароль WDTT", client.password) },
+            onCopyLink = { link?.let { copyText(context, "Новая ссылка WDTT", it) } },
+            onShare = { link?.let { shareText(context, it) } },
+            onQr = {
+                link?.let { value ->
+                    scope.launch {
+                        runCatching { withContext(Dispatchers.Default) { TransferFiles.createQrBitmap(context, value) } }
+                            .onSuccess { qrData = client.displayName() to it }
+                            .onFailure { status = "Ошибка: ${it.message ?: "QR-код не создан"}" }
+                    }
+                }
+            },
+            onFile = {
+                link?.let { value ->
+                    scope.launch {
+                        runCatching {
+                            withContext(Dispatchers.IO) { TransferFiles.writeTransferText(context, "WDTT-Plus-${client.safeFileName()}.wdtt", value) }
+                        }.onSuccess { shareUri(context, it, "application/vnd.wdtt.plus.transfer", "Передать новое подключение WDTT Plus") }
+                            .onFailure { status = "Ошибка: ${it.message ?: "файл не создан"}" }
                     }
                 }
             }
@@ -991,8 +1251,10 @@ private fun ServerClientActions(
     onFile: (String) -> Unit,
     onQr: (String) -> Unit,
     onExtend: () -> Unit,
+    onExport: () -> Unit,
     onDetails: () -> Unit,
     onUnbind: () -> Unit,
+    onChangePassword: () -> Unit,
     onToggle: () -> Unit,
     onDelete: () -> Unit
 ) {
@@ -1031,6 +1293,7 @@ private fun ServerClientActions(
         ) {
             OutlinedButton(onClick = onExtend, enabled = !busy) { Text("Продлить") }
             OutlinedButton(onClick = onDetails, enabled = !busy) { Text("Подробнее") }
+            OutlinedButton(onClick = onExport, enabled = !busy) { Text("Экспорт") }
         }
 
         ClientActionCategoryBlock(
@@ -1041,6 +1304,10 @@ private fun ServerClientActions(
                 category = ClientActionCategory.Access.takeUnless { category == it }
             }
         ) {
+            OutlinedButton(onClick = onChangePassword, enabled = !busy) {
+                Icon(Icons.Default.Key, null, Modifier.size(16.dp))
+                Text(" Сменить пароль")
+            }
             OutlinedButton(onClick = onUnbind, enabled = !busy && client.isBound) {
                 Icon(Icons.Default.Smartphone, null, Modifier.size(16.dp))
                 Text(" Отвязать")
@@ -1124,6 +1391,7 @@ private fun ClientActionCategoryBlock(
 @Composable
 private fun AccessResultDialog(
     title: String,
+    statusText: String? = null,
     password: String,
     link: String?,
     noLinkText: String,
@@ -1139,6 +1407,14 @@ private fun AccessResultDialog(
         title = { DialogTitle(title, onDismiss) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                statusText?.let {
+                    Text(
+                        it,
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
                 Card(
                     shape = RoundedCornerShape(18.dp),
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f))
@@ -1741,10 +2017,231 @@ private fun DialogTitle(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun ClientImportMethodsDialog(
+    onDismiss: () -> Unit,
+    onCamera: () -> Unit,
+    onGallery: () -> Unit,
+    onFile: () -> Unit,
+    onPaste: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { DialogTitle("Импорт клиента", onDismiss) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text("Выберите данные переноса клиента. Обычная ссылка подключения сюда не импортируется.")
+                FlowRow(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedButton(onClick = onCamera) {
+                        Icon(Icons.Default.CameraAlt, null, Modifier.size(18.dp))
+                        Text(" Камера")
+                    }
+                    OutlinedButton(onClick = onGallery) {
+                        Icon(Icons.Default.Image, null, Modifier.size(18.dp))
+                        Text(" Галерея")
+                    }
+                    OutlinedButton(onClick = onFile) {
+                        Icon(Icons.Default.FileOpen, null, Modifier.size(18.dp))
+                        Text(" Файл")
+                    }
+                    OutlinedButton(onClick = onPaste) { Text("Вставить") }
+                }
+                Text(
+                    "Файл, изображение или код содержит пароль клиента. После чтения приложение покажет проверку перед записью на сервер.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error
+                )
+            }
+        },
+        confirmButton = {}
+    )
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun ClientTransferExportDialog(
+    client: ServerClientInfo,
+    onDismiss: () -> Unit,
+    onCopy: () -> Unit,
+    onShare: () -> Unit,
+    onQr: () -> Unit,
+    onFile: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { DialogTitle("Экспорт клиента", onDismiss) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text("Клиент: ${client.displayName()}", fontWeight = FontWeight.Bold)
+                Text("Переносятся пароль, название, VK-хеши, срок и состояние доступа.")
+                Text(
+                    "Не переносятся устройство, WireGuard-ключи, адрес, порты, трафик и история. На новом сервере используются его настройки, а устройство привяжется при первом подключении.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                FlowRow(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedButton(onClick = onQr) {
+                        Icon(Icons.Default.QrCode2, null, Modifier.size(18.dp))
+                        Text(" QR")
+                    }
+                    OutlinedButton(onClick = onFile) {
+                        Icon(Icons.AutoMirrored.Filled.InsertDriveFile, null, Modifier.size(18.dp))
+                        Text(" Файл")
+                    }
+                    OutlinedButton(onClick = onShare) {
+                        Icon(Icons.Default.Share, null, Modifier.size(18.dp))
+                        Text(" Поделиться")
+                    }
+                    OutlinedButton(onClick = onCopy) { Text("Копировать") }
+                }
+                Text(
+                    "Передача содержит рабочий пароль клиента. Отправляйте её только себе или доверенному администратору.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error
+                )
+            }
+        },
+        confirmButton = {}
+    )
+}
+
+@Composable
+private fun ClientImportConfirmDialog(
+    payload: ClientTransferPayload,
+    targetHost: String,
+    targetPorts: String,
+    passwordConflict: Boolean,
+    mainPasswordConflict: Boolean,
+    limitReached: Boolean,
+    onDismiss: () -> Unit,
+    onConfirm: () -> Unit
+) {
+    val expired = payload.expiresAt > 0 && payload.expiresAt <= System.currentTimeMillis() / 1000L
+    val errors = buildList {
+        if (passwordConflict) add("На новом сервере уже есть клиент с таким паролем.")
+        if (mainPasswordConflict) add("Пароль клиента совпадает с главным паролем нового сервера.")
+        if (expired) add("Срок этого клиента уже истёк.")
+        if (limitReached) add("На новом сервере достигнут лимит клиентов.")
+        if (targetHost.isBlank()) add("Не определён адрес нового сервера.")
+        if (!targetPorts.isPortsSpec()) add("На новом сервере указаны некорректные порты.")
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { DialogTitle("Проверка импорта", onDismiss) },
+        text = {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                InfoLine("Клиент", payload.label.ifBlank { "Без имени" })
+                InfoLine("Пароль", "${payload.password.take(3)}••••${payload.password.takeLast(3)}")
+                InfoLine("Срок", formatExpiry(payload.expiresAt))
+                InfoLine("Состояние", if (payload.deactivated) "Отключён" else "Активен")
+                InfoLine("VK-хеши", if (payload.vkHash.isBlank()) "не заданы" else "заданы")
+                HorizontalDivider()
+                InfoLine("Новый сервер", targetHost.ifBlank { "не определён" })
+                InfoLine("Порты нового сервера", targetPorts.ifBlank { "не заданы" })
+                Text(
+                    "Клиент будет скопирован без устройства, ключей, статистики и истории. Старый сервер не изменится. Импорт применяется наживую без перезапуска.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                errors.forEach { Text("• $it", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+            }
+        },
+        confirmButton = { Button(onClick = onConfirm, enabled = errors.isEmpty()) { Text("Импортировать") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } }
+    )
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun ChangeClientPasswordDialog(
+    client: ServerClientInfo,
+    existingPasswords: Set<String>,
+    mainPassword: String,
+    onDismiss: () -> Unit,
+    onConfirm: (String) -> Unit
+) {
+    var automatic by rememberSaveable(client.password) { mutableStateOf(true) }
+    var generated by remember(client.password) { mutableStateOf(ClientPasswordRules.generate()) }
+    var manual by rememberSaveable(client.password) { mutableStateOf("") }
+    val value = if (automatic) generated else manual.trim()
+    val error = when {
+        ClientPasswordRules.validate(value) != null -> ClientPasswordRules.validate(value)
+        value == client.password -> "Новый пароль совпадает с текущим."
+        value == mainPassword -> "Пароль клиента не должен совпадать с главным паролем."
+        value in existingPasswords -> "Клиент с таким паролем уже существует."
+        else -> null
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { DialogTitle("Сменить пароль", onDismiss) },
+        text = {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text("Клиент: ${client.displayName()}", fontWeight = FontWeight.Bold)
+                InfoLine("Текущий пароль", client.maskedPassword().removePrefix("Пароль: "))
+                val deviceLabel = listOf(
+                    client.deviceName,
+                    client.device?.name.orEmpty(),
+                    client.device?.model.orEmpty(),
+                    client.deviceId
+                ).firstOrNull { it.isNotBlank() }
+                InfoLine("Устройство", deviceLabel ?: "не привязано")
+                FlowRow(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    SelectButton("Автоматически", automatic) { automatic = true }
+                    SelectButton("Вручную", !automatic) { automatic = false }
+                }
+                if (automatic) {
+                    OutlinedTextField(value = generated, onValueChange = {}, readOnly = true, label = { Text("Новый пароль") }, modifier = Modifier.fillMaxWidth())
+                    error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+                    OutlinedButton(onClick = { generated = ClientPasswordRules.generate() }) { Text("Другой пароль") }
+                } else {
+                    OutlinedTextField(
+                        value = manual,
+                        onValueChange = { manual = it.trim().take(32) },
+                        label = { Text("Новый пароль, 16 символов") },
+                        supportingText = { error?.let { Text(it) } },
+                        isError = error != null,
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+                Text(
+                    "Старые ссылки перестанут работать, активное соединение этого клиента завершится. Название, срок, VK-хеши и привязка устройства сохранятся; остальные клиенты не затрагиваются.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error
+                )
+                Text("Изменение применяется наживую без перезапуска сервера.", style = MaterialTheme.typography.bodySmall)
+            }
+        },
+        confirmButton = { Button(onClick = { onConfirm(value) }, enabled = error == null) { Text("Изменить") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } }
+    )
+}
+
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 private fun CreateClientWizardDialog(
     defaultPorts: String,
+    existingPasswords: Set<String>,
+    mainPassword: String,
     busy: Boolean,
     onDismiss: () -> Unit,
     onCreate: (ServerClientCreateRequest) -> Unit
@@ -1755,8 +2252,17 @@ private fun CreateClientWizardDialog(
     var vkHash by rememberSaveable { mutableStateOf("") }
     var useDefaultPorts by rememberSaveable { mutableStateOf(true) }
     var customPorts by rememberSaveable { mutableStateOf(defaultPorts) }
+    var useAutoPassword by rememberSaveable { mutableStateOf(true) }
+    var customPassword by rememberSaveable { mutableStateOf("") }
     val effectivePorts = if (useDefaultPorts) defaultPorts else customPorts
     val portsValid = effectivePorts.isPortsSpec()
+    val passwordError = if (useAutoPassword || customPassword.isEmpty()) null else when {
+        ClientPasswordRules.validate(customPassword) != null -> ClientPasswordRules.validate(customPassword)
+        customPassword == mainPassword -> "Пароль клиента не должен совпадать с главным паролем."
+        customPassword in existingPasswords -> "Клиент с таким паролем уже существует."
+        else -> null
+    }
+    val passwordValid = useAutoPassword || (customPassword.isNotEmpty() && passwordError == null)
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -1845,12 +2351,44 @@ private fun CreateClientWizardDialog(
                                     )
                                     if (!portsValid) Text("Формат: 56000,56001,9000", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
                                 }
+                                ClientWizardStep.Password -> {
+                                    Text("Пароль клиента", fontWeight = FontWeight.Bold)
+                                    Text(
+                                        "Автоматический пароль безопаснее. Ручной режим нужен, например, для переноса существующего клиента с другого сервера.",
+                                        style = MaterialTheme.typography.bodySmall
+                                    )
+                                    FlowRow(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
+                                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        SelectButton("Автоматически", useAutoPassword) { useAutoPassword = true }
+                                        SelectButton("Вручную", !useAutoPassword) { useAutoPassword = false }
+                                    }
+                                    if (!useAutoPassword) {
+                                        OutlinedTextField(
+                                            value = customPassword,
+                                            onValueChange = { customPassword = it.trim().take(32) },
+                                            label = { Text("16 символов") },
+                                            supportingText = {
+                                                Text(passwordError ?: "Допустимы безопасные латинские буквы и цифры.")
+                                            },
+                                            isError = customPassword.isNotEmpty() && passwordError != null,
+                                            singleLine = true,
+                                            modifier = Modifier.fillMaxWidth()
+                                        )
+                                        OutlinedButton(onClick = { customPassword = ClientPasswordRules.generate() }) {
+                                            Text("Сгенерировать")
+                                        }
+                                    }
+                                }
                                 ClientWizardStep.Confirm -> {
                                     Text("Проверка", fontWeight = FontWeight.Bold)
                                     Text("Срок: ${if (days == 0) "бессрочно" else "$days дн."}")
                                     Text("Название: ${label.ifBlank { "без имени" }}")
                                     Text("VK-хеш: ${if (vkHash.isBlank()) "не задан" else "задан"}")
                                     Text("Порты: $effectivePorts")
+                                    Text("Пароль: ${if (useAutoPassword) "будет создан автоматически" else customPassword}")
                                     Text(
                                         "Новый доступ начнёт работать сразу, текущие подключения не прервутся.",
                                         style = MaterialTheme.typography.bodySmall,
@@ -1864,7 +2402,9 @@ private fun CreateClientWizardDialog(
         },
         confirmButton = {
             Button(
-                enabled = !busy && (step != ClientWizardStep.Ports || portsValid),
+                enabled = !busy &&
+                    (step != ClientWizardStep.Ports || portsValid) &&
+                    (step != ClientWizardStep.Password || passwordValid),
                 onClick = {
                     if (step == ClientWizardStep.Confirm) {
                         onCreate(
@@ -1872,7 +2412,8 @@ private fun CreateClientWizardDialog(
                                 days = days.coerceIn(0, 365),
                                 label = label,
                                 vkHash = vkHash,
-                                ports = effectivePorts
+                                ports = effectivePorts,
+                                password = customPassword.takeUnless { useAutoPassword }
                             )
                         )
                     } else {
@@ -2256,12 +2797,12 @@ private fun String.isPortsSpec(): Boolean {
     return parts.size == 3 && parts.all { it != null && it in 1..65535 }
 }
 
-private fun shareText(context: Context, text: String) {
+private fun shareText(context: Context, text: String, title: String = "Передать подключение WDTT Plus") {
     val intent = Intent(Intent.ACTION_SEND).apply {
         type = "text/plain"
         putExtra(Intent.EXTRA_TEXT, text)
     }
-    context.startActivity(Intent.createChooser(intent, "Передать подключение WDTT Plus"))
+    context.startActivity(Intent.createChooser(intent, title))
 }
 
 private fun copyText(context: Context, label: String, text: String) {

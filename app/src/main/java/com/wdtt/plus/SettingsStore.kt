@@ -218,6 +218,7 @@ class SettingsStore(context: Context) {
     companion object {
         private val Context.dataStore by preferencesDataStore("settings")
         private val ACTIVE_PROFILE = intPreferencesKey("active_profile")
+        private val PROFILE_NAME = stringPreferencesKey("profile_name")
         private val SHOW_SYSTEM_APPS = booleanPreferencesKey("show_system_apps")
         private val LOGGING_ENABLED = booleanPreferencesKey("logging_enabled")
         private val WDTT_LINK = stringPreferencesKey("wdtt_link")
@@ -297,6 +298,7 @@ class SettingsStore(context: Context) {
         private val UPDATE_DIALOG_LAST_ACTION = stringPreferencesKey("update_dialog_last_action")
         private val UPDATE_DIALOG_LAST_ACTION_AT = longPreferencesKey("update_dialog_last_action_at")
         private val MIGRATION_NOTICE_V2_SHOWN = booleanPreferencesKey("migration_notice_v2_shown")
+        private val MIGRATION_NOTICE_V3_SHOWN = booleanPreferencesKey("migration_notice_v3_shown")
         private val DEPLOY_CLIENTS_SECTION_EXPANDED = booleanPreferencesKey("deploy_clients_section_expanded")
         private val DEPLOY_OUTBOUND_SECTION_EXPANDED = booleanPreferencesKey("deploy_outbound_section_expanded")
         private val DEPLOY_MIGRATION_SECTION_EXPANDED = booleanPreferencesKey("deploy_migration_section_expanded")
@@ -311,7 +313,7 @@ class SettingsStore(context: Context) {
             val newName = "${baseKey.name}_$profile"
             @Suppress("UNCHECKED_CAST")
             return when (baseKey) {
-                PEER, VK_HASHES, SECONDARY_VK_HASH, PROTOCOL, SNI, USER_AGENT, DEPLOY_IP, DEPLOY_LOGIN, DEPLOY_PASSWORD, DEPLOY_PASSWORD_ENCRYPTED, DEPLOY_SSH_PORT, DEPLOY_DNS1, DEPLOY_DNS2, EXCLUDED_APPS, BLACKLIST_APPS, WHITELIST_APPS, CONNECTION_PASSWORD, CONNECTION_PASSWORD_ENCRYPTED, DEPLOY_MAIN_PASSWORD, DEPLOY_MAIN_PASSWORD_ENCRYPTED, DEPLOY_ADMIN_ID, DEPLOY_ADMIN_ID_ENCRYPTED, DEPLOY_BOT_TOKEN, DEPLOY_BOT_TOKEN_ENCRYPTED, PROXY_MODE, PROXY_HOST, CAPTCHA_MODE, CAPTCHA_SOLVE_METHOD, CAPTCHA_WBV_SOLVE_METHOD, WDTT_LINK, SELECTED_FINGERPRINT, ACTIVE_CLIENT_IDS -> stringPreferencesKey(newName) as Preferences.Key<T>
+                PROFILE_NAME, PEER, VK_HASHES, SECONDARY_VK_HASH, PROTOCOL, SNI, USER_AGENT, DEPLOY_IP, DEPLOY_LOGIN, DEPLOY_PASSWORD, DEPLOY_PASSWORD_ENCRYPTED, DEPLOY_SSH_PORT, DEPLOY_DNS1, DEPLOY_DNS2, EXCLUDED_APPS, BLACKLIST_APPS, WHITELIST_APPS, CONNECTION_PASSWORD, CONNECTION_PASSWORD_ENCRYPTED, DEPLOY_MAIN_PASSWORD, DEPLOY_MAIN_PASSWORD_ENCRYPTED, DEPLOY_ADMIN_ID, DEPLOY_ADMIN_ID_ENCRYPTED, DEPLOY_BOT_TOKEN, DEPLOY_BOT_TOKEN_ENCRYPTED, PROXY_MODE, PROXY_HOST, CAPTCHA_MODE, CAPTCHA_SOLVE_METHOD, CAPTCHA_WBV_SOLVE_METHOD, WDTT_LINK, SELECTED_FINGERPRINT, ACTIVE_CLIENT_IDS -> stringPreferencesKey(newName) as Preferences.Key<T>
                 WORKERS_PER_HASH, VK_HASH_NEXT_SLOT, LISTEN_PORT, SERVER_DTLS_PORT, SERVER_WG_PORT, PROXY_PORT -> intPreferencesKey(newName) as Preferences.Key<T>
                 MANUAL_PORTS_ENABLED, NO_DTLS, NO_DNS, IS_WHITELIST, WDTT_LINK_MODE, VKCALLS_PREFLIGHT, DETAILED_LOGS -> booleanPreferencesKey(newName) as Preferences.Key<T>
                 else -> throw IllegalArgumentException("Unsupported key type: ${baseKey.name}")
@@ -330,6 +332,11 @@ class SettingsStore(context: Context) {
     }
 
     val activeProfile: Flow<Int> = dataStore.data.map { it[ACTIVE_PROFILE] ?: 0 }
+    val profileNames: Flow<List<String>> = dataStore.data.map { prefs ->
+        (0 until VPN_PROFILE_COUNT).map { profile ->
+            prefs[getProfileKey(PROFILE_NAME, profile)].orEmpty()
+        }
+    }
     val showSystemApps: Flow<Boolean> = dataStore.data.map { it[SHOW_SYSTEM_APPS] ?: false }
     val loggingEnabled: Flow<Boolean> = dataStore.data.map { it[LOGGING_ENABLED] ?: true }
     val wdttLink: Flow<String> = dataStore.data.map { prefs ->
@@ -515,6 +522,7 @@ class SettingsStore(context: Context) {
     val updateDialogLastAction: Flow<String> = dataStore.data.map { it[UPDATE_DIALOG_LAST_ACTION] ?: "" }
     val updateDialogLastActionAt: Flow<Long> = dataStore.data.map { it[UPDATE_DIALOG_LAST_ACTION_AT] ?: 0L }
     val migrationNoticeV2Shown: Flow<Boolean> = dataStore.data.map { it[MIGRATION_NOTICE_V2_SHOWN] ?: false }
+    val migrationNoticeV3Shown: Flow<Boolean> = dataStore.data.map { it[MIGRATION_NOTICE_V3_SHOWN] ?: false }
     val deployClientsSectionExpanded: Flow<Boolean> = dataStore.data.map { it[DEPLOY_CLIENTS_SECTION_EXPANDED] ?: true }
     val deployOutboundSectionExpanded: Flow<Boolean> = dataStore.data.map { it[DEPLOY_OUTBOUND_SECTION_EXPANDED] ?: false }
     val deployMigrationSectionExpanded: Flow<Boolean> = dataStore.data.map { it[DEPLOY_MIGRATION_SECTION_EXPANDED] ?: false }
@@ -621,6 +629,12 @@ class SettingsStore(context: Context) {
         }
     }
 
+    suspend fun saveMigrationNoticeV3Shown() {
+        dataStore.edit { prefs ->
+            prefs[MIGRATION_NOTICE_V3_SHOWN] = true
+        }
+    }
+
     suspend fun saveDeployClientsSectionExpanded(expanded: Boolean) {
         dataStore.edit { prefs ->
             prefs[DEPLOY_CLIENTS_SECTION_EXPANDED] = expanded
@@ -642,6 +656,19 @@ class SettingsStore(context: Context) {
     suspend fun saveActiveProfile(profile: Int) {
         dataStore.edit { prefs ->
             prefs[ACTIVE_PROFILE] = profile
+        }
+    }
+
+    suspend fun saveProfileName(profile: Int, name: String) {
+        dataStore.edit { prefs ->
+            val index = profile.coerceIn(0, VPN_PROFILE_COUNT - 1)
+            val clean = normalizeVpnProfileName(name)
+            val key = getProfileKey(PROFILE_NAME, index)
+            if (clean.isBlank() || clean == vpnProfileDefaultName(index)) {
+                prefs.remove(key)
+            } else {
+                prefs[key] = clean
+            }
         }
     }
 
@@ -696,8 +723,12 @@ class SettingsStore(context: Context) {
             )
             val link = WdttTransferCodec.buildConnectionLink(parts)
             val validation = WdttDeepLink.validate(link)
+            val profileLabel = vpnProfileDisplayName(
+                profile,
+                (0 until VPN_PROFILE_COUNT).map { index -> prefs[getProfileKey(PROFILE_NAME, index)].orEmpty() }
+            )
             require(validation.canStartVpn) {
-                "Профиль VPN ${profile + 1} заполнен не полностью. Проверьте адрес, порты, пароль и VK-хеши."
+                "Профиль «$profileLabel» заполнен не полностью. Проверьте адрес, порты, пароль и VK-хеши."
             }
             link
         }.first()
@@ -745,6 +776,7 @@ class SettingsStore(context: Context) {
                 put("detailedLogs", prefs[getProfileKey(DETAILED_LOGS, profile)] ?: false)
                 put("selectedFingerprint", prefs[getProfileKey(SELECTED_FINGERPRINT, profile)] ?: "firefox")
                 put("activeClientIds", prefs[getProfileKey(ACTIVE_CLIENT_IDS, profile)] ?: "6287487,8202606")
+                put("profileName", prefs[getProfileKey(PROFILE_NAME, profile)].orEmpty())
             })
         }
         JSONObject().apply {
@@ -815,6 +847,13 @@ class SettingsStore(context: Context) {
                 prefs[getProfileKey(DETAILED_LOGS, profile)] = item.optBoolean("detailedLogs")
                 prefs[getProfileKey(SELECTED_FINGERPRINT, profile)] = item.optString("selectedFingerprint", "firefox")
                 prefs[getProfileKey(ACTIVE_CLIENT_IDS, profile)] = item.optString("activeClientIds", "6287487,8202606")
+                val importedName = normalizeVpnProfileName(item.optString("profileName"))
+                val profileNameKey = getProfileKey(PROFILE_NAME, profile)
+                if (importedName.isBlank() || importedName == vpnProfileDefaultName(profile)) {
+                    prefs.remove(profileNameKey)
+                } else {
+                    prefs[profileNameKey] = importedName
+                }
             }
             prefs[ACTIVE_PROFILE] = root.optInt("activeProfile", 0).coerceIn(0, VPN_PROFILE_COUNT - 1)
             prefs[THEME_MODE] = root.optString("themeMode", "system")
@@ -1206,4 +1245,17 @@ class SettingsStore(context: Context) {
 
     private fun JSONObject.safePort(name: String, fallback: Int): Int =
         optInt(name, fallback).takeIf { it in 1..65535 } ?: fallback
+}
+
+fun vpnProfileDefaultName(profile: Int): String = "VPN ${profile.coerceIn(0, 2) + 1}"
+
+fun normalizeVpnProfileName(name: String): String =
+    name
+        .replace(Regex("\\s+"), " ")
+        .trim()
+        .take(48)
+
+fun vpnProfileDisplayName(profile: Int, names: List<String>): String {
+    val clean = normalizeVpnProfileName(names.getOrNull(profile).orEmpty())
+    return clean.ifBlank { vpnProfileDefaultName(profile) }
 }

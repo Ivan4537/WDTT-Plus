@@ -24,6 +24,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
@@ -44,8 +45,11 @@ class TunnelService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
     private var updateJob: Job? = null
+    private var profileNameJob: Job? = null
     private var networkChangeJob: Job? = null
+    private var lastNotificationTitle: String? = null
     private var lastNotificationText: String? = null
+    private var notificationProfileTitle: String = "WDTT Plus"
     
     // Network Monitoring
     private var connectivityManager: ConnectivityManager? = null
@@ -153,13 +157,16 @@ class TunnelService : Service() {
         CaptchaWebViewManager.onTunnelStart(applicationContext)
 
         TunnelManager.start(this, params)
+        startNotificationProfileWatcher()
         startStatsUpdater()
     }
 
     private fun stopTunnel() {
         updateJob?.cancel()
+        profileNameJob?.cancel()
         networkChangeJob?.cancel()
         wakeRescueJob?.cancel()
+        profileNameJob = null
         networkChangeJob = null
         wakeRescueJob = null
 
@@ -175,6 +182,26 @@ class TunnelService : Service() {
         activeNetworks.clear()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
+    }
+
+    private fun startNotificationProfileWatcher() {
+        profileNameJob?.cancel()
+        val settingsStore = SettingsStore(applicationContext)
+        profileNameJob = TunnelManager.scope.launch(Dispatchers.Main) {
+            combine(
+                settingsStore.activeProfile,
+                settingsStore.profileNames
+            ) { activeProfile, profileNames ->
+                val profile = activeProfile.coerceIn(0, 2)
+                val profileLabel = vpnProfileDisplayName(profile, profileNames)
+                "WDTT Plus · $profileLabel"
+            }.collect { prefix ->
+                notificationProfileTitle = prefix
+                if (TunnelManager.running.value && !isTunnelPaused) {
+                    updateNotification(buildTunnelNotificationText())
+                }
+            }
+        }
     }
 
     private fun registerScreenStateReceiver() {
@@ -647,7 +674,7 @@ class TunnelService : Service() {
         )
 
         return NotificationCompat.Builder(this, TUNNEL_NOTIFICATION_CHANNEL_ID)
-            .setContentTitle("WDTT Plus")
+            .setContentTitle(notificationProfileTitle)
             .setContentText(text)
             .setSmallIcon(R.drawable.ic_notification_icon)
             .setOngoing(true)
@@ -677,7 +704,9 @@ class TunnelService : Service() {
     }
 
     private fun updateNotification(text: String) {
-        if (lastNotificationText == text) return
+        val title = notificationProfileTitle
+        if (lastNotificationTitle == title && lastNotificationText == text) return
+        lastNotificationTitle = title
         lastNotificationText = text
         val notification = createNotification(text)
         getSystemService(NotificationManager::class.java).notify(TUNNEL_NOTIFICATION_ID, notification)

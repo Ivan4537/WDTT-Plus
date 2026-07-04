@@ -217,7 +217,9 @@ class MainActivity : ComponentActivity() {
                 } ?: intent.clipData?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.uri
                 val streamFirst = intent.type?.let { type ->
                     type.startsWith("image/") || type == "application/json" ||
-                        type == "application/vnd.wdtt.plus.transfer" || type == "application/octet-stream"
+                        type == "application/vnd.wdtt.plus.transfer" ||
+                            type == "application/vnd.wdtt.plus.client" ||
+                            type == "application/octet-stream"
                 } == true
                 if (streamFirst && streamUri != null) {
                     handleIncomingUri(streamUri, intent.type)
@@ -252,6 +254,10 @@ class MainActivity : ComponentActivity() {
     private fun handleIncomingTransferText(value: String) {
         val link = WdttTransferCodec.extractWdttLink(value)
         when {
+            ClientTransferCodec.isClientTransfer(value) -> {
+                ClientTransferInbox.offer(value)
+                wdttDeepLinkMessage = "Распознан перенос клиента. В режиме «Я — админ» откройте «Деплой» → «Клиенты и сервер»: перед импортом приложение покажет проверку данных и целевого сервера."
+            }
             link != null -> handleIncomingWdttLink(link)
             WdttTransferCodec.isAdminTransfer(value) -> pendingAdminTransfer = value.trim()
             WdttTransferCodec.documentFormat(value) == "wdtt-server-backup" -> {
@@ -292,7 +298,7 @@ class MainActivity : ComponentActivity() {
                 wdttDeepLinkMessage = if (result == null) {
                     WdttDeepLink.validate(plan.link).userMessage()
                 } else {
-                    val profileLabel = "VPN ${result.targetProfile + 1}"
+                    val profileLabel = vpnProfileDisplayName(result.targetProfile, store.profileNames.first())
                     val action = if (result.overwritten) "перезаписана" else "добавлена"
                     val mode = if (result.storedAsLink) "сохранена в режиме ссылки" else "разобрана, поля подключения заполнены"
                     "Ссылка wdtt:// $action в профиль $profileLabel: $mode."
@@ -641,10 +647,12 @@ fun MainScreen(
     val focusManager = LocalFocusManager.current
     val scope = rememberCoroutineScope()
     val activeProfile by settingsStore.activeProfile.collectAsStateWithLifecycle(initialValue = 0)
+    val profileNames by settingsStore.profileNames.collectAsStateWithLifecycle(initialValue = emptyList())
     val wdttLinkMode by settingsStore.wdttLinkMode.collectAsStateWithLifecycle(initialValue = false)
     val interfaceRole by settingsStore.interfaceRole.collectAsStateWithLifecycle(initialValue = "")
     val permissionOnboardingComplete by settingsStore.permissionOnboardingComplete.collectAsStateWithLifecycle(initialValue = false)
     val migrationNoticeV2Shown by settingsStore.migrationNoticeV2Shown.collectAsStateWithLifecycle(initialValue = true)
+    val migrationNoticeV3Shown by settingsStore.migrationNoticeV3Shown.collectAsStateWithLifecycle(initialValue = true)
     val isAdminInterface = interfaceRole == "admin"
     val isUpdatedInstall = remember(context) {
         runCatching {
@@ -944,8 +952,12 @@ fun MainScreen(
         // Floating theme toolbar overlay
         FloatingToolbar(
             activeProfile = activeProfile,
+            profileNames = profileNames,
             onActiveProfileChange = { profile ->
                 scope.launch { settingsStore.saveActiveProfile(profile) }
+            },
+            onProfileNameChange = { profile, name ->
+                scope.launch { settingsStore.saveProfileName(profile, name) }
             },
             interfaceRole = interfaceRole,
             onInterfaceRoleChange = { role ->
@@ -989,6 +1001,38 @@ fun MainScreen(
                 Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
                     Button(
                         onClick = { scope.launch { settingsStore.saveMigrationNoticeV2Shown() } }
+                    ) {
+                        Text("Хорошо")
+                    }
+                }
+            }
+        )
+    }
+
+    if (
+        BuildConfig.VERSION_CODE == 3 &&
+        isAdminInterface &&
+        isUpdatedInstall &&
+        !migrationNoticeV3Shown
+    ) {
+        AlertDialog(
+            onDismissRequest = {},
+            properties = DialogProperties(
+                dismissOnBackPress = false,
+                dismissOnClickOutside = false
+            ),
+            title = { Text("Требуется обновление сервера") },
+            text = {
+                Text(
+                    "Для корректной работы новых функций необходимо обновить установку серверной части во вкладке «Деплой».\n\n" +
+                        "Выберите установку с сохранением данных. Настройки, клиенты и выданные доступы сохранятся — будет обновлена только серверная часть.\n\n" +
+                        "Установку с нуля выполнять не нужно."
+                )
+            },
+            confirmButton = {
+                Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                    Button(
+                        onClick = { scope.launch { settingsStore.saveMigrationNoticeV3Shown() } }
                     ) {
                         Text("Хорошо")
                     }
@@ -1126,7 +1170,7 @@ fun MainScreen(
     }
 
     pendingWdttDeepLinkPlan?.let { plan ->
-        val profileLabel = "VPN ${plan.targetProfile + 1}"
+        val profileLabel = vpnProfileDisplayName(plan.targetProfile, profileNames)
         AlertDialog(
             onDismissRequest = onCancelWdttDeepLinkOverwrite,
             title = { Text("Профили VPN заполнены") },
@@ -1138,7 +1182,7 @@ fun MainScreen(
                             FilterChip(
                                 selected = plan.targetProfile == profile,
                                 onClick = { onSelectWdttDeepLinkOverwriteProfile(profile) },
-                                label = { Text("VPN ${profile + 1}") }
+                                label = { Text(vpnProfileDisplayName(profile, profileNames)) }
                             )
                         }
                     }

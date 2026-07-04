@@ -11,9 +11,11 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
 import androidx.compose.animation.shrinkVertically
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -35,8 +37,11 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.wdtt.plus.SettingsStore
+import com.wdtt.plus.normalizeVpnProfileName
+import com.wdtt.plus.vpnProfileDisplayName
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -52,11 +57,13 @@ import androidx.compose.material.icons.filled.Share
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 
-@OptIn(ExperimentalLayoutApi::class)
+@OptIn(ExperimentalLayoutApi::class, ExperimentalFoundationApi::class)
 @Composable
 fun FloatingToolbar(
     activeProfile: Int,
+    profileNames: List<String>,
     onActiveProfileChange: (Int) -> Unit,
+    onProfileNameChange: (Int, String) -> Unit,
     interfaceRole: String,
     onInterfaceRoleChange: (String) -> Unit,
     currentTheme: String,
@@ -89,6 +96,8 @@ fun FloatingToolbar(
     var isExpanded by rememberSaveable { mutableStateOf(false) }
     var tabHeightPx by remember { mutableFloatStateOf(0f) }
     var panelHeightPx by remember { mutableFloatStateOf(0f) }
+    var renamingProfile by remember { mutableStateOf<Int?>(null) }
+    var profileNameInput by rememberSaveable { mutableStateOf("") }
 
     val tabWidthDp = 42.dp
     val tabHeightDp = 52.dp
@@ -219,20 +228,29 @@ fun FloatingToolbar(
 
                     FlowRow(
                         modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         listOf(0, 1, 2).forEach { profile ->
                             val selected = profile == activeProfile
-                            val profileLabel = "VPN ${profile + 1}"
+                            val profileLabel = vpnProfileDisplayName(profile, profileNames)
+                            val profileShape = RoundedCornerShape(12.dp)
                             Surface(
-                                onClick = { onActiveProfileChange(profile) },
-                                shape = RoundedCornerShape(12.dp),
+                                shape = profileShape,
                                 color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
-                                modifier = Modifier.weight(1f).widthIn(min = 62.dp)
+                                modifier = Modifier
+                                    .widthIn(min = 72.dp, max = 180.dp)
+                                    .clip(profileShape)
+                                    .combinedClickable(
+                                        onClick = { onActiveProfileChange(profile) },
+                                        onLongClick = {
+                                            renamingProfile = profile
+                                            profileNameInput = profileLabel
+                                        }
+                                    )
                             ) {
                                 Box(
-                                    modifier = Modifier.padding(vertical = 8.dp),
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 8.dp),
                                     contentAlignment = Alignment.Center
                                 ) {
                                     Text(
@@ -240,7 +258,8 @@ fun FloatingToolbar(
                                         style = MaterialTheme.typography.bodyMedium,
                                         fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
                                         color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
-                                        fontSize = 12.sp
+                                        fontSize = 12.sp,
+                                        textAlign = TextAlign.Center
                                     )
                                 }
                             }
@@ -531,6 +550,43 @@ fun FloatingToolbar(
                 }
             }
         }
+    }
+
+    renamingProfile?.let { profile ->
+        AlertDialog(
+            onDismissRequest = { renamingProfile = null },
+            title = {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Название профиля")
+                    IconButton(onClick = { renamingProfile = null }) {
+                        Icon(Icons.Filled.Close, contentDescription = "Закрыть")
+                    }
+                }
+            },
+            text = {
+                OutlinedTextField(
+                    value = profileNameInput,
+                    onValueChange = { profileNameInput = normalizeVpnProfileName(it) },
+                    label = { Text("Название") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        onProfileNameChange(profile, profileNameInput)
+                        renamingProfile = null
+                    }
+                ) {
+                    Text("Сохранить")
+                }
+            }
+        )
     }
 }
 }

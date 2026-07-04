@@ -140,6 +140,127 @@ func normalizePasswordLabel(input string) string {
 	return label
 }
 
+func createBotClient(
+	wgDev *device.Device,
+	requestedPassword string,
+	days int,
+	expiresAt int64,
+	label string,
+	vkHash string,
+	ports string,
+	deactivated bool,
+) (string, *PasswordEntry, error) {
+	dbMutex.Lock()
+	defer dbMutex.Unlock()
+	if cleanupExpiredPasswordsLocked(wgDev) > 0 {
+		saveDB()
+	}
+	if len(db.Passwords) >= maxGeneratedPasswords {
+		return "", nil, fmt.Errorf("лимит клиентов: максимум %d", maxGeneratedPasswords)
+	}
+	password := ""
+	if strings.TrimSpace(requestedPassword) != "" {
+		value, err := normalizeClientPassword(requestedPassword)
+		if err != nil {
+			return "", nil, err
+		}
+		if value == db.MainPassword {
+			return "", nil, errors.New("пароль клиента не должен совпадать с главным паролем")
+		}
+		if _, exists := db.Passwords[value]; exists {
+			return "", nil, errors.New("клиент с таким паролем уже существует")
+		}
+		password = value
+	} else {
+		for i := 0; i < 64; i++ {
+			candidate := generatePassword()
+			if candidate == db.MainPassword {
+				continue
+			}
+			if _, exists := db.Passwords[candidate]; !exists {
+				password = candidate
+				break
+			}
+		}
+	}
+	if password == "" {
+		return "", nil, errors.New("не удалось создать уникальный пароль")
+	}
+	if expiresAt < 0 {
+		if days < 0 || days > 365 {
+			return "", nil, errors.New("срок должен быть 0..365 дней")
+		}
+		if days > 0 {
+			expiresAt = time.Now().Add(time.Duration(days) * 24 * time.Hour).Unix()
+		} else {
+			expiresAt = 0
+		}
+	} else if expiresAt > 0 && expiresAt <= time.Now().Unix() {
+		return "", nil, errors.New("срок переносимого клиента уже истёк")
+	}
+	normalizedPorts, err := parsePortsSpec(ports)
+	if err != nil {
+		return "", nil, err
+	}
+	normalizedHash := ""
+	if strings.TrimSpace(vkHash) != "" {
+		normalizedHash, err = normalizeVKHashesInput(vkHash)
+		if err != nil {
+			return "", nil, err
+		}
+	}
+	if !deactivated {
+		if err := serverWrapKeys.AddPassword(password); err != nil {
+			return "", nil, fmt.Errorf("не удалось добавить WRAP-ключ: %w", err)
+		}
+	}
+	entry := &PasswordEntry{
+		ExpiresAt:     expiresAt,
+		Label:         normalizePasswordLabel(label),
+		VkHash:        normalizedHash,
+		Ports:         normalizedPorts,
+		IsDeactivated: deactivated,
+	}
+	db.Passwords[password] = entry
+	saveDB()
+	return password, entry, nil
+}
+
+func changeBotClientPassword(wgDev *device.Device, oldPassword, requested string) (string, error) {
+	newPassword, err := normalizeClientPassword(requested)
+	if err != nil {
+		return "", err
+	}
+	dbMutex.Lock()
+	defer dbMutex.Unlock()
+	entry, exists := db.Passwords[oldPassword]
+	if !exists || entry == nil {
+		return "", errors.New("клиент не найден")
+	}
+	if newPassword == oldPassword {
+		return "", errors.New("новый пароль совпадает с текущим")
+	}
+	if newPassword == db.MainPassword {
+		return "", errors.New("пароль клиента не должен совпадать с главным паролем")
+	}
+	if _, exists := db.Passwords[newPassword]; exists {
+		return "", errors.New("клиент с таким паролем уже существует")
+	}
+	if !entry.IsDeactivated && !isPasswordExpired(entry) {
+		if err := serverWrapKeys.AddPassword(newPassword); err != nil {
+			return "", fmt.Errorf("не удалось добавить новый WRAP-ключ: %w", err)
+		}
+	}
+	delete(db.Passwords, oldPassword)
+	db.Passwords[newPassword] = entry
+	serverWrapKeys.RemovePassword(oldPassword)
+	if entry.DeviceID != "" {
+		removePeerFromWG(wgDev, db.Devices[entry.DeviceID])
+	}
+	saveDB()
+	return newPassword, nil
+}
+
 func mdCode(value string) string {
 	return strings.ReplaceAll(value, "`", "'")
 }
@@ -1736,6 +1857,78 @@ func showPortsMenu(token string, adminID int64, messageID int, mainPassword bool
 	))
 }
 
+func showNewClientPasswordMode(token string, adminID int64, messageID int) int {
+	return sendOrEditTelegram(token, adminID, messageID,
+		"🔐 *Пароль клиента*\n\nАвтоматический пароль безопаснее. Ручной режим нужен, например, чтобы перенести существующего клиента с другого сервера.",
+		inlineKeyboard(
+			[]map[string]interface{}{inlineButton("🎲 Создать автоматически", "new_password_auto")},
+			[]map[string]interface{}{inlineButton("⌨️ Задать вручную", "new_password_manual")},
+			[]map[string]interface{}{inlineButton("◀️ Отмена", "mainmenu")},
+		),
+	)
+}
+
+func sendBotClientCreated(token string, adminID int64, messageID int, password string, entry *PasswordEntry, imported bool) int {
+	title := "✅ *Клиент создан*"
+	if imported {
+		title = "✅ *Клиент импортирован без перезапуска сервера*"
+	}
+	ttlText := "⏰ Бессрочный доступ"
+	if entry.ExpiresAt > 0 {
+		ttlText = fmt.Sprintf("⏰ Действует до %s", time.Unix(entry.ExpiresAt, 0).Format("02.01.2006"))
+	}
+	statusText := "📱 Ожидает первого подключения"
+	if entry.IsDeactivated {
+		statusText = "⏸ Доступ импортирован отключённым"
+	}
+	labelText := ""
+	if entry.Label != "" {
+		labelText = fmt.Sprintf("🏷 %s\n", mdCode(entry.Label))
+	}
+	linkText := ""
+	if entry.VkHash != "" {
+		pts := strings.Split(entry.Ports, ",")
+		if len(pts) == 3 {
+			link := fmt.Sprintf("wdtt://%s:%s:%s:%s:%s:%s", getPublicIP(), pts[0], pts[1], pts[2], password, entry.VkHash)
+			linkText = fmt.Sprintf("\n\n🔗 *Быстрая ссылка:* `%s`", mdCode(link))
+		}
+	}
+	return sendOrEditTelegram(token, adminID, messageID,
+		fmt.Sprintf("%s\n\n🔑 Пароль: `%s`\n%s%s\n%s%s", title, mdCode(password), labelText, ttlText, statusText, linkText),
+		inlineKeyboard(
+			[]map[string]interface{}{inlineButton("🔍 Открыть клиента", "viewpass_"+password)},
+			[]map[string]interface{}{inlineButton("🔐 К списку", "backlist")},
+			[]map[string]interface{}{inlineButton("◀️ Главное меню", "mainmenu")},
+		),
+	)
+}
+
+func showBotClientImportPreview(token string, adminID int64, messageID int, payload clientTransferPayload) int {
+	label := payload.Label
+	if label == "" {
+		label = "Без имени"
+	}
+	status := "активен"
+	if payload.Deactivated {
+		status = "отключён"
+	}
+	expires := "бессрочно"
+	if payload.ExpiresAt > 0 {
+		expires = time.Unix(payload.ExpiresAt, 0).Format("02.01.2006 15:04")
+	}
+	return sendOrEditTelegram(token, adminID, messageID,
+		fmt.Sprintf(
+			"📥 *Проверка импорта клиента*\n\nНазвание: `%s`\nПароль: `%s`\nСрок: `%s`\nСостояние: `%s`\nVK-хеши: `%s`\nПорты нового сервера: `%s`\n\nУстройство, WireGuard-ключи, трафик, история, адрес и старые порты не переносятся. Клиент будет добавлен наживую без перезапуска; старый сервер не изменится.",
+			mdCode(label), mdCode(maskPassword(payload.Password)), mdCode(expires), mdCode(status),
+			map[bool]string{true: "заданы", false: "не заданы"}[payload.VkHash != ""], mdCode(defaultPortsSpec()),
+		),
+		inlineKeyboard(
+			[]map[string]interface{}{inlineButton("📥 Импортировать", "confirm_import_client")},
+			[]map[string]interface{}{inlineButton("Отмена", "backlist")},
+		),
+	)
+}
+
 func showLabelMenu(token string, adminID int64, messageID int) int {
 	return sendOrEditTelegram(token, adminID, messageID,
 		"🏷 Название ключа\n\nМожно оставить без имени или ввести короткое название, например `Дом`, `Друг`, `Ноутбук`.",
@@ -1779,6 +1972,7 @@ func showPasswordEditMenu(token string, adminID int64, messageID int, pass strin
 		mdCode(pass), mdCode(label), mdCode(ttl), mdCode(ports), mdCode(hash),
 	)
 	return sendOrEditTelegram(token, adminID, messageID, text, inlineKeyboard(
+		[]map[string]interface{}{inlineButton("🔐 Пароль", "edit_password_"+pass)},
 		[]map[string]interface{}{inlineButton("🏷 Название", "edit_label_"+pass)},
 		[]map[string]interface{}{inlineButton("⏰ Срок действия", "edit_exp_"+pass)},
 		[]map[string]interface{}{inlineButton("🔑 VK-хеш/ссылка", "edit_hash_"+pass)},
@@ -1851,15 +2045,20 @@ func botLoop(token string, adminIDstr string, wgDev *device.Device) {
 	var waitingForPorts bool
 	var waitingForHash bool
 	var waitingForLabel bool
+	var waitingForNewClientPassword bool
+	var waitingForClientImport bool
 	var waitingForSetting string
 	var editMode string
 	var editPassword string
 	var targetPassword string
 
 	var tempDays int
-	var tempPermanent bool
 	var tempLabel string
 	var tempPorts string // "dtls,wg,tun"
+	var tempHash string
+	var pendingClientImport *clientTransferPayload
+	var pendingPasswordChangeOld string
+	var pendingPasswordChangeNew string
 	var promptMessageID int
 
 	for {
@@ -2008,6 +2207,10 @@ func botLoop(token string, adminIDstr string, wgDev *device.Device) {
 						"callback_data": "editpass_" + pass,
 					})
 					kb = append(kb, map[string]interface{}{
+						"text":          "📤 Экспорт клиента",
+						"callback_data": "exportclient_" + pass,
+					})
+					kb = append(kb, map[string]interface{}{
 						"text":          "◀️ Назад к списку",
 						"callback_data": "backlist",
 					})
@@ -2022,12 +2225,17 @@ func botLoop(token string, adminIDstr string, wgDev *device.Device) {
 					waitingForPorts = false
 					waitingForHash = false
 					waitingForLabel = false
+					waitingForNewClientPassword = false
+					waitingForClientImport = false
 					waitingForSetting = ""
 					targetPassword = ""
 					tempDays = 0
-					tempPermanent = false
 					tempLabel = ""
 					tempPorts = ""
+					tempHash = ""
+					pendingClientImport = nil
+					pendingPasswordChangeOld = ""
+					pendingPasswordChangeNew = ""
 					editMode = ""
 					editPassword = ""
 					promptMessageID = sendMainMenu(token, adminID, menuMessageID)
@@ -2036,6 +2244,8 @@ func botLoop(token string, adminIDstr string, wgDev *device.Device) {
 					waitingForPorts = false
 					waitingForHash = false
 					waitingForLabel = false
+					waitingForNewClientPassword = false
+					waitingForClientImport = false
 					waitingForSetting = ""
 					editMode = ""
 					editPassword = ""
@@ -2045,24 +2255,28 @@ func botLoop(token string, adminIDstr string, wgDev *device.Device) {
 					waitingForPorts = false
 					waitingForHash = false
 					waitingForLabel = false
+					waitingForNewClientPassword = false
+					waitingForClientImport = false
 					waitingForSetting = ""
 					editMode = ""
 					editPassword = ""
 					targetPassword = ""
 					tempDays = 0
-					tempPermanent = false
 					tempLabel = ""
 					tempPorts = ""
+					tempHash = ""
+					pendingClientImport = nil
 					promptMessageID = startNewPasswordFlow(token, adminID, wgDev, &waitingForDays, menuMessageID)
 				} else if strings.HasPrefix(data, "new_days_") {
 					value := strings.TrimPrefix(data, "new_days_")
 					waitingForPorts = false
 					waitingForHash = false
 					waitingForLabel = false
+					waitingForNewClientPassword = false
+					waitingForClientImport = false
 					waitingForSetting = ""
 					if value == "custom" {
 						waitingForDays = true
-						tempPermanent = false
 						promptMessageID = sendOrEditTelegram(token, adminID, menuMessageID, "📅 Введите срок действия в днях.\n\n`0` — бессрочно, `1..365` — количество дней.", inlineKeyboard(
 							[]map[string]interface{}{inlineButton("◀️ Назад", "mainmenu")},
 						))
@@ -2076,9 +2290,139 @@ func botLoop(token string, adminIDstr string, wgDev *device.Device) {
 						continue
 					}
 					tempDays = days
-					tempPermanent = days == 0
 					waitingForDays = false
 					promptMessageID = showLabelMenu(token, adminID, menuMessageID)
+				} else if data == "new_password_auto" {
+					waitingForNewClientPassword = false
+					password, entry, err := createBotClient(wgDev, "", tempDays, -1, tempLabel, tempHash, tempPorts, false)
+					if err != nil {
+						promptMessageID = sendOrEditTelegram(token, adminID, menuMessageID, "❌ "+mdCode(err.Error()), inlineKeyboard(
+							[]map[string]interface{}{inlineButton("Повторить", "menu_new")},
+							[]map[string]interface{}{inlineButton("🔐 К списку", "backlist")},
+						))
+						continue
+					}
+					promptMessageID = sendBotClientCreated(token, adminID, menuMessageID, password, entry, false)
+				} else if data == "new_password_manual" {
+					waitingForNewClientPassword = true
+					promptMessageID = sendOrEditTelegram(token, adminID, menuMessageID,
+						"⌨️ Введите пароль клиента из 16 символов. Допустимы безопасные латинские буквы и цифры без неоднозначных `0`, `1`, `I`, `i`, `O`, `o` и `l`.\n\nСервер проверит формат, уникальность и совпадение с главным паролем.",
+						inlineKeyboard([]map[string]interface{}{inlineButton("◀️ Отмена", "mainmenu")}),
+					)
+				} else if data == "import_client" {
+					waitingForClientImport = true
+					pendingClientImport = nil
+					promptMessageID = sendOrEditTelegram(token, adminID, menuMessageID,
+						"📥 *Импорт клиента*\n\nОтправьте текстовый код переноса, созданный в приложении или другом WDTT Plus-боте. Перед записью я проверю пароль, срок, лимит и покажу данные нового сервера.",
+						inlineKeyboard([]map[string]interface{}{inlineButton("Отмена", "backlist")}),
+					)
+				} else if data == "confirm_import_client" {
+					if pendingClientImport == nil {
+						promptMessageID = sendOrEditTelegram(token, adminID, menuMessageID, "❌ Данные импорта потеряны. Отправьте код ещё раз.", inlineKeyboard(
+							[]map[string]interface{}{inlineButton("📥 Импорт", "import_client")},
+							[]map[string]interface{}{inlineButton("🔐 К списку", "backlist")},
+						))
+						continue
+					}
+					payload := *pendingClientImport
+					password, entry, err := createBotClient(wgDev, payload.Password, 0, payload.ExpiresAt, payload.Label, payload.VkHash, defaultPortsSpec(), payload.Deactivated)
+					pendingClientImport = nil
+					if err != nil {
+						promptMessageID = sendOrEditTelegram(token, adminID, menuMessageID, "❌ Импорт отменён: "+mdCode(err.Error()), inlineKeyboard(
+							[]map[string]interface{}{inlineButton("📥 Другой клиент", "import_client")},
+							[]map[string]interface{}{inlineButton("🔐 К списку", "backlist")},
+						))
+						continue
+					}
+					promptMessageID = sendBotClientCreated(token, adminID, menuMessageID, password, entry, true)
+				} else if strings.HasPrefix(data, "exportclient_") {
+					pass := strings.TrimPrefix(data, "exportclient_")
+					dbMutex.Lock()
+					entry := db.Passwords[pass]
+					transfer, err := encodeClientTransfer(pass, entry)
+					dbMutex.Unlock()
+					if err != nil {
+						promptMessageID = sendOrEditTelegram(token, adminID, menuMessageID, "❌ Экспорт не выполнен: "+mdCode(err.Error()), inlineKeyboard(
+							[]map[string]interface{}{inlineButton("🔐 К списку", "backlist")},
+						))
+						continue
+					}
+					promptMessageID = sendOrEditTelegram(token, adminID, menuMessageID,
+						fmt.Sprintf("📤 *Код переноса клиента*\n\n`%s`\n\nСодержит рабочий пароль, название, VK-хеши, срок и состояние. Устройство, ключи, адрес, порты, трафик и история не переносятся. Отправляйте код только себе или доверенному администратору.", mdCode(transfer)),
+						inlineKeyboard(
+							[]map[string]interface{}{inlineButton("◀️ К клиенту", "viewpass_"+pass)},
+							[]map[string]interface{}{inlineButton("🔐 К списку", "backlist")},
+						),
+					)
+				} else if strings.HasPrefix(data, "edit_password_") {
+					pass := strings.TrimPrefix(data, "edit_password_")
+					promptMessageID = sendOrEditTelegram(token, adminID, menuMessageID,
+						fmt.Sprintf("🔐 *Смена пароля `%s`*\n\nСтарые ссылки перестанут работать, а текущее соединение клиента завершится. Название, срок, VK-хеши и привязка сохранятся. Изменение применяется без перезапуска сервера.", mdCode(pass)),
+						inlineKeyboard(
+							[]map[string]interface{}{inlineButton("🎲 Новый автоматически", "change_pass_auto_"+pass)},
+							[]map[string]interface{}{inlineButton("⌨️ Ввести вручную", "change_pass_manual_"+pass)},
+							[]map[string]interface{}{inlineButton("◀️ Назад", "editpass_"+pass)},
+						),
+					)
+				} else if strings.HasPrefix(data, "change_pass_auto_") {
+					pendingPasswordChangeOld = strings.TrimPrefix(data, "change_pass_auto_")
+					pendingPasswordChangeNew = ""
+					dbMutex.Lock()
+					for i := 0; i < 64; i++ {
+						candidate := generatePassword()
+						if candidate == db.MainPassword || candidate == pendingPasswordChangeOld {
+							continue
+						}
+						if _, exists := db.Passwords[candidate]; !exists {
+							pendingPasswordChangeNew = candidate
+							break
+						}
+					}
+					dbMutex.Unlock()
+					if pendingPasswordChangeNew == "" {
+						promptMessageID = sendOrEditTelegram(token, adminID, menuMessageID, "❌ Не удалось создать уникальный пароль.", inlineKeyboard(
+							[]map[string]interface{}{inlineButton("Повторить", "edit_password_"+pendingPasswordChangeOld)},
+							[]map[string]interface{}{inlineButton("Отмена", "editpass_"+pendingPasswordChangeOld)},
+						))
+						continue
+					}
+					promptMessageID = sendOrEditTelegram(token, adminID, menuMessageID,
+						fmt.Sprintf("⚠️ Заменить пароль клиента `%s` на `%s`?\n\nТекущее соединение этого клиента завершится, старые ссылки перестанут работать. Остальные клиенты не затрагиваются.", mdCode(pendingPasswordChangeOld), mdCode(pendingPasswordChangeNew)),
+						inlineKeyboard(
+							[]map[string]interface{}{inlineButton("Изменить", "confirm_change_password")},
+							[]map[string]interface{}{inlineButton("Отмена", "editpass_"+pendingPasswordChangeOld)},
+						),
+					)
+				} else if strings.HasPrefix(data, "change_pass_manual_") {
+					editMode = "password"
+					editPassword = strings.TrimPrefix(data, "change_pass_manual_")
+					promptMessageID = sendOrEditTelegram(token, adminID, menuMessageID,
+						"⌨️ Введите новый пароль из 16 разрешённых символов. После проверки бот отдельно попросит подтверждение.",
+						inlineKeyboard([]map[string]interface{}{inlineButton("Отмена", "editpass_"+editPassword)}),
+					)
+				} else if data == "confirm_change_password" {
+					if pendingPasswordChangeOld == "" || pendingPasswordChangeNew == "" {
+						promptMessageID = sendPasswordList(token, adminID, wgDev, menuMessageID)
+						continue
+					}
+					oldPassword := pendingPasswordChangeOld
+					newPassword, err := changeBotClientPassword(wgDev, oldPassword, pendingPasswordChangeNew)
+					pendingPasswordChangeOld = ""
+					pendingPasswordChangeNew = ""
+					if err != nil {
+						promptMessageID = sendOrEditTelegram(token, adminID, menuMessageID, "❌ Пароль не изменён: "+mdCode(err.Error()), inlineKeyboard(
+							[]map[string]interface{}{inlineButton("◀️ К клиенту", "viewpass_"+oldPassword)},
+							[]map[string]interface{}{inlineButton("🔐 К списку", "backlist")},
+						))
+						continue
+					}
+					promptMessageID = sendOrEditTelegram(token, adminID, menuMessageID,
+						fmt.Sprintf("✅ Пароль изменён без перезапуска сервера.\n\nНовый пароль: `%s`\nСтарые ссылки больше не работают.", mdCode(newPassword)),
+						inlineKeyboard(
+							[]map[string]interface{}{inlineButton("🔍 Открыть клиента", "viewpass_"+newPassword)},
+							[]map[string]interface{}{inlineButton("🔐 К списку", "backlist")},
+						),
+					)
 				} else if strings.HasPrefix(data, "editpass_") {
 					editMode = ""
 					editPassword = ""
@@ -2629,12 +2973,18 @@ func botLoop(token string, adminIDstr string, wgDev *device.Device) {
 					waitingForPorts = false
 					waitingForHash = false
 					waitingForLabel = false
+					waitingForNewClientPassword = false
+					waitingForClientImport = false
 					waitingForSetting = ""
+					pendingClientImport = nil
+					pendingPasswordChangeOld = ""
+					pendingPasswordChangeNew = ""
 					promptMessageID = sendPasswordList(token, adminID, wgDev, menuMessageID)
 				} else if data == "ports_def" {
 					waitingForDays = false
 					waitingForPorts = false
 					waitingForLabel = false
+					waitingForNewClientPassword = false
 					waitingForSetting = ""
 					tempPorts = defaultPortsSpec()
 					waitingForHash = true
@@ -2646,6 +2996,7 @@ func botLoop(token string, adminIDstr string, wgDev *device.Device) {
 					waitingForPorts = true
 					waitingForHash = false
 					waitingForLabel = false
+					waitingForNewClientPassword = false
 					waitingForSetting = ""
 					promptMessageID = sendOrEditTelegram(token, adminID, menuMessageID, "⚙️ Укажите через запятую 3 порта (DTLS,WG,TUN):\n\nНапример: `56000,56001,9000`", inlineKeyboard(
 						[]map[string]interface{}{inlineButton("Стандартные порты", "ports_def")},
@@ -2669,14 +3020,19 @@ func botLoop(token string, adminIDstr string, wgDev *device.Device) {
 				waitingForPorts = false
 				waitingForHash = false
 				waitingForLabel = false
+				waitingForNewClientPassword = false
+				waitingForClientImport = false
 				waitingForSetting = ""
 				editMode = ""
 				editPassword = ""
 				targetPassword = ""
 				tempDays = 0
-				tempPermanent = false
 				tempLabel = ""
 				tempPorts = ""
+				tempHash = ""
+				pendingClientImport = nil
+				pendingPasswordChangeOld = ""
+				pendingPasswordChangeNew = ""
 
 				if commandName == "/start" || commandName == "/help" {
 					promptMessageID = sendMainMenu(token, adminID, promptMessageID)
@@ -2687,6 +3043,63 @@ func botLoop(token string, adminIDstr string, wgDev *device.Device) {
 				} else if commandName == "/settings" {
 					promptMessageID = sendSettingsMenu(token, adminID, promptMessageID)
 				}
+				continue
+			}
+
+			if waitingForClientImport {
+				deleteTelegramMessage(token, adminID, msg.MessageID)
+				payload, err := decodeClientTransfer(cmd)
+				if err != nil {
+					promptMessageID = sendOrEditTelegram(token, adminID, promptMessageID, "❌ "+mdCode(err.Error())+"\n\nОтправьте корректный код переноса клиента.", inlineKeyboard(
+						[]map[string]interface{}{inlineButton("Отмена", "backlist")},
+					))
+					continue
+				}
+				dbMutex.Lock()
+				if cleanupExpiredPasswordsLocked(wgDev) > 0 {
+					saveDB()
+				}
+				_, duplicate := db.Passwords[payload.Password]
+				mainConflict := payload.Password == db.MainPassword
+				limitReached := len(db.Passwords) >= maxGeneratedPasswords
+				dbMutex.Unlock()
+				if duplicate || mainConflict || limitReached {
+					reason := "на новом сервере уже есть клиент с таким паролем"
+					if mainConflict {
+						reason = "пароль клиента совпадает с главным паролем нового сервера"
+					} else if limitReached {
+						reason = "на новом сервере достигнут лимит клиентов"
+					}
+					promptMessageID = sendOrEditTelegram(token, adminID, promptMessageID, "❌ Импорт невозможен: "+reason+".", inlineKeyboard(
+						[]map[string]interface{}{inlineButton("📥 Другой клиент", "import_client")},
+						[]map[string]interface{}{inlineButton("🔐 К списку", "backlist")},
+					))
+					continue
+				}
+				waitingForClientImport = false
+				pendingClientImport = &payload
+				promptMessageID = showBotClientImportPreview(token, adminID, promptMessageID, payload)
+				continue
+			}
+
+			if waitingForNewClientPassword {
+				deleteTelegramMessage(token, adminID, msg.MessageID)
+				if _, err := normalizeClientPassword(cmd); err != nil {
+					promptMessageID = sendOrEditTelegram(token, adminID, promptMessageID, "❌ "+mdCode(err.Error())+"\n\nВведите пароль ещё раз.", inlineKeyboard(
+						[]map[string]interface{}{inlineButton("◀️ Отмена", "mainmenu")},
+					))
+					continue
+				}
+				password, entry, err := createBotClient(wgDev, cmd, tempDays, -1, tempLabel, tempHash, tempPorts, false)
+				if err != nil {
+					promptMessageID = sendOrEditTelegram(token, adminID, promptMessageID, "❌ Клиент не создан: "+mdCode(err.Error()), inlineKeyboard(
+						[]map[string]interface{}{inlineButton("Повторить", "menu_new")},
+						[]map[string]interface{}{inlineButton("🔐 К списку", "backlist")},
+					))
+					continue
+				}
+				waitingForNewClientPassword = false
+				promptMessageID = sendBotClientCreated(token, adminID, promptMessageID, password, entry, false)
 				continue
 			}
 
@@ -2833,6 +3246,47 @@ func botLoop(token string, adminIDstr string, wgDev *device.Device) {
 				mode := editMode
 				editMode = ""
 				editPassword = ""
+				if mode == "password" {
+					newPassword, err := normalizeClientPassword(cmd)
+					if err != nil {
+						editMode = "password"
+						editPassword = pass
+						promptMessageID = sendOrEditTelegram(token, adminID, promptMessageID, "❌ "+mdCode(err.Error())+"\n\nВведите новый пароль ещё раз.", inlineKeyboard(
+							[]map[string]interface{}{inlineButton("Отмена", "editpass_"+pass)},
+						))
+						continue
+					}
+					dbMutex.Lock()
+					_, oldExists := db.Passwords[pass]
+					_, duplicate := db.Passwords[newPassword]
+					mainConflict := newPassword == db.MainPassword
+					dbMutex.Unlock()
+					if !oldExists || duplicate || mainConflict || newPassword == pass {
+						reason := "новый пароль совпадает с текущим"
+						if !oldExists {
+							reason = "клиент не найден"
+						} else if duplicate {
+							reason = "клиент с таким паролем уже существует"
+						} else if mainConflict {
+							reason = "пароль совпадает с главным паролем"
+						}
+						promptMessageID = sendOrEditTelegram(token, adminID, promptMessageID, "❌ "+reason+".", inlineKeyboard(
+							[]map[string]interface{}{inlineButton("Попробовать снова", "change_pass_manual_"+pass)},
+							[]map[string]interface{}{inlineButton("Отмена", "editpass_"+pass)},
+						))
+						continue
+					}
+					pendingPasswordChangeOld = pass
+					pendingPasswordChangeNew = newPassword
+					promptMessageID = sendOrEditTelegram(token, adminID, promptMessageID,
+						fmt.Sprintf("⚠️ Заменить пароль клиента `%s` на `%s`?\n\nТекущее соединение завершится, старые ссылки перестанут работать. Остальные клиенты не затрагиваются.", mdCode(pass), mdCode(newPassword)),
+						inlineKeyboard(
+							[]map[string]interface{}{inlineButton("Изменить", "confirm_change_password")},
+							[]map[string]interface{}{inlineButton("Отмена", "editpass_"+pass)},
+						),
+					)
+					continue
+				}
 
 				dbMutex.Lock()
 				entry, exists := db.Passwords[pass]
@@ -2926,7 +3380,6 @@ func botLoop(token string, adminIDstr string, wgDev *device.Device) {
 					continue
 				}
 				tempDays = days
-				tempPermanent = days == 0
 
 				promptMessageID = showLabelMenu(token, adminID, promptMessageID)
 				continue
@@ -2992,73 +3445,8 @@ func botLoop(token string, adminIDstr string, wgDev *device.Device) {
 					continue
 				}
 
-				dbMutex.Lock()
-				if cleanupExpiredPasswordsLocked(wgDev) > 0 {
-					saveDB()
-				}
-				if len(db.Passwords) >= maxGeneratedPasswords {
-					dbMutex.Unlock()
-					promptMessageID = sendOrEditTelegram(token, adminID, promptMessageID, fmt.Sprintf("❌ Лимит паролей: максимум %d активных. Удалите ненужный пароль через список доступов.", maxGeneratedPasswords), inlineKeyboard(
-						[]map[string]interface{}{inlineButton("🔐 К списку", "backlist")},
-						[]map[string]interface{}{inlineButton("◀️ Главное меню", "mainmenu")},
-					))
-					continue
-				}
-				newPass := ""
-				for i := 0; i < 10; i++ {
-					candidate := generatePassword()
-					if _, exists := db.Passwords[candidate]; !exists {
-						newPass = candidate
-						break
-					}
-				}
-				if newPass == "" {
-					dbMutex.Unlock()
-					promptMessageID = sendOrEditTelegram(token, adminID, promptMessageID, "❌ Не удалось создать уникальный пароль.", inlineKeyboard(
-						[]map[string]interface{}{inlineButton("Повторить", "menu_new")},
-						[]map[string]interface{}{inlineButton("◀️ Главное меню", "mainmenu")},
-					))
-					continue
-				}
-				if err := serverWrapKeys.AddPassword(newPass); err != nil {
-					dbMutex.Unlock()
-					promptMessageID = sendOrEditTelegram(token, adminID, promptMessageID, "❌ Не удалось создать WRAP-ключ для пароля.", inlineKeyboard(
-						[]map[string]interface{}{inlineButton("Повторить", "menu_new")},
-						[]map[string]interface{}{inlineButton("◀️ Главное меню", "mainmenu")},
-					))
-					continue
-				}
-				expiresAt := int64(0)
-				if !tempPermanent {
-					expiresAt = time.Now().Add(time.Duration(tempDays) * 24 * time.Hour).Unix()
-				}
-				db.Passwords[newPass] = &PasswordEntry{
-					ExpiresAt: expiresAt,
-					Label:     tempLabel,
-					VkHash:    hash,
-					Ports:     tempPorts,
-				}
-				saveDB()
-				dbMutex.Unlock()
-
-				ttlText := "⏰ Бессрочный доступ"
-				if !tempPermanent {
-					expDate := time.Unix(expiresAt, 0).Format("02.01.2006")
-					ttlText = fmt.Sprintf("⏰ Действует %d дн. (до %s)", tempDays, expDate)
-				}
-				srvIP := getPublicIP()
-				pts := strings.Split(tempPorts, ",")
-				link := fmt.Sprintf("wdtt://%s:%s:%s:%s:%s:%s", srvIP, pts[0], pts[1], pts[2], newPass, hash)
-
-				labelText := ""
-				if tempLabel != "" {
-					labelText = fmt.Sprintf("🏷 %s\n", tempLabel)
-				}
-				promptMessageID = sendOrEditTelegram(token, adminID, promptMessageID, fmt.Sprintf("🔑 Новый пароль:\n`%s`\n\n%s%s\n📱 Ожидает первого подключения\n\n🔗 *Быстрая ссылка:* `%s`", mdCode(newPass), labelText, ttlText, mdCode(link)), inlineKeyboard(
-					[]map[string]interface{}{inlineButton("➕ Ещё пароль", "menu_new")},
-					[]map[string]interface{}{inlineButton("🔐 К списку", "backlist")},
-					[]map[string]interface{}{inlineButton("◀️ Главное меню", "mainmenu")},
-				))
+				tempHash = hash
+				promptMessageID = showNewClientPasswordMode(token, adminID, promptMessageID)
 				continue
 			}
 		}
@@ -3121,6 +3509,7 @@ func sendPasswordList(token string, adminID int64, wgDev *device.Device, message
 		}
 	}
 	keyboard = append(keyboard, []map[string]interface{}{inlineButton("➕ Новый пароль", "menu_new")})
+	keyboard = append(keyboard, []map[string]interface{}{inlineButton("📥 Импорт клиента", "import_client")})
 	keyboard = append(keyboard, []map[string]interface{}{inlineButton("◀️ Главное меню", "mainmenu")})
 	replyMarkup := map[string]interface{}{"inline_keyboard": keyboard}
 	return sendOrEditTelegram(token, adminID, messageID, txt, replyMarkup)

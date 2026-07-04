@@ -58,12 +58,14 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import com.wdtt.plus.SettingsStore
 import com.wdtt.plus.TransferFiles
 import com.wdtt.plus.WdttTransferCodec
 import com.wdtt.plus.QrCaptureActivity
+import com.wdtt.plus.vpnProfileDisplayName
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -88,6 +90,8 @@ fun TransferCenterDialog(
     var error by remember { mutableStateOf<String?>(null) }
     var qrData by remember { mutableStateOf<Pair<String, Bitmap>?>(null) }
     var adminAction by remember { mutableStateOf<AdminExportAction?>(null) }
+    val profileNames by settingsStore.profileNames.collectAsStateWithLifecycle(initialValue = emptyList())
+    val activeProfileLabel = vpnProfileDisplayName(activeProfile, profileNames)
 
     fun runCatchingUi(block: suspend () -> Unit) {
         busy = true
@@ -154,7 +158,7 @@ fun TransferCenterDialog(
                 }
 
                 HorizontalDivider()
-                Text("Передача VPN ${activeProfile + 1}", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                Text("Передача $activeProfileLabel", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                 Text(
                     "Ссылка содержит пароль подключения и VK-хеши. Передавайте её только тому, кому доверяете.",
                     style = MaterialTheme.typography.bodySmall,
@@ -169,7 +173,7 @@ fun TransferCenterDialog(
                         runCatchingUi {
                             val link = settingsStore.connectionLinkForProfile(activeProfile)
                             val bitmap = withContext(Dispatchers.Default) { TransferFiles.createQrBitmap(context, link) }
-                            qrData = "VPN ${activeProfile + 1}" to bitmap
+                            qrData = activeProfileLabel to bitmap
                         }
                     }
                     TransferButton("Ссылка", Icons.Default.Share, busy) {
@@ -181,7 +185,7 @@ fun TransferCenterDialog(
                         runCatchingUi {
                             val link = settingsStore.connectionLinkForProfile(activeProfile)
                             val uri = withContext(Dispatchers.IO) {
-                                TransferFiles.writeTransferText(context, "WDTT-Plus-VPN-${activeProfile + 1}.wdtt", link)
+                                TransferFiles.writeTransferText(context, "WDTT-Plus-${activeProfileLabel.safeTransferFileName()}.wdtt", link)
                             }
                             shareUri(context, uri, "application/vnd.wdtt.plus.transfer", "Передать подключение WDTT Plus")
                         }
@@ -494,6 +498,14 @@ private fun String.safeQrFileName(): String =
         .take(48)
         .trim('_', '.', '-')
         .ifBlank { "qr" }
+
+private fun String.safeTransferFileName(): String =
+    replace(Regex("[^\\p{L}\\p{N}._-]+"), "-")
+        .replace(Regex("-+"), "-")
+        .trim('_', '.', '-')
+        .take(48)
+        .trim('_', '.', '-')
+        .ifBlank { "VPN" }
 
 private fun shareUri(context: Context, uri: Uri, mimeType: String, title: String) {
     val intent = Intent(Intent.ACTION_SEND).apply {
