@@ -27,6 +27,81 @@ class TransferCodecTest {
     }
 
     @Test
+    fun modernConnectionLink_preservesFourVkHashesAndTheirOrder() {
+        val hashes = listOf(
+            "3XariaxnHDP9eTiWVFukTMO6ZjCw7c0QQS_J3gYiiaM",
+            "8b6EGN4gYNV5IoCO8tsnKuj49od-GxNhotdbBqjPlaU",
+            "OnEpu4S_nWEKy9wN_ehrMn-8tCfKaL7iiJEe4N50ggg",
+            "pjCFYpjm_ibjy3YTyVZoEWZv3Oai4-QxAWcD2hWexLE"
+        )
+        val original = WdttLinkParts(
+            host = "vpn.example.org",
+            dtlsPort = 56000,
+            wgPort = 56001,
+            localPort = 9000,
+            password = "ABCDEFGHJKLMNPQR",
+            hashes = hashes.joinToString(",")
+        )
+
+        val link = WdttTransferCodec.buildConnectionLink(original)
+        val parsed = WdttDeepLink.validate(link).parts
+
+        assertEquals(hashes, parsed?.hashes?.split(","))
+    }
+
+    @Test
+    fun modernConnectionLink_acceptsVkJoinLinksAsHashInputs() {
+        val first = "3XariaxnHDP9eTiWVFukTMO6ZjCw7c0QQS_J3gYiiaM"
+        val second = "8b6EGN4gYNV5IoCO8tsnKuj49od-GxNhotdbBqjPlaU"
+        val link = WdttTransferCodec.buildConnectionLink(
+            WdttLinkParts(
+                host = "vpn.example.org",
+                dtlsPort = 56000,
+                wgPort = 56001,
+                localPort = 9000,
+                password = "ABCDEFGHJKLMNPQR",
+                hashes = "https://vk.com/call/join/$first?from=share,https://vk.ru/call/join/$second"
+            )
+        )
+
+        assertEquals("$first,$second", WdttDeepLink.validate(link).parts?.hashes)
+    }
+
+    @Test
+    fun modernConnectionLink_carriesCustomProfileName() {
+        val original = WdttLinkParts(
+            host = "vpn.example.org",
+            dtlsPort = 56000,
+            wgPort = 56001,
+            localPort = 9000,
+            password = "ABCDEFGHJKLMNPQR",
+            hashes = "1234567890abcdef",
+            profileName = "Домашний VPN"
+        )
+
+        val link = WdttTransferCodec.buildConnectionLink(original)
+
+        assertTrue(link.contains("name=%D0%94"))
+        assertEquals(original, WdttDeepLink.parse(link))
+    }
+
+    @Test
+    fun modernConnectionLink_omitsEmptyProfileName() {
+        val link = WdttTransferCodec.buildConnectionLink(
+            WdttLinkParts(
+                host = "vpn.example.org",
+                dtlsPort = 56000,
+                wgPort = 56001,
+                localPort = 9000,
+                password = "ABCDEFGHJKLMNPQR",
+                hashes = "1234567890abcdef"
+            )
+        )
+
+        assertFalse(link.contains("&name="))
+    }
+
+    @Test
     fun legacyConnectionLink_remainsSupported() {
         val validation = WdttDeepLink.validate(
             "wdtt://vpn.example.org:56000:56001:9000:secret:1234567890abcdef"
@@ -34,6 +109,29 @@ class TransferCodecTest {
 
         assertTrue(validation.canStartVpn)
         assertEquals("vpn.example.org", validation.parts?.host)
+        assertEquals("", validation.parts?.profileName)
+    }
+
+    @Test
+    fun onlyRenamedProfileIsPreparedForTransfer() {
+        assertEquals("", vpnProfileTransferName(0, listOf("", "", "")))
+        assertEquals("", vpnProfileTransferName(1, listOf("", "VPN 2", "")))
+        assertEquals("Работа", vpnProfileTransferName(2, listOf("", "", "Работа")))
+    }
+
+    @Test
+    fun serverClientLink_carriesSourceVpnProfileName() {
+        val link = buildServerConnectionLink(
+            password = "ABCDEFGHJKLMNPQR",
+            hashes = "1234567890abcdef",
+            ports = "56000,56001,9000",
+            fallbackHost = "vpn.example.org",
+            publicHost = "",
+            profileName = "Мой сервер"
+        )
+
+        assertNotNull(link)
+        assertEquals("Мой сервер", WdttDeepLink.parse(link.orEmpty())?.profileName)
     }
 
     @Test

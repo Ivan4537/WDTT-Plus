@@ -50,6 +50,7 @@ class TunnelService : Service() {
     private var lastNotificationTitle: String? = null
     private var lastNotificationText: String? = null
     private var notificationProfileTitle: String = "WDTT Plus"
+    private var requestedStopReason: TunnelStopReason? = null
     
     // Network Monitoring
     private var connectivityManager: ConnectivityManager? = null
@@ -100,7 +101,7 @@ class TunnelService : Service() {
                 )
                 startTunnel(params)
             }
-            "STOP" -> stopTunnel()
+            "STOP" -> stopTunnel(TunnelStopReason.User)
             "DEPLOY_START" -> {
                 val notification = createNotification("Установка на сервер...", "DEPLOY_CANCEL", "Отменить")
                 startPersistentForeground(notification)
@@ -136,18 +137,19 @@ class TunnelService : Service() {
                     }
                 } else {
                     launch(Dispatchers.Main) {
-                        stopTunnel()
+                        stopTunnel(TunnelStopReason.RestoreFailed)
                     }
                 }
             } catch (e: Exception) {
                 launch(Dispatchers.Main) {
-                    stopTunnel()
+                    stopTunnel(TunnelStopReason.RestoreFailed)
                 }
             }
         }
     }
 
     private fun startTunnel(params: TunnelParams) {
+        requestedStopReason = null
         updateNotification("Подключение...")
         acquireWakeLock()
         acquireWifiLock()
@@ -161,7 +163,9 @@ class TunnelService : Service() {
         startStatsUpdater()
     }
 
-    private fun stopTunnel() {
+    private fun stopTunnel(reason: TunnelStopReason = TunnelStopReason.User) {
+        val effectiveReason = requestedStopReason ?: reason
+        requestedStopReason = effectiveReason
         updateJob?.cancel()
         profileNameJob?.cancel()
         networkChangeJob?.cancel()
@@ -173,7 +177,7 @@ class TunnelService : Service() {
         // Уничтожаем текущий WebView (если капча решается) и чистим контекст
         CaptchaWebViewManager.onTunnelStop()
 
-        TunnelManager.stop()
+        TunnelManager.stop(effectiveReason)
         releaseWakeLock()
         releaseWifiLock()
         lastValidatedNetwork = null
@@ -266,7 +270,7 @@ class TunnelService : Service() {
                 "WDTT Plus остановил VPN",
                 "После пробуждения VPN не восстановился, поэтому приложение выключило VPN и вернуло прямой интернет."
             )
-            stopTunnel()
+            stopTunnel(TunnelStopReason.WakeRecoveryFailed)
         }
     }
 
@@ -551,12 +555,12 @@ class TunnelService : Service() {
                     val captchaActive = TunnelManager.isCaptchaInProgress()
                     if (!startupWindow && !captchaActive && android.net.VpnService.prepare(applicationContext) != null) {
                         Log.w("TunnelService", "VPN-разрешение WDTT Plus отозвано или слот передан другому VPN. Выключаем WDTT Plus.")
-                        stopTunnel()
+                        stopTunnel(TunnelStopReason.VpnSlotTransferred)
                         break
                     }
                     if (!startupWindow && !captchaActive && !helper.isTunnelUp()) {
                         Log.w("TunnelService", "Обнаружена пропажа или замена VPN-интерфейса! Экстренное выключение туннеля.")
-                        stopTunnel()
+                        stopTunnel(TunnelStopReason.VpnInterfaceLost)
                         break
                     }
                     if (!startupWindow && !captchaActive) {
@@ -580,7 +584,7 @@ class TunnelService : Service() {
                                     "WDTT Plus остановил VPN",
                                     "Связь не восстановилась автоматически, поэтому VPN выключен и интернет телефона возвращён напрямую."
                                 )
-                                stopTunnel()
+                                stopTunnel(TunnelStopReason.NetworkRecoveryFailed)
                                 break
                             }
                             null -> Unit
@@ -723,7 +727,7 @@ class TunnelService : Service() {
         networkCallback?.let {
             connectivityManager?.unregisterNetworkCallback(it)
         }
-        stopTunnel()
+        stopTunnel(TunnelStopReason.ServiceDestroyed)
     }
 
     override fun onBind(intent: Intent?): IBinder? = null

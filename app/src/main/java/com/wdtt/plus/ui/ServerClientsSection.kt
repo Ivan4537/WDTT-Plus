@@ -178,6 +178,7 @@ fun ServerClientsSection(
     mainPassword: String,
     defaultPorts: String,
     adminProfile: ServerAdminProfileInfo,
+    sourceProfileName: String,
     enabled: Boolean,
     expanded: Boolean = true,
     modifier: Modifier = Modifier,
@@ -540,6 +541,7 @@ fun ServerClientsSection(
                                 client = selectedClient,
                                 fallbackHost = host,
                                 publicHost = publicHost,
+                                sourceProfileName = sourceProfileName,
                                 busy = busy,
                                 onShareLink = { link -> shareText(context, link) },
                                 onFile = { link ->
@@ -836,7 +838,11 @@ fun ServerClientsSection(
     }
 
     createdClient?.let { client ->
-        val link = client.connectionLink(host, state?.publicHost?.ifBlank { state?.effectivePublicHost.orEmpty() }.orEmpty())
+        val link = client.connectionLink(
+            host,
+            state?.publicHost?.ifBlank { state?.effectivePublicHost.orEmpty() }.orEmpty(),
+            sourceProfileName
+        )
         AccessResultDialog(
             title = "Клиент создан",
             password = client.password,
@@ -869,7 +875,11 @@ fun ServerClientsSection(
     }
 
     importedClient?.let { client ->
-        val link = client.connectionLink(host, state?.publicHost?.ifBlank { state?.effectivePublicHost.orEmpty() }.orEmpty())
+        val link = client.connectionLink(
+            host,
+            state?.publicHost?.ifBlank { state?.effectivePublicHost.orEmpty() }.orEmpty(),
+            sourceProfileName
+        )
         AccessResultDialog(
             title = "Импорт готов",
             statusText = "Клиент импортирован и найден в списке.",
@@ -903,7 +913,11 @@ fun ServerClientsSection(
     }
 
     changedPasswordClient?.let { client ->
-        val link = client.connectionLink(host, state?.publicHost?.ifBlank { state?.effectivePublicHost.orEmpty() }.orEmpty())
+        val link = client.connectionLink(
+            host,
+            state?.publicHost?.ifBlank { state?.effectivePublicHost.orEmpty() }.orEmpty(),
+            sourceProfileName
+        )
         AccessResultDialog(
             title = "Пароль изменён",
             password = client.password,
@@ -941,6 +955,7 @@ fun ServerClientsSection(
             defaultPorts = state?.defaultPorts ?: defaultPorts.ifBlank { "56000,56001,9000" },
             fallbackHost = host,
             publicHost = state?.publicHost?.ifBlank { state?.effectivePublicHost.orEmpty() }.orEmpty(),
+            sourceProfileName = sourceProfileName,
             busy = busy,
             onDismiss = { detailsClient = null },
             onSave = { label, hash, ports ->
@@ -1246,6 +1261,7 @@ private fun ServerClientActions(
     client: ServerClientInfo,
     fallbackHost: String,
     publicHost: String,
+    sourceProfileName: String,
     busy: Boolean,
     onShareLink: (String) -> Unit,
     onFile: (String) -> Unit,
@@ -1258,7 +1274,9 @@ private fun ServerClientActions(
     onToggle: () -> Unit,
     onDelete: () -> Unit
 ) {
-    val link = remember(client, fallbackHost, publicHost) { client.connectionLink(fallbackHost, publicHost) }
+    val link = remember(client, fallbackHost, publicHost, sourceProfileName) {
+        client.connectionLink(fallbackHost, publicHost, sourceProfileName)
+    }
     var category by remember(client.password) { mutableStateOf<ClientActionCategory?>(null) }
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         ClientActionCategoryBlock(
@@ -1453,6 +1471,7 @@ private fun ClientDetailsDialog(
     defaultPorts: String,
     fallbackHost: String,
     publicHost: String,
+    sourceProfileName: String,
     busy: Boolean,
     onDismiss: () -> Unit,
     onSave: (String, String, String) -> Unit
@@ -1463,7 +1482,9 @@ private fun ClientDetailsDialog(
     var hash by rememberSaveable(client.password) { mutableStateOf(client.vkHash) }
     var ports by rememberSaveable(client.password) { mutableStateOf(client.ports) }
     val portsValid = ports.isPortsSpec()
-    val link = remember(client, fallbackHost, publicHost) { client.connectionLink(fallbackHost, publicHost) }
+    val link = remember(client, fallbackHost, publicHost, sourceProfileName) {
+        client.connectionLink(fallbackHost, publicHost, sourceProfileName)
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,

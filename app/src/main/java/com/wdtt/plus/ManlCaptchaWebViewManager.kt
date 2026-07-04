@@ -390,7 +390,7 @@ class ManlCaptchaActivity : ComponentActivity() {
 
 class CaptchaCancelReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        TunnelManager.stop()
+        TunnelManager.stop(TunnelStopReason.CaptchaCancelled)
         ManlCaptchaWebViewManager.activeActivity?.finish()
         val notifMgr = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         notifMgr.cancel(9001) // NOTIFICATION_ID

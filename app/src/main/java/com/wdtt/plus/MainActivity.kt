@@ -1171,12 +1171,16 @@ fun MainScreen(
 
     pendingWdttDeepLinkPlan?.let { plan ->
         val profileLabel = vpnProfileDisplayName(plan.targetProfile, profileNames)
+        val incomingProfileName = WdttDeepLink.parse(plan.link)?.profileName.orEmpty()
         AlertDialog(
             onDismissRequest = onCancelWdttDeepLinkOverwrite,
             title = { Text("Профили VPN заполнены") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Text("Свободных профилей VPN нет. Выберите профиль, который можно перезаписать:")
+                    if (incomingProfileName.isNotBlank()) {
+                        Text("Название из подключения: «$incomingProfileName».")
+                    }
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         repeat(3) { profile ->
                             FilterChip(

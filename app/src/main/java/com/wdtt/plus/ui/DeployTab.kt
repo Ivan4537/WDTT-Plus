@@ -58,6 +58,7 @@ import com.wdtt.plus.SettingsStore
 import com.wdtt.plus.TunnelManager
 import com.wdtt.plus.WDTTColors
 import com.wdtt.plus.vpnProfileDisplayName
+import com.wdtt.plus.vpnProfileTransferName
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
@@ -1212,6 +1213,7 @@ fun DeployTab(
                 mainPassword = savedMainPass,
                 defaultPorts = "${if (savedManualPorts) savedServerDtlsPort else 56000},${if (savedManualPorts) savedServerWgPort else 56001},${if (savedManualPorts) savedListenPort else 9000}",
                 adminProfile = currentOwnerProfile(),
+                sourceProfileName = vpnProfileTransferName(activeProfile, profileNames),
                 enabled = !isDeploying && !isCheckingExistingInstall && !migrationBusy && !outboundBusy && isServerAddressValid,
                 expanded = clientsExpanded,
                 modifier = Modifier.onGloballyPositioned { clientsSectionY = it.positionInParent().y },

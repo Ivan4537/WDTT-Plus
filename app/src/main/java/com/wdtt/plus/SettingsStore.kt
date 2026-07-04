@@ -33,7 +33,8 @@ data class WdttLinkParts(
     val wgPort: Int,
     val localPort: Int,
     val password: String,
-    val hashes: String
+    val hashes: String,
+    val profileName: String = ""
 )
 
 data class WdttDeepLinkValidation(
@@ -47,6 +48,11 @@ data class WdttDeepLinkValidation(
         return if (canStartVpn) {
             buildString {
                 append("Ссылка wdtt:// корректна. VPN сможет использовать эти данные для подключения.")
+                parts?.profileName?.takeIf { it.isNotBlank() }?.let {
+                    append("\nНазвание профиля: «")
+                    append(it)
+                    append("».")
+                }
                 if (warnings.isNotEmpty()) {
                     append("\n\nПредупреждения:\n")
                     append(warnings.joinToString("\n") { "• $it" })
@@ -158,7 +164,15 @@ object WdttDeepLink {
         }
 
         val linkParts = if (errors.isEmpty() && dtlsPort != null && wgPort != null && localPort != null) {
-            WdttLinkParts(host, dtlsPort, wgPort, localPort, password, hashes)
+            WdttLinkParts(
+                host = host,
+                dtlsPort = dtlsPort,
+                wgPort = wgPort,
+                localPort = localPort,
+                password = password,
+                hashes = hashes,
+                profileName = normalizeVpnProfileName(modernParts?.profileName.orEmpty())
+            )
         } else null
 
         return WdttDeepLinkValidation(linkParts, errors, warnings)
@@ -688,6 +702,15 @@ class SettingsStore(context: Context) {
         dataStore.edit { prefs ->
             val profile = prefs[ACTIVE_PROFILE] ?: 0
             prefs[getProfileKey(WDTT_LINK, profile)] = link
+            val importedProfileName = normalizeVpnProfileName(WdttDeepLink.parse(link)?.profileName.orEmpty())
+            if (importedProfileName.isNotBlank()) {
+                val profileNameKey = getProfileKey(PROFILE_NAME, profile)
+                if (importedProfileName == vpnProfileDefaultName(profile)) {
+                    prefs.remove(profileNameKey)
+                } else {
+                    prefs[profileNameKey] = importedProfileName
+                }
+            }
         }
     }
 
@@ -721,12 +744,14 @@ class SettingsStore(context: Context) {
                 password = readSecret(prefs, CONNECTION_PASSWORD_ENCRYPTED, CONNECTION_PASSWORD, profile),
                 hashes = prefs[getProfileKey(VK_HASHES, profile)].orEmpty()
             )
-            val link = WdttTransferCodec.buildConnectionLink(parts)
-            val validation = WdttDeepLink.validate(link)
-            val profileLabel = vpnProfileDisplayName(
-                profile,
-                (0 until VPN_PROFILE_COUNT).map { index -> prefs[getProfileKey(PROFILE_NAME, index)].orEmpty() }
+            val names = (0 until VPN_PROFILE_COUNT).map { index ->
+                prefs[getProfileKey(PROFILE_NAME, index)].orEmpty()
+            }
+            val profileLabel = vpnProfileDisplayName(profile, names)
+            val link = WdttTransferCodec.buildConnectionLink(
+                parts.copy(profileName = vpnProfileTransferName(profile, names))
             )
+            val validation = WdttDeepLink.validate(link)
             require(validation.canStartVpn) {
                 "Профиль «$profileLabel» заполнен не полностью. Проверьте адрес, порты, пароль и VK-хеши."
             }
@@ -872,6 +897,15 @@ class SettingsStore(context: Context) {
         val profile = plan.targetProfile.coerceIn(0, VPN_PROFILE_COUNT - 1)
         dataStore.edit { prefs ->
             prefs[ACTIVE_PROFILE] = profile
+            val importedProfileName = normalizeVpnProfileName(parts.profileName)
+            if (importedProfileName.isNotBlank()) {
+                val profileNameKey = getProfileKey(PROFILE_NAME, profile)
+                if (importedProfileName == vpnProfileDefaultName(profile)) {
+                    prefs.remove(profileNameKey)
+                } else {
+                    prefs[profileNameKey] = importedProfileName
+                }
+            }
             prefs[getProfileKey(WDTT_LINK_MODE, profile)] = plan.storeAsLink
             if (plan.storeAsLink) {
                 prefs[getProfileKey(WDTT_LINK, profile)] = plan.link
@@ -1258,4 +1292,9 @@ fun normalizeVpnProfileName(name: String): String =
 fun vpnProfileDisplayName(profile: Int, names: List<String>): String {
     val clean = normalizeVpnProfileName(names.getOrNull(profile).orEmpty())
     return clean.ifBlank { vpnProfileDefaultName(profile) }
+}
+
+fun vpnProfileTransferName(profile: Int, names: List<String>): String {
+    val displayName = vpnProfileDisplayName(profile, names)
+    return displayName.takeUnless { it == vpnProfileDefaultName(profile) }.orEmpty()
 }

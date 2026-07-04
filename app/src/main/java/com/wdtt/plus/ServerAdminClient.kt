@@ -610,8 +610,8 @@ private class AdminSshClient(private val session: Session, private val sudoPassw
 private fun String.thirdPortOrDefault(default: Int): Int =
     split(",").map { it.trim().toIntOrNull() }.getOrNull(2)?.takeIf { it in 1..65535 } ?: default
 
-fun ServerClientInfo.connectionLink(fallbackHost: String, publicHost: String): String? {
-    return buildServerConnectionLink(password, vkHash, ports, fallbackHost, publicHost)
+fun ServerClientInfo.connectionLink(fallbackHost: String, publicHost: String, profileName: String = ""): String? {
+    return buildServerConnectionLink(password, vkHash, ports, fallbackHost, publicHost, profileName)
 }
 
 fun buildServerConnectionLink(
@@ -619,7 +619,8 @@ fun buildServerConnectionLink(
     hashes: String,
     ports: String,
     fallbackHost: String,
-    publicHost: String
+    publicHost: String,
+    profileName: String = ""
 ): String? {
     if (hashes.isBlank() || password.isBlank()) return null
     val parts = ports.split(",").map { it.trim().toIntOrNull() }
@@ -636,7 +637,8 @@ fun buildServerConnectionLink(
             wgPort = wg,
             localPort = local,
             password = password,
-            hashes = hashes
+            hashes = hashes,
+            profileName = profileName
         )
     )
 }

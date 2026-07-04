@@ -27,6 +27,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.wdtt.plus.LogEntry
+import com.wdtt.plus.LogSeverity
 import com.wdtt.plus.TunnelManager
 import com.wdtt.plus.WDTTColors
 import com.wdtt.plus.SettingsStore
@@ -43,6 +44,7 @@ fun LogsTab(
     val loggingEnabled by settingsStore.loggingEnabled.collectAsStateWithLifecycle(initialValue = true)
     val scope = rememberCoroutineScope()
     val currentLogs by TunnelManager.logs.collectAsStateWithLifecycle()
+    val tunnelRunning by TunnelManager.running.collectAsStateWithLifecycle()
     val listState = rememberRememberedLazyListState(
         firstVisibleItemIndex,
         firstVisibleItemScrollOffset
@@ -124,7 +126,7 @@ fun LogsTab(
                 contentPadding = PaddingValues(bottom = 12.dp)
             ) {
                 items(currentLogs, key = { it.key }) { entry ->
-                    LogLine(entry)
+                    LogLine(entry, sessionActive = tunnelRunning)
                 }
             }
         }
@@ -132,12 +134,24 @@ fun LogsTab(
 }
 
 @Composable
-fun LogLine(entry: LogEntry) {
-    val color = when {
-        entry.isError -> WDTTColors.terminalRed
+fun LogLine(entry: LogEntry, sessionActive: Boolean) {
+    val activeColor = when {
+        entry.severity == LogSeverity.Error -> WDTTColors.terminalRed
+        entry.severity == LogSeverity.Warning -> WDTTColors.terminalYellow
         entry.priority <= 2 -> WDTTColors.terminalGreen
         entry.priority == 3 -> WDTTColors.terminalBlue
         else -> WDTTColors.terminalText
+    }
+    val isStoppedStats = entry.key == "stats" && entry.message.contains("VPN отключён")
+    val color = when {
+        sessionActive -> activeColor
+        isStoppedStats -> MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.9f)
+        else -> MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.48f)
+    }
+    val counterColor = if (sessionActive) {
+        WDTTColors.terminalBlue
+    } else {
+        MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = if (isStoppedStats) 0.85f else 0.48f)
     }
 
     var trigger by remember { mutableIntStateOf(0) }
@@ -167,7 +181,7 @@ fun LogLine(entry: LogEntry) {
             ) {
                 Text(
                     text = "${entry.count}",
-                    color = WDTTColors.terminalBlue,
+                    color = counterColor,
                     fontSize = 10.sp,
                     fontWeight = FontWeight.Bold,
                     maxLines = 1
@@ -182,7 +196,11 @@ fun LogLine(entry: LogEntry) {
             color = color,
             fontSize = 13.sp,
             fontFamily = FontFamily.Monospace,
-            fontWeight = if (entry.isError) FontWeight.Bold else FontWeight.Normal,
+            fontWeight = when (entry.severity) {
+                LogSeverity.Error -> FontWeight.Bold
+                LogSeverity.Warning -> FontWeight.Medium
+                LogSeverity.Info -> FontWeight.Normal
+            },
             lineHeight = 18.sp,
             modifier = Modifier.weight(1f)
         )

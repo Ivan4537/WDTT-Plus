@@ -42,6 +42,9 @@ object WdttTransferCodec {
             "password" to parts.password,
             "hashes" to parts.hashes
         )
+        normalizeVpnProfileName(parts.profileName)
+            .takeIf { it.isNotBlank() }
+            ?.let { values["name"] = it }
         return "wdtt://connect?" + values.entries.joinToString("&") { (key, value) ->
             "${encode(key)}=${encode(value)}"
         }
@@ -69,7 +72,8 @@ object WdttTransferCodec {
             wgPort = values["wg"]?.toIntOrNull() ?: return null,
             localPort = values["local"]?.toIntOrNull() ?: return null,
             password = values["password"].orEmpty(),
-            hashes = values["hashes"].orEmpty()
+            hashes = values["hashes"].orEmpty(),
+            profileName = values["name"].orEmpty()
         )
     }
 
