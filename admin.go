@@ -490,6 +490,7 @@ func normalizeAdminProfileForStorage(profile AdminProfileEntry, defaultPorts str
 	}
 	profile.VkHashes = strings.TrimSpace(profile.VkHashes)
 	profile.SecondaryVkHash = strings.TrimSpace(profile.SecondaryVkHash)
+	profile.ProfileName = normalizeAdminProfileName(profile.ProfileName)
 	if profile.WorkersPerHash < 1 || profile.WorkersPerHash > 128 {
 		profile.WorkersPerHash = 16
 	}
@@ -540,6 +541,28 @@ func normalizeAdminProfileSNI(value string) string {
 		value = string([]rune(value)[:253])
 	}
 	return value
+}
+
+func normalizeAdminProfileName(value string) string {
+	value = strings.Join(strings.Fields(strings.TrimSpace(value)), " ")
+	if isDefaultAdminProfileName(value) {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) > 48 {
+		value = string(runes[:48])
+	}
+	return value
+}
+
+func isDefaultAdminProfileName(value string) bool {
+	normalized := strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(value), " ", ""))
+	switch normalized {
+	case "VPN1", "VPN2", "VPN3", "ВПН1", "ВПН2", "ВПН3":
+		return true
+	default:
+		return false
+	}
 }
 
 func normalizeAdminProfileDeviceIDs(values []string) []string {
@@ -1246,6 +1269,7 @@ func adminUpdateAdminProfile(configDir string, loaded *Database, args []string) 
 	fs.SetOutput(io.Discard)
 	vkHashes := fs.String("vk-hashes", "", "VK-хеши владельца")
 	secondaryVkHash := fs.String("secondary-vk-hash", "", "резервный VK-хеш владельца")
+	profileName := fs.String("profile-name", "", "название VPN-профиля владельца")
 	workers := fs.Int("workers", 16, "потоков на хеш")
 	protocol := fs.String("protocol", "udp", "протокол клиента")
 	listenPort := fs.Int("listen-port", 0, "локальный порт клиента")
@@ -1273,6 +1297,7 @@ func adminUpdateAdminProfile(configDir string, loaded *Database, args []string) 
 		}
 		profile.SecondaryVkHash = normalized
 	}
+	profile.ProfileName = normalizeAdminProfileName(*profileName)
 	if *workers < 1 || *workers > 128 {
 		return adminResponse{}, errors.New("workers должен быть 1..128")
 	}

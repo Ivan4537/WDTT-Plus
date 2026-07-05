@@ -2,13 +2,23 @@ package com.wdtt.plus.ui
 
 import androidx.compose.runtime.MutableState
 
+import android.app.ActivityManager
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
+import android.net.VpnService
 import android.os.Build
+import android.os.PowerManager
+import android.os.StatFs
 import android.provider.Settings
+import android.system.Os
+import android.system.OsConstants
+import android.webkit.WebView
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -92,8 +102,11 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.wdtt.plus.BuildConfig
+import com.wdtt.plus.DeviceCheckAction
+import com.wdtt.plus.DeviceCompatibility
 import com.wdtt.plus.R
 import com.wdtt.plus.SettingsStore
+import com.wdtt.plus.TunnelManager
 import com.wdtt.plus.UPDATE_DIALOG_ACTION_POSTPONED
 import com.wdtt.plus.UPDATE_DIALOG_ACTION_UPDATE
 import com.wdtt.plus.WDTTColors
@@ -104,9 +117,19 @@ import com.wdtt.plus.downloadUpdateApk
 import com.wdtt.plus.fetchLatestReleaseInfo
 import com.wdtt.plus.installUpdateApk
 import com.wdtt.plus.isNewerVersion
+import com.wdtt.plus.label
 import com.wdtt.plus.selectUpdateApkAsset
+import com.wdtt.plus.deviceCheckActionIntent
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
+import java.security.MessageDigest
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.TimeZone
 import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.min
@@ -175,6 +198,23 @@ private fun openUrlInBrowser(context: Context, url: String) {
     }
 }
 
+private fun openDeviceCheckAction(context: Context, action: DeviceCheckAction) {
+    runCatching {
+        val intent = deviceCheckActionIntent(context, action)
+        if (intent.resolveActivity(context.packageManager) != null) {
+            context.startActivity(intent)
+        } else {
+            context.startActivity(
+                Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                    data = Uri.parse("package:${context.packageName}")
+                }
+            )
+        }
+    }.onFailure {
+        Toast.makeText(context, "Не удалось открыть настройки Android", Toast.LENGTH_SHORT).show()
+    }
+}
+
 @Composable
 fun InfoTab(
     actionsExpandedState: MutableState<Boolean> = rememberSaveable { mutableStateOf(true) },
@@ -198,6 +238,8 @@ fun InfoTab(
     var pendingUpdateApkPath by rememberSaveable { mutableStateOf<String?>(null) }
 	var showHelpDialog by remember { mutableStateOf(false) }
 	var showSupportDialog by remember { mutableStateOf(false) }
+    var isCheckingDevice by remember { mutableStateOf(false) }
+    var deviceCheckReport by remember { mutableStateOf<com.wdtt.plus.DeviceCompatibilityReport?>(null) }
 	var actionsExpanded by actionsExpandedState
 	var projectExpanded by projectExpandedState
     val updateLatestVersion by settingsStore.updateLatestVersion.collectAsStateWithLifecycle(initialValue = "")
@@ -256,6 +298,33 @@ fun InfoTab(
         }
     }
 
+    suspend fun buildDeviceCheckReportWithVersion(): com.wdtt.plus.DeviceCompatibilityReport {
+        val latestCheckedAt = System.currentTimeMillis()
+        val latestRelease = fetchLatestReleaseInfo(currentVersion)
+        settingsStore.saveUpdateState(
+            lastCheckAt = latestCheckedAt,
+            latestVersion = latestRelease?.versionTag ?: "",
+            error = if (latestRelease == null) "Не удалось проверить" else ""
+        )
+        val versionItem = DeviceCompatibility.appVersionItem(
+            currentVersion = currentVersion,
+            releaseDate = releaseDate,
+            latestRelease = latestRelease
+        )
+        val workers = runCatching { settingsStore.workersPerHash.first() }.getOrNull()
+        val report = withContext(Dispatchers.Default) {
+            DeviceCompatibility.check(
+                context = context.applicationContext,
+                includeRuntimeChecks = true,
+                workersPerHash = workers
+            )
+        }
+        return report.copy(
+            items = listOf(versionItem) +
+                report.items.filterNot { it.title == DeviceCompatibility.APP_VERSION_ITEM_TITLE }
+        )
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -285,7 +354,7 @@ fun InfoTab(
 
         ExpandableSectionCard(
             title = "Действия",
-            itemCount = "4 пункта",
+            itemCount = "5 пунктов",
             expanded = actionsExpanded,
             modifier = Modifier.onGloballyPositioned { actionsSectionY = it.positionInParent().y },
             onToggle = {
@@ -323,15 +392,55 @@ fun InfoTab(
 
             WideActionTile(
                 title = "Собрать отчёт",
-                subtitle = "Android, ABI, версия, устройство",
+                subtitle = "Android, ABI, память, сеть и компоненты",
                 onClick = {
-                    val clipboard = context.getSystemService(ClipboardManager::class.java)
-                    clipboard?.setPrimaryClip(ClipData.newPlainText("WDTT Report", buildSupportReport()))
-                    Toast.makeText(context, "Отчёт сформирован и скопирован", Toast.LENGTH_SHORT).show()
+                    scope.launch {
+                        val report = withContext(Dispatchers.Default) {
+                            buildSupportReport(context.applicationContext, settingsStore)
+                        }
+                        val clipboard = context.getSystemService(ClipboardManager::class.java)
+                        clipboard?.setPrimaryClip(ClipData.newPlainText("WDTT Report", report))
+                        Toast.makeText(context, "Отчёт сформирован и скопирован", Toast.LENGTH_SHORT).show()
+                    }
                 },
                 icon = {
                     Icon(
                         imageVector = Icons.Default.ContentCopy,
+                        contentDescription = null,
+                        modifier = Modifier.size(20.dp),
+                        tint = MaterialTheme.colorScheme.onPrimaryContainer
+                    )
+                }
+            )
+
+            WideActionTile(
+                title = "Проверить устройство",
+                subtitle = if (isCheckingDevice) {
+                    "Проверяем версию, Android, ABI и системные условия..."
+                } else {
+                    "Версия, совместимость, ABI, native, WebView и настройки"
+                },
+                onClick = {
+                    if (isCheckingDevice) return@WideActionTile
+                    isCheckingDevice = true
+                    scope.launch {
+                        runCatching {
+                            buildDeviceCheckReportWithVersion()
+                        }.onSuccess { report ->
+                            deviceCheckReport = report
+                        }.onFailure { error ->
+                            Toast.makeText(
+                                context,
+                                error.message ?: "Не удалось проверить устройство",
+                                Toast.LENGTH_LONG
+                            ).show()
+                        }
+                        isCheckingDevice = false
+                    }
+                },
+                icon = {
+                    Icon(
+                        imageVector = Icons.Default.Info,
                         contentDescription = null,
                         modifier = Modifier.size(20.dp),
                         tint = MaterialTheme.colorScheme.onPrimaryContainer
@@ -561,6 +670,29 @@ fun InfoTab(
 	}
 
 	if (showHelpDialog) ImportantInfoDialog(onDismiss = { showHelpDialog = false })
+    deviceCheckReport?.let { report ->
+        DeviceCompatibilityDialog(
+            report = report,
+            title = "Проверка устройства",
+            subtitle = "Расширенная проверка не запускает VPN, но показывает совместимость устройства, настройки Android и текущее состояние туннеля.",
+            note = "Здесь проверяется всё, что можно проверить без тестового подключения: VPN-разрешение, активен ли туннель сейчас, сеть, WebView, батарея, установка APK и базовая совместимость устройства.",
+            onDismiss = { deviceCheckReport = null },
+            onCopy = {
+                scope.launch {
+                    val freshReport = runCatching {
+                        buildDeviceCheckReportWithVersion()
+                    }.getOrElse {
+                        report
+                    }
+                    deviceCheckReport = freshReport
+                    val clipboard = context.getSystemService(ClipboardManager::class.java)
+                    clipboard?.setPrimaryClip(ClipData.newPlainText("WDTT Device Check", freshReport.toPlainText()))
+                    Toast.makeText(context, "Проверка устройства скопирована", Toast.LENGTH_SHORT).show()
+                }
+            },
+            onAction = { action -> openDeviceCheckAction(context, action) }
+        )
+    }
 	if (showSupportDialog) {
 		SupportProjectDialog(
 			onDismiss = { showSupportDialog = false },
@@ -1131,7 +1263,13 @@ private fun ProjectLinkRow(
     }
 }
 
-private fun buildSupportReport(): String {
+private fun diagnosticText(block: () -> Any?): String =
+    runCatching { block()?.toString()?.takeIf(String::isNotBlank) ?: "недоступно" }
+        .getOrDefault("недоступно")
+
+private fun formatMiB(bytes: Long): String = "${bytes.coerceAtLeast(0L) / (1024L * 1024L)} МБ"
+
+private suspend fun buildSupportReport(context: Context, settingsStore: SettingsStore): String {
     val androidVersion = Build.VERSION.RELEASE ?: "?"
     val sdkInt = Build.VERSION.SDK_INT
     val primaryAbi = Build.SUPPORTED_ABIS.firstOrNull().orEmpty().ifBlank { "unknown" }
@@ -1158,15 +1296,168 @@ private fun buildSupportReport(): String {
         "n/a"
     }
 
+    val appInfo = runCatching { context.applicationInfo }.getOrNull()
+    val packageInfo = runCatching {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.packageManager.getPackageInfo(
+                context.packageName,
+                PackageManager.PackageInfoFlags.of(PackageManager.GET_SIGNING_CERTIFICATES.toLong())
+            )
+        } else {
+            @Suppress("DEPRECATION")
+            context.packageManager.getPackageInfo(
+                context.packageName,
+                PackageManager.GET_SIGNING_CERTIFICATES
+            )
+        }
+    }.getOrNull()
+    val signingCertificate = diagnosticText {
+        val certificate = packageInfo?.signingInfo?.apkContentsSigners?.firstOrNull()?.toByteArray()
+            ?: return@diagnosticText null
+        MessageDigest.getInstance("SHA-256")
+            .digest(certificate)
+            .joinToString("") { "%02x".format(it) }
+    }
+    val installSource = diagnosticText {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            context.packageManager.getInstallSourceInfo(context.packageName).installingPackageName
+        } else {
+            @Suppress("DEPRECATION")
+            context.packageManager.getInstallerPackageName(context.packageName)
+        } ?: "ручная установка"
+    }
+    val dateFormat = SimpleDateFormat("dd.MM.yyyy HH:mm:ss", Locale.ROOT)
+    val firstInstallTime = diagnosticText { packageInfo?.firstInstallTime?.let { dateFormat.format(Date(it)) } }
+    val lastUpdateTime = diagnosticText { packageInfo?.lastUpdateTime?.let { dateFormat.format(Date(it)) } }
+    val processBits = diagnosticText { if (android.os.Process.is64Bit()) "64-bit" else "32-bit" }
+    val pageSize = diagnosticText { "${Os.sysconf(OsConstants._SC_PAGESIZE)} байт" }
+    val securityPatch = Build.VERSION.SECURITY_PATCH.orEmpty().ifBlank { "unknown" }
+    val kernel = diagnosticText { System.getProperty("os.version") }
+
+    val activityManager = runCatching {
+        context.getSystemService(ActivityManager::class.java)
+    }.getOrNull()
+    val memoryInfo = runCatching {
+        ActivityManager.MemoryInfo().also { activityManager?.getMemoryInfo(it) }
+    }.getOrNull()
+    val memorySummary = if (memoryInfo != null && memoryInfo.totalMem > 0L) {
+        "всего ${formatMiB(memoryInfo.totalMem)}, доступно ${formatMiB(memoryInfo.availMem)}, " +
+            "lowMemory=${memoryInfo.lowMemory}"
+    } else {
+        "недоступно"
+    }
+    val memoryClass = diagnosticText {
+        "обычный ${activityManager?.memoryClass} МБ, большой ${activityManager?.largeMemoryClass} МБ"
+    }
+    val lowRamDevice = diagnosticText { activityManager?.isLowRamDevice }
+
+    val storageSummary = runCatching {
+        val stat = StatFs(context.filesDir.absolutePath)
+        "свободно ${formatMiB(stat.availableBytes)}, всего ${formatMiB(stat.totalBytes)}"
+    }.getOrDefault("недоступно")
+
+    val powerManager = runCatching { context.getSystemService(PowerManager::class.java) }.getOrNull()
+    val powerSummary = diagnosticText {
+        "экономия=${powerManager?.isPowerSaveMode}, " +
+            "без ограничений батареи=${powerManager?.isIgnoringBatteryOptimizations(context.packageName)}"
+    }
+
+    val connectivityManager = runCatching {
+        context.getSystemService(ConnectivityManager::class.java)
+    }.getOrNull()
+    val activeNetwork = runCatching { connectivityManager?.activeNetwork }.getOrNull()
+    val networkCapabilities = runCatching {
+        activeNetwork?.let { connectivityManager?.getNetworkCapabilities(it) }
+    }.getOrNull()
+    val networkTransports = buildList {
+        if (networkCapabilities?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true) add("Wi-Fi")
+        if (networkCapabilities?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true) add("мобильная")
+        if (networkCapabilities?.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) == true) add("Ethernet")
+        if (networkCapabilities?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true) add("VPN")
+    }.joinToString().ifBlank { "не определён" }
+    val networkSummary = if (networkCapabilities != null) {
+        "$networkTransports, internet=${networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)}, " +
+            "validated=${networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)}, " +
+            "metered=${connectivityManager?.isActiveNetworkMetered}"
+    } else {
+        "недоступно"
+    }
+    val privateDns = diagnosticText {
+        val properties = activeNetwork?.let { connectivityManager?.getLinkProperties(it) }
+        properties?.isPrivateDnsActive
+    }
+
+    val webViewInfo = diagnosticText {
+        WebView.getCurrentWebViewPackage()?.let { "${it.packageName} ${it.versionName}" }
+    }
+    val nativeClientInfo = runCatching {
+        val nativeClient = File(appInfo?.nativeLibraryDir.orEmpty(), "libclient.so")
+        if (nativeClient.isFile) {
+            "найден, ${formatMiB(nativeClient.length())}, executable=${nativeClient.canExecute()}"
+        } else {
+            "не найден"
+        }
+    }.getOrDefault("недоступно")
+
+    val notificationPermission = diagnosticText {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            "не требуется до Android 13"
+        } else {
+            context.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) ==
+                PackageManager.PERMISSION_GRANTED
+        }
+    }
+    val updateInstallPermission = diagnosticText {
+        context.packageManager.canRequestPackageInstalls()
+    }
+    val vpnPermission = diagnosticText { VpnService.prepare(context) == null }
+    val displayMetrics = context.resources.displayMetrics
+    val screenSummary = diagnosticText {
+        "${displayMetrics.widthPixels}×${displayMetrics.heightPixels}, " +
+            "density=${displayMetrics.densityDpi} dpi, fontScale=${context.resources.configuration.fontScale}"
+    }
+
+    val activeProfile = runCatching { settingsStore.activeProfile.first() + 1 }.getOrNull()
+    val workers = runCatching { settingsStore.workersPerHash.first() }.getOrNull()
+    val deviceCompatibility = DeviceCompatibility.check(
+        context = context,
+        includeRuntimeChecks = true,
+        workersPerHash = workers
+    )
+    val vkHashes = runCatching { settingsStore.vkHashes.first() }.getOrDefault("")
+    val hashCount = vkHashes
+        .split(Regex("[,\\s\\n]+"))
+        .count { it.isNotBlank() }
+        .coerceAtMost(4)
+    val hasSecondaryHash = runCatching { settingsStore.secondaryVkHash.first().isNotBlank() }.getOrNull()
+    val vkCallsEnabled = runCatching { settingsStore.vkCallsPreflight.first() }.getOrNull()
+    val captchaMode = runCatching { settingsStore.captchaMode.first() }.getOrNull()
+    val fingerprint = runCatching { settingsStore.selectedFingerprint.first() }.getOrNull()
+    val linkMode = runCatching { settingsStore.wdttLinkMode.first() }.getOrNull()
+    val interfaceRole = runCatching { settingsStore.interfaceRole.first() }.getOrNull()
+    val themeMode = runCatching { settingsStore.themeMode.first() }.getOrNull()
+    val dynamicColor = runCatching { settingsStore.isDynamicColor.first() }.getOrNull()
+    val loggingEnabled = runCatching { settingsStore.loggingEnabled.first() }.getOrNull()
+    val tunnelIssue = TunnelManager.connectionIssue.value?.title.orEmpty().ifBlank { "нет" }
+
     return buildString {
+        appendLine("Отчёт создан: ${diagnosticText { dateFormat.format(Date()) }}")
         appendLine("Версия приложения: ${BuildConfig.VERSION_NAME}")
         appendLine("Дата релиза: ${BuildConfig.MOD_RELEASE_DATE}")
-        appendLine("Андроид: $androidVersion (SDK $sdkInt)")
+        appendLine("Версия пакета: code ${packageInfo?.longVersionCode ?: "?"}")
+        appendLine("Источник установки: $installSource")
+        appendLine("Первая установка: $firstInstallTime")
+        appendLine("Последнее обновление: $lastUpdateTime")
+        appendLine("SHA-256 сертификата: $signingCertificate")
+        appendLine("Android: $androidVersion (SDK $sdkInt, patch $securityPatch)")
+        appendLine("SDK приложения: min ${appInfo?.minSdkVersion ?: "?"}, target ${appInfo?.targetSdkVersion ?: "?"}")
         appendLine("Устройство: $manufacturer / $brand / $model")
         appendLine("Код устройства: $device")
         appendLine("Продукт: $product")
         appendLine("ABI: $primaryAbi")
         appendLine("Все ABI: $supportedAbis")
+        appendLine("Процесс: $processBits")
+        appendLine("Страница памяти: $pageSize")
         appendLine("SoC: $socManufacturer / $socModel")
         appendLine("Hardware: $hardware")
         appendLine("Board: $board")
@@ -1174,5 +1465,40 @@ private fun buildSupportReport(): String {
         appendLine("Build ID: $buildId")
         appendLine("Build type: $buildType")
         appendLine("Fingerprint: $buildFingerprint")
+        appendLine("Kernel: $kernel")
+        appendLine("RAM: $memorySummary")
+        appendLine("Memory class: $memoryClass")
+        appendLine("Low-RAM устройство: $lowRamDevice")
+        appendLine("Хранилище приложения: $storageSummary")
+        appendLine("Питание: $powerSummary")
+        appendLine("Сеть: $networkSummary")
+        appendLine("Private DNS: $privateDns")
+        appendLine("WebView: $webViewInfo")
+        appendLine("Нативный клиент: $nativeClientInfo")
+        appendLine("Экран: $screenSummary")
+        appendLine("Разрешение уведомлений: $notificationPermission")
+        appendLine("Установка обновлений APK: $updateInstallPermission")
+        appendLine("VPN-разрешение: $vpnPermission")
+        appendLine("Совместимость устройства: ${deviceCompatibility.overallStatus}")
+        deviceCompatibility.items.forEach { item ->
+            appendLine(" - [${item.severity.label()}] ${item.title}: ${item.status}")
+            if (item.recommendation.isNotBlank()) {
+                appendLine("   Рекомендация: ${item.recommendation}")
+            }
+        }
+        appendLine("Локаль: ${diagnosticText { Locale.getDefault().toLanguageTag() }}")
+        appendLine("Часовой пояс: ${diagnosticText { TimeZone.getDefault().id }}")
+        appendLine("Туннель: запущен=${TunnelManager.running.value}, активных=${TunnelManager.activeWorkers.value}")
+        appendLine("Последняя проблема: $tunnelIssue")
+        appendLine("Профиль: ${activeProfile ?: "недоступно"}")
+        appendLine("Потоки: ${workers ?: "недоступно"}")
+        appendLine("VK-хеши: заполнено $hashCount, запасной=${hasSecondaryHash ?: "недоступно"}")
+        appendLine("VKCalls: ${vkCallsEnabled ?: "недоступно"}")
+        appendLine("Captcha mode: ${captchaMode ?: "недоступно"}")
+        appendLine("TLS fingerprint: ${fingerprint ?: "недоступно"}")
+        appendLine("Режим ссылки: ${linkMode ?: "недоступно"}")
+        appendLine("Роль интерфейса: ${interfaceRole?.ifBlank { "не выбрана" } ?: "недоступно"}")
+        appendLine("Тема: ${themeMode ?: "недоступно"}, Dynamic Colors=${dynamicColor ?: "недоступно"}")
+        appendLine("Логирование: ${loggingEnabled ?: "недоступно"}")
     }.trim()
 }

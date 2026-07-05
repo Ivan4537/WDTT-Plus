@@ -90,6 +90,7 @@ func TestAdminSocketAppliesClientChangesWithoutRestart(t *testing.T) {
 		"update-admin-profile",
 		"--vk-hashes", "abcdefghijklmnop,qrstuvwxyzABCDEF",
 		"--secondary-vk-hash", "1234567890abcdef",
+		"--profile-name", "Домашний телефон",
 		"--workers", "27",
 		"--protocol", "tcp",
 		"--listen-port", "9010",
@@ -104,6 +105,7 @@ func TestAdminSocketAppliesClientChangesWithoutRestart(t *testing.T) {
 	profile := listedOwner.Server.AdminProfile
 	if profile.VkHashes != "abcdefghijklmnop,qrstuvwxyzABCDEF" ||
 		profile.SecondaryVkHash != "1234567890abcdef" ||
+		profile.ProfileName != "Домашний телефон" ||
 		profile.WorkersPerHash != 27 ||
 		profile.Protocol != "tcp" ||
 		profile.ListenPort != 9010 ||

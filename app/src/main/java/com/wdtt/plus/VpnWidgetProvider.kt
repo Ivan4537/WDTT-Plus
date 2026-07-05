@@ -14,6 +14,7 @@ import android.widget.Toast
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
 class VpnWidgetProvider : AppWidgetProvider() {
@@ -35,13 +36,26 @@ class VpnWidgetProvider : AppWidgetProvider() {
                     context.sendBroadcast(intent)
                 }
             }
+            VpnCompactWidgetProvider.updateAllWidgets(context)
         }
     }
 
     override fun onUpdate(context: Context, appWidgetManager: AppWidgetManager, appWidgetIds: IntArray) {
         val running = TunnelManager.running.value
-        for (appWidgetId in appWidgetIds) {
-            updateWidgetState(context, appWidgetManager, appWidgetId, running)
+        scope.launch {
+            val settingsStore = SettingsStore(context)
+            val activeProfile = settingsStore.activeProfile.first().coerceIn(0, 2)
+            val profileNames = settingsStore.profileNames.first()
+            for (appWidgetId in appWidgetIds) {
+                updateWidgetState(
+                    context = context,
+                    appWidgetManager = appWidgetManager,
+                    appWidgetId = appWidgetId,
+                    running = running,
+                    activeProfile = activeProfile,
+                    profileNames = profileNames
+                )
+            }
         }
     }
 
@@ -93,13 +107,17 @@ class VpnWidgetProvider : AppWidgetProvider() {
         context: Context,
         appWidgetManager: AppWidgetManager,
         appWidgetId: Int,
-        running: Boolean
+        running: Boolean,
+        activeProfile: Int,
+        profileNames: List<String>
     ) {
         val views = RemoteViews(context.packageName, R.layout.vpn_widget)
 
         // Обновляем текст статуса и неоновую иконку кнопки
         if (running) {
-            views.setTextViewText(R.id.widget_status, "Подключено")
+            val profileName = vpnProfileDisplayName(activeProfile, profileNames)
+            val status = "Подключено к $profileName"
+            views.setTextViewText(R.id.widget_status, status)
             views.setTextColor(R.id.widget_status, 0xFF00E5FF.toInt()) // Неоновый голубой
             views.setInt(R.id.widget_toggle_btn, "setBackgroundResource", R.drawable.bg_widget_button_active)
         } else {

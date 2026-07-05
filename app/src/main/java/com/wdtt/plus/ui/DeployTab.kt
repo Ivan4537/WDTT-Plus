@@ -1,9 +1,12 @@
 package com.wdtt.plus.ui
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
@@ -21,9 +24,11 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.HelpOutline
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.Key
@@ -58,6 +63,7 @@ import com.wdtt.plus.ServerAdminTarget
 import com.wdtt.plus.SettingsStore
 import com.wdtt.plus.TunnelManager
 import com.wdtt.plus.WDTTColors
+import com.wdtt.plus.vpnProfileRestorableName
 import com.wdtt.plus.vpnProfileDisplayName
 import com.wdtt.plus.vpnProfileTransferName
 import kotlinx.coroutines.Dispatchers
@@ -791,7 +797,8 @@ fun DeployTab(
         sni = savedSni,
         noDns = savedNoDns,
         dtlsPort = if (savedManualPorts) savedServerDtlsPort else 56000,
-        wgPort = if (savedManualPorts) savedServerWgPort else 56001
+        wgPort = if (savedManualPorts) savedServerWgPort else 56001,
+        profileName = vpnProfileTransferName(activeProfile, profileNames)
     )
 
     fun currentOutboundProfileForms(): OutboundProfileForms = OutboundProfileForms(
@@ -864,6 +871,9 @@ fun DeployTab(
         )
         settingsStore.saveDeploy(ip.trim(), effectiveLogin, password, savedSshPort.ifBlank { "22" }, connection.dns1, connection.dns2)
         settingsStore.saveWdttLinkMode(false)
+        vpnProfileRestorableName(normalizedProfile.profileName)
+            .takeIf { it.isNotBlank() }
+            ?.let { settingsStore.saveProfileName(activeProfile, it) }
 
         existingConnectStatus = when (source) {
             OwnerProfileSource.Server -> "Готово: данные восстановлены с сервера в приложение. Сервер не изменялся. Адрес: ${connection.host}; порты: ${ports.first}, ${ports.second}, ${ports.third}."
@@ -1207,18 +1217,11 @@ fun DeployTab(
             .verticalScroll(deployScrollState),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-            Text(
-                "Настройки сервера",
-                style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-                color = MaterialTheme.colorScheme.onSurface
-            )
-            Text(
-                "(${vpnProfileDisplayName(activeProfile, profileNames)})",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-        }
+        Text(
+            "Настройки сервера (${vpnProfileDisplayName(activeProfile, profileNames)})",
+            style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+            color = MaterialTheme.colorScheme.onSurface
+        )
 
         val importCanProvideMainPassword = selectedImportMode == ServerImportMode.Replace &&
             selectedImportBackup?.mainPassword?.isNotBlank() == true
@@ -6200,7 +6203,8 @@ private fun buildOwnerProfile(
     sni: String,
     noDns: Boolean,
     dtlsPort: Int,
-    wgPort: Int
+    wgPort: Int,
+    profileName: String = ""
 ): ServerAdminProfileInfo {
     val safeListenPort = listenPort.coerceIn(1, 65535)
     val ports = Triple(
@@ -6211,6 +6215,7 @@ private fun buildOwnerProfile(
     return ServerAdminProfileInfo(
         vkHashes = vkHashes.trim(),
         secondaryVkHash = secondaryVkHash.trim(),
+        profileName = vpnProfileRestorableName(profileName),
         workersPerHash = workersPerHash.coerceIn(1, 128),
         protocol = protocol.trim().lowercase().takeIf { it == "udp" || it == "tcp" } ?: "udp",
         listenPort = safeListenPort,
@@ -6236,6 +6241,7 @@ private fun parseOwnerProfileFromDb(json: JSONObject?, defaultPorts: String): Se
     return ServerAdminProfileInfo(
         vkHashes = json?.optString("vk_hashes", "").orEmpty().trim(),
         secondaryVkHash = json?.optString("secondary_vk_hash", "").orEmpty().trim(),
+        profileName = vpnProfileRestorableName(json?.optString("profile_name", "").orEmpty()),
         workersPerHash = (json?.optInt("workers_per_hash", 16) ?: 16).coerceIn(1, 128),
         protocol = json?.optString("protocol", "udp").orEmpty().lowercase().takeIf { it == "udp" || it == "tcp" } ?: "udp",
         listenPort = listenPort,
@@ -6256,6 +6262,7 @@ private fun ServerAdminProfileInfo.effectivePorts(fallback: Triple<Int, Int, Int
 private data class OwnerProfileComparable(
     val vkHashes: String,
     val secondaryVkHash: String,
+    val profileName: String,
     val workersPerHash: Int,
     val protocol: String,
     val listenPort: Int,
@@ -6269,6 +6276,7 @@ private fun ServerAdminProfileInfo.comparableOwnerProfile(): OwnerProfileCompara
     return OwnerProfileComparable(
         vkHashes = vkHashes.trim(),
         secondaryVkHash = secondaryVkHash.trim(),
+        profileName = vpnProfileRestorableName(profileName),
         workersPerHash = workersPerHash.coerceIn(1, 128),
         protocol = protocol.trim().lowercase().takeIf { it == "udp" || it == "tcp" } ?: "udp",
         listenPort = ports.third,
@@ -6279,7 +6287,12 @@ private fun ServerAdminProfileInfo.comparableOwnerProfile(): OwnerProfileCompara
 }
 
 private fun ownerProfilesDiffer(server: ServerAdminProfileInfo, local: ServerAdminProfileInfo): Boolean =
-    server.comparableOwnerProfile() != local.comparableOwnerProfile()
+    server.comparableOwnerProfile().let { serverComparable ->
+        local.comparableOwnerProfile().let { localComparable ->
+            serverComparable.copy(profileName = "") != localComparable.copy(profileName = "") ||
+                (serverComparable.profileName.isNotBlank() && serverComparable.profileName != localComparable.profileName)
+        }
+    }
 
 private fun ownerProfileDiffLines(server: ServerAdminProfileInfo, local: ServerAdminProfileInfo): List<String> {
     val serverComparable = server.comparableOwnerProfile()
@@ -6290,6 +6303,9 @@ private fun ownerProfileDiffLines(server: ServerAdminProfileInfo, local: ServerA
     }
     if (serverComparable.secondaryVkHash != localComparable.secondaryVkHash) {
         lines += "Резервный VK-хеш: сервер — ${secretPresenceLabel(serverComparable.secondaryVkHash)}, приложение — ${secretPresenceLabel(localComparable.secondaryVkHash)}"
+    }
+    if (serverComparable.profileName.isNotBlank() && serverComparable.profileName != localComparable.profileName) {
+        lines += "Название профиля: сервер — ${serverComparable.profileName.ifBlank { "стандартное" }}, приложение — ${localComparable.profileName.ifBlank { "стандартное" }}"
     }
     if (serverComparable.workersPerHash != localComparable.workersPerHash) {
         lines += "Потоки на хеш: сервер — ${serverComparable.workersPerHash}, приложение — ${localComparable.workersPerHash}"
@@ -7177,6 +7193,7 @@ fun DeploySecretsDialog(
     var passInput by rememberSaveable { mutableStateOf(initialMainPass) }
     var adminIdInput by rememberSaveable { mutableStateOf(initialAdminId) }
     var botTokenInput by rememberSaveable { mutableStateOf(initialBotToken) }
+    var showTelegramBotHelp by rememberSaveable { mutableStateOf(false) }
     var passInputFocused by remember { mutableStateOf(false) }
     var botTokenFocused by remember { mutableStateOf(false) }
     var sshPortInput by rememberSaveable { mutableStateOf(if (initialSshPort.isBlank()) "22" else initialSshPort) }
@@ -7262,7 +7279,30 @@ fun DeploySecretsDialog(
                 Spacer(Modifier.height(16.dp))
                 HorizontalDivider()
                 Spacer(Modifier.height(8.dp))
-                Text("Телеграм бот для управления", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.SemiBold)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        "Telegram-бот для управления",
+                        color = MaterialTheme.colorScheme.primary,
+                        fontWeight = FontWeight.SemiBold,
+                        style = MaterialTheme.typography.titleSmall,
+                        modifier = Modifier.weight(1f)
+                    )
+                    IconButton(
+                        onClick = { showTelegramBotHelp = true },
+                        modifier = Modifier.size(36.dp)
+                    ) {
+                        Icon(
+                            Icons.AutoMirrored.Filled.HelpOutline,
+                            contentDescription = "Как создать и подключить Telegram-бота",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+                }
                 Text(
                     "Можно оставить пустым, если бот не нужен. При подключении без установки приложение проверяет SSH-доступ и главный пароль, а Telegram-поля читает с сервера и подставляет автоматически.",
                     style = MaterialTheme.typography.bodySmall,
@@ -7274,7 +7314,7 @@ fun DeploySecretsDialog(
                     value = adminIdInput,
                     onValueChange = { adminIdInput = it },
                     label = { Text("ID Админа (опционально)") },
-                    placeholder = { Text("ID из @getmyid_bot") },
+                    placeholder = { Text("ID из @userinfobot") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(16.dp),
@@ -7462,6 +7502,169 @@ fun DeploySecretsDialog(
                     Spacer(Modifier.height(4.dp))
                 }
             }
+        }
+    }
+
+    if (showTelegramBotHelp) {
+        TelegramBotHelpDialog(onDismiss = { showTelegramBotHelp = false })
+    }
+}
+
+@Composable
+private fun TelegramBotHelpDialog(onDismiss: () -> Unit) {
+    val context = LocalContext.current
+
+    fun openTelegramBot(username: String, miniApp: Boolean = false) {
+        val tgUri = if (miniApp) {
+            "tg://resolve?domain=$username&startapp="
+        } else {
+            "tg://resolve?domain=$username"
+        }
+        val webUri = if (miniApp) {
+            "https://t.me/$username?startapp"
+        } else {
+            "https://t.me/$username"
+        }
+        val tgIntent = Intent(Intent.ACTION_VIEW, Uri.parse(tgUri)).apply {
+            addCategory(Intent.CATEGORY_BROWSABLE)
+        }
+        val webIntent = Intent(Intent.ACTION_VIEW, Uri.parse(webUri)).apply {
+            addCategory(Intent.CATEGORY_BROWSABLE)
+        }
+        val intent = if (tgIntent.resolveActivity(context.packageManager) != null) tgIntent else webIntent
+        runCatching {
+            context.startActivity(intent)
+        }.onFailure {
+            Toast.makeText(context, "Не удалось открыть Telegram", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    fun copyTelegramHandle(handle: String) {
+        val clipboard = context.getSystemService(ClipboardManager::class.java)
+        clipboard?.setPrimaryClip(ClipData.newPlainText("Telegram", handle))
+        Toast.makeText(context, "$handle скопирован", Toast.LENGTH_SHORT).show()
+    }
+
+    androidx.compose.ui.window.Dialog(onDismissRequest = onDismiss) {
+        BoxWithConstraints(
+            modifier = Modifier.fillMaxSize().padding(8.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Surface(
+                modifier = Modifier.heightIn(max = maxHeight * 0.92f),
+                shape = RoundedCornerShape(24.dp),
+                color = MaterialTheme.colorScheme.surface,
+                contentColor = MaterialTheme.colorScheme.onSurface,
+                tonalElevation = 8.dp
+            ) {
+                Column(
+                    modifier = Modifier
+                        .padding(22.dp)
+                        .fillMaxWidth()
+                        .verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            "Подключение Telegram-бота",
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.weight(1f)
+                        )
+                        IconButton(onClick = onDismiss) {
+                            Icon(Icons.Default.Close, contentDescription = "Закрыть")
+                        }
+                    }
+
+                    Text(
+                        "1. Откройте мини-приложение BotFather и создайте бота без ручной отправки команд. Если мини-приложение недоступно в вашей версии Telegram, откройте обычный чат @BotFather, нажмите «Запустить» и отправьте /newbot. Задайте имя и username, который заканчивается на bot, затем скопируйте выданный токен.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    TelegramBotActionRow(
+                        buttonText = "Мини-приложение BotFather",
+                        handle = "@BotFather",
+                        onOpen = { openTelegramBot("BotFather", miniApp = true) },
+                        onCopy = { copyTelegramHandle("@BotFather") }
+                    )
+                    TelegramBotActionRow(
+                        buttonText = "Обычный чат @BotFather",
+                        handle = "@BotFather",
+                        onOpen = { openTelegramBot("BotFather") },
+                        onCopy = { copyTelegramHandle("@BotFather") }
+                    )
+
+                    Text(
+                        "2. Откройте @userinfobot, нажмите «Запустить» и скопируйте свой числовой Telegram ID.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    TelegramBotActionRow(
+                        buttonText = "Открыть @userinfobot",
+                        handle = "@userinfobot",
+                        onOpen = { openTelegramBot("userinfobot") },
+                        onCopy = { copyTelegramHandle("@userinfobot") }
+                    )
+
+                    Text(
+                        "3. Вставьте ID в поле администратора, токен — в поле бота и нажмите «Сохранить». Чтобы передать эти данные серверу, выполните установку во вкладке «Деплой» — при обновлении сервера можно выбрать установку с сохранением данных.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(
+                        "Токен даёт доступ к управлению ботом. Не отправляйте его другим людям и не публикуйте; при утечке перевыпустите токен через @BotFather.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error
+                    )
+
+                    Button(
+                        onClick = onDismiss,
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                        shape = RoundedCornerShape(16.dp)
+                    ) {
+                        Text("Понятно", fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun TelegramBotActionRow(
+    buttonText: String,
+    handle: String,
+    onOpen: () -> Unit,
+    onCopy: () -> Unit
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        OutlinedButton(
+            onClick = onOpen,
+            modifier = Modifier
+                .weight(1f)
+                .heightIn(min = 48.dp),
+            shape = RoundedCornerShape(16.dp)
+        ) {
+            Text(buttonText, textAlign = TextAlign.Center)
+        }
+        FilledTonalIconButton(
+            onClick = onCopy,
+            modifier = Modifier.size(48.dp)
+        ) {
+            Icon(
+                Icons.Default.ContentCopy,
+                contentDescription = "Скопировать $handle",
+                modifier = Modifier.size(20.dp)
+            )
         }
     }
 }

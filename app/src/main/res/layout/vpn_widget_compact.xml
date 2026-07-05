@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/compact_widget_container"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/bg_widget_card"
+    android:gravity="center"
+    android:orientation="vertical"
+    android:padding="6dp">
+
+    <ImageView
+        android:id="@+id/compact_widget_toggle"
+        android:layout_width="42dp"
+        android:layout_height="42dp"
+        android:background="@drawable/bg_widget_button_inactive"
+        android:contentDescription="Включить или отключить VPN"
+        android:padding="9dp"
+        android:scaleType="fitCenter"
+        android:src="@drawable/ic_tile_logo" />
+
+    <TextView
+        android:id="@+id/compact_widget_profile"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:ellipsize="end"
+        android:gravity="center"
+        android:maxLines="1"
+        android:text="VPN 1"
+        android:textColor="#FFFFFF"
+        android:textSize="10sp"
+        android:textStyle="bold" />
+
+</LinearLayout>

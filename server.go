@@ -93,6 +93,7 @@ type PasswordEntry struct {
 type AdminProfileEntry struct {
 	VkHashes        string   `json:"vk_hashes,omitempty"`
 	SecondaryVkHash string   `json:"secondary_vk_hash,omitempty"`
+	ProfileName     string   `json:"profile_name,omitempty"`
 	WorkersPerHash  int      `json:"workers_per_hash,omitempty"`
 	Protocol        string   `json:"protocol,omitempty"`
 	ListenPort      int      `json:"listen_port,omitempty"`

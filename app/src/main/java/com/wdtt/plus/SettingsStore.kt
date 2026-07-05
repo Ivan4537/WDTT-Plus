@@ -314,6 +314,7 @@ class SettingsStore(context: Context) {
         private val MIGRATION_NOTICE_V2_SHOWN = booleanPreferencesKey("migration_notice_v2_shown")
         private val MIGRATION_NOTICE_V3_SHOWN = booleanPreferencesKey("migration_notice_v3_shown")
         private val MIGRATION_NOTICE_V5_SHOWN = booleanPreferencesKey("migration_notice_v5_shown")
+        private val DEVICE_COMPATIBILITY_CHECK_COMPLETE = booleanPreferencesKey("device_compatibility_check_complete")
         private val DEPLOY_CLIENTS_SECTION_EXPANDED = booleanPreferencesKey("deploy_clients_section_expanded")
         private val DEPLOY_OUTBOUND_SECTION_EXPANDED = booleanPreferencesKey("deploy_outbound_section_expanded")
         private val DEPLOY_MIGRATION_SECTION_EXPANDED = booleanPreferencesKey("deploy_migration_section_expanded")
@@ -539,6 +540,9 @@ class SettingsStore(context: Context) {
     val migrationNoticeV2Shown: Flow<Boolean> = dataStore.data.map { it[MIGRATION_NOTICE_V2_SHOWN] ?: false }
     val migrationNoticeV3Shown: Flow<Boolean> = dataStore.data.map { it[MIGRATION_NOTICE_V3_SHOWN] ?: false }
     val migrationNoticeV5Shown: Flow<Boolean> = dataStore.data.map { it[MIGRATION_NOTICE_V5_SHOWN] ?: false }
+    val deviceCompatibilityCheckComplete: Flow<Boolean> = dataStore.data.map {
+        it[DEVICE_COMPATIBILITY_CHECK_COMPLETE] ?: false
+    }
     val deployClientsSectionExpanded: Flow<Boolean> = dataStore.data.map { it[DEPLOY_CLIENTS_SECTION_EXPANDED] ?: true }
     val deployOutboundSectionExpanded: Flow<Boolean> = dataStore.data.map { it[DEPLOY_OUTBOUND_SECTION_EXPANDED] ?: false }
     val deployMigrationSectionExpanded: Flow<Boolean> = dataStore.data.map { it[DEPLOY_MIGRATION_SECTION_EXPANDED] ?: false }
@@ -657,6 +661,12 @@ class SettingsStore(context: Context) {
         }
     }
 
+    suspend fun saveDeviceCompatibilityCheckComplete(complete: Boolean) {
+        dataStore.edit { prefs ->
+            prefs[DEVICE_COMPATIBILITY_CHECK_COMPLETE] = complete
+        }
+    }
+
     suspend fun saveDeployClientsSectionExpanded(expanded: Boolean) {
         dataStore.edit { prefs ->
             prefs[DEPLOY_CLIENTS_SECTION_EXPANDED] = expanded
@@ -710,14 +720,10 @@ class SettingsStore(context: Context) {
         dataStore.edit { prefs ->
             val profile = prefs[ACTIVE_PROFILE] ?: 0
             prefs[getProfileKey(WDTT_LINK, profile)] = link
-            val importedProfileName = normalizeVpnProfileName(WdttDeepLink.parse(link)?.profileName.orEmpty())
+            val importedProfileName = vpnProfileRestorableName(WdttDeepLink.parse(link)?.profileName.orEmpty())
             if (importedProfileName.isNotBlank()) {
                 val profileNameKey = getProfileKey(PROFILE_NAME, profile)
-                if (importedProfileName == vpnProfileDefaultName(profile)) {
-                    prefs.remove(profileNameKey)
-                } else {
-                    prefs[profileNameKey] = importedProfileName
-                }
+                prefs[profileNameKey] = importedProfileName
             }
         }
     }
@@ -905,14 +911,10 @@ class SettingsStore(context: Context) {
         val profile = plan.targetProfile.coerceIn(0, VPN_PROFILE_COUNT - 1)
         dataStore.edit { prefs ->
             prefs[ACTIVE_PROFILE] = profile
-            val importedProfileName = normalizeVpnProfileName(parts.profileName)
+            val importedProfileName = vpnProfileRestorableName(parts.profileName)
             if (importedProfileName.isNotBlank()) {
                 val profileNameKey = getProfileKey(PROFILE_NAME, profile)
-                if (importedProfileName == vpnProfileDefaultName(profile)) {
-                    prefs.remove(profileNameKey)
-                } else {
-                    prefs[profileNameKey] = importedProfileName
-                }
+                prefs[profileNameKey] = importedProfileName
             }
             prefs[getProfileKey(WDTT_LINK_MODE, profile)] = plan.storeAsLink
             if (plan.storeAsLink) {
@@ -1305,4 +1307,14 @@ fun vpnProfileDisplayName(profile: Int, names: List<String>): String {
 fun vpnProfileTransferName(profile: Int, names: List<String>): String {
     val displayName = vpnProfileDisplayName(profile, names)
     return displayName.takeUnless { it == vpnProfileDefaultName(profile) }.orEmpty()
+}
+
+fun isStandardVpnProfileName(name: String): Boolean {
+    val clean = normalizeVpnProfileName(name)
+    return clean.isNotBlank() && (0..2).any { clean == vpnProfileDefaultName(it) }
+}
+
+fun vpnProfileRestorableName(name: String): String {
+    val clean = normalizeVpnProfileName(name)
+    return clean.takeUnless { it.isBlank() || isStandardVpnProfileName(it) }.orEmpty()
 }

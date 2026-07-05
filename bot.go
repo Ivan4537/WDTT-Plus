@@ -1561,9 +1561,10 @@ func sendOwnerProfileMenu(token string, adminID int64, messageID int) int {
 	dbMutex.Unlock()
 
 	text := fmt.Sprintf(
-		"👤 *Профиль владельца*\n\nЭтот профиль принадлежит главному паролю и хранится отдельно от клиентов. Он не виден в списке доступов, не занимает лимит клиентов и используется для восстановления полей владельца в Android-приложении.\n\nVK-хеши: `%s`\nРезервный VK-хеш: `%s`\nПорты ссылки: `%s`\nПотоки на хеш: `%d`\nПротокол: `%s`\nSNI: `%s`\nNo DNS: `%s`\nОбновлён: `%s`",
+		"👤 *Профиль владельца*\n\nЭтот профиль принадлежит главному паролю и хранится отдельно от клиентов. Он не виден в списке доступов, не занимает лимит клиентов и используется для восстановления полей владельца в Android-приложении.\n\nVK-хеши: `%s`\nРезервный VK-хеш: `%s`\nНазвание профиля: `%s`\nПорты ссылки: `%s`\nПотоки на хеш: `%d`\nПротокол: `%s`\nSNI: `%s`\nNo DNS: `%s`\nОбновлён: `%s`",
 		mdCode(ownerSecretPresenceLabel(profile.VkHashes)),
 		mdCode(ownerSecretPresenceLabel(profile.SecondaryVkHash)),
+		mdCode(emptyLabel(profile.ProfileName, "стандартное")),
 		mdCode(profile.Ports),
 		profile.WorkersPerHash,
 		mdCode(profile.Protocol),

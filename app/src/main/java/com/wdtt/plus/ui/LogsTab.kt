@@ -5,7 +5,6 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.widget.Toast
 import androidx.compose.animation.core.*
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -20,6 +19,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -110,9 +110,13 @@ fun LogsTab(
             }
         }
 
-        // Logs container — адаптивный к теме
-        val isDark = isSystemInDarkTheme()
-        val terminalBg = if (isDark) WDTTColors.terminalBgDark else WDTTColors.terminalBg
+        // Нейтральный фон в светлой теме не спорит с цветами уровней лога.
+        val isDark = MaterialTheme.colorScheme.background.luminance() < 0.5f
+        val terminalBg = if (isDark) {
+            WDTTColors.terminalBgDark
+        } else {
+            MaterialTheme.colorScheme.surfaceContainerHighest
+        }
 
         Card(
             modifier = Modifier.fillMaxSize(),
@@ -135,23 +139,24 @@ fun LogsTab(
 
 @Composable
 fun LogLine(entry: LogEntry, sessionActive: Boolean) {
+    val isDark = MaterialTheme.colorScheme.background.luminance() < 0.5f
     val activeColor = when {
-        entry.severity == LogSeverity.Error -> WDTTColors.terminalRed
-        entry.severity == LogSeverity.Warning -> WDTTColors.terminalYellow
-        entry.priority <= 2 -> WDTTColors.terminalGreen
-        entry.priority == 3 -> WDTTColors.terminalBlue
-        else -> WDTTColors.terminalText
+        entry.severity == LogSeverity.Error -> if (isDark) WDTTColors.terminalRed else MaterialTheme.colorScheme.error
+        entry.severity == LogSeverity.Warning -> if (isDark) WDTTColors.terminalYellow else MaterialTheme.colorScheme.tertiary
+        entry.priority <= 2 -> if (isDark) WDTTColors.terminalGreen else WDTTColors.onConnected
+        entry.priority == 3 -> if (isDark) WDTTColors.terminalBlue else MaterialTheme.colorScheme.primary
+        else -> if (isDark) WDTTColors.terminalText else MaterialTheme.colorScheme.onSurface
     }
     val isStoppedStats = entry.key == "stats" && entry.message.contains("VPN отключён")
     val color = when {
         sessionActive -> activeColor
         isStoppedStats -> MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.9f)
-        else -> MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.48f)
+        else -> MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.68f)
     }
     val counterColor = if (sessionActive) {
         WDTTColors.terminalBlue
     } else {
-        MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = if (isStoppedStats) 0.85f else 0.48f)
+        MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = if (isStoppedStats) 0.85f else 0.68f)
     }
 
     var trigger by remember { mutableIntStateOf(0) }
@@ -169,7 +174,11 @@ fun LogLine(entry: LogEntry, sessionActive: Boolean) {
         verticalAlignment = Alignment.CenterVertically
     ) {
         Surface(
-            color = WDTTColors.terminalCounter.copy(alpha = 0.2f),
+            color = if (isDark) {
+                WDTTColors.terminalCounter.copy(alpha = 0.2f)
+            } else {
+                MaterialTheme.colorScheme.primaryContainer
+            },
             shape = RoundedCornerShape(12.dp),
             modifier = Modifier
                 .defaultMinSize(minWidth = 24.dp, minHeight = 24.dp)

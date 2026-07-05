@@ -19,6 +19,7 @@ data class ServerAdminTarget(
 data class ServerAdminProfileInfo(
     val vkHashes: String = "",
     val secondaryVkHash: String = "",
+    val profileName: String = "",
     val workersPerHash: Int = 16,
     val protocol: String = "udp",
     val listenPort: Int = 9000,
@@ -29,7 +30,7 @@ data class ServerAdminProfileInfo(
     val updatedAt: Long = 0
 ) {
     val hasSavedFields: Boolean
-        get() = updatedAt > 0L || vkHashes.isNotBlank() || secondaryVkHash.isNotBlank()
+        get() = updatedAt > 0L || vkHashes.isNotBlank() || secondaryVkHash.isNotBlank() || vpnProfileRestorableName(profileName).isNotBlank()
 }
 
 data class ServerAdminState(
@@ -288,6 +289,7 @@ object ServerAdminClient {
             "update-admin-profile",
             "--vk-hashes", profile.vkHashes.trim(),
             "--secondary-vk-hash", profile.secondaryVkHash.trim(),
+            "--profile-name", profile.profileName.trim(),
             "--workers", profile.workersPerHash.coerceIn(1, 128).toString(),
             "--protocol", profile.protocol.trim().lowercase().takeIf { it == "udp" || it == "tcp" } ?: "udp",
             "--listen-port", profile.listenPort.coerceIn(1, 65535).toString(),
@@ -430,6 +432,7 @@ object ServerAdminClient {
         return ServerAdminProfileInfo(
             vkHashes = json?.optString("vk_hashes", "").orEmpty().trim(),
             secondaryVkHash = json?.optString("secondary_vk_hash", "").orEmpty().trim(),
+            profileName = vpnProfileRestorableName(json?.optString("profile_name", "").orEmpty()),
             workersPerHash = (json?.optInt("workers_per_hash", 16) ?: 16).coerceIn(1, 128),
             protocol = json?.optString("protocol", "udp").orEmpty().lowercase().takeIf { it == "udp" || it == "tcp" } ?: "udp",
             listenPort = listenPort,

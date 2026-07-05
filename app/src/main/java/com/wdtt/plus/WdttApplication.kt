@@ -8,6 +8,7 @@ import com.wireguard.android.backend.Tunnel
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
 
 class WdttApplication : Application() {
@@ -35,10 +36,16 @@ class WdttApplication : Application() {
             }
         }
 
-        // Реактивно обновляем все виджеты на домашнем экране при изменении состояния туннеля
+        val settingsStore = SettingsStore(this)
+
+        // Реактивно обновляем виджеты при изменении туннеля, активного профиля или его названия.
         CoroutineScope(SupervisorJob() + Dispatchers.Main).launch {
             try {
-                TunnelManager.running.collect {
+                combine(
+                    TunnelManager.running,
+                    settingsStore.activeProfile,
+                    settingsStore.profileNames
+                ) { _, _, _ -> Unit }.collect {
                     VpnWidgetProvider.updateAllWidgets(this@WdttApplication)
                 }
             } catch (e: Exception) {
@@ -47,7 +54,6 @@ class WdttApplication : Application() {
         }
 
         // Реактивно отслеживаем флаг логирования
-        val settingsStore = SettingsStore(this)
         CoroutineScope(SupervisorJob() + Dispatchers.Main).launch {
             try {
                 settingsStore.loggingEnabled.collect { enabled ->

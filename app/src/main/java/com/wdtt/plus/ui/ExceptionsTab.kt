@@ -1,6 +1,11 @@
 package com.wdtt.plus.ui
 
 import android.content.pm.PackageManager
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -32,6 +37,8 @@ import com.wdtt.plus.SettingsStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -201,150 +208,197 @@ fun ExceptionsTab(
         }
     }
 
+    val listState = rememberRememberedLazyListState(
+        firstVisibleItemIndex,
+        firstVisibleItemScrollOffset
+    )
+    var topBlockVisible by rememberSaveable { mutableStateOf(true) }
+
+    LaunchedEffect(listState) {
+        var previousIndex = listState.firstVisibleItemIndex
+        var previousOffset = listState.firstVisibleItemScrollOffset
+
+        snapshotFlow {
+            Triple(
+                listState.firstVisibleItemIndex,
+                listState.firstVisibleItemScrollOffset,
+                listState.isScrollInProgress
+            )
+        }
+            .distinctUntilChanged()
+            .filter { it.third }
+            .collect { (index, offset, _) ->
+                val scrollingDown = index > previousIndex ||
+                    (index == previousIndex && offset > previousOffset)
+                val scrollingUp = index < previousIndex ||
+                    (index == previousIndex && offset < previousOffset)
+
+                if (scrollingDown) {
+                    topBlockVisible = false
+                } else if (scrollingUp || (index == 0 && offset == 0)) {
+                    topBlockVisible = true
+                }
+
+                previousIndex = index
+                previousOffset = offset
+            }
+    }
+
     Column(modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
-        // Header
-        Text(
-            "Маршрутизация приложений",
-            style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-            color = MaterialTheme.colorScheme.onSurface,
-            modifier = Modifier.padding(top = 16.dp, bottom = 4.dp)
-        )
+        AnimatedVisibility(
+            visible = topBlockVisible,
+            enter = slideInVertically(initialOffsetY = { -it }) + fadeIn(),
+            exit = slideOutVertically(targetOffsetY = { -it }) + fadeOut()
+        ) {
+            Column {
+                // Header
+                Text(
+                    "Маршрутизация приложений",
+                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                    color = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.padding(top = 16.dp, bottom = 4.dp)
+                )
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                // Mode Toggle
+                AppSectionCard(
+                    modifier = Modifier.padding(bottom = 12.dp),
+                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(0.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+                            Text(
+                                "Режим списка",
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.Medium,
+                                fontSize = 14.sp,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                            Text(
+                                if (isWhitelist) "БС: только отмеченные — через VPN"
+                                else "ЧС: отмеченные — без VPN",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                fontSize = 11.sp,
+                                lineHeight = 14.sp
+                            )
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            ModeChip("ЧС", !isWhitelist) {
+                                if (isWhitelist) {
+                                    scope.launch {
+                                        settingsStore.saveIsWhitelist(false)
+                                        scheduleWireGuardReload()
+                                    }
+                                }
+                            }
+                            ModeChip("БС", isWhitelist) {
+                                if (!isWhitelist) {
+                                    scope.launch {
+                                        settingsStore.saveIsWhitelist(true)
+                                        scheduleWireGuardReload()
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    HorizontalDivider(
+                        modifier = Modifier.padding(vertical = 12.dp),
+                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
+                    )
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(
+                            "Показывать системные",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Medium,
+                            fontSize = 14.sp,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        Switch(
+                            checked = showSystemAppsOpt ?: false,
+                            onCheckedChange = { enabled ->
+                                scope.launch {
+                                    settingsStore.saveShowSystemApps(enabled)
+                                }
+                            }
+                        )
+                    }
+
+                    if (!isWhitelist) {
+                        Spacer(modifier = Modifier.height(12.dp))
+                        OutlinedButton(
+                            onClick = {
+                                val detectedPackages = appsList
+                                    .filter { it.matchesVpnDetectionApp() }
+                                    .map { it.packageName }
+                                    .toSet()
+                                if (detectedPackages.isEmpty()) {
+                                    quickExcludeStatus = "Подходящие приложения не найдены."
+                                } else {
+                                    scope.launch {
+                                        val addedCount = settingsStore.addBlacklistPackages(detectedPackages)
+                                        quickExcludeStatus = "Исключено: ${detectedPackages.size}, добавлено: $addedCount."
+                                        scheduleWireGuardReload()
+                                    }
+                                }
+                            },
+                            enabled = !isLoading && appsList.isNotEmpty(),
+                            modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                            shape = RoundedCornerShape(16.dp)
+                        ) {
+                            Icon(Icons.Default.Search, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                "Быстрые исключения",
+                                fontWeight = FontWeight.SemiBold,
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                        Text(
+                            "Банки, маркетплейсы и другие приложения, чувствительные к VPN. Поиск выполняется по известным названиям.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(top = 6.dp)
+                        )
+                        if (quickExcludeStatus.isNotBlank()) {
+                            Text(
+                                quickExcludeStatus,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(top = 6.dp)
+                            )
+                        }
+                    }
+                }
+            }
+        }
 
         // Search Bar
         OutlinedTextField(
             value = searchQuery,
             onValueChange = { searchQuery = it },
             placeholder = { Text("Поиск приложений...", fontSize = 14.sp) },
-            modifier = Modifier.fillMaxWidth().padding(top = 12.dp).height(52.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = if (topBlockVisible) 0.dp else 16.dp, bottom = 12.dp)
+                .height(52.dp),
             shape = RoundedCornerShape(16.dp),
             leadingIcon = { Icon(Icons.Default.Search, null, modifier = Modifier.size(20.dp)) },
             singleLine = true,
         )
-
-        Spacer(modifier = Modifier.height(14.dp))
-
-        // Mode Toggle
-        AppSectionCard(
-            modifier = Modifier.padding(bottom = 12.dp),
-            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
-            verticalArrangement = Arrangement.spacedBy(0.dp)
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
-                    Text(
-                        "Режим списка",
-                        style = MaterialTheme.typography.bodyMedium,
-                        fontWeight = FontWeight.Medium,
-                        fontSize = 14.sp,
-                        color = MaterialTheme.colorScheme.onSurface
-                    )
-                    Text(
-                        if (isWhitelist) "БС: только отмеченные — через VPN"
-                        else "ЧС: отмеченные — без VPN",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        fontSize = 11.sp,
-                        lineHeight = 14.sp
-                    )
-                }
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    ModeChip("ЧС", !isWhitelist) {
-                        if (isWhitelist) {
-                            scope.launch {
-                                settingsStore.saveIsWhitelist(false)
-                                scheduleWireGuardReload()
-                            }
-                        }
-                    }
-                    ModeChip("БС", isWhitelist) {
-                        if (!isWhitelist) {
-                            scope.launch {
-                                settingsStore.saveIsWhitelist(true)
-                                scheduleWireGuardReload()
-                            }
-                        }
-                    }
-                }
-            }
-
-            HorizontalDivider(
-                modifier = Modifier.padding(vertical = 12.dp),
-                color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
-            )
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Text(
-                    "Показывать системные",
-                    style = MaterialTheme.typography.bodyMedium,
-                    fontWeight = FontWeight.Medium,
-                    fontSize = 14.sp,
-                    color = MaterialTheme.colorScheme.onSurface
-                )
-                Switch(
-                    checked = showSystemAppsOpt ?: false,
-                    onCheckedChange = { enabled ->
-                        scope.launch {
-                            settingsStore.saveShowSystemApps(enabled)
-                        }
-                    }
-                )
-            }
-
-            if (!isWhitelist) {
-                Spacer(modifier = Modifier.height(12.dp))
-                OutlinedButton(
-                    onClick = {
-                        val detectedPackages = appsList
-                            .filter { it.matchesVpnDetectionApp() }
-                            .map { it.packageName }
-                            .toSet()
-                        if (detectedPackages.isEmpty()) {
-                            quickExcludeStatus = "Подходящие приложения не найдены."
-                        } else {
-                            scope.launch {
-                                val addedCount = settingsStore.addBlacklistPackages(detectedPackages)
-                                quickExcludeStatus = "Исключено: ${detectedPackages.size}, добавлено: $addedCount."
-                                scheduleWireGuardReload()
-                            }
-                        }
-                    },
-                    enabled = !isLoading && appsList.isNotEmpty(),
-                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
-                    shape = RoundedCornerShape(16.dp)
-                ) {
-                    Icon(Icons.Default.Search, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(8.dp))
-                    Text(
-                        "Быстрые исключения",
-                        fontWeight = FontWeight.SemiBold,
-                        textAlign = TextAlign.Center,
-                        modifier = Modifier.weight(1f)
-                    )
-                }
-                Text(
-                    "Банки, маркетплейсы и другие приложения, чувствительные к VPN. Поиск выполняется по известным названиям.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(top = 6.dp)
-                )
-                if (quickExcludeStatus.isNotBlank()) {
-                    Text(
-                        quickExcludeStatus,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(top = 6.dp)
-                    )
-                }
-            }
-        }
 
         // List
         if (isLoading || showSystemAppsOpt == null) {
@@ -352,10 +406,6 @@ fun ExceptionsTab(
                 CircularProgressIndicator()
             }
         } else {
-            val listState = rememberRememberedLazyListState(
-                firstVisibleItemIndex,
-                firstVisibleItemScrollOffset
-            )
             if (filteredApps.isEmpty()) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     Text(

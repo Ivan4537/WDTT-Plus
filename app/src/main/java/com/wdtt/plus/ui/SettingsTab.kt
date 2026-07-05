@@ -444,18 +444,11 @@ fun SettingsTabContent(
             if (!wdttLinkMode) {
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     // ═══ Заголовок раздела ═══
-                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                        Text(
-                            "Настройки туннеля",
-                            style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-                            color = MaterialTheme.colorScheme.onSurface
-                        )
-                        Text(
-                            "(${vpnProfileDisplayName(activeProfile, profileNames)})",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
+                    Text(
+                        "Настройки туннеля (${vpnProfileDisplayName(activeProfile, profileNames)})",
+                        style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
 
                     // ═══ Настройки туннеля ═══
                     AppSectionCard(

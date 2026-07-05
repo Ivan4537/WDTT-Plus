@@ -79,13 +79,16 @@ import com.wdtt.plus.ui.FloatingToolbar
 import com.wdtt.plus.ui.LogsTab
 import com.wdtt.plus.ui.SettingsTab
 import com.wdtt.plus.ui.DeployTab
+import com.wdtt.plus.ui.DeviceCompatibilityDialog
 import com.wdtt.plus.ui.ExceptionsTab
 import com.wdtt.plus.ui.InfoTab
 import com.wdtt.plus.ui.AdminImportDialog
 import com.wdtt.plus.ui.TransferCenterDialog
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withContext
 import java.io.File
 import kotlin.math.PI
 import kotlin.math.abs
@@ -654,6 +657,9 @@ fun MainScreen(
     val migrationNoticeV2Shown by settingsStore.migrationNoticeV2Shown.collectAsStateWithLifecycle(initialValue = true)
     val migrationNoticeV3Shown by settingsStore.migrationNoticeV3Shown.collectAsStateWithLifecycle(initialValue = true)
     val migrationNoticeV5Shown by settingsStore.migrationNoticeV5Shown.collectAsStateWithLifecycle(initialValue = true)
+    val deviceCompatibilityCheckComplete by settingsStore.deviceCompatibilityCheckComplete.collectAsStateWithLifecycle(
+        initialValue = true
+    )
     val isAdminInterface = interfaceRole == "admin"
     val isUpdatedInstall = remember(context) {
         runCatching {
@@ -684,6 +690,8 @@ fun MainScreen(
     val safeBottomInset = with(density) { WindowInsets.safeDrawing.getBottom(density).toDp() }
     val navOverlayReserve = safeBottomInset + 96.dp
     var showTransferCenter by rememberSaveable { mutableStateOf(false) }
+    var startupDeviceReport by remember { mutableStateOf<DeviceCompatibilityReport?>(null) }
+    var startupDeviceCheckRunning by remember { mutableStateOf(false) }
     val updateInstallPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) {
@@ -727,12 +735,47 @@ fun MainScreen(
         }
     }
 
+    fun dismissStartupDeviceReport() {
+        startupDeviceReport = null
+        scope.launch {
+            settingsStore.saveDeviceCompatibilityCheckComplete(true)
+        }
+    }
+
+    LaunchedEffect(deviceCompatibilityCheckComplete) {
+        if (!deviceCompatibilityCheckComplete && !startupDeviceCheckRunning) {
+            startupDeviceCheckRunning = true
+            val report = withContext(Dispatchers.Default) {
+                DeviceCompatibility.check(
+                    context = context.applicationContext,
+                    includeRuntimeChecks = false
+                )
+            }.firstLaunchReport()
+
+            if (report.items.isEmpty()) {
+                settingsStore.saveDeviceCompatibilityCheckComplete(true)
+            } else {
+                startupDeviceReport = report
+            }
+            startupDeviceCheckRunning = false
+        }
+    }
+
     if (interfaceRole.isBlank()) {
         RoleSelectionScreen(
             onRoleSelected = { role ->
                 scope.launch { settingsStore.saveInterfaceRole(role) }
             }
         )
+        startupDeviceReport?.let { report ->
+            DeviceCompatibilityDialog(
+                report = report,
+                title = "Проверка устройства",
+                subtitle = "WDTT Plus нашёл нюансы совместимости. Запуск не блокируется — это предупреждение, чтобы было понятно, куда смотреть при проблемах.",
+                note = "Первый запуск проверяет только базовую совместимость устройства: Android, ABI, нативный клиент, память и page size. Активен ли VPN сейчас — на этом этапе не важно.",
+                onDismiss = ::dismissStartupDeviceReport
+            )
+        }
         return
     }
 
@@ -742,6 +785,15 @@ fun MainScreen(
                 scope.launch { settingsStore.savePermissionOnboardingComplete(true) }
             }
         )
+        startupDeviceReport?.let { report ->
+            DeviceCompatibilityDialog(
+                report = report,
+                title = "Проверка устройства",
+                subtitle = "WDTT Plus нашёл нюансы совместимости. Запуск не блокируется — это предупреждение, чтобы было понятно, куда смотреть при проблемах.",
+                note = "Первый запуск проверяет только базовую совместимость устройства: Android, ABI, нативный клиент, память и page size. Активен ли VPN сейчас — на этом этапе не важно.",
+                onDismiss = ::dismissStartupDeviceReport
+            )
+        }
         return
     }
 
@@ -1071,6 +1123,16 @@ fun MainScreen(
                     }
                 }
             }
+        )
+    }
+
+    startupDeviceReport?.let { report ->
+        DeviceCompatibilityDialog(
+            report = report,
+            title = "Проверка устройства",
+            subtitle = "WDTT Plus нашёл нюансы совместимости. Запуск не блокируется — это предупреждение, чтобы было понятно, куда смотреть при проблемах.",
+            note = "Первый запуск проверяет только базовую совместимость устройства: Android, ABI, нативный клиент, память и page size. Активен ли VPN сейчас — на этом этапе не важно.",
+            onDismiss = ::dismissStartupDeviceReport
         )
     }
 
