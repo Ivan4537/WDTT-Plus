@@ -120,6 +120,38 @@ class TransferCodecTest {
     }
 
     @Test
+    fun vpnProfileNameInput_allowsSpacesBetweenWords() {
+        assertEquals("Домашний ", sanitizeVpnProfileNameInput("Домашний "))
+        assertEquals("Домашний сервер", sanitizeVpnProfileNameInput("  Домашний   сервер"))
+        assertEquals("Домашний сервер", normalizeVpnProfileName("  Домашний   сервер  "))
+    }
+
+    @Test
+    fun adminProfilePatch_omitsEmptyAndDefaultTunnelFields() {
+        val defaults = ServerAdminProfileInfo()
+        assertEquals(listOf("update-admin-profile"), buildAdminProfilePatchArgs(defaults))
+        assertFalse(hasMeaningfulAdminProfileFields(defaults))
+
+        val custom = defaults.copy(
+            vkHashes = "hash-value",
+            profileName = "Домашний сервер",
+            workersPerHash = 24,
+            noDns = true
+        )
+        assertEquals(
+            listOf(
+                "update-admin-profile",
+                "--vk-hashes", "hash-value",
+                "--profile-name", "Домашний сервер",
+                "--workers", "24",
+                "--no-dns"
+            ),
+            buildAdminProfilePatchArgs(custom)
+        )
+        assertTrue(hasMeaningfulAdminProfileFields(custom))
+    }
+
+    @Test
     fun serverClientLink_carriesSourceVpnProfileName() {
         val link = buildServerConnectionLink(
             password = "ABCDEFGHJKLMNPQR",

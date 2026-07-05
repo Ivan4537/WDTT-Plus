@@ -127,6 +127,7 @@ import com.wdtt.plus.ServerClientCreateRequest
 import com.wdtt.plus.ServerClientInfo
 import com.wdtt.plus.ServerTrafficPeriod
 import com.wdtt.plus.TransferFiles
+import com.wdtt.plus.WDTTColors
 import com.wdtt.plus.connectionLink
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -159,6 +160,37 @@ private enum class ClientExpiryFilter { All, Valid, Expired, Unlimited }
 
 private enum class ClientVkHashFilter { All, Present, Missing }
 
+private enum class ClientsServerRefreshState { Unknown, Ready, Error }
+
+internal fun serverClientsAccessIssue(
+    host: String,
+    hostValid: Boolean,
+    sshPassword: String,
+    sshPort: Int,
+    mainPassword: String
+): String? = when {
+    host.isBlank() -> "Укажите IP-адрес или домен сервера в верхнем блоке «Деплой»."
+    !hostValid -> "Проверьте IP-адрес или домен сервера в верхнем блоке «Деплой»."
+    sshPassword.isBlank() -> "Укажите SSH-пароль сервера в верхнем блоке «Деплой»."
+    sshPort !in 1..65535 -> "Укажите корректный SSH-порт от 1 до 65535."
+    mainPassword.isBlank() -> "Откройте «Секреты» и укажите главный пароль администратора."
+    else -> null
+}
+
+internal fun shouldAutoRefreshServerClients(
+    expanded: Boolean,
+    targetReady: Boolean,
+    enabled: Boolean,
+    busy: Boolean,
+    automaticRefreshAttempted: Boolean,
+    lastRefreshAt: Long
+): Boolean = expanded &&
+    targetReady &&
+    enabled &&
+    !busy &&
+    !automaticRefreshAttempted &&
+    lastRefreshAt == 0L
+
 private data class PendingClientAction(
     val title: String,
     val message: String,
@@ -167,6 +199,108 @@ private data class PendingClientAction(
     val onConfirm: () -> Unit = {},
     val run: suspend () -> ServerAdminActionResult
 )
+
+@Composable
+private fun ClientsServerStateCard(
+    state: ServerAdminState?,
+    refreshBusy: Boolean,
+    lastRefreshAt: Long,
+    lastRefreshAttemptAt: Long,
+    lastRefreshError: String,
+    accessIssue: String?,
+    enabled: Boolean,
+    onRefresh: () -> Unit
+) {
+    val visualState = when {
+        lastRefreshError.isNotBlank() -> ClientsServerRefreshState.Error
+        lastRefreshAt > 0L && state != null -> ClientsServerRefreshState.Ready
+        else -> ClientsServerRefreshState.Unknown
+    }
+    val indicatorColor = when (visualState) {
+        ClientsServerRefreshState.Unknown -> MaterialTheme.colorScheme.outline
+        ClientsServerRefreshState.Ready -> WDTTColors.connected
+        ClientsServerRefreshState.Error -> MaterialTheme.colorScheme.error
+    }
+    val title = when {
+        refreshBusy -> "Обновляю клиентов и состояние сервера..."
+        accessIssue != null -> "Обновление пока недоступно"
+        lastRefreshError.isNotBlank() -> "Не удалось обновить данные"
+        lastRefreshAt > 0L && state != null -> "Клиенты и сервер обновлены"
+        else -> "Клиенты и сервер ещё не проверены"
+    }
+    val details = when {
+        refreshBusy -> "Проверяю SSH-доступ, главный пароль администратора и читаю актуальный список."
+        accessIssue != null -> accessIssue
+        lastRefreshError.isNotBlank() -> buildString {
+            if (lastRefreshAttemptAt > 0L) {
+                append("Последняя попытка: ${formatRefreshDateTime(lastRefreshAttemptAt)}. ")
+            }
+            append(lastRefreshError)
+        }
+        lastRefreshAt > 0L && state != null ->
+            "Обновлено: ${formatRefreshDateTime(lastRefreshAt)}.\nКлиентов: ${state.passwordCount}, устройств: ${state.deviceCount}."
+        else -> "При первом раскрытии за текущий запуск список обновится автоматически. Правильность главного пароля проверит сервер."
+    }
+
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.40f),
+        border = BorderStroke(1.dp, indicatorColor.copy(alpha = 0.42f))
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                if (refreshBusy) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(14.dp),
+                        strokeWidth = 2.dp,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                } else {
+                    Box(
+                        modifier = Modifier
+                            .size(12.dp)
+                            .background(indicatorColor, CircleShape)
+                    )
+                }
+                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(
+                        title,
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Text(
+                        details,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (lastRefreshError.isNotBlank()) {
+                            MaterialTheme.colorScheme.error
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        }
+                    )
+                }
+            }
+            TextButton(
+                onClick = onRefresh,
+                enabled = enabled && accessIssue == null && !refreshBusy,
+                modifier = Modifier.align(Alignment.End)
+            ) {
+                if (refreshBusy) {
+                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                    Spacer(Modifier.width(6.dp))
+                }
+                Text(if (refreshBusy) "Обновляю..." else "Обновить")
+            }
+        }
+    }
+}
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -180,7 +314,8 @@ fun ServerClientsSection(
     adminProfile: ServerAdminProfileInfo,
     sourceProfileName: String,
     enabled: Boolean,
-    expanded: Boolean = true,
+    hostValid: Boolean,
+    expanded: Boolean = false,
     modifier: Modifier = Modifier,
     onExpandedChange: (Boolean) -> Unit = {},
     onExpanded: () -> Unit = {}
@@ -190,6 +325,7 @@ fun ServerClientsSection(
     val clientsViewModel: ServerClientsViewModel = viewModel()
     var state by clientsViewModel.serverState
     var busy by remember { mutableStateOf(false) }
+    var refreshBusy by remember { mutableStateOf(false) }
     var status by rememberSaveable { mutableStateOf("") }
     var showCreateWizard by rememberSaveable { mutableStateOf(false) }
     var showImportMethods by rememberSaveable { mutableStateOf(false) }
@@ -212,21 +348,43 @@ fun ServerClientsSection(
     var clientSearchFocused by remember { mutableStateOf(false) }
     var clientSearch by clientsViewModel.clientSearch
     var selectedClientIndex by clientsViewModel.selectedClientIndex
+    var lastRefreshAt by clientsViewModel.lastRefreshAt
+    var lastRefreshAttemptAt by clientsViewModel.lastRefreshAttemptAt
+    var lastRefreshError by clientsViewModel.lastRefreshError
+    var automaticRefreshAttempted by clientsViewModel.automaticRefreshAttempted
     val inboxTransfer by ClientTransferInbox.pending.collectAsStateWithLifecycle()
     val arrowRotation by animateFloatAsState(
         targetValue = if (expanded) 180f else 0f,
         label = "server_clients_arrow_rotation"
     )
 
-    val targetReady = host.isNotBlank() && sshPassword.isNotBlank() && mainPassword.isNotBlank()
-    val targetKey = remember(host, user, sshPort, mainPassword) {
-        listOf(host.trim(), user.ifBlank { "root" }, sshPort.toString(), mainPassword.hashCode().toString()).joinToString("\u0000")
+    val accessIssue = serverClientsAccessIssue(
+        host = host,
+        hostValid = hostValid,
+        sshPassword = sshPassword,
+        sshPort = sshPort,
+        mainPassword = mainPassword
+    )
+    val targetReady = accessIssue == null
+    val targetKey = remember(host, user, sshPassword, sshPort, mainPassword) {
+        listOf(
+            host.trim(),
+            user.ifBlank { "root" },
+            sshPort.toString(),
+            sshPassword.hashCode().toString(),
+            mainPassword.hashCode().toString()
+        ).joinToString("\u0000")
     }
-    LaunchedEffect(targetKey, targetReady) {
-        if (targetReady && clientsViewModel.targetKey != targetKey) {
+    LaunchedEffect(targetKey) {
+        if (clientsViewModel.targetKey != targetKey) {
             clientsViewModel.targetKey = targetKey
-            state = null
+            val cached = ServerClientsProcessCache.get(targetKey)
+            state = cached?.state
             status = ""
+            lastRefreshAt = cached?.lastRefreshAt ?: 0L
+            lastRefreshAttemptAt = cached?.lastRefreshAttemptAt ?: 0L
+            lastRefreshError = cached?.lastRefreshError.orEmpty()
+            automaticRefreshAttempted = cached?.attempted == true
             detailsClient = null
             showServerTools = false
             clientSearch = ""
@@ -284,18 +442,89 @@ fun ServerClientsSection(
         }
     }
 
+    fun applyFreshServerState(freshState: ServerAdminState) {
+        val refreshedAt = System.currentTimeMillis()
+        state = freshState
+        lastRefreshAt = refreshedAt
+        lastRefreshAttemptAt = refreshedAt
+        lastRefreshError = ""
+        automaticRefreshAttempted = true
+        ServerClientsProcessCache.put(
+            targetKey,
+            ServerClientsProcessSnapshot(
+                state = freshState,
+                lastRefreshAt = refreshedAt,
+                lastRefreshAttemptAt = refreshedAt,
+                lastRefreshError = "",
+                attempted = true
+            )
+        )
+    }
+
+    fun recordRefreshFailure(error: Throwable) {
+        lastRefreshAttemptAt = System.currentTimeMillis()
+        lastRefreshError = error.message ?: "не удалось прочитать клиентов и состояние сервера"
+        automaticRefreshAttempted = true
+        ServerClientsProcessCache.put(
+            targetKey,
+            ServerClientsProcessSnapshot(
+                state = state,
+                lastRefreshAt = lastRefreshAt,
+                lastRefreshAttemptAt = lastRefreshAttemptAt,
+                lastRefreshError = lastRefreshError,
+                attempted = true
+            )
+        )
+    }
+
     fun refreshClients() {
-        if (!targetReady || busy) return
+        if (!targetReady || !enabled || busy) return
+        val requestedTargetKey = targetKey
         busy = true
-        status = "Читаю клиентов на сервере..."
+        refreshBusy = true
+        lastRefreshError = ""
+        automaticRefreshAttempted = true
+        ServerClientsProcessCache.put(
+            targetKey,
+            ServerClientsProcessSnapshot(
+                state = state,
+                lastRefreshAt = lastRefreshAt,
+                lastRefreshAttemptAt = lastRefreshAttemptAt,
+                lastRefreshError = "",
+                attempted = true
+            )
+        )
         scope.launch {
-            runCatching { ServerAdminClient.list(target) }
-                .onSuccess {
-                    state = it
-                    status = "Готово: клиентов ${it.passwordCount}, устройств ${it.deviceCount}."
-                }
-                .onFailure { status = "Ошибка: ${it.message ?: "не удалось прочитать клиентов"}" }
-            busy = false
+            try {
+                runCatching { ServerAdminClient.list(target) }
+                    .onSuccess {
+                        if (clientsViewModel.targetKey == requestedTargetKey) {
+                            applyFreshServerState(it)
+                        }
+                    }
+                    .onFailure {
+                        if (clientsViewModel.targetKey == requestedTargetKey) {
+                            recordRefreshFailure(it)
+                        }
+                    }
+            } finally {
+                refreshBusy = false
+                busy = false
+            }
+        }
+    }
+
+    LaunchedEffect(expanded, targetKey, targetReady, enabled, busy, automaticRefreshAttempted, lastRefreshAt) {
+        if (shouldAutoRefreshServerClients(
+                expanded = expanded,
+                targetReady = targetReady,
+                enabled = enabled,
+                busy = busy,
+                automaticRefreshAttempted = automaticRefreshAttempted,
+                lastRefreshAt = lastRefreshAt
+            )
+        ) {
+            refreshClients()
         }
     }
 
@@ -311,7 +540,9 @@ fun ServerClientsSection(
                         append(result.message)
                         if (result.restarted) append(". Сервис перезапущен.")
                     }
-                    runCatching { ServerAdminClient.list(target) }.onSuccess { state = it }
+                    runCatching { ServerAdminClient.list(target) }
+                        .onSuccess(::applyFreshServerState)
+                        .onFailure(::recordRefreshFailure)
                 }
                 .onFailure { status = "Ошибка: ${it.message ?: "операция не выполнена"}" }
             busy = false
@@ -325,7 +556,9 @@ fun ServerClientsSection(
             runCatching { action() }
                 .onSuccess { result ->
                     status = result.message + if (result.restarted) ". Сервис перезапущен." else ""
-                    runCatching { ServerAdminClient.list(target) }.onSuccess { state = it }
+                    runCatching { ServerAdminClient.list(target) }
+                        .onSuccess(::applyFreshServerState)
+                        .onFailure(::recordRefreshFailure)
                 }
                 .onFailure { status = "Ошибка: ${it.message ?: "операция не выполнена"}" }
             busy = false
@@ -389,32 +622,39 @@ fun ServerClientsSection(
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
 
-                if (!targetReady) {
-                    Text(
-                        "Укажите IP/домен, SSH-пароль и главный пароль в «Секретах». После деплоя нажмите «Обновить».",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
+                ClientsServerStateCard(
+                    state = state,
+                    refreshBusy = refreshBusy,
+                    lastRefreshAt = lastRefreshAt,
+                    lastRefreshAttemptAt = lastRefreshAttemptAt,
+                    lastRefreshError = lastRefreshError,
+                    accessIssue = accessIssue,
+                    enabled = enabled && !busy,
+                    onRefresh = { refreshClients() }
+                )
 
-                FlowRow(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    OutlinedButton(onClick = { refreshClients() }, enabled = canUse) {
-                        Icon(Icons.Default.Refresh, null, Modifier.size(18.dp))
-                        Text(" Обновить")
-                    }
-                    Button(onClick = { showCreateWizard = true }, enabled = canUse) {
-                        Icon(Icons.Default.Add, null, Modifier.size(18.dp))
-                        Text(" Создать")
-                    }
-                    OutlinedButton(onClick = { showImportMethods = true }, enabled = canUse && state != null) {
-                        Text("Импорт")
-                    }
-                    OutlinedButton(onClick = { showServerTools = true }, enabled = canUse && state != null) {
-                        Text("Сервер")
+                ClientPanel {
+                    Text(
+                        "Действия для сервера",
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.align(Alignment.CenterHorizontally)
+                    )
+                    FlowRow(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Button(onClick = { showCreateWizard = true }, enabled = canUse) {
+                            Icon(Icons.Default.Add, null, Modifier.size(18.dp))
+                            Text(" Создать")
+                        }
+                        OutlinedButton(onClick = { showImportMethods = true }, enabled = canUse && state != null) {
+                            Text("Импорт")
+                        }
+                        OutlinedButton(onClick = { showServerTools = true }, enabled = canUse && state != null) {
+                            Text("Сервер")
+                        }
                     }
                 }
 
@@ -667,7 +907,9 @@ fun ServerClientsSection(
                                 if (result.restarted) append(". Сервис перезапущен.")
                             }
                             createdClient = result.createdClient
-                            runCatching { ServerAdminClient.list(target) }.onSuccess { state = it }
+                            runCatching { ServerAdminClient.list(target) }
+                                .onSuccess(::applyFreshServerState)
+                                .onFailure(::recordRefreshFailure)
                         }
                         .onFailure { status = "Ошибка: ${it.message ?: "клиент не создан"}" }
                     busy = false
@@ -722,11 +964,13 @@ fun ServerClientsSection(
                             current?.defaultPorts ?: defaultPorts.ifBlank { "56000,56001,9000" }
                         )
                         status = "Импорт: клиент записан, проверяю список на сервере..."
-                        val refreshed = ServerAdminClient.list(target)
+                        val refreshed = runCatching { ServerAdminClient.list(target) }
+                            .onFailure(::recordRefreshFailure)
+                            .getOrThrow()
                         val imported = refreshed.clients.firstOrNull { it.password == payload.password }
                             ?: result.createdClient?.takeIf { created -> created.password == payload.password }
                             ?: throw IllegalStateException("сервер принял импорт, но клиент не найден в свежем списке. Нажмите «Обновить» и проверьте, не достигнут ли лимит клиентов.")
-                        state = refreshed
+                        applyFreshServerState(refreshed)
                         clientSearch = ""
                         statusFilter = ClientStatusFilter.All
                         bindingFilter = ClientBindingFilter.All
@@ -803,7 +1047,9 @@ fun ServerClientsSection(
                         .onSuccess { result ->
                             status = result.message
                             changedPasswordClient = result.createdClient
-                            runCatching { ServerAdminClient.list(target) }.onSuccess { state = it }
+                            runCatching { ServerAdminClient.list(target) }
+                                .onSuccess(::applyFreshServerState)
+                                .onFailure(::recordRefreshFailure)
                         }
                         .onFailure { status = "Ошибка: ${it.message ?: "пароль не изменён"}" }
                     busy = false
@@ -2804,6 +3050,11 @@ private fun formatTrafficPair(down: Long, up: Long): String =
 private fun formatDateTime(ts: Long): String {
     if (ts <= 0) return "неизвестно"
     return SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault()).format(Date(ts * 1000L))
+}
+
+private fun formatRefreshDateTime(timestampMillis: Long): String {
+    if (timestampMillis <= 0L) return "неизвестно"
+    return SimpleDateFormat("dd.MM.yyyy HH:mm", Locale("ru", "RU")).format(Date(timestampMillis))
 }
 
 private fun secretPresenceLabel(value: String): String {

@@ -123,6 +123,22 @@ func TestAdminSocketAppliesClientChangesWithoutRestart(t *testing.T) {
 		t.Fatalf("owner profile on disk differs from live state: disk=%#v live=%#v", persisted.AdminProfile, profile)
 	}
 
+	request("update-admin-profile", "--vk-hashes", "fedcba9876543210")
+	patchedOwner := request("list").Server.AdminProfile
+	if patchedOwner.VkHashes != "fedcba9876543210" {
+		t.Fatalf("owner profile patch did not update VK hashes: %#v", patchedOwner)
+	}
+	if patchedOwner.SecondaryVkHash != profile.SecondaryVkHash ||
+		patchedOwner.ProfileName != profile.ProfileName ||
+		patchedOwner.WorkersPerHash != profile.WorkersPerHash ||
+		patchedOwner.Protocol != profile.Protocol ||
+		patchedOwner.ListenPort != profile.ListenPort ||
+		patchedOwner.SNI != profile.SNI ||
+		patchedOwner.NoDNS != profile.NoDNS ||
+		patchedOwner.Ports != profile.Ports {
+		t.Fatalf("owner profile patch erased fields that were not provided: before=%#v after=%#v", profile, patchedOwner)
+	}
+
 	dbMutex.Lock()
 	db.Devices["phone"] = &ClientDevice{DeviceID: "phone", IP: "10.66.66.2"}
 	db.Devices["orphan"] = &ClientDevice{DeviceID: "orphan", IP: "10.66.66.3"}

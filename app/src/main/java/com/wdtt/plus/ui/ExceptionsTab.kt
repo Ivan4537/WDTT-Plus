@@ -1,17 +1,15 @@
 package com.wdtt.plus.ui
 
 import android.content.pm.PackageManager
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.slideInVertically
-import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Search
@@ -21,9 +19,13 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.Layout
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -37,10 +39,9 @@ import com.wdtt.plus.SettingsStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlin.math.roundToInt
 
 import androidx.compose.runtime.Stable
 
@@ -212,43 +213,57 @@ fun ExceptionsTab(
         firstVisibleItemIndex,
         firstVisibleItemScrollOffset
     )
-    var topBlockVisible by rememberSaveable { mutableStateOf(true) }
+    var topBlockHeightPx by remember { mutableFloatStateOf(0f) }
+    var topBlockOffsetPx by rememberSaveable { mutableStateOf(0f) }
+    var topBlockPositionInitialized by rememberSaveable { mutableStateOf(false) }
 
-    LaunchedEffect(listState) {
-        var previousIndex = listState.firstVisibleItemIndex
-        var previousOffset = listState.firstVisibleItemScrollOffset
-
-        snapshotFlow {
-            Triple(
-                listState.firstVisibleItemIndex,
-                listState.firstVisibleItemScrollOffset,
-                listState.isScrollInProgress
-            )
-        }
-            .distinctUntilChanged()
-            .filter { it.third }
-            .collect { (index, offset, _) ->
-                val scrollingDown = index > previousIndex ||
-                    (index == previousIndex && offset > previousOffset)
-                val scrollingUp = index < previousIndex ||
-                    (index == previousIndex && offset < previousOffset)
-
-                if (scrollingDown) {
-                    topBlockVisible = false
-                } else if (scrollingUp || (index == 0 && offset == 0)) {
-                    topBlockVisible = true
-                }
-
-                previousIndex = index
-                previousOffset = offset
+    LaunchedEffect(topBlockHeightPx) {
+        if (topBlockHeightPx <= 0f) return@LaunchedEffect
+        if (!topBlockPositionInitialized) {
+            if (listState.firstVisibleItemIndex > 0 || listState.firstVisibleItemScrollOffset > 0) {
+                topBlockOffsetPx = -topBlockHeightPx
             }
+            topBlockPositionInitialized = true
+        } else {
+            topBlockOffsetPx = topBlockOffsetPx.coerceIn(-topBlockHeightPx, 0f)
+        }
     }
 
-    Column(modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
-        AnimatedVisibility(
-            visible = topBlockVisible,
-            enter = slideInVertically(initialOffsetY = { -it }) + fadeIn(),
-            exit = slideOutVertically(targetOffsetY = { -it }) + fadeOut()
+    val collapsingHeaderConnection = remember(topBlockHeightPx) {
+        object : NestedScrollConnection {
+            override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+                if (topBlockHeightPx <= 0f) return Offset.Zero
+                val delta = available.y
+                val canCollapse = delta < 0f && topBlockOffsetPx > -topBlockHeightPx
+                val canExpand = delta > 0f && topBlockOffsetPx < 0f
+                if (!canCollapse && !canExpand) return Offset.Zero
+
+                val previousOffset = topBlockOffsetPx
+                topBlockOffsetPx = (previousOffset + delta).coerceIn(-topBlockHeightPx, 0f)
+                topBlockPositionInitialized = true
+                return Offset(x = 0f, y = topBlockOffsetPx - previousOffset)
+            }
+        }
+    }
+    val collapseFraction = if (topBlockHeightPx > 0f) {
+        (-topBlockOffsetPx / topBlockHeightPx).coerceIn(0f, 1f)
+    } else {
+        0f
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .nestedScroll(collapsingHeaderConnection)
+            .padding(horizontal = 16.dp)
+    ) {
+        CollapsingExceptionsHeader(
+            offsetPx = topBlockOffsetPx,
+            onHeightChanged = { measuredHeight ->
+                if (measuredHeight > 0 && topBlockHeightPx != measuredHeight.toFloat()) {
+                    topBlockHeightPx = measuredHeight.toFloat()
+                }
+            }
         ) {
             Column {
                 // Header
@@ -393,7 +408,7 @@ fun ExceptionsTab(
             placeholder = { Text("Поиск приложений...", fontSize = 14.sp) },
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(top = if (topBlockVisible) 0.dp else 16.dp, bottom = 12.dp)
+                .padding(top = 16.dp * collapseFraction, bottom = 12.dp)
                 .height(52.dp),
             shape = RoundedCornerShape(16.dp),
             leadingIcon = { Icon(Icons.Default.Search, null, modifier = Modifier.size(20.dp)) },
@@ -436,6 +451,35 @@ fun ExceptionsTab(
                     }
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun CollapsingExceptionsHeader(
+    offsetPx: Float,
+    onHeightChanged: (Int) -> Unit,
+    content: @Composable () -> Unit
+) {
+    Layout(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clipToBounds(),
+        content = {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .onSizeChanged { onHeightChanged(it.height) }
+            ) {
+                content()
+            }
+        }
+    ) { measurables, constraints ->
+        val placeable = measurables.single().measure(constraints.copy(minHeight = 0))
+        val safeOffset = offsetPx.roundToInt().coerceIn(-placeable.height, 0)
+        val visibleHeight = (placeable.height + safeOffset).coerceAtLeast(0)
+        layout(placeable.width, visibleHeight) {
+            placeable.placeRelative(0, safeOffset)
         }
     }
 }

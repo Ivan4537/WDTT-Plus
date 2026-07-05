@@ -63,6 +63,7 @@ import com.wdtt.plus.ServerAdminTarget
 import com.wdtt.plus.SettingsStore
 import com.wdtt.plus.TunnelManager
 import com.wdtt.plus.WDTTColors
+import com.wdtt.plus.hasMeaningfulAdminProfileFields
 import com.wdtt.plus.vpnProfileRestorableName
 import com.wdtt.plus.vpnProfileDisplayName
 import com.wdtt.plus.vpnProfileTransferName
@@ -117,6 +118,21 @@ private enum class OwnerProfileSource {
     Server,
     LocalOnly
 }
+
+internal fun shouldAutoRefreshOutboundState(
+    expanded: Boolean,
+    outboundBusy: Boolean,
+    snapshotBusy: Boolean,
+    hostValid: Boolean,
+    hasSshPassword: Boolean,
+    targetKey: String,
+    checkedTargetKey: String
+): Boolean = expanded &&
+    !outboundBusy &&
+    !snapshotBusy &&
+    hostValid &&
+    hasSshPassword &&
+    checkedTargetKey != targetKey
 
 private enum class ProxyKind(val label: String, val protocol: String) {
     Socks5("SOCKS5", "socks5"),
@@ -287,6 +303,23 @@ private data class OutboundServerSnapshot(
         } else {
             null
         }
+}
+
+private data class OutboundProcessSnapshot(
+    val snapshot: OutboundServerSnapshot?,
+    val lastCheckAttemptAt: Long,
+    val lastCheckError: String,
+    val attempted: Boolean
+)
+
+private object OutboundProcessCache {
+    private val values = java.util.concurrent.ConcurrentHashMap<String, OutboundProcessSnapshot>()
+
+    fun get(targetKey: String): OutboundProcessSnapshot? = values[targetKey]
+
+    fun put(targetKey: String, snapshot: OutboundProcessSnapshot) {
+        values[targetKey] = snapshot
+    }
 }
 
 private enum class OutboundModeVisualState {
@@ -628,6 +661,9 @@ fun DeployTab(
     var outboundStatusOwner by rememberSaveable { mutableStateOf<String?>(null) }
     var outboundSnapshot by remember { mutableStateOf<OutboundServerSnapshot?>(null) }
     var outboundSnapshotBusy by remember { mutableStateOf(false) }
+    var outboundLastCheckAttemptAt by remember { mutableLongStateOf(0L) }
+    var outboundLastCheckError by remember { mutableStateOf("") }
+    var outboundAutoCheckedTargetKey by remember { mutableStateOf("") }
     var importedWgConfigText by rememberSaveable { mutableStateOf("") }
     val outboundPrefs = remember { context.getSharedPreferences("wdtt_outbound_forms", Context.MODE_PRIVATE) }
     var localProxyPortInput by rememberSaveable { mutableStateOf(outboundPrefs.getString("local_proxy_port", "1080") ?: "1080") }
@@ -675,8 +711,23 @@ fun DeployTab(
     LaunchedEffect(savedPassword) { password = savedPassword }
     LaunchedEffect(savedDns1) { dns1 = savedDns1 }
     LaunchedEffect(savedDns2) { dns2 = savedDns2 }
-    LaunchedEffect(ip.trim(), login.trim(), savedSshPort) {
-        outboundSnapshot = null
+    val outboundTargetKey = remember(ip, login, password, savedSshPort) {
+        listOf(
+            ip.trim(),
+            login.ifBlank { "root" },
+            savedSshPort.ifBlank { "22" },
+            password.hashCode().toString()
+        ).joinToString("\u0000")
+    }
+    val currentOutboundTargetKey by rememberUpdatedState(outboundTargetKey)
+    LaunchedEffect(outboundTargetKey) {
+        val cached = OutboundProcessCache.get(outboundTargetKey)
+        outboundSnapshot = cached?.snapshot
+        outboundLastCheckAttemptAt = cached?.lastCheckAttemptAt ?: 0L
+        outboundLastCheckError = cached?.lastCheckError.orEmpty()
+        outboundAutoCheckedTargetKey = if (cached?.attempted == true) outboundTargetKey else ""
+        outboundStatus = ""
+        outboundStatusOwner = null
     }
     LaunchedEffect(
         localProxyPortInput,
@@ -741,7 +792,7 @@ fun DeployTab(
         scope.launch {
             try {
                 writeServerBackupToUri(context, uri, backup)
-                migrationStatus = "Экспорт готов: паролей ${backup.passwordCount}, устройств ${backup.deviceCount}${if (backup.hasWgKeys) ", WG-ключи включены" else ""}"
+                migrationStatus = "${if (backup.hasWgKeys) "Полный" else "Частичный"} экспорт готов: паролей ${backup.passwordCount}, устройств ${backup.deviceCount}."
             } catch (e: Exception) {
                 migrationStatus = "Ошибка экспорта: ${friendlyDeployError(e, "экспорт")}"
                 DeployManager.writeError("Server export error: ${e.message}")
@@ -761,7 +812,7 @@ fun DeployTab(
                 val backup = loadServerBackupFromUri(context, uri)
                 selectedImportBackup = backup
                 selectedImportModeName = ServerImportMode.Replace.name
-                migrationStatus = "Импорт выбран: паролей ${backup.passwordCount}, устройств ${backup.deviceCount}${if (backup.hasWgKeys) ", полный перенос" else ", без WG-ключей"}"
+                migrationStatus = "Выбран ${if (backup.hasWgKeys) "полный" else "частичный"} бэкап: паролей ${backup.passwordCount}, устройств ${backup.deviceCount}."
             } catch (e: Exception) {
                 selectedImportBackup = null
                 migrationStatus = "Ошибка файла импорта: ${friendlyDeployError(e, "файл импорта")}"
@@ -826,8 +877,9 @@ fun DeployTab(
         requestSshPort: Int,
         requestMainPassword: String,
         profile: ServerAdminProfileInfo
-    ): Result<Unit> = runCatching {
-        ServerAdminClient.updateAdminProfile(
+    ): Result<Boolean> = runCatching {
+        if (!hasMeaningfulAdminProfileFields(profile)) return@runCatching false
+        ServerAdminClient.updateAdminProfileFromTunnel(
             ServerAdminTarget(
                 host = requestHost,
                 user = requestUser.ifBlank { "root" },
@@ -837,7 +889,8 @@ fun DeployTab(
             ),
             profile
         )
-    }.map { }
+        true
+    }
 
     suspend fun applyExistingConnection(
         connection: ExistingServerConnection,
@@ -912,7 +965,14 @@ fun DeployTab(
                 )
                 if (success) {
                     val ownerProfile = currentOwnerProfile()
-                    DeployManager.updateProgress(0.97f, "Сохраняю профиль владельца на сервере...")
+                    DeployManager.updateProgress(
+                        0.97f,
+                        if (hasMeaningfulAdminProfileFields(ownerProfile)) {
+                            "Сохраняю заданные поля профиля владельца на сервере..."
+                        } else {
+                            "Поля «Туннеля» стандартные — профиль владельца на сервере не изменяю..."
+                        }
+                    )
                     val ownerProfileSaved = syncOwnerProfileToServer(
                         requestHost = request.host,
                         requestUser = request.user,
@@ -943,8 +1003,10 @@ fun DeployTab(
                     DeployManager.updateProgress(
                         1f,
                         when {
-                            ownerProfileSaved.isSuccess && outboundProfileSaved.isSuccess -> "Сервер обновлён, профили сохранены."
-                            ownerProfileSaved.isSuccess -> "Сервер обновлён, профиль владельца сохранён."
+                            ownerProfileSaved.getOrNull() == true && outboundProfileSaved.isSuccess -> "Сервер обновлён, заданные поля профиля владельца и профиль выходного IP сохранены."
+                            ownerProfileSaved.getOrNull() == true -> "Сервер обновлён, заданные поля профиля владельца сохранены."
+                            ownerProfileSaved.isSuccess && outboundProfileSaved.isSuccess -> "Сервер обновлён. Стандартные поля «Туннеля» не меняли профиль владельца на сервере."
+                            ownerProfileSaved.isSuccess -> "Сервер обновлён. Профиль владельца на сервере не изменён."
                             outboundProfileSaved.isSuccess -> "Сервер обновлён, профиль выходного IP сохранён."
                             else -> "Сервер обновлён. Дополнительные профили не сохранились автоматически."
                         }
@@ -1026,9 +1088,57 @@ fun DeployTab(
         )
     }
 
+    fun acceptOutboundSnapshot(requestTargetKey: String, snapshot: OutboundServerSnapshot): Boolean {
+        if (currentOutboundTargetKey != requestTargetKey) return false
+        outboundSnapshot = snapshot
+        outboundLastCheckAttemptAt = snapshot.checkedAtMillis
+        outboundLastCheckError = ""
+        outboundAutoCheckedTargetKey = requestTargetKey
+        OutboundProcessCache.put(
+            requestTargetKey,
+            OutboundProcessSnapshot(
+                snapshot = snapshot,
+                lastCheckAttemptAt = snapshot.checkedAtMillis,
+                lastCheckError = "",
+                attempted = true
+            )
+        )
+        return true
+    }
+
+    fun recordOutboundCheckFailure(requestTargetKey: String, error: Throwable) {
+        if (currentOutboundTargetKey != requestTargetKey) return
+        outboundSnapshot = null
+        outboundLastCheckAttemptAt = System.currentTimeMillis()
+        outboundLastCheckError = friendlyDeployError(error, "выходной IP")
+        outboundAutoCheckedTargetKey = requestTargetKey
+        OutboundProcessCache.put(
+            requestTargetKey,
+            OutboundProcessSnapshot(
+                snapshot = null,
+                lastCheckAttemptAt = outboundLastCheckAttemptAt,
+                lastCheckError = outboundLastCheckError,
+                attempted = true
+            )
+        )
+    }
+
     fun refreshOutboundSnapshot(showStatus: Boolean = true) {
+        if (outboundBusy || outboundSnapshotBusy) return
         val target = currentOutboundTarget() ?: return
+        val requestTargetKey = outboundTargetKey
+        outboundAutoCheckedTargetKey = requestTargetKey
+        OutboundProcessCache.put(
+            requestTargetKey,
+            OutboundProcessSnapshot(
+                snapshot = outboundSnapshot,
+                lastCheckAttemptAt = outboundLastCheckAttemptAt,
+                lastCheckError = "",
+                attempted = true
+            )
+        )
         outboundSnapshotBusy = true
+        outboundLastCheckError = ""
         if (showStatus) {
             outboundStatus = "Проверяю, какой выходной IP/прокси сейчас активен на сервере..."
             outboundStatusOwner = null
@@ -1036,13 +1146,14 @@ fun DeployTab(
         scope.launch {
             try {
                 val snapshot = readOutboundServerSnapshot(context, target)
-                outboundSnapshot = snapshot
-                if (showStatus) {
+                val accepted = acceptOutboundSnapshot(requestTargetKey, snapshot)
+                if (showStatus && accepted) {
                     outboundStatus = outboundServerStateSummary(snapshot)
                     outboundStatusOwner = null
                 }
             } catch (e: Exception) {
-                if (showStatus) {
+                recordOutboundCheckFailure(requestTargetKey, e)
+                if (showStatus && currentOutboundTargetKey == requestTargetKey) {
                     outboundStatus = "Не удалось прочитать состояние выходного IP: ${friendlyDeployError(e, "выходной IP")}"
                     outboundStatusOwner = null
                 }
@@ -1061,6 +1172,7 @@ fun DeployTab(
     ) {
         val owner = outboundDialog?.name
         val target = currentOutboundTarget() ?: return
+        val requestTargetKey = outboundTargetKey
         outboundBusy = true
         outboundSnapshotBusy = true
         outboundProgressActive = true
@@ -1073,7 +1185,7 @@ fun DeployTab(
                 if (preflightRouteMode != null) {
                     DeployManager.updateProgress(0.04f, "Проверяю текущий выход перед переключением...")
                     val before = readOutboundServerSnapshot(context, target)
-                    outboundSnapshot = before
+                    if (!acceptOutboundSnapshot(requestTargetKey, before)) return@launch
                     before.routeConflictMessage?.let { conflict ->
                         outboundStatus = "Установка остановлена. $conflict"
                         outboundStatusOwner = owner
@@ -1085,7 +1197,9 @@ fun DeployTab(
                 val afterSnapshot = runCatching {
                     readOutboundServerSnapshot(context, target)
                 }.onSuccess {
-                    outboundSnapshot = it
+                    acceptOutboundSnapshot(requestTargetKey, it)
+                }.onFailure {
+                    recordOutboundCheckFailure(requestTargetKey, it)
                 }.getOrNull()
                 val afterWarning = afterSnapshot?.routeConflictMessage
                     ?: afterSnapshot?.outboundModeMismatchWarning()
@@ -1141,6 +1255,7 @@ fun DeployTab(
 
     fun restoreOutboundFromServer() {
         val target = currentOutboundTarget() ?: return
+        val requestTargetKey = outboundTargetKey
         outboundBusy = true
         outboundSnapshotBusy = true
         outboundProgressActive = true
@@ -1151,10 +1266,11 @@ fun DeployTab(
         scope.launch {
             try {
                 val snapshot = readOutboundServerSnapshot(context, target)
-                outboundSnapshot = snapshot
+                if (!acceptOutboundSnapshot(requestTargetKey, snapshot)) return@launch
                 applyOutboundSnapshot(snapshot)
                 outboundStatus = outboundRestoreSummary(snapshot)
             } catch (e: Exception) {
+                recordOutboundCheckFailure(requestTargetKey, e)
                 outboundStatus = "Не удалось прочитать настройки выходного IP с сервера: ${friendlyDeployError(e, "выходной IP")}"
                 outboundStatusOwner = null
                 DeployManager.writeError("Outbound profile restore failed: ${e.message}")
@@ -1177,36 +1293,26 @@ fun DeployTab(
     fun dialogStatus(dialog: OutboundDialog): String =
         if (outboundStatusOwner == dialog.name) outboundStatus else ""
 
-    LaunchedEffect(outboundSectionExpanded) {
-        if (
-            outboundSectionExpanded == true &&
-            outboundSnapshot == null &&
-            !outboundBusy &&
-            !outboundSnapshotBusy &&
-            isServerAddressValid &&
-            password.isNotBlank()
-        ) {
-            val target = OutboundSshTarget(
-                host = ip.trim(),
-                user = login.ifBlank { "root" },
-                pass = password,
-                port = savedSshPort.toIntOrNull() ?: 22
+    LaunchedEffect(
+        outboundSectionExpanded,
+        outboundTargetKey,
+        outboundBusy,
+        outboundSnapshotBusy,
+        isServerAddressValid,
+        password,
+        outboundAutoCheckedTargetKey
+    ) {
+        if (shouldAutoRefreshOutboundState(
+                expanded = outboundSectionExpanded == true,
+                outboundBusy = outboundBusy,
+                snapshotBusy = outboundSnapshotBusy,
+                hostValid = isServerAddressValid,
+                hasSshPassword = password.isNotBlank(),
+                targetKey = outboundTargetKey,
+                checkedTargetKey = outboundAutoCheckedTargetKey
             )
-            outboundSnapshotBusy = true
-            try {
-                runCatching {
-                    readOutboundServerSnapshot(context, target)
-                }.onSuccess {
-                    outboundSnapshot = it
-                }.onFailure {
-                    outboundStatus = "Не удалось автоматически проверить выходной IP: ${friendlyDeployError(it, "выходной IP")}"
-                    outboundStatusOwner = null
-                    DeployManager.writeError("Outbound auto refresh failed: ${it.message}")
-                }
-            } finally {
-                outboundSnapshotBusy = false
-                DeployManager.updateProgress(0f, "")
-            }
+        ) {
+            refreshOutboundSnapshot(showStatus = false)
         }
     }
 
@@ -1609,6 +1715,7 @@ fun DeployTab(
                 adminProfile = currentOwnerProfile(),
                 sourceProfileName = vpnProfileTransferName(activeProfile, profileNames),
                 enabled = !isDeploying && !isCheckingExistingInstall && !migrationBusy && !outboundBusy && isServerAddressValid,
+                hostValid = isServerAddressValid,
                 expanded = clientsExpanded,
                 modifier = Modifier.onGloballyPositioned { clientsSectionY = it.positionInParent().y },
                 onExpandedChange = { expanded ->
@@ -1628,6 +1735,8 @@ fun DeployTab(
                 busy = outboundBusy,
                 snapshot = outboundSnapshot,
                 snapshotBusy = outboundSnapshotBusy,
+                lastCheckAttemptAt = outboundLastCheckAttemptAt,
+                lastCheckError = outboundLastCheckError,
                 status = if (outboundDialog == null && outboundStatusOwner == null) outboundStatus else "",
                 actionTitle = outboundActionTitle,
                 enabled = !isDeploying && !migrationBusy && !outboundBusy && !outboundSnapshotBusy,
@@ -2004,12 +2113,12 @@ fun DeployTab(
                 ) {
                     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.30f))
             Text(
-                "Экспорт сохраняет пароли, Telegram-бота, привязки устройств и историю. Полный экспорт дополнительно сохраняет WireGuard-ключи сервера и клиентов.",
+                "Экспорт сохраняет базу WDTT Plus: профиль владельца, Telegram-бота, клиентов, привязки устройств, статистику и историю. Полный экспорт дополнительно сохраняет WireGuard-ключи сервера.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             Text(
-                "Старые ссылки пользователей останутся рабочими только если в них был домен и после переноса DNS этого домена указывает на новый сервер. Если ссылки выдавались с IP, после переноса сгенерируйте и отправьте пользователям новые ссылки; пароли и привязки при полном переносе сохранятся.",
+                "Старые ссылки останутся рабочими, если в них был домен, DNS указывает на новый сервер и при импорте сохранены прежние порты. Для ссылок с IP или при смене портов создайте и отправьте новые. Пароли, привязки и история входят в оба вида экспорта; серверные WireGuard-ключи — только в полный.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -2026,30 +2135,32 @@ fun DeployTab(
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text(
-                    "Полный экспорт: сохранить WireGuard-ключи",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurface,
-                    modifier = Modifier.weight(1f)
-                )
+                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                    Text(
+                        if (exportIncludeWgKeys) "Полный экспорт" else "Частичный экспорт",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Text(
+                        if (exportIncludeWgKeys) {
+                            "База WDTT Plus и WireGuard-ключи сервера. Для полного переезда с сохранением серверной WG-идентичности."
+                        } else {
+                            "Только база WDTT Plus без серверных WG-ключей. На целевом сервере сохранятся его ключи, а при их отсутствии создадутся новые."
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
                 Switch(
                     checked = exportIncludeWgKeys,
                     enabled = !migrationBusy && !isDeploying,
                     onCheckedChange = { exportIncludeWgKeys = it }
                 )
             }
-            Text(
-                if (exportIncludeWgKeys) {
-                    "Полный перенос нужен для переезда своего сервера: сохраняет WireGuard-идентичность и снижает риск перепривязки устройств."
-                } else {
-                    "Без WireGuard-ключей переносится только база доступа. Новый сервер создаст новые ключи, часть клиентов может потребовать повторное подключение."
-                },
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -2115,7 +2226,7 @@ fun DeployTab(
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         Text(
-                            "Выбран импорт: ${backup.passwordCount} паролей, ${backup.deviceCount} устройств${if (backup.hasWgKeys) ", WG-ключи есть" else ", WG-ключей нет"}",
+                            "Выбран ${if (backup.hasWgKeys) "полный" else "частичный"} бэкап: ${backup.passwordCount} паролей, ${backup.deviceCount} устройств${if (backup.hasWgKeys) ", WG-ключи сервера включены" else ", без WG-ключей сервера"}.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurface
                         )
@@ -2452,6 +2563,8 @@ private fun OutboundRoutingSection(
     busy: Boolean,
     snapshot: OutboundServerSnapshot?,
     snapshotBusy: Boolean,
+    lastCheckAttemptAt: Long,
+    lastCheckError: String,
     status: String,
     actionTitle: String,
     enabled: Boolean,
@@ -2539,6 +2652,8 @@ private fun OutboundRoutingSection(
                 OutboundServerStateCard(
                     snapshot = snapshot,
                     snapshotBusy = snapshotBusy,
+                    lastCheckAttemptAt = lastCheckAttemptAt,
+                    lastCheckError = lastCheckError,
                     enabled = enabled,
                     onRefreshState = onRefreshState
                 )
@@ -2678,10 +2793,13 @@ private fun BetaBadge() {
 private fun OutboundServerStateCard(
     snapshot: OutboundServerSnapshot?,
     snapshotBusy: Boolean,
+    lastCheckAttemptAt: Long,
+    lastCheckError: String,
     enabled: Boolean,
     onRefreshState: () -> Unit
 ) {
     val state = when {
+        lastCheckError.isNotBlank() -> OutboundModeVisualState.Error
         snapshot == null -> OutboundModeVisualState.Unknown
         snapshot.hasRouteConflict -> OutboundModeVisualState.Error
         snapshot.outboundModeMismatchWarning() != null -> OutboundModeVisualState.Warning
@@ -2707,17 +2825,30 @@ private fun OutboundServerStateCard(
                 OutboundStateDot(state)
                 Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     Text(
-                        text = snapshot?.let { "На сервере: ${outboundServerShortState(it)}" }
-                            ?: "На сервере: состояние ещё не проверено",
+                        text = when {
+                            snapshotBusy -> "Проверяю состояние на сервере..."
+                            lastCheckError.isNotBlank() -> "Не удалось проверить выходной IP"
+                            snapshot != null -> "На сервере: ${outboundServerShortState(snapshot)}"
+                            else -> "На сервере: состояние ещё не проверено"
+                        },
                         style = MaterialTheme.typography.bodyMedium,
                         fontWeight = FontWeight.SemiBold,
                         color = MaterialTheme.colorScheme.onSurface
                     )
                     Text(
-                        text = snapshot?.let { outboundServerStateHint(it) }
-                            ?: "Откройте блок или нажмите «Обновить состояние», чтобы увидеть, что реально запущено на сервере.",
+                        text = when {
+                            snapshotBusy -> "Читаю активный режим и проверяю конфликтующие маршруты."
+                            lastCheckError.isNotBlank() -> buildString {
+                                if (lastCheckAttemptAt > 0L) {
+                                    append("Последняя попытка: ${formatOutboundCheckTime(lastCheckAttemptAt)}. ")
+                                }
+                                append(lastCheckError)
+                            }
+                            snapshot != null -> outboundServerStateHint(snapshot)
+                            else -> "Откройте блок или нажмите «Обновить состояние», чтобы увидеть, что реально запущено на сервере."
+                        },
                         style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                        color = if (lastCheckError.isNotBlank()) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
             }
@@ -5976,6 +6107,7 @@ private fun validateTrafficBucket(owner: String, index: Int, bucket: JSONObject)
 
 private fun validatePasswordEntry(pass: String, entry: JSONObject) {
     require(pass.isNotBlank()) { "пустой пароль в passwords" }
+    require(pass.length <= 256) { "пароль в passwords слишком длинный" }
     entry.optStringLength("device_id", 256, "пароля $pass")
     entry.optStringLength("label", 120, "пароля $pass")
     entry.optStringLength("vk_hash", 512, "пароля $pass")
@@ -6006,6 +6138,7 @@ private fun validatePasswordEntry(pass: String, entry: JSONObject) {
 
 private fun validateDeviceEntry(deviceId: String, device: JSONObject) {
     require(deviceId.isNotBlank()) { "пустой ключ устройства в devices" }
+    require(deviceId.length <= 256) { "ключ устройства слишком длинный" }
     val storedId = device.optString("device_id", deviceId)
     require(storedId.isNotBlank()) { "device_id устройства $deviceId пустой" }
     val ip = device.optString("ip")
@@ -6026,11 +6159,42 @@ private fun validateDeviceEntry(deviceId: String, device: JSONObject) {
     require(device.optLong("last_seen_at", 0) >= 0) { "last_seen_at устройства $deviceId должен быть >= 0" }
 }
 
-private fun validatePasswordsDbStructure(db: JSONObject) {
+private fun validateAdminProfile(profile: JSONObject?) {
+    if (profile == null) return
+    profile.optStringLength("vk_hashes", 2048, "admin_profile")
+    profile.optStringLength("secondary_vk_hash", 512, "admin_profile")
+    profile.optStringLength("profile_name", 48, "admin_profile")
+    profile.optStringLength("sni", 253, "admin_profile")
+    if (profile.has("workers_per_hash")) {
+        require(profile.optInt("workers_per_hash", 0) in 1..128) { "workers_per_hash в admin_profile должен быть 1..128" }
+    }
+    if (profile.has("protocol")) {
+        require(profile.optString("protocol").lowercase() in setOf("udp", "tcp")) { "protocol в admin_profile должен быть udp или tcp" }
+    }
+    if (profile.has("listen_port")) {
+        require(profile.optInt("listen_port", 0) in 1..65535) { "listen_port в admin_profile некорректен" }
+    }
+    val ports = profile.optString("ports", "")
+    require(ports.isBlank() || ports.isValidPortsSpec()) { "ports в admin_profile некорректны" }
+    require(profile.optLong("updated_at", 0L) >= 0L) { "updated_at в admin_profile должен быть >= 0" }
+    profile.optJSONArray("device_ids")?.let { ids ->
+        require(ids.length() <= 500) { "слишком много device_ids в admin_profile" }
+        for (index in 0 until ids.length()) {
+            require(ids.optString(index).length <= 256) { "device_id в admin_profile слишком длинный" }
+        }
+    }
+}
+
+internal fun validatePasswordsDbStructure(db: JSONObject) {
     require(db.has("main_password")) { "в базе нет main_password" }
     require(db.optString("main_password").isNotBlank()) { "main_password пустой" }
+    require(db.optString("main_password").length <= 256) { "main_password слишком длинный" }
+    require(db.optString("admin_id", "").length <= 64) { "admin_id слишком длинный" }
+    require(db.optString("bot_token", "").length <= 256) { "bot_token слишком длинный" }
     val passwords = db.optJSONObject("passwords") ?: throw IllegalArgumentException("passwords должен быть объектом")
     val devices = db.optJSONObject("devices") ?: throw IllegalArgumentException("devices должен быть объектом")
+    require(passwords.length() <= 500) { "в бэкапе больше 500 паролей" }
+    require(devices.length() <= 500) { "в бэкапе больше 500 устройств" }
     val dns = db.optString("dns", "")
     require(dns.isBlank() || dns.length <= 256) { "dns слишком длинный" }
     val publicHost = db.optString("public_ip", "")
@@ -6052,9 +6216,13 @@ private fun validatePasswordsDbStructure(db: JSONObject) {
             validateTrafficBucket("admin_traffic", i, bucket)
         }
     }
+    validateAdminProfile(db.optJSONObject("admin_profile"))
     passwords.keys().forEach { pass ->
         val entry = passwords.optJSONObject(pass) ?: throw IllegalArgumentException("passwords.$pass должен быть объектом")
         validatePasswordEntry(pass, entry)
+        entry.optString("device_id", "").takeIf { it.isNotBlank() }?.let { deviceId ->
+            require(devices.has(deviceId)) { "у пароля $pass указано отсутствующее устройство $deviceId" }
+        }
     }
     devices.keys().forEach { deviceId ->
         val device = devices.optJSONObject(deviceId) ?: throw IllegalArgumentException("devices.$deviceId должен быть объектом")
@@ -6160,6 +6328,9 @@ private suspend fun readServerBackup(
         val dbB64 = markerValue(output, "WDTT_DB_B64") ?: throw IllegalStateException("сервер не отдал passwords.json")
         val passwordsJson = decodeBase64Text(dbB64)
         val wgKeys = markerValue(output, "WDTT_WG_KEYS_B64")?.takeIf { it.isNotBlank() }?.let { decodeBase64Text(it) }
+        if (includeWgKeys && wgKeys.isNullOrBlank()) {
+            throw IllegalStateException("полный экспорт невозможен: на сервере не найден корректный /etc/wdtt/wg-keys.dat. Выполните установку сервера или выберите частичный экспорт")
+        }
         parseBackup(
             passwordsJson = passwordsJson,
             wgKeysDat = wgKeys,
@@ -6328,6 +6499,43 @@ private fun ownerProfileDiffLines(server: ServerAdminProfileInfo, local: ServerA
     return lines.ifEmpty { listOf("Отличия есть только в служебных данных профиля.") }
 }
 
+private fun ownerProfileInstallDiffLines(
+    server: ServerAdminProfileInfo,
+    local: ServerAdminProfileInfo
+): List<String> {
+    val serverComparable = server.comparableOwnerProfile()
+    val localComparable = local.comparableOwnerProfile()
+    return buildList {
+        if (localComparable.vkHashes.isNotBlank() && serverComparable.vkHashes != localComparable.vkHashes) {
+            add("VK-хеши: сервер — ${secretPresenceLabel(serverComparable.vkHashes)}, приложение — ${secretPresenceLabel(localComparable.vkHashes)}")
+        }
+        if (localComparable.secondaryVkHash.isNotBlank() && serverComparable.secondaryVkHash != localComparable.secondaryVkHash) {
+            add("Резервный VK-хеш: сервер — ${secretPresenceLabel(serverComparable.secondaryVkHash)}, приложение — ${secretPresenceLabel(localComparable.secondaryVkHash)}")
+        }
+        if (localComparable.profileName.isNotBlank() && serverComparable.profileName != localComparable.profileName) {
+            add("Название профиля: сервер — ${serverComparable.profileName.ifBlank { "стандартное" }}, приложение — ${localComparable.profileName}")
+        }
+        if (localComparable.workersPerHash != 16 && serverComparable.workersPerHash != localComparable.workersPerHash) {
+            add("Потоки на хеш: сервер — ${serverComparable.workersPerHash}, приложение — ${localComparable.workersPerHash}")
+        }
+        if (localComparable.protocol != "udp" && serverComparable.protocol != localComparable.protocol) {
+            add("Протокол: сервер — ${serverComparable.protocol}, приложение — ${localComparable.protocol}")
+        }
+        if (localComparable.listenPort != 9000 && serverComparable.listenPort != localComparable.listenPort) {
+            add("Локальный порт: сервер — ${serverComparable.listenPort}, приложение — ${localComparable.listenPort}")
+        }
+        if (localComparable.ports != "56000,56001,9000" && serverComparable.ports != localComparable.ports) {
+            add("Порты ссылки: сервер — ${serverComparable.ports}, приложение — ${localComparable.ports}")
+        }
+        if (localComparable.sni.isNotBlank() && serverComparable.sni != localComparable.sni) {
+            add("SNI: сервер — ${serverComparable.sni.ifBlank { "не задан" }}, приложение — ${localComparable.sni}")
+        }
+        if (localComparable.noDns && !serverComparable.noDns) {
+            add("No DNS: сервер — выключено, приложение — включено")
+        }
+    }
+}
+
 private fun existingConnectionDiffLines(
     connection: ExistingServerConnection,
     localPeer: String,
@@ -6447,11 +6655,14 @@ private suspend fun compareDeployWithServer(
 
                     val defaultPorts = db.optString("default_ports").ifBlank { "56000,56001,9000" }
                     val serverProfile = parseOwnerProfileFromDb(db.optJSONObject("admin_profile"), defaultPorts)
-                    if (serverProfile.hasSavedFields && ownerProfilesDiffer(serverProfile, localOwnerProfile)) {
+                    val ownerInstallDiff = ownerProfileInstallDiffLines(serverProfile, localOwnerProfile)
+                    if (serverProfile.hasSavedFields && ownerInstallDiff.isNotEmpty()) {
                         overwriteLines += "Профиль владельца («Туннель» и порты)"
-                        overwriteLines += ownerProfileDiffLines(serverProfile, localOwnerProfile).map { "  $it" }
-                    } else if (!serverProfile.hasSavedFields) {
-                        notes += "На сервере ещё нет профиля владельца; установка создаст его из текущих полей приложения."
+                        overwriteLines += ownerInstallDiff.map { "  $it" }
+                    } else if (!serverProfile.hasSavedFields && hasMeaningfulAdminProfileFields(localOwnerProfile)) {
+                        notes += "На сервере ещё нет профиля владельца; установка сохранит только заданные нестандартные поля «Туннеля»."
+                    } else if (serverProfile.hasSavedFields && !hasMeaningfulAdminProfileFields(localOwnerProfile)) {
+                        notes += "Поля «Туннеля» в приложении пустые или стандартные — сохранённый профиль владельца на сервере не изменится."
                     }
                 } finally {
                     try { session?.disconnect() } catch (_: Exception) {}
@@ -6550,6 +6761,55 @@ private suspend fun readExistingServerConnection(
     }
 }
 
+internal fun mergeServerDatabaseEntries(
+    source: JSONObject,
+    target: JSONObject,
+    portsSpec: String
+) {
+    require(portsSpec.isValidPortsSpec()) { "некорректные порты целевого сервера" }
+    val sourcePasswords = source.optJSONObject("passwords") ?: JSONObject()
+    val sourceDevices = source.optJSONObject("devices") ?: JSONObject()
+    val targetPasswords = target.childObject("passwords")
+    val targetDevices = target.childObject("devices")
+    val devicesToImport = linkedSetOf<String>()
+    val usedDeviceIps = targetDevices.keys()
+        .asSequence()
+        .mapNotNull { targetDevices.optJSONObject(it)?.optString("ip")?.takeIf(String::isNotBlank) }
+        .toMutableSet()
+
+    sourcePasswords.keys().forEach { password ->
+        if (targetPasswords.has(password)) return@forEach
+        val entry = JSONObject(sourcePasswords.getJSONObject(password).toString())
+        entry.put("ports", portsSpec)
+        entry.optString("device_id", "").takeIf { it.isNotBlank() }?.let { deviceId ->
+            val sourceDevice = sourceDevices.optJSONObject(deviceId)
+                ?: throw IllegalArgumentException("в бэкапе нет устройства $deviceId, привязанного к клиенту ${password.take(4)}…")
+            targetDevices.optJSONObject(deviceId)?.let { targetDevice ->
+                val sameKeys = sourceDevice.optString("priv_key") == targetDevice.optString("priv_key") &&
+                    sourceDevice.optString("pub_key") == targetDevice.optString("pub_key")
+                require(sameKeys) {
+                    "на целевом сервере уже есть другое устройство с ID $deviceId. Отвяжите конфликтующее устройство или используйте импорт с заменой"
+                }
+            } ?: devicesToImport.add(deviceId)
+        }
+        targetPasswords.put(password, entry)
+    }
+
+    devicesToImport.forEach { deviceId ->
+        val importedDevice = JSONObject(sourceDevices.getJSONObject(deviceId).toString())
+        val sourceIp = importedDevice.optString("ip")
+        val targetIp = sourceIp.takeIf { it.isNotBlank() && it !in usedDeviceIps }
+            ?: (2..250)
+                .asSequence()
+                .map { "10.66.66.$it" }
+                .firstOrNull { it !in usedDeviceIps }
+            ?: throw IllegalStateException("на целевом сервере нет свободных внутренних IP для импортируемых устройств")
+        importedDevice.put("ip", targetIp)
+        usedDeviceIps += targetIp
+        targetDevices.put(deviceId, importedDevice)
+    }
+}
+
 private fun normalizeDbForTarget(
     backup: ServerBackup,
     currentDbJson: String?,
@@ -6566,22 +6826,7 @@ private fun normalizeDbForTarget(
     }
 
     if (mode == ServerImportMode.Merge) {
-        val sourcePasswords = source.optJSONObject("passwords") ?: JSONObject()
-        val targetPasswords = target.childObject("passwords")
-        sourcePasswords.keys().forEach { key ->
-            if (!targetPasswords.has(key)) {
-                val entry = JSONObject(sourcePasswords.getJSONObject(key).toString())
-                entry.put("ports", portsSpec)
-                targetPasswords.put(key, entry)
-            }
-        }
-        val sourceDevices = source.optJSONObject("devices") ?: JSONObject()
-        val targetDevices = target.childObject("devices")
-        sourceDevices.keys().forEach { key ->
-            if (!targetDevices.has(key)) {
-                targetDevices.put(key, JSONObject(sourceDevices.getJSONObject(key).toString()))
-            }
-        }
+        mergeServerDatabaseEntries(source, target, portsSpec)
         if (!target.has("main_password") || target.optString("main_password").isBlank()) {
             target.put("main_password", backup.mainPassword)
         }
@@ -6662,18 +6907,43 @@ private suspend fun performServerImportNow(
     onProgress: (Float, String) -> Unit
 ): Boolean = withContext(Dispatchers.IO) {
     var session: Session? = null
+    var sshClient: SSHClient? = null
+    var rollbackPrepared = false
     try {
         onProgress(0.05f, "Подключение...")
         session = createSSHSession(request.host, request.user, request.pass, request.sshPort)
         DeployManager.activeSession = session
         val ssh = SSHClient(session, request.pass)
-        onProgress(0.30f, "Подготовка импорта...")
+        sshClient = ssh
+        onProgress(0.15f, "Проверяю текущую базу и создаю страховочную копию...")
+        val beforeJson = readRemotePasswordsJson(ssh)?.also {
+            validatePasswordsDbStructure(JSONObject(it))
+        }
+        prepareServerUpdateRollback(ssh)
+        rollbackPrepared = true
+        onProgress(0.35f, "Подготовка импорта...")
         applyServerImport(context, ssh, request, backup, mode, restartService = true)
+        onProgress(0.85f, "Проверяю импортированные данные и службу...")
+        val afterJson = readRemotePasswordsJson(ssh)
+            ?: throw IllegalStateException("после импорта не найдена база passwords.json")
+        validateImportedServerState(
+            sourceJson = backup.passwordsJson,
+            beforeJson = beforeJson,
+            afterJson = afterJson,
+            replace = mode == ServerImportMode.Replace
+        )
+        cleanupServerUpdateRollback(ssh)
+        rollbackPrepared = false
         onProgress(1.0f, "Импорт завершён")
         DeployManager.stopDeploy("success")
         TunnelManager.addDeploySuccessLog("Импорт состояния WDTT Plus завершён.")
         true
     } catch (e: Exception) {
+        if (rollbackPrepared) {
+            runCatching { sshClient?.let(::rollbackServerUpdate) }
+                .onFailure { rollbackError -> DeployManager.writeError("Import rollback failed: ${rollbackError.message}") }
+            rollbackPrepared = false
+        }
         DeployManager.writeError("Server import critical: ${e.message}\n${e.stackTraceToString().take(500)}")
         DeployManager.stopDeploy("Ошибка импорта")
         throw e
@@ -6774,6 +7044,60 @@ private fun validatePreservedServerState(beforeJson: String, afterJson: String) 
     }
 }
 
+internal fun validateImportedServerState(
+    sourceJson: String,
+    beforeJson: String?,
+    afterJson: String,
+    replace: Boolean
+) {
+    val source = JSONObject(sourceJson)
+    val after = JSONObject(afterJson)
+    validatePasswordsDbStructure(source)
+    validatePasswordsDbStructure(after)
+    if (!replace && beforeJson != null) {
+        validatePreservedServerState(beforeJson, afterJson)
+    }
+
+    val sourcePasswords = source.optJSONObject("passwords") ?: JSONObject()
+    val beforePasswords = beforeJson?.let { JSONObject(it).optJSONObject("passwords") } ?: JSONObject()
+    val afterPasswords = after.optJSONObject("passwords") ?: JSONObject()
+    val afterDevices = after.optJSONObject("devices") ?: JSONObject()
+    val safeExpiryCutoff = System.currentTimeMillis() / 1000L + 300L
+
+    sourcePasswords.keys().forEach { password ->
+        if (!replace && beforePasswords.has(password)) return@forEach
+        val expected = sourcePasswords.optJSONObject(password) ?: return@forEach
+        val expiresAt = expected.optLong("expires_at", 0L)
+        if (expiresAt != 0L && expiresAt <= safeExpiryCutoff) return@forEach
+        val actual = afterPasswords.optJSONObject(password)
+            ?: throw IllegalStateException("после импорта не найден клиент ${password.take(4)}…")
+        listOf("device_id", "label", "vk_hash").forEach { field ->
+            require(expected.optString(field, "") == actual.optString(field, "")) {
+                "после импорта изменилось поле $field у клиента ${password.take(4)}…"
+            }
+        }
+        listOf("expires_at", "down_bytes", "up_bytes").forEach { field ->
+            require(expected.optLong(field, 0L) == actual.optLong(field, 0L)) {
+                "после импорта изменилось поле $field у клиента ${password.take(4)}…"
+            }
+        }
+        require(expected.optBoolean("is_deactivated", false) == actual.optBoolean("is_deactivated", false)) {
+            "после импорта изменился статус клиента ${password.take(4)}…"
+        }
+        listOf("bind_history", "traffic").forEach { field ->
+            require(expected.optJSONArray(field)?.toString().orEmpty() == actual.optJSONArray(field)?.toString().orEmpty()) {
+                "после импорта изменилась история $field у клиента ${password.take(4)}…"
+            }
+        }
+        val deviceId = expected.optString("device_id", "")
+        if (deviceId.isNotBlank()) {
+            require(afterDevices.has(deviceId)) {
+                "после импорта отсутствует привязанное устройство клиента ${password.take(4)}…"
+            }
+        }
+    }
+}
+
 private suspend fun performDeploy(
 	context: Context,
 	host: String, user: String, pass: String, port: Int,
@@ -6787,6 +7111,7 @@ private suspend fun performDeploy(
     var sshClient: SSHClient? = null
     var rollbackPrepared = false
     var preservedDbJson: String? = null
+    var preImportDbJson: String? = null
     try {
         onProgress(0.02f, "Подключение...")
         session = createSSHSession(host, user, pass, port)
@@ -6819,12 +7144,15 @@ private suspend fun performDeploy(
             return@withContext false
         }
         val expectedServerSha256 = sha256File(serverFile)
-        if (mode == DeployMode.PreserveData) {
+        if (mode == DeployMode.PreserveData || importPlan != null) {
             onProgress(0.055f, "Проверка сохранённых данных...")
             val currentDbJson = readRemotePasswordsJson(ssh)?.also {
                 validatePasswordsDbStructure(JSONObject(it))
             }
-            if (importPlan == null) preservedDbJson = currentDbJson
+            if (mode == DeployMode.PreserveData) {
+                if (importPlan == null) preservedDbJson = currentDbJson
+                if (importPlan?.mode == ServerImportMode.Merge) preImportDbJson = currentDbJson
+            }
             prepareServerUpdateRollback(ssh)
             rollbackPrepared = true
         }
@@ -6911,6 +7239,14 @@ private suspend fun performDeploy(
 				?: throw IllegalStateException("после обновления не найдена база passwords.json")
 			validatePasswordsDbStructure(JSONObject(updatedDbJson))
 			preservedDbJson?.let { validatePreservedServerState(it, updatedDbJson) }
+			importPlan?.let { plan ->
+				validateImportedServerState(
+					sourceJson = plan.backup.passwordsJson,
+					beforeJson = if (plan.mode == ServerImportMode.Merge) preImportDbJson else null,
+					afterJson = updatedDbJson,
+					replace = plan.mode == ServerImportMode.Replace
+				)
+			}
 			if (rollbackPrepared) {
 				cleanupServerUpdateRollback(ssh)
 				rollbackPrepared = false
@@ -7054,7 +7390,8 @@ private fun ServerImportConfirmDialog(
     }
     val wgText = when {
         mode == ServerImportMode.Replace && backup.hasWgKeys -> "заменить WG-ключи из бэкапа"
-        mode == ServerImportMode.Replace -> "WG-ключей в бэкапе нет, сервер создаст новые"
+        mode == ServerImportMode.Replace -> "не менять ключи целевого сервера; если их нет, сервер создаст новые"
+        backup.hasWgKeys -> "не трогать ключи целевого сервера; WG-ключи из бэкапа в режиме «Добавить» не применяются"
         else -> "не трогать WG-ключи текущего сервера"
     }
 
@@ -7586,16 +7923,9 @@ private fun TelegramBotHelpDialog(onDismiss: () -> Unit) {
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
-                    TelegramBotActionRow(
-                        buttonText = "Мини-приложение BotFather",
-                        handle = "@BotFather",
-                        onOpen = { openTelegramBot("BotFather", miniApp = true) },
-                        onCopy = { copyTelegramHandle("@BotFather") }
-                    )
-                    TelegramBotActionRow(
-                        buttonText = "Обычный чат @BotFather",
-                        handle = "@BotFather",
-                        onOpen = { openTelegramBot("BotFather") },
+                    TelegramBotFatherRows(
+                        onOpenMiniApp = { openTelegramBot("BotFather", miniApp = true) },
+                        onOpenChat = { openTelegramBot("BotFather") },
                         onCopy = { copyTelegramHandle("@BotFather") }
                     )
 
@@ -7631,6 +7961,53 @@ private fun TelegramBotHelpDialog(onDismiss: () -> Unit) {
                     }
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun TelegramBotFatherRows(
+    onOpenMiniApp: () -> Unit,
+    onOpenChat: () -> Unit,
+    onCopy: () -> Unit
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            OutlinedButton(
+                onClick = onOpenMiniApp,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 48.dp),
+                shape = RoundedCornerShape(16.dp)
+            ) {
+                Text("Мини-приложение BotFather", textAlign = TextAlign.Center)
+            }
+            OutlinedButton(
+                onClick = onOpenChat,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 48.dp),
+                shape = RoundedCornerShape(16.dp)
+            ) {
+                Text("Обычный чат @BotFather", textAlign = TextAlign.Center)
+            }
+        }
+        FilledTonalIconButton(
+            onClick = onCopy,
+            modifier = Modifier.size(48.dp)
+        ) {
+            Icon(
+                Icons.Default.ContentCopy,
+                contentDescription = "Скопировать @BotFather",
+                modifier = Modifier.size(20.dp)
+            )
         }
     }
 }

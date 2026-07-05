@@ -37,7 +37,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.wdtt.plus.SettingsStore
-import com.wdtt.plus.normalizeVpnProfileName
+import com.wdtt.plus.sanitizeVpnProfileNameInput
 import com.wdtt.plus.vpnProfileDisplayName
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
@@ -570,7 +570,7 @@ fun FloatingToolbar(
             text = {
                 OutlinedTextField(
                     value = profileNameInput,
-                    onValueChange = { profileNameInput = normalizeVpnProfileName(it) },
+                    onValueChange = { profileNameInput = sanitizeVpnProfileNameInput(it) },
                     label = { Text("Название") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()

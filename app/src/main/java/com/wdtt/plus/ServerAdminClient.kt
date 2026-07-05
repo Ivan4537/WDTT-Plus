@@ -284,21 +284,10 @@ object ServerAdminClient {
         "--public-ip", publicHost.ifBlank { "auto" }
     ))
 
-    suspend fun updateAdminProfile(target: ServerAdminTarget, profile: ServerAdminProfileInfo): ServerAdminActionResult {
-        val args = mutableListOf(
-            "update-admin-profile",
-            "--vk-hashes", profile.vkHashes.trim(),
-            "--secondary-vk-hash", profile.secondaryVkHash.trim(),
-            "--profile-name", profile.profileName.trim(),
-            "--workers", profile.workersPerHash.coerceIn(1, 128).toString(),
-            "--protocol", profile.protocol.trim().lowercase().takeIf { it == "udp" || it == "tcp" } ?: "udp",
-            "--listen-port", profile.listenPort.coerceIn(1, 65535).toString(),
-            "--sni", profile.sni.trim(),
-            "--ports", profile.ports.trim().ifBlank { "56000,56001,9000" }
-        )
-        if (profile.noDns) args += "--no-dns"
-        return runArgsAction(target, args)
-    }
+    suspend fun updateAdminProfileFromTunnel(
+        target: ServerAdminTarget,
+        profile: ServerAdminProfileInfo
+    ): ServerAdminActionResult = runArgsAction(target, buildAdminProfilePatchArgs(profile))
 
     suspend fun refreshPublicHost(target: ServerAdminTarget): ServerAdminActionResult =
         runArgsAction(target, listOf("refresh-public-ip"))
@@ -556,6 +545,46 @@ object ServerAdminClient {
             else -> text.take(220)
         }
     }
+}
+
+internal fun hasMeaningfulAdminProfileFields(profile: ServerAdminProfileInfo): Boolean =
+    buildAdminProfilePatchArgs(profile).size > 1
+
+internal fun buildAdminProfilePatchArgs(profile: ServerAdminProfileInfo): List<String> = buildList {
+    add("update-admin-profile")
+    profile.vkHashes.trim().takeIf { it.isNotBlank() }?.let {
+        add("--vk-hashes")
+        add(it)
+    }
+    profile.secondaryVkHash.trim().takeIf { it.isNotBlank() }?.let {
+        add("--secondary-vk-hash")
+        add(it)
+    }
+    vpnProfileRestorableName(profile.profileName).takeIf { it.isNotBlank() }?.let {
+        add("--profile-name")
+        add(it)
+    }
+    profile.workersPerHash.coerceIn(1, 128).takeIf { it != 16 }?.let {
+        add("--workers")
+        add(it.toString())
+    }
+    profile.protocol.trim().lowercase().takeIf { it == "tcp" }?.let {
+        add("--protocol")
+        add(it)
+    }
+    profile.listenPort.coerceIn(1, 65535).takeIf { it != 9000 }?.let {
+        add("--listen-port")
+        add(it.toString())
+    }
+    profile.sni.trim().takeIf { it.isNotBlank() }?.let {
+        add("--sni")
+        add(it)
+    }
+    profile.ports.trim().takeIf { it.isNotBlank() && it != "56000,56001,9000" }?.let {
+        add("--ports")
+        add(it)
+    }
+    if (profile.noDns) add("--no-dns")
 }
 
 private class AdminSshClient(private val session: Session, private val sudoPassword: String) {

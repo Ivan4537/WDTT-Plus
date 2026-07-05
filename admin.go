@@ -1279,53 +1279,70 @@ func adminUpdateAdminProfile(configDir string, loaded *Database, args []string) 
 	if err := fs.Parse(args); err != nil {
 		return adminResponse{}, err
 	}
+	provided := make(map[string]bool)
+	fs.Visit(func(value *flag.Flag) {
+		provided[value.Name] = true
+	})
+	if len(provided) == 0 {
+		return adminResponse{OK: true, Message: "Профиль владельца не изменён", Server: buildAdminServerInfo(configDir, loaded)}, nil
+	}
 
-	profile := loaded.AdminProfile
-	profile.VkHashes = ""
-	if strings.TrimSpace(*vkHashes) != "" {
-		normalized, err := normalizeVKHashesInput(*vkHashes)
+	profile := normalizeAdminProfileForStorage(loaded.AdminProfile, loaded.DefaultPorts)
+	if provided["vk-hashes"] {
+		profile.VkHashes = ""
+		if strings.TrimSpace(*vkHashes) != "" {
+			normalized, err := normalizeVKHashesInput(*vkHashes)
+			if err != nil {
+				return adminResponse{}, err
+			}
+			profile.VkHashes = normalized
+		}
+	}
+	if provided["secondary-vk-hash"] {
+		profile.SecondaryVkHash = ""
+		if strings.TrimSpace(*secondaryVkHash) != "" {
+			normalized, err := normalizeVKHashesInput(*secondaryVkHash)
+			if err != nil {
+				return adminResponse{}, err
+			}
+			profile.SecondaryVkHash = normalized
+		}
+	}
+	if provided["profile-name"] {
+		profile.ProfileName = normalizeAdminProfileName(*profileName)
+	}
+	if provided["workers"] {
+		if *workers < 1 || *workers > 128 {
+			return adminResponse{}, errors.New("workers должен быть 1..128")
+		}
+		profile.WorkersPerHash = *workers
+	}
+	if provided["protocol"] {
+		normalizedProtocol, err := normalizeAdminProfileProtocol(*protocol)
 		if err != nil {
 			return adminResponse{}, err
 		}
-		profile.VkHashes = normalized
+		profile.Protocol = normalizedProtocol
 	}
-	profile.SecondaryVkHash = ""
-	if strings.TrimSpace(*secondaryVkHash) != "" {
-		normalized, err := normalizeVKHashesInput(*secondaryVkHash)
-		if err != nil {
-			return adminResponse{}, err
-		}
-		profile.SecondaryVkHash = normalized
-	}
-	profile.ProfileName = normalizeAdminProfileName(*profileName)
-	if *workers < 1 || *workers > 128 {
-		return adminResponse{}, errors.New("workers должен быть 1..128")
-	}
-	profile.WorkersPerHash = *workers
-	normalizedProtocol, err := normalizeAdminProfileProtocol(*protocol)
-	if err != nil {
-		return adminResponse{}, err
-	}
-	profile.Protocol = normalizedProtocol
-	if strings.TrimSpace(*ports) != "" {
+	if provided["ports"] {
 		normalizedPorts, err := parsePortsSpec(*ports)
 		if err != nil {
 			return adminResponse{}, err
 		}
 		profile.Ports = normalizedPorts
-	} else {
-		profile.Ports = loaded.DefaultPorts
 	}
-	if *listenPort < 0 || *listenPort > 65535 {
-		return adminResponse{}, errors.New("listen-port должен быть 1..65535")
-	}
-	if *listenPort > 0 {
+	if provided["listen-port"] {
+		if *listenPort < 1 || *listenPort > 65535 {
+			return adminResponse{}, errors.New("listen-port должен быть 1..65535")
+		}
 		profile.ListenPort = *listenPort
-	} else {
-		profile.ListenPort = adminProfileDefaultListenPort(profile.Ports)
 	}
-	profile.SNI = normalizeAdminProfileSNI(*sni)
-	profile.NoDNS = *noDNS
+	if provided["sni"] {
+		profile.SNI = normalizeAdminProfileSNI(*sni)
+	}
+	if provided["no-dns"] {
+		profile.NoDNS = *noDNS
+	}
 	profile.UpdatedAt = time.Now().Unix()
 	profile = normalizeAdminProfileForStorage(profile, loaded.DefaultPorts)
 

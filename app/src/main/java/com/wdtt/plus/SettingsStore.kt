@@ -543,7 +543,7 @@ class SettingsStore(context: Context) {
     val deviceCompatibilityCheckComplete: Flow<Boolean> = dataStore.data.map {
         it[DEVICE_COMPATIBILITY_CHECK_COMPLETE] ?: false
     }
-    val deployClientsSectionExpanded: Flow<Boolean> = dataStore.data.map { it[DEPLOY_CLIENTS_SECTION_EXPANDED] ?: true }
+    val deployClientsSectionExpanded: Flow<Boolean> = dataStore.data.map { it[DEPLOY_CLIENTS_SECTION_EXPANDED] ?: false }
     val deployOutboundSectionExpanded: Flow<Boolean> = dataStore.data.map { it[DEPLOY_OUTBOUND_SECTION_EXPANDED] ?: false }
     val deployMigrationSectionExpanded: Flow<Boolean> = dataStore.data.map { it[DEPLOY_MIGRATION_SECTION_EXPANDED] ?: false }
     val interfaceRole: Flow<String> = dataStore.data.map { it[INTERFACE_ROLE] ?: "" }
@@ -1293,11 +1293,23 @@ class SettingsStore(context: Context) {
 
 fun vpnProfileDefaultName(profile: Int): String = "VPN ${profile.coerceIn(0, 2) + 1}"
 
-fun normalizeVpnProfileName(name: String): String =
-    name
-        .replace(Regex("\\s+"), " ")
-        .trim()
+fun sanitizeVpnProfileNameInput(name: String): String {
+    val safe = buildString {
+        name.forEach { character ->
+            when {
+                character.isWhitespace() -> append(' ')
+                !Character.isISOControl(character) -> append(character)
+            }
+        }
+    }
+    return safe
+        .replace(Regex(" +"), " ")
+        .trimStart()
         .take(48)
+}
+
+fun normalizeVpnProfileName(name: String): String =
+    sanitizeVpnProfileNameInput(name).trimEnd()
 
 fun vpnProfileDisplayName(profile: Int, names: List<String>): String {
     val clean = normalizeVpnProfileName(names.getOrNull(profile).orEmpty())
