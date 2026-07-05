@@ -71,7 +71,10 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.lifecycleScope
 import androidx.compose.ui.platform.LocalContext
 import com.wdtt.plus.ui.AppUpdateDialog
@@ -88,6 +91,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import kotlin.math.PI
@@ -648,7 +653,9 @@ fun MainScreen(
     val context = LocalContext.current
     val density = LocalDensity.current
     val focusManager = LocalFocusManager.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     val scope = rememberCoroutineScope()
+    val updateCheckMutex = remember { Mutex() }
     val activeProfile by settingsStore.activeProfile.collectAsStateWithLifecycle(initialValue = 0)
     val profileNames by settingsStore.profileNames.collectAsStateWithLifecycle(initialValue = emptyList())
     val wdttLinkMode by settingsStore.wdttLinkMode.collectAsStateWithLifecycle(initialValue = false)
@@ -686,6 +693,8 @@ fun MainScreen(
     var updateDownloadStatus by rememberSaveable { mutableStateOf("") }
     var updateDownloadBusy by remember { mutableStateOf(false) }
     var pendingUpdateApkPath by rememberSaveable { mutableStateOf<String?>(null) }
+    var startupUpdateCheckComplete by remember { mutableStateOf(false) }
+    val startupUpdateCheckCompleteState by rememberUpdatedState(startupUpdateCheckComplete)
     val currentVersion = remember { "v${BuildConfig.VERSION_NAME.removePrefix("v")}" }
     val safeBottomInset = with(density) { WindowInsets.safeDrawing.getBottom(density).toDp() }
     val navOverlayReserve = safeBottomInset + 96.dp
@@ -837,14 +846,14 @@ fun MainScreen(
         if (selectedTab == 3) TunnelManager.clearUnreadErrors()
     }
 
-    LaunchedEffect(updateCheckIntervalMinutes) {
-        if (updateCheckIntervalMinutes == UPDATE_CHECK_NEVER) return@LaunchedEffect
+    suspend fun runUpdateCheck(
+        reason: String,
+        shouldRun: suspend () -> Boolean = { true }
+    ) {
+        if (updateCheckIntervalMinutes == UPDATE_CHECK_NEVER) return
 
-        val intervalMillis = updateIntervalMinutesToMillis(updateCheckIntervalMinutes)
-            ?: updateIntervalMinutesToMillis(DEFAULT_UPDATE_CHECK_INTERVAL_MINUTES)
-            ?: DEFAULT_UPDATE_CHECK_INTERVAL_MINUTES * 60L * 1000L
-
-        suspend fun runUpdateCheck(reason: String) {
+        updateCheckMutex.withLock {
+            if (!shouldRun()) return@withLock
             val checkedAt = System.currentTimeMillis()
             var release: AppReleaseInfo? = null
             var updateCandidate: AppUpdateCandidate? = null
@@ -868,7 +877,7 @@ fun MainScreen(
 
             if (release == null) {
                 Log.w("WDTT", "[WARN] Update check: no release info, local=$currentVersion reason=$reason")
-                return
+                return@withLock
             }
 
             val candidate = updateCandidate
@@ -886,8 +895,39 @@ fun MainScreen(
                 pendingUpdateCandidate = candidate
             }
         }
+    }
+
+    DisposableEffect(lifecycleOwner, updateCheckIntervalMinutes) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (
+                event == Lifecycle.Event.ON_START &&
+                startupUpdateCheckCompleteState &&
+                updateCheckIntervalMinutes != UPDATE_CHECK_NEVER
+            ) {
+                scope.launch {
+                    runUpdateCheck("foreground") {
+                        val now = System.currentTimeMillis()
+                        val lastCheckAt = settingsStore.updateLastCheckAt.first()
+                        shouldRunForegroundUpdateCheck(lastCheckAt, now)
+                    }
+                }
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
+
+    LaunchedEffect(updateCheckIntervalMinutes) {
+        if (updateCheckIntervalMinutes == UPDATE_CHECK_NEVER) return@LaunchedEffect
+
+        val intervalMillis = updateIntervalMinutesToMillis(updateCheckIntervalMinutes)
+            ?: updateIntervalMinutesToMillis(DEFAULT_UPDATE_CHECK_INTERVAL_MINUTES)
+            ?: DEFAULT_UPDATE_CHECK_INTERVAL_MINUTES * 60L * 1000L
 
         runUpdateCheck("startup")
+        startupUpdateCheckComplete = true
 
         while (isActive) {
             val now = System.currentTimeMillis()
@@ -896,7 +936,11 @@ fun MainScreen(
             val waitMs = (nextCheckAt - now).coerceAtLeast(intervalMillis)
             delay(waitMs)
             if (isActive) {
-                runUpdateCheck("periodic")
+                runUpdateCheck("periodic") {
+                    val currentTime = System.currentTimeMillis()
+                    val currentLastCheck = settingsStore.updateLastCheckAt.first()
+                    currentTime - currentLastCheck >= intervalMillis
+                }
             }
         }
     }

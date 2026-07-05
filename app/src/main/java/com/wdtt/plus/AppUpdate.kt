@@ -18,6 +18,7 @@ import java.util.Locale
 
 const val UPDATE_CHECK_NEVER = -1
 const val DEFAULT_UPDATE_CHECK_INTERVAL_MINUTES = 30
+const val FOREGROUND_UPDATE_CHECK_MIN_INTERVAL_MS = 5L * 60L * 1000L
 const val UPDATE_DIALOG_ACTION_POSTPONED = "postponed"
 const val UPDATE_DIALOG_ACTION_UPDATE = "update"
 
@@ -45,6 +46,10 @@ fun updateIntervalMinutesToMillis(minutes: Int): Long? = when {
     minutes == UPDATE_CHECK_NEVER -> null
     minutes <= 0 -> null
     else -> minutes.coerceAtLeast(DEFAULT_UPDATE_CHECK_INTERVAL_MINUTES) * 60L * 1000L
+}
+
+fun shouldRunForegroundUpdateCheck(lastCheckAt: Long, now: Long): Boolean {
+    return lastCheckAt <= 0L || now - lastCheckAt >= FOREGROUND_UPDATE_CHECK_MIN_INTERVAL_MS
 }
 
 data class AppReleaseInfo(

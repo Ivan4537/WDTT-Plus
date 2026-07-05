@@ -71,6 +71,25 @@ class AppUpdateTest {
         assertEquals(DEFAULT_UPDATE_CHECK_INTERVAL_MINUTES, normalizeUpdateCheckIntervalMinutes(1))
     }
 
+    @Test
+    fun foregroundUpdateCheck_isThrottledByFiveMinutes() {
+        val now = 1_000_000L
+
+        assertTrue(shouldRunForegroundUpdateCheck(lastCheckAt = 0L, now = now))
+        assertFalse(
+            shouldRunForegroundUpdateCheck(
+                lastCheckAt = now - FOREGROUND_UPDATE_CHECK_MIN_INTERVAL_MS + 1L,
+                now = now
+            )
+        )
+        assertTrue(
+            shouldRunForegroundUpdateCheck(
+                lastCheckAt = now - FOREGROUND_UPDATE_CHECK_MIN_INTERVAL_MS,
+                now = now
+            )
+        )
+    }
+
     private fun releaseWithHashes(vararg hashes: String): AppReleaseInfo {
         return AppReleaseInfo(
             versionTag = "v7",
