@@ -34,11 +34,13 @@ import androidx.compose.ui.window.DialogProperties
 import com.wdtt.plus.AppReleaseInfo
 import com.wdtt.plus.AppReleaseAsset
 import com.wdtt.plus.AppUpdateDownloadProgress
+import com.wdtt.plus.AppUpdateKind
 import com.wdtt.plus.RemoteVersionSource
 
 @Composable
 fun AppUpdateDialog(
     release: AppReleaseInfo,
+    updateKind: AppUpdateKind = AppUpdateKind.NewVersion,
     apkAsset: AppReleaseAsset?,
     isDownloading: Boolean,
     downloadProgress: AppUpdateDownloadProgress?,
@@ -48,9 +50,18 @@ fun AppUpdateDialog(
     onOpenRelease: () -> Unit
 ) {
     val isTagOnly = release.source == RemoteVersionSource.Tag
-    val title = if (isTagOnly) "Найден новый tag" else "Доступно обновление"
+    val isSameVersionFix = updateKind == AppUpdateKind.SameVersionFix
+    val title = when {
+        isSameVersionFix -> "Доступно исправление"
+        isTagOnly -> "Найден новый tag"
+        else -> "Доступно обновление"
+    }
     val canDownloadInApp = !isTagOnly && apkAsset != null
     val description = when {
+        isSameVersionFix && canDownloadInApp ->
+            "Версия ${release.versionTag} не изменилась, но APK в релизе обновлён. Это исправление текущей версии; WDTT Plus скачает подходящий файл и откроет установку Android."
+        isSameVersionFix ->
+            "Версия ${release.versionTag} не изменилась, но APK в релизе обновлён. Не удалось подобрать файл для этого устройства, можно открыть страницу релиза."
         isTagOnly ->
             "На GitHub обнаружен более новый tag ${release.versionTag}. Похоже, опубликованный release ещё не догнал его."
         canDownloadInApp ->

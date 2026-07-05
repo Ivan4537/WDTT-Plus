@@ -303,7 +303,7 @@ class SettingsStore(context: Context) {
         private val UPDATE_LAST_CHECK_AT = longPreferencesKey("update_last_check_at")
         private val UPDATE_LATEST_VERSION = stringPreferencesKey("update_latest_version")
         private val UPDATE_LAST_ERROR = stringPreferencesKey("update_last_error")
-        private val UPDATE_CHECK_INTERVAL_HOURS = intPreferencesKey("update_check_interval_hours")
+        private val UPDATE_CHECK_INTERVAL_MINUTES = intPreferencesKey("update_check_interval_hours")
         private val UPDATE_POSTPONE_UNTIL = longPreferencesKey("update_postpone_until")
         private val UPDATE_POSTPONE_VERSION = stringPreferencesKey("update_postpone_version")
         private val UPDATE_DIALOG_LAST_SHOWN_VERSION = stringPreferencesKey("update_dialog_last_shown_version")
@@ -529,7 +529,9 @@ class SettingsStore(context: Context) {
     val updateLastCheckAt: Flow<Long> = dataStore.data.map { it[UPDATE_LAST_CHECK_AT] ?: 0L }
     val updateLatestVersion: Flow<String> = dataStore.data.map { it[UPDATE_LATEST_VERSION] ?: "" }
     val updateLastError: Flow<String> = dataStore.data.map { it[UPDATE_LAST_ERROR] ?: "" }
-    val updateCheckIntervalHours: Flow<Int> = dataStore.data.map { it[UPDATE_CHECK_INTERVAL_HOURS] ?: 24 }
+    val updateCheckIntervalMinutes: Flow<Int> = dataStore.data.map {
+        normalizeUpdateCheckIntervalMinutes(it[UPDATE_CHECK_INTERVAL_MINUTES] ?: DEFAULT_UPDATE_CHECK_INTERVAL_MINUTES)
+    }
     val updatePostponeUntil: Flow<Long> = dataStore.data.map { it[UPDATE_POSTPONE_UNTIL] ?: 0L }
     val updatePostponeVersion: Flow<String> = dataStore.data.map { it[UPDATE_POSTPONE_VERSION] ?: "" }
     val updateDialogLastShownVersion: Flow<String> = dataStore.data.map { it[UPDATE_DIALOG_LAST_SHOWN_VERSION] ?: "" }
@@ -615,9 +617,9 @@ class SettingsStore(context: Context) {
         }
     }
 
-    suspend fun saveUpdateCheckIntervalHours(hours: Int) {
+    suspend fun saveUpdateCheckIntervalMinutes(minutes: Int) {
         dataStore.edit { prefs ->
-            prefs[UPDATE_CHECK_INTERVAL_HOURS] = hours
+            prefs[UPDATE_CHECK_INTERVAL_MINUTES] = normalizeUpdateCheckIntervalMinutes(minutes)
         }
     }
 
@@ -827,7 +829,12 @@ class SettingsStore(context: Context) {
             put("themePalette", prefs[THEME_PALETTE] ?: "indigo")
             put("showSystemApps", prefs[SHOW_SYSTEM_APPS] ?: false)
             put("loggingEnabled", prefs[LOGGING_ENABLED] ?: true)
-            put("updateCheckIntervalHours", prefs[UPDATE_CHECK_INTERVAL_HOURS] ?: 12)
+            put(
+                "updateCheckIntervalMinutes",
+                normalizeUpdateCheckIntervalMinutes(
+                    prefs[UPDATE_CHECK_INTERVAL_MINUTES] ?: DEFAULT_UPDATE_CHECK_INTERVAL_MINUTES
+                )
+            )
             put("profiles", profiles)
             put("outbound", exportSharedPreferences("wdtt_outbound_forms"))
         }.toString()
@@ -900,7 +907,14 @@ class SettingsStore(context: Context) {
             prefs[THEME_PALETTE] = root.optString("themePalette", "indigo")
             prefs[SHOW_SYSTEM_APPS] = root.optBoolean("showSystemApps")
             prefs[LOGGING_ENABLED] = root.optBoolean("loggingEnabled", true)
-            prefs[UPDATE_CHECK_INTERVAL_HOURS] = root.optInt("updateCheckIntervalHours", 12)
+            val updateIntervalMinutes = when {
+                root.has("updateCheckIntervalMinutes") ->
+                    root.optInt("updateCheckIntervalMinutes", DEFAULT_UPDATE_CHECK_INTERVAL_MINUTES)
+                root.has("updateCheckIntervalHours") ->
+                    root.optInt("updateCheckIntervalHours", 1) * 60
+                else -> DEFAULT_UPDATE_CHECK_INTERVAL_MINUTES
+            }.let(::normalizeUpdateCheckIntervalMinutes)
+            prefs[UPDATE_CHECK_INTERVAL_MINUTES] = updateIntervalMinutes
             prefs[INTERFACE_ROLE] = "admin"
         }
         importSharedPreferences("wdtt_outbound_forms", root.optJSONObject("outbound") ?: JSONObject())
@@ -1310,6 +1324,13 @@ fun sanitizeVpnProfileNameInput(name: String): String {
 
 fun normalizeVpnProfileName(name: String): String =
     sanitizeVpnProfileNameInput(name).trimEnd()
+
+fun normalizeUpdateCheckIntervalMinutes(minutes: Int): Int =
+    if (minutes == UPDATE_CHECK_NEVER) {
+        UPDATE_CHECK_NEVER
+    } else {
+        minutes.coerceAtLeast(DEFAULT_UPDATE_CHECK_INTERVAL_MINUTES)
+    }
 
 fun vpnProfileDisplayName(profile: Int, names: List<String>): String {
     val clean = normalizeVpnProfileName(names.getOrNull(profile).orEmpty())

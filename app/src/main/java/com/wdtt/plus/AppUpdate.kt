@@ -17,7 +17,7 @@ import java.security.MessageDigest
 import java.util.Locale
 
 const val UPDATE_CHECK_NEVER = -1
-const val DEFAULT_UPDATE_CHECK_INTERVAL_HOURS = 12
+const val DEFAULT_UPDATE_CHECK_INTERVAL_MINUTES = 30
 const val UPDATE_DIALOG_ACTION_POSTPONED = "postponed"
 const val UPDATE_DIALOG_ACTION_UPDATE = "update"
 
@@ -28,15 +28,23 @@ private const val GITHUB_LATEST_RELEASE_WEB_URL = "https://github.com/Ivan4537/W
 private const val GITHUB_RELEASE_TAG_URL_PREFIX = "https://github.com/Ivan4537/WDTT-Plus/releases/tag/"
 private const val GITHUB_TAGS_URL = "https://api.github.com/repos/Ivan4537/WDTT-Plus/tags?per_page=100"
 private const val GITHUB_TAG_TREE_URL_PREFIX = "https://github.com/Ivan4537/WDTT-Plus/tree/"
+private const val UPDATE_CHECK_TOTAL_TIMEOUT_MS = 25_000L
+private const val UPDATE_CHECK_REQUEST_TIMEOUT_MS = 6_000L
+private const val UPDATE_CHECK_MIN_REQUEST_TIMEOUT_MS = 1_000L
+private const val UPDATE_APK_HASH_TIMEOUT_MS = 4_000L
 private const val GITHUB_API_RATE_LIMIT_FALLBACK_MS = 30L * 60L * 1000L
 private val SIMPLE_VERSION_TAG_REGEX = Regex("^v?(\\d+)$", RegexOption.IGNORE_CASE)
 
 @Volatile
 private var githubApiCooldownUntilMs = 0L
 
-fun updateIntervalHoursToMillis(hours: Int): Long? = when {
-    hours <= 0 -> null
-    else -> hours * 60L * 60L * 1000L
+@Volatile
+private var installedApkSha256Cache: InstalledApkSha256Cache? = null
+
+fun updateIntervalMinutesToMillis(minutes: Int): Long? = when {
+    minutes == UPDATE_CHECK_NEVER -> null
+    minutes <= 0 -> null
+    else -> minutes.coerceAtLeast(DEFAULT_UPDATE_CHECK_INTERVAL_MINUTES) * 60L * 1000L
 }
 
 data class AppReleaseInfo(
@@ -77,16 +85,63 @@ enum class RemoteVersionSource {
     Tag
 }
 
+enum class AppUpdateKind {
+    NewVersion,
+    SameVersionFix
+}
+
+data class AppUpdateCandidate(
+    val release: AppReleaseInfo,
+    val kind: AppUpdateKind,
+    val sameVersionFixKey: String? = null
+) {
+    val postponeKey: String
+        get() = when (kind) {
+            AppUpdateKind.NewVersion -> release.versionTag
+            AppUpdateKind.SameVersionFix -> sameVersionFixKey ?: "${release.versionTag}:fix"
+        }
+}
+
+private data class InstalledApkSha256Cache(
+    val path: String,
+    val length: Long,
+    val lastModified: Long,
+    val sha256: String
+)
+
+private class UpdateCheckBudget(
+    timeoutMs: Long = UPDATE_CHECK_TOTAL_TIMEOUT_MS
+) {
+    private val deadlineAt = System.currentTimeMillis() + timeoutMs
+
+    val expired: Boolean
+        get() = System.currentTimeMillis() >= deadlineAt
+
+    fun timeoutForHttpPhase(): Int? {
+        val remaining = deadlineAt - System.currentTimeMillis()
+        if (remaining < UPDATE_CHECK_MIN_REQUEST_TIMEOUT_MS * 2L) return null
+        return minOf(
+            UPDATE_CHECK_REQUEST_TIMEOUT_MS,
+            (remaining / 2L).coerceAtLeast(UPDATE_CHECK_MIN_REQUEST_TIMEOUT_MS)
+        ).toInt()
+    }
+
+    fun requireTimeLeft(operation: String) {
+        if (expired) throw IOException("$operation не уложилась в лимит времени")
+    }
+}
+
 suspend fun fetchLatestReleaseInfo(localVersion: String? = null): AppReleaseInfo? = withContext(Dispatchers.IO) {
-    val webRelease = fetchReleaseFromLatestWebRedirect()
-    val apiRelease = fetchReleaseFromLatestEndpoint() ?: fetchLatestStableReleaseFromList()
+    val budget = UpdateCheckBudget()
+    val webRelease = fetchReleaseFromLatestWebRedirect(budget)
+    val apiRelease = fetchReleaseFromLatestEndpoint(budget) ?: fetchLatestStableReleaseFromList(budget)
     val latestRelease = when {
         webRelease == null -> apiRelease
-        apiRelease == null -> fetchReleaseByTag(webRelease.versionTag) ?: webRelease
-        isNewerVersion(apiRelease.versionTag, webRelease.versionTag) -> fetchReleaseByTag(webRelease.versionTag) ?: webRelease
+        apiRelease == null -> fetchReleaseByTag(webRelease.versionTag, budget) ?: webRelease
+        isNewerVersion(apiRelease.versionTag, webRelease.versionTag) -> fetchReleaseByTag(webRelease.versionTag, budget) ?: webRelease
         else -> apiRelease
     }
-    val latestTag = fetchLatestTagFromList()
+    val latestTag = fetchLatestTagFromList(budget)
 
     when {
         latestRelease == null -> latestTag
@@ -94,6 +149,33 @@ suspend fun fetchLatestReleaseInfo(localVersion: String? = null): AppReleaseInfo
         isNewerVersion(latestRelease.versionTag, latestTag.versionTag) -> latestTag
         else -> latestRelease
     }
+}
+
+suspend fun resolveAppUpdateCandidate(
+    context: Context,
+    localVersion: String,
+    release: AppReleaseInfo?
+): AppUpdateCandidate? = withContext(Dispatchers.IO) {
+    if (release == null) return@withContext null
+    if (isNewerVersion(localVersion, release.versionTag)) {
+        return@withContext AppUpdateCandidate(
+            release = release,
+            kind = AppUpdateKind.NewVersion
+        )
+    }
+
+    if (!isSameVersion(localVersion, release.versionTag) || release.source != RemoteVersionSource.Release) {
+        return@withContext null
+    }
+
+    val installedSha256 = installedApkSha256(context, UpdateCheckBudget(UPDATE_APK_HASH_TIMEOUT_MS))
+        ?: return@withContext null
+    if (!hasSameVersionApkFix(installedSha256, release)) return@withContext null
+    AppUpdateCandidate(
+        release = release,
+        kind = AppUpdateKind.SameVersionFix,
+        sameVersionFixKey = sameVersionFixPostponeKey(release)
+    )
 }
 
 fun selectUpdateApkAsset(release: AppReleaseInfo): AppReleaseAsset? {
@@ -222,8 +304,45 @@ fun isNewerVersion(local: String, remote: String): Boolean {
     return false
 }
 
-private fun fetchLatestStableReleaseFromList(): AppReleaseInfo? {
-    val response = fetchGitHubApi(GITHUB_RELEASES_URL) ?: return null
+fun isSameVersion(left: String, right: String): Boolean {
+    val leftNumber = versionNumber(left) ?: return false
+    val rightNumber = versionNumber(right) ?: return false
+    return leftNumber == rightNumber
+}
+
+internal fun releaseApkSha256Set(release: AppReleaseInfo): Set<String> {
+    return release.assets
+        .asSequence()
+        .filter { it.name.endsWith(".apk", ignoreCase = true) }
+        .mapNotNull { it.sha256 }
+        .map { it.lowercase(Locale.US) }
+        .toSet()
+}
+
+internal fun hasSameVersionApkFix(installedSha256: String?, release: AppReleaseInfo): Boolean {
+    val installed = installedSha256
+        ?.trim()
+        ?.lowercase(Locale.US)
+        ?.takeIf { it.matches(Regex("^[0-9a-f]{64}$")) }
+        ?: return false
+    val officialApkHashes = releaseApkSha256Set(release)
+    return officialApkHashes.isNotEmpty() && installed !in officialApkHashes
+}
+
+internal fun sameVersionFixPostponeKey(release: AppReleaseInfo): String? {
+    val officialApkHashes = releaseApkSha256Set(release)
+        .takeIf { it.isNotEmpty() }
+        ?: return null
+    val fingerprint = officialApkHashes
+        .sorted()
+        .joinToString("\n")
+        .sha256Hex()
+        .take(16)
+    return "${release.versionTag}:fix:$fingerprint"
+}
+
+private fun fetchLatestStableReleaseFromList(budget: UpdateCheckBudget): AppReleaseInfo? {
+    val response = fetchGitHubApi(GITHUB_RELEASES_URL, budget) ?: return null
     val releases = try {
         JSONArray(response)
     } catch (e: Exception) {
@@ -243,8 +362,8 @@ private fun fetchLatestStableReleaseFromList(): AppReleaseInfo? {
     return bestRelease
 }
 
-private fun fetchLatestTagFromList(): AppReleaseInfo? {
-    val response = fetchGitHubApi(GITHUB_TAGS_URL) ?: return null
+private fun fetchLatestTagFromList(budget: UpdateCheckBudget): AppReleaseInfo? {
+    val response = fetchGitHubApi(GITHUB_TAGS_URL, budget) ?: return null
     val tags = try {
         JSONArray(response)
     } catch (e: Exception) {
@@ -269,8 +388,8 @@ private fun fetchLatestTagFromList(): AppReleaseInfo? {
     return bestTag
 }
 
-private fun fetchReleaseFromLatestEndpoint(): AppReleaseInfo? {
-    val response = fetchGitHubApi(GITHUB_LATEST_RELEASE_URL) ?: return null
+private fun fetchReleaseFromLatestEndpoint(budget: UpdateCheckBudget): AppReleaseInfo? {
+    val response = fetchGitHubApi(GITHUB_LATEST_RELEASE_URL, budget) ?: return null
     val json = try {
         JSONObject(response)
     } catch (e: Exception) {
@@ -280,10 +399,10 @@ private fun fetchReleaseFromLatestEndpoint(): AppReleaseInfo? {
     return json.toAppReleaseInfo()
 }
 
-private fun fetchReleaseByTag(tag: String): AppReleaseInfo? {
+private fun fetchReleaseByTag(tag: String, budget: UpdateCheckBudget): AppReleaseInfo? {
     val normalizedTag = normalizeVersionTag(tag)
     if (normalizedTag.isBlank()) return null
-    val response = fetchGitHubApi("https://api.github.com/repos/Ivan4537/WDTT-Plus/releases/tags/$normalizedTag")
+    val response = fetchGitHubApi("https://api.github.com/repos/Ivan4537/WDTT-Plus/releases/tags/$normalizedTag", budget)
         ?: return null
     val json = try {
         JSONObject(response)
@@ -294,17 +413,18 @@ private fun fetchReleaseByTag(tag: String): AppReleaseInfo? {
     return json.toAppReleaseInfo()
 }
 
-private fun fetchReleaseFromLatestWebRedirect(): AppReleaseInfo? {
+private fun fetchReleaseFromLatestWebRedirect(budget: UpdateCheckBudget): AppReleaseInfo? {
     var conn: HttpURLConnection? = null
     return try {
+        val requestTimeout = budget.timeoutForHttpPhase() ?: return null
         conn = URL(GITHUB_LATEST_RELEASE_WEB_URL).openConnection() as HttpURLConnection
         applyNoCacheHeaders(conn)
         conn.instanceFollowRedirects = false
         conn.requestMethod = "GET"
         conn.setRequestProperty("Accept", "text/html,*/*")
         conn.setRequestProperty("User-Agent", "WDTTAndroid/${BuildConfig.VERSION_NAME}")
-        conn.connectTimeout = 8_000
-        conn.readTimeout = 8_000
+        conn.connectTimeout = requestTimeout
+        conn.readTimeout = requestTimeout
 
         val responseCode = conn.responseCode
         val location = conn.getHeaderField("Location")
@@ -334,13 +454,14 @@ private fun fetchReleaseFromLatestWebRedirect(): AppReleaseInfo? {
     }
 }
 
-private fun fetchGitHubApi(url: String): String? {
+private fun fetchGitHubApi(url: String, budget: UpdateCheckBudget): String? {
     val now = System.currentTimeMillis()
-    if (now < githubApiCooldownUntilMs) return null
+    if (now < githubApiCooldownUntilMs || budget.expired) return null
     return fetchHttpText(
         url = url,
         sourceLabel = "GitHub API",
         accept = "application/vnd.github+json",
+        budget = budget,
         isGitHubApi = true
     )
 }
@@ -349,10 +470,12 @@ private fun fetchHttpText(
     url: String,
     sourceLabel: String,
     accept: String,
+    budget: UpdateCheckBudget,
     isGitHubApi: Boolean = false
 ): String? {
     var conn: HttpURLConnection? = null
     return try {
+        val requestTimeout = budget.timeoutForHttpPhase() ?: return null
         conn = URL(url).openConnection() as HttpURLConnection
         applyNoCacheHeaders(conn)
         conn.requestMethod = "GET"
@@ -361,8 +484,8 @@ private fun fetchHttpText(
             conn.setRequestProperty("X-GitHub-Api-Version", "2022-11-28")
         }
         conn.setRequestProperty("User-Agent", "WDTTAndroid/${BuildConfig.VERSION_NAME}")
-        conn.connectTimeout = 8_000
-        conn.readTimeout = 8_000
+        conn.connectTimeout = requestTimeout
+        conn.readTimeout = requestTimeout
 
         val responseCode = conn.responseCode
         val stream = if (responseCode in 200..299) conn.inputStream else conn.errorStream
@@ -476,15 +599,51 @@ private fun String.safeUpdateAssetName(): String {
     return if (cleaned.endsWith(".apk", ignoreCase = true)) cleaned else "$cleaned.apk"
 }
 
-private fun File.sha256Hex(): String {
+private fun installedApkSha256(context: Context, budget: UpdateCheckBudget): String? {
+    val appContext = context.applicationContext
+    val path = appContext.applicationInfo.sourceDir?.takeIf { it.isNotBlank() } ?: return null
+    val apkFile = File(path)
+    if (!apkFile.isFile) return null
+
+    val cached = installedApkSha256Cache
+    if (
+        cached != null &&
+        cached.path == apkFile.absolutePath &&
+        cached.length == apkFile.length() &&
+        cached.lastModified == apkFile.lastModified()
+    ) {
+        return cached.sha256
+    }
+
+    return runCatching {
+        apkFile.sha256Hex(budget)
+    }.onSuccess { sha ->
+        installedApkSha256Cache = InstalledApkSha256Cache(
+            path = apkFile.absolutePath,
+            length = apkFile.length(),
+            lastModified = apkFile.lastModified(),
+            sha256 = sha
+        )
+    }.onFailure { error ->
+        Log.w(UPDATE_LOG_TAG, "[WARN] Update check: failed to hash installed APK", error)
+    }.getOrNull()
+}
+
+private fun File.sha256Hex(budget: UpdateCheckBudget? = null): String {
     val digest = MessageDigest.getInstance("SHA-256")
     inputStream().use { input ->
         val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
         while (true) {
+            budget?.requireTimeLeft("SHA-256 установленного APK")
             val read = input.read(buffer)
             if (read < 0) break
             digest.update(buffer, 0, read)
         }
     }
     return digest.digest().joinToString("") { "%02x".format(it) }
+}
+
+private fun String.sha256Hex(): String {
+    val digest = MessageDigest.getInstance("SHA-256")
+    return digest.digest(toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
 }

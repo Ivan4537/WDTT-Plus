@@ -678,10 +678,10 @@ fun MainScreen(
     val infoScrollPosition = rememberSaveable { mutableIntStateOf(0) }
     var dragTargetIndex by remember { mutableIntStateOf(-1) }
     var dragProgress by remember { mutableFloatStateOf(0f) }
-    val updateCheckIntervalHours by settingsStore.updateCheckIntervalHours.collectAsStateWithLifecycle(
-        initialValue = DEFAULT_UPDATE_CHECK_INTERVAL_HOURS
+    val updateCheckIntervalMinutes by settingsStore.updateCheckIntervalMinutes.collectAsStateWithLifecycle(
+        initialValue = DEFAULT_UPDATE_CHECK_INTERVAL_MINUTES
     )
-    var pendingRelease by remember { mutableStateOf<AppReleaseInfo?>(null) }
+    var pendingUpdateCandidate by remember { mutableStateOf<AppUpdateCandidate?>(null) }
     var updateDownloadProgress by remember { mutableStateOf<AppUpdateDownloadProgress?>(null) }
     var updateDownloadStatus by rememberSaveable { mutableStateOf("") }
     var updateDownloadBusy by remember { mutableStateOf(false) }
@@ -699,7 +699,7 @@ fun MainScreen(
         if (apkFile != null && apkFile.exists() && canRequestApkInstall(context)) {
             runCatching {
                 installUpdateApk(context, apkFile)
-                pendingRelease = null
+                pendingUpdateCandidate = null
                 updateDownloadStatus = ""
                 updateDownloadProgress = null
             }.onFailure { error ->
@@ -726,7 +726,7 @@ fun MainScreen(
 
         runCatching {
             installUpdateApk(context, apkFile)
-            pendingRelease = null
+            pendingUpdateCandidate = null
             updateDownloadStatus = ""
             updateDownloadProgress = null
         }.onFailure { error ->
@@ -837,20 +837,33 @@ fun MainScreen(
         if (selectedTab == 3) TunnelManager.clearUnreadErrors()
     }
 
-    LaunchedEffect(updateCheckIntervalHours) {
-        if (updateCheckIntervalHours == UPDATE_CHECK_NEVER) return@LaunchedEffect
+    LaunchedEffect(updateCheckIntervalMinutes) {
+        if (updateCheckIntervalMinutes == UPDATE_CHECK_NEVER) return@LaunchedEffect
 
-        val intervalMillis = updateIntervalHoursToMillis(updateCheckIntervalHours)
-            ?: updateIntervalHoursToMillis(DEFAULT_UPDATE_CHECK_INTERVAL_HOURS)
-            ?: 12L * 60L * 60L * 1000L
+        val intervalMillis = updateIntervalMinutesToMillis(updateCheckIntervalMinutes)
+            ?: updateIntervalMinutesToMillis(DEFAULT_UPDATE_CHECK_INTERVAL_MINUTES)
+            ?: DEFAULT_UPDATE_CHECK_INTERVAL_MINUTES * 60L * 1000L
 
         suspend fun runUpdateCheck(reason: String) {
             val checkedAt = System.currentTimeMillis()
-            val release = fetchLatestReleaseInfo(currentVersion)
+            var release: AppReleaseInfo? = null
+            var updateCandidate: AppUpdateCandidate? = null
+            var errorMessage = ""
+            runCatching {
+                release = fetchLatestReleaseInfo(currentVersion)
+                if (release == null) {
+                    errorMessage = "Не удалось проверить"
+                    return@runCatching
+                }
+                updateCandidate = resolveAppUpdateCandidate(context, currentVersion, release)
+            }.onFailure { error ->
+                errorMessage = error.message ?: "Не удалось проверить"
+                Log.w("WDTT", "[WARN] Update check failed unexpectedly, local=$currentVersion reason=$reason", error)
+            }
             settingsStore.saveUpdateState(
                 lastCheckAt = checkedAt,
                 latestVersion = release?.versionTag ?: "",
-                error = if (release == null) "Не удалось проверить" else ""
+                error = errorMessage
             )
 
             if (release == null) {
@@ -858,18 +871,19 @@ fun MainScreen(
                 return
             }
 
-            val hasUpdate = isNewerVersion(currentVersion, release.versionTag)
+            val candidate = updateCandidate
+            val hasUpdate = candidate != null
             val postponeVer = settingsStore.updatePostponeVersion.first()
             val postponeUntil = settingsStore.updatePostponeUntil.first()
-            val isPostponed = postponeVer == release.versionTag && checkedAt < postponeUntil
+            val isPostponed = candidate != null && postponeVer == candidate.postponeKey && checkedAt < postponeUntil
             Log.i(
                 "WDTT",
-                "Update check: local=$currentVersion remote=${release.versionTag} newer=$hasUpdate postponed=$isPostponed reason=$reason"
+                "Update check: local=$currentVersion remote=${release?.versionTag} candidate=${candidate?.kind} newer=$hasUpdate postponed=$isPostponed reason=$reason"
             )
 
-            if (hasUpdate && !isPostponed) {
-                settingsStore.saveUpdateDialogShown(release.versionTag, checkedAt)
-                pendingRelease = release
+            if (candidate != null && !isPostponed) {
+                settingsStore.saveUpdateDialogShown(candidate.postponeKey, checkedAt)
+                pendingUpdateCandidate = candidate
             }
         }
 
@@ -1158,27 +1172,29 @@ fun MainScreen(
         )
     }
 
-    pendingRelease?.let { release ->
+    pendingUpdateCandidate?.let { candidate ->
+        val release = candidate.release
         val apkAsset = remember(release) { selectUpdateApkAsset(release) }
         AppUpdateDialog(
             release = release,
+            updateKind = candidate.kind,
             apkAsset = apkAsset,
             isDownloading = updateDownloadBusy,
             downloadProgress = updateDownloadProgress,
             downloadStatus = updateDownloadStatus,
             onPostpone = {
-                pendingRelease = null
+                pendingUpdateCandidate = null
                 updateDownloadStatus = ""
                 updateDownloadProgress = null
                 Toast.makeText(context, "Обновление отложено на 24 часа.", Toast.LENGTH_SHORT).show()
                 scope.launch {
                     val now = System.currentTimeMillis()
                     settingsStore.saveUpdatePostpone(
-                        version = release.versionTag,
+                        version = candidate.postponeKey,
                         until = now + 24L * 60L * 60L * 1000L
                     )
                     settingsStore.saveUpdateDialogAction(
-                        version = release.versionTag,
+                        version = candidate.postponeKey,
                         action = UPDATE_DIALOG_ACTION_POSTPONED,
                         actedAt = now
                     )
@@ -1187,12 +1203,12 @@ fun MainScreen(
             onUpdate = {
                 scope.launch {
                     settingsStore.saveUpdateDialogAction(
-                        version = release.versionTag,
+                        version = candidate.postponeKey,
                         action = UPDATE_DIALOG_ACTION_UPDATE,
                         actedAt = System.currentTimeMillis()
                     )
                     if (apkAsset == null) {
-                        pendingRelease = null
+                        pendingUpdateCandidate = null
                         openReleaseUrl(context, release.releaseUrl)
                         return@launch
                     }
@@ -1223,7 +1239,7 @@ fun MainScreen(
                 }
             },
             onOpenRelease = {
-                pendingRelease = null
+                pendingUpdateCandidate = null
                 updateDownloadStatus = ""
                 updateDownloadProgress = null
                 openReleaseUrl(context, release.releaseUrl)

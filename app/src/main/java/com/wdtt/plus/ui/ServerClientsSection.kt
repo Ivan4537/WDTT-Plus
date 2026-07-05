@@ -662,9 +662,8 @@ fun ServerClientsSection(
                     ClientStatusBanner(status = status, busy = busy)
                 }
 
-                AnimatedVisibility(state != null) {
+                state?.let { current ->
                     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                val current = state ?: return@AnimatedVisibility
                 val activeFilterCount = activeClientFilterCount(statusFilter, bindingFilter, expiryFilter, vkHashFilter)
                 ClientPanel {
                     Text(

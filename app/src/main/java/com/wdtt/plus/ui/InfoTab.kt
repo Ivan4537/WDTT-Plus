@@ -111,6 +111,7 @@ import com.wdtt.plus.UPDATE_DIALOG_ACTION_POSTPONED
 import com.wdtt.plus.UPDATE_DIALOG_ACTION_UPDATE
 import com.wdtt.plus.WDTTColors
 import com.wdtt.plus.AppReleaseInfo
+import com.wdtt.plus.AppUpdateCandidate
 import com.wdtt.plus.AppUpdateDownloadProgress
 import com.wdtt.plus.canRequestApkInstall
 import com.wdtt.plus.downloadUpdateApk
@@ -118,6 +119,7 @@ import com.wdtt.plus.fetchLatestReleaseInfo
 import com.wdtt.plus.installUpdateApk
 import com.wdtt.plus.isNewerVersion
 import com.wdtt.plus.label
+import com.wdtt.plus.resolveAppUpdateCandidate
 import com.wdtt.plus.selectUpdateApkAsset
 import com.wdtt.plus.deviceCheckActionIntent
 import kotlinx.coroutines.Dispatchers
@@ -231,7 +233,7 @@ fun InfoTab(
     val currentVersion = remember { "v${BuildConfig.VERSION_NAME.removePrefix("v")}" }
     val releaseDate = remember { BuildConfig.MOD_RELEASE_DATE }
 	var isCheckingUpdates by remember { mutableStateOf(false) }
-	var pendingManualRelease by remember { mutableStateOf<AppReleaseInfo?>(null) }
+	var pendingManualUpdateCandidate by remember { mutableStateOf<AppUpdateCandidate?>(null) }
     var updateDownloadProgress by remember { mutableStateOf<AppUpdateDownloadProgress?>(null) }
     var updateDownloadStatus by rememberSaveable { mutableStateOf("") }
     var updateDownloadBusy by remember { mutableStateOf(false) }
@@ -261,7 +263,7 @@ fun InfoTab(
         if (apkFile != null && apkFile.exists() && canRequestApkInstall(context)) {
             runCatching {
                 installUpdateApk(context, apkFile)
-                pendingManualRelease = null
+                pendingManualUpdateCandidate = null
                 updateDownloadStatus = ""
                 updateDownloadProgress = null
             }.onFailure { error ->
@@ -289,7 +291,7 @@ fun InfoTab(
 
         runCatching {
             installUpdateApk(context, apkFile)
-            pendingManualRelease = null
+            pendingManualUpdateCandidate = null
             updateDownloadStatus = ""
             updateDownloadProgress = null
         }.onFailure { error ->
@@ -470,34 +472,51 @@ fun InfoTab(
                     isCheckingUpdates = true
                     scope.launch {
                         val checkedAt = System.currentTimeMillis()
-                        val release = fetchLatestReleaseInfo(currentVersion)
-                        val latest = release?.versionTag
-                        settingsStore.saveUpdateState(
-                            lastCheckAt = checkedAt,
-                            latestVersion = latest ?: "",
-                            error = if (release == null) "Не удалось проверить" else ""
-                        )
-                        isCheckingUpdates = false
-
-                        if (release == null) {
-                            val message = if (updateLatestVersion.isNotBlank()) {
-                                "Не удалось проверить. Последняя известная версия: $updateLatestVersion"
-                            } else {
-                                "Не удалось проверить обновления"
+                        var release: AppReleaseInfo? = null
+                        var updateCandidate: AppUpdateCandidate? = null
+                        var errorMessage = ""
+                        try {
+                            runCatching {
+                                release = fetchLatestReleaseInfo(currentVersion)
+                                if (release == null) {
+                                    errorMessage = "Не удалось проверить"
+                                    return@runCatching
+                                }
+                                updateCandidate = resolveAppUpdateCandidate(context, currentVersion, release)
+                            }.onFailure { error ->
+                                errorMessage = error.message ?: "Не удалось проверить обновления"
                             }
-                            Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
-                            return@launch
-                        }
 
-                        if (isNewerVersion(currentVersion, release.versionTag)) {
-                            settingsStore.saveUpdateDialogShown(release.versionTag, checkedAt)
-                            pendingManualRelease = release
-                        } else {
-                            Toast.makeText(
-                                context,
-                                "У вас уже последняя версия: ${release.versionTag}",
-                                Toast.LENGTH_SHORT
-                            ).show()
+                            settingsStore.saveUpdateState(
+                                lastCheckAt = checkedAt,
+                                latestVersion = release?.versionTag ?: "",
+                                error = errorMessage
+                            )
+
+                            val currentRelease = release
+                            if (currentRelease == null) {
+                                val message = if (updateLatestVersion.isNotBlank()) {
+                                    "Не удалось проверить. Последняя известная версия: $updateLatestVersion"
+                                } else {
+                                    "Не удалось проверить обновления"
+                                }
+                                Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
+                                return@launch
+                            }
+
+                            val candidate = updateCandidate
+                            if (candidate != null) {
+                                settingsStore.saveUpdateDialogShown(candidate.postponeKey, checkedAt)
+                                pendingManualUpdateCandidate = candidate
+                            } else {
+                                Toast.makeText(
+                                    context,
+                                    "У вас уже последняя версия: ${currentRelease.versionTag}",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            }
+                        } finally {
+                            isCheckingUpdates = false
                         }
                     }
                 },
@@ -512,27 +531,29 @@ fun InfoTab(
             )
         }
 
-        pendingManualRelease?.let { release ->
+        pendingManualUpdateCandidate?.let { candidate ->
+            val release = candidate.release
             val apkAsset = remember(release) { selectUpdateApkAsset(release) }
             AppUpdateDialog(
                 release = release,
+                updateKind = candidate.kind,
                 apkAsset = apkAsset,
                 isDownloading = updateDownloadBusy,
                 downloadProgress = updateDownloadProgress,
                 downloadStatus = updateDownloadStatus,
                 onPostpone = {
-                    pendingManualRelease = null
+                    pendingManualUpdateCandidate = null
                     updateDownloadStatus = ""
                     updateDownloadProgress = null
                     Toast.makeText(context, "Обновление отложено на 24 часа.", Toast.LENGTH_SHORT).show()
                     scope.launch {
                         val now = System.currentTimeMillis()
                         settingsStore.saveUpdatePostpone(
-                            version = release.versionTag,
+                            version = candidate.postponeKey,
                             until = now + 24L * 60L * 60L * 1000L
                         )
                         settingsStore.saveUpdateDialogAction(
-                            version = release.versionTag,
+                            version = candidate.postponeKey,
                             action = UPDATE_DIALOG_ACTION_POSTPONED,
                             actedAt = now
                         )
@@ -541,12 +562,12 @@ fun InfoTab(
                 onUpdate = {
                     scope.launch {
                         settingsStore.saveUpdateDialogAction(
-                            version = release.versionTag,
+                            version = candidate.postponeKey,
                             action = UPDATE_DIALOG_ACTION_UPDATE,
                             actedAt = System.currentTimeMillis()
                         )
                         if (apkAsset == null) {
-                            pendingManualRelease = null
+                            pendingManualUpdateCandidate = null
                             openUrlInBrowser(context, release.releaseUrl)
                             return@launch
                         }
@@ -577,7 +598,7 @@ fun InfoTab(
                     }
                 },
                 onOpenRelease = {
-                    pendingManualRelease = null
+                    pendingManualUpdateCandidate = null
                     updateDownloadStatus = ""
                     updateDownloadProgress = null
                     openUrlInBrowser(context, release.releaseUrl)
