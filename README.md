@@ -12,7 +12,7 @@
 
 **WDTT Plus** — это модифицированная версия WDTT для создания защищённого **WireGuard-туннеля поверх TURN/DTLS**. Клиент поднимает локальный VPN-интерфейс на устройстве, получает WireGuard-конфигурацию от вашего сервера и передаёт транспорт через TURN-серверы VK, маскируя соединение под обычный зашифрованный медиатрафик звонка.
 
-<img width="1000" height="347" alt="photo_2026-07-05_14-44-50" src="https://github.com/user-attachments/assets/619058a2-3fa8-4fa3-a70a-cdd459d3904b" />
+<img width="1000" height="297" alt="Скриншоты" src="https://github.com/user-attachments/assets/7794efea-9f8c-40bb-ba79-bd8118796fd9" />
 
 ## Содержание
 
