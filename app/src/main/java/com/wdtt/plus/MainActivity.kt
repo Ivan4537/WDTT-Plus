@@ -653,6 +653,7 @@ fun MainScreen(
     val permissionOnboardingComplete by settingsStore.permissionOnboardingComplete.collectAsStateWithLifecycle(initialValue = false)
     val migrationNoticeV2Shown by settingsStore.migrationNoticeV2Shown.collectAsStateWithLifecycle(initialValue = true)
     val migrationNoticeV3Shown by settingsStore.migrationNoticeV3Shown.collectAsStateWithLifecycle(initialValue = true)
+    val migrationNoticeV5Shown by settingsStore.migrationNoticeV5Shown.collectAsStateWithLifecycle(initialValue = true)
     val isAdminInterface = interfaceRole == "admin"
     val isUpdatedInstall = remember(context) {
         runCatching {
@@ -1033,6 +1034,38 @@ fun MainScreen(
                 Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
                     Button(
                         onClick = { scope.launch { settingsStore.saveMigrationNoticeV3Shown() } }
+                    ) {
+                        Text("Хорошо")
+                    }
+                }
+            }
+        )
+    }
+
+    if (
+        BuildConfig.VERSION_CODE == 5 &&
+        isAdminInterface &&
+        isUpdatedInstall &&
+        !migrationNoticeV5Shown
+    ) {
+        AlertDialog(
+            onDismissRequest = {},
+            properties = DialogProperties(
+                dismissOnBackPress = false,
+                dismissOnClickOutside = false
+            ),
+            title = { Text("Обновите серверную часть") },
+            text = {
+                Text(
+                    "Чтобы управление выходным IP, бесплатным WARP и новыми проверками корректно работало в приложении и Telegram-боте, выполните установку сервера во вкладке «Деплой».\n\n" +
+                        "Выберите установку с сохранением данных. Клиенты, доступы и настройки сохранятся.\n\n" +
+                        "Установку с нуля выполнять не нужно."
+                )
+            },
+            confirmButton = {
+                Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                    Button(
+                        onClick = { scope.launch { settingsStore.saveMigrationNoticeV5Shown() } }
                     ) {
                         Text("Хорошо")
                     }

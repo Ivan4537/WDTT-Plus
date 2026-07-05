@@ -36,6 +36,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.platform.LocalContext
@@ -69,6 +70,11 @@ import java.io.FileOutputStream
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.text.SimpleDateFormat
+import java.time.Instant
+import java.time.LocalDateTime
+import java.time.OffsetDateTime
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import java.util.Base64
 import java.util.Date
 import java.util.Locale
@@ -76,6 +82,11 @@ import java.util.Properties
 import org.json.JSONObject
 
 private const val CMD_TIMEOUT = 900000L // 15 minutes
+private const val WGCF_VERSION = "2.2.31"
+private const val WGCF_LINUX_AMD64_SHA256 = "69147e1a517c66129edd8ac8cb60484d6c9515178d7b4a2f95e3c925f225572a"
+private const val WGCF_LINUX_AMD64_URL =
+    "https://github.com/ViRb3/wgcf/releases/download/v$WGCF_VERSION/wgcf_${WGCF_VERSION}_linux_amd64"
+private const val WGCF_LATEST_RELEASE_API = "https://api.github.com/repos/ViRb3/wgcf/releases/latest"
 
 private enum class DeployMode {
     PreserveData,
@@ -91,6 +102,7 @@ private enum class OutboundDialog {
     LocalProxy,
     ExternalProxy,
     WireGuardVps,
+    FreeWarp,
     ImportedWireGuard,
     Diagnostics
 }
@@ -230,13 +242,17 @@ private data class OutboundServerSnapshot(
     val wireGuardExitPassword: String,
     val wireGuardExitPort: String,
     val wireGuardExitDns: String,
-    val importedWireGuardConfig: String
+    val warpPresent: Boolean,
+    val warpMtu: String,
+    val importedWireGuardConfig: String,
+    val checkedAtMillis: Long = System.currentTimeMillis()
 ) {
     val modeLabel: String
         get() = when (mode) {
             "direct" -> "прямой выход"
             "external_proxy" -> "внешний TCP-прокси"
-            "imported_wg" -> "VPN/WARP-файл"
+            "warp_free" -> "бесплатный WARP"
+            "imported_wg" -> "VPN/WireGuard-файл"
             "wireguard_vps" -> "выход через другой сервер"
             else -> mode.ifBlank { "не указан" }
         }
@@ -244,10 +260,283 @@ private data class OutboundServerSnapshot(
     fun preferredDialog(): OutboundDialog? = when {
         mode == "external_proxy" -> OutboundDialog.ExternalProxy
         mode == "wireguard_vps" -> OutboundDialog.WireGuardVps
+        mode == "warp_free" -> OutboundDialog.FreeWarp
         mode == "imported_wg" -> OutboundDialog.ImportedWireGuard
         localProxyPresent -> OutboundDialog.LocalProxy
         else -> null
     }
+
+    val activeRouteLabels: List<String>
+        get() = buildList {
+            if (externalProxyActive) add("внешний TCP-прокси")
+            if (wireGuardActive) add("WireGuard-выход")
+        }
+
+    val hasRouteConflict: Boolean
+        get() = externalProxyActive && wireGuardActive
+
+    val routeConflictMessage: String?
+        get() = if (hasRouteConflict) {
+            "На сервере одновременно активны внешний TCP-прокси и WireGuard-выход. Так можно сломать выход клиентов; сначала верните прямой выход или выполните диагностику/очистку."
+        } else {
+            null
+        }
+}
+
+private enum class OutboundModeVisualState {
+    Unknown,
+    Off,
+    Active,
+    Warning,
+    Error
+}
+
+private data class OutboundModeIndicator(
+    val state: OutboundModeVisualState,
+    val text: String
+)
+
+private val wireGuardOutboundModes = setOf("wireguard_vps", "warp_free", "imported_wg")
+
+private fun outboundModeIndicator(snapshot: OutboundServerSnapshot?, dialog: OutboundDialog): OutboundModeIndicator {
+    if (snapshot == null) {
+        return OutboundModeIndicator(OutboundModeVisualState.Unknown, "не проверено")
+    }
+
+    if (dialog == OutboundDialog.LocalProxy) {
+        return when {
+            snapshot.localProxyActive -> OutboundModeIndicator(OutboundModeVisualState.Active, "запущен")
+            snapshot.localProxyPresent -> OutboundModeIndicator(OutboundModeVisualState.Warning, "найден")
+            else -> OutboundModeIndicator(OutboundModeVisualState.Off, "выключен")
+        }
+    }
+
+    if (dialog == OutboundDialog.ExternalProxy) {
+        return when {
+            snapshot.hasRouteConflict && snapshot.externalProxyActive -> OutboundModeIndicator(OutboundModeVisualState.Error, "конфликт")
+            snapshot.mode == "external_proxy" && snapshot.externalProxyActive -> OutboundModeIndicator(OutboundModeVisualState.Active, "активен")
+            snapshot.mode == "external_proxy" -> OutboundModeIndicator(OutboundModeVisualState.Error, "не запущен")
+            snapshot.externalProxyActive -> OutboundModeIndicator(OutboundModeVisualState.Warning, "активен вне режима")
+            snapshot.externalProxyPresent -> OutboundModeIndicator(OutboundModeVisualState.Warning, "настроен")
+            else -> OutboundModeIndicator(OutboundModeVisualState.Off, "выключен")
+        }
+    }
+
+    if (dialog == OutboundDialog.FreeWarp) {
+        return when {
+            snapshot.hasRouteConflict && snapshot.wireGuardActive && snapshot.mode == "warp_free" -> OutboundModeIndicator(OutboundModeVisualState.Error, "конфликт")
+            snapshot.mode == "warp_free" && snapshot.wireGuardActive -> OutboundModeIndicator(OutboundModeVisualState.Active, "активен")
+            snapshot.mode == "warp_free" && snapshot.warpPresent -> OutboundModeIndicator(OutboundModeVisualState.Error, "не запущен")
+            snapshot.warpPresent -> OutboundModeIndicator(OutboundModeVisualState.Warning, "настроен")
+            else -> OutboundModeIndicator(OutboundModeVisualState.Off, "выключен")
+        }
+    }
+
+    val expectedMode = when (dialog) {
+        OutboundDialog.WireGuardVps -> "wireguard_vps"
+        OutboundDialog.ImportedWireGuard -> "imported_wg"
+        else -> ""
+    }
+    if (expectedMode.isNotBlank()) {
+        return when {
+            snapshot.hasRouteConflict && snapshot.wireGuardActive -> OutboundModeIndicator(OutboundModeVisualState.Error, "конфликт")
+            snapshot.mode == expectedMode && snapshot.wireGuardActive -> OutboundModeIndicator(OutboundModeVisualState.Active, "активен")
+            snapshot.mode == expectedMode && snapshot.wireGuardPresent -> OutboundModeIndicator(OutboundModeVisualState.Error, "не запущен")
+            snapshot.mode == expectedMode -> OutboundModeIndicator(OutboundModeVisualState.Error, "нет конфига")
+            snapshot.wireGuardActive && snapshot.mode !in wireGuardOutboundModes -> OutboundModeIndicator(OutboundModeVisualState.Warning, "WG активен")
+            else -> OutboundModeIndicator(OutboundModeVisualState.Off, "выключен")
+        }
+    }
+
+    return OutboundModeIndicator(OutboundModeVisualState.Off, "выключен")
+}
+
+private fun OutboundServerSnapshot.outboundModeMismatchWarning(): String? = when {
+    routeConflictMessage != null -> routeConflictMessage
+    mode == "direct" && activeRouteLabels.isNotEmpty() ->
+        "в профиле указан прямой выход, но на сервере активен ${activeRouteLabels.joinToString(" и ")}."
+    mode == "external_proxy" && !externalProxyActive ->
+        "режим записан как внешний TCP-прокси, но служба маршрутизации через прокси не запущена."
+    mode in wireGuardOutboundModes && !wireGuardActive ->
+        "режим записан как ${modeLabel}, но WireGuard-выход не запущен."
+    externalProxyActive && mode != "external_proxy" ->
+        "внешний TCP-прокси запущен, но профиль режима указывает «${modeLabel}»."
+    wireGuardActive && mode !in wireGuardOutboundModes ->
+        "WireGuard-выход запущен, но профиль режима указывает «${modeLabel}»."
+    else -> null
+}
+
+private fun outboundServerShortState(snapshot: OutboundServerSnapshot): String = when {
+    snapshot.hasRouteConflict -> "конфликт — ${snapshot.activeRouteLabels.joinToString(" и ")}"
+    snapshot.externalProxyActive -> "внешний TCP-прокси"
+    snapshot.wireGuardActive -> snapshot.modeLabel.takeIf { snapshot.mode in wireGuardOutboundModes } ?: "WireGuard-выход"
+    else -> "прямой выход"
+}
+
+private fun outboundServerStateHint(snapshot: OutboundServerSnapshot): String {
+    val checkedAt = formatOutboundCheckTime(snapshot.checkedAtMillis)
+    val modeChangedAt = formatOutboundTimestamp(snapshot.updatedAt)
+    val warning = snapshot.routeConflictMessage ?: snapshot.outboundModeMismatchWarning()
+    if (warning != null) {
+        return buildString {
+            append(warning)
+            if (checkedAt.isNotBlank()) append(" Проверено: $checkedAt.")
+            if (modeChangedAt.isNotBlank()) append(" Режим изменён: $modeChangedAt.")
+        }
+    }
+    return buildString {
+        append("Конфликтных режимов не найдено.")
+        if (snapshot.localProxyActive) {
+            append(" Прокси VPS запущен отдельно и не переключает выход WDTT-клиентов.")
+        }
+        if (checkedAt.isNotBlank()) {
+            append(" Проверено: $checkedAt.")
+        }
+        if (modeChangedAt.isNotBlank()) {
+            append(" Режим изменён: $modeChangedAt.")
+        }
+    }
+}
+
+private fun outboundServerStateSummary(snapshot: OutboundServerSnapshot): String {
+    val parts = mutableListOf<String>()
+    parts += "Состояние выхода WDTT прочитано с сервера: ${outboundServerShortState(snapshot)}."
+    snapshot.routeConflictMessage?.let { parts += it }
+    snapshot.outboundModeMismatchWarning()?.takeIf { it != snapshot.routeConflictMessage }?.let { parts += it }
+    if (snapshot.localProxyActive) {
+        parts += "Прокси VPS запущен отдельно; он не конфликтует с маршрутизацией выхода WDTT."
+    } else if (snapshot.localProxyPresent) {
+        parts += "Прокси VPS найден, но служба не запущена."
+    }
+    formatOutboundCheckTime(snapshot.checkedAtMillis).takeIf { it.isNotBlank() }?.let {
+        parts += "Состояние проверено: $it."
+    }
+    formatOutboundTimestamp(snapshot.updatedAt).takeIf { it.isNotBlank() }?.let {
+        parts += "Режим последний раз изменён: $it."
+    }
+    return parts.joinToString(" ")
+}
+
+private fun canReturnDirect(snapshot: OutboundServerSnapshot?): Boolean =
+    snapshot != null && (snapshot.mode != "direct" || snapshot.externalProxyActive || snapshot.wireGuardActive)
+
+private fun canDisableOutboundDialog(snapshot: OutboundServerSnapshot?, dialog: OutboundDialog): Boolean {
+    if (snapshot == null) return false
+    return when (dialog) {
+        OutboundDialog.ExternalProxy -> snapshot.externalProxyActive
+        OutboundDialog.WireGuardVps -> snapshot.mode == "wireguard_vps" && snapshot.wireGuardActive
+        OutboundDialog.FreeWarp -> snapshot.mode == "warp_free" && snapshot.wireGuardActive
+        OutboundDialog.ImportedWireGuard -> snapshot.mode == "imported_wg" && snapshot.wireGuardActive
+        else -> false
+    }
+}
+
+private fun canCheckOutboundDialog(snapshot: OutboundServerSnapshot?, dialog: OutboundDialog): Boolean {
+    if (snapshot == null) return false
+    return when (dialog) {
+        OutboundDialog.WireGuardVps -> snapshot.mode == "wireguard_vps" && snapshot.wireGuardActive
+        OutboundDialog.FreeWarp -> snapshot.mode == "warp_free" && snapshot.wireGuardActive
+        OutboundDialog.ImportedWireGuard -> snapshot.mode == "imported_wg" && snapshot.wireGuardActive
+        else -> false
+    }
+}
+
+private fun canUpdateFreeWarp(snapshot: OutboundServerSnapshot?): Boolean =
+    snapshot?.warpPresent == true
+
+private fun canDeleteFreeWarp(snapshot: OutboundServerSnapshot?): Boolean =
+    snapshot?.warpPresent == true
+
+private fun canDeleteImportedWireGuard(snapshot: OutboundServerSnapshot?): Boolean =
+    snapshot != null && (snapshot.mode == "imported_wg" || snapshot.importedWireGuardConfig.isNotBlank())
+
+private fun canStopLocalProxy(snapshot: OutboundServerSnapshot?): Boolean =
+    snapshot?.localProxyActive == true
+
+private fun canRemoveLocalProxy(snapshot: OutboundServerSnapshot?): Boolean =
+    snapshot?.localProxyPresent == true
+
+private fun outboundDialogServerStateSummary(snapshot: OutboundServerSnapshot, dialog: OutboundDialog): String {
+    val indicator = outboundModeIndicator(snapshot, dialog)
+    val checkedAt = formatOutboundCheckTime(snapshot.checkedAtMillis)
+    val prefix = when (dialog) {
+        OutboundDialog.LocalProxy -> "Прокси VPS"
+        OutboundDialog.ExternalProxy -> "Внешний TCP-прокси"
+        OutboundDialog.WireGuardVps -> "Выход через другой сервер"
+        OutboundDialog.FreeWarp -> "Бесплатный WARP"
+        OutboundDialog.ImportedWireGuard -> "VPN/WireGuard-файл"
+        OutboundDialog.Diagnostics -> "Диагностика"
+    }
+    val parts = mutableListOf("$prefix: ${indicator.text}.")
+    when (dialog) {
+        OutboundDialog.LocalProxy -> when {
+            snapshot.localProxyActive -> parts += "Служба прокси на сервере запущена."
+            snapshot.localProxyPresent -> parts += "Настройки прокси найдены, но служба сейчас не запущена."
+            else -> parts += "Настройки прокси на сервере не найдены."
+        }
+        OutboundDialog.ExternalProxy -> when {
+            snapshot.externalProxyActive -> parts += "Маршрутизация обычного TCP-трафика WDTT через внешний прокси включена."
+            snapshot.externalProxyPresent -> parts += "Настройки внешнего прокси найдены, но маршрутизация сейчас не активна."
+            else -> parts += "Внешний TCP-прокси на сервере не настроен."
+        }
+        OutboundDialog.WireGuardVps -> when {
+            snapshot.mode == "wireguard_vps" && snapshot.wireGuardActive -> parts += "WireGuard-выход через другой сервер активен."
+            snapshot.mode == "wireguard_vps" && snapshot.wireGuardPresent -> parts += "Конфиг выхода через другой сервер найден, но WireGuard сейчас не запущен."
+            snapshot.wireGuardExitHost.isNotBlank() || snapshot.wireGuardExitPort.isNotBlank() -> parts += "Сохранённые поля второго сервера найдены; нажмите «Настроить выход», чтобы включить режим."
+            else -> parts += "Настройки выхода через другой сервер на сервере не найдены."
+        }
+        OutboundDialog.FreeWarp -> when {
+            snapshot.mode == "warp_free" && snapshot.wireGuardActive -> parts += "WARP активен; можно выполнить глубокую проверку Cloudflare."
+            snapshot.warpPresent -> parts += "Регистрация или профиль WARP найдены, но WARP сейчас не активен. Нажмите «Установить / восстановить», чтобы включить его без новой регистрации, если сохранённый аккаунт рабочий."
+            else -> parts += "Регистрация WARP на сервере не найдена."
+        }
+        OutboundDialog.ImportedWireGuard -> when {
+            snapshot.mode == "imported_wg" && snapshot.wireGuardActive -> parts += "Импортированный VPN/WireGuard-файл активен."
+            snapshot.importedWireGuardConfig.isNotBlank() -> parts += "Сохранённый VPN/WireGuard-файл найден, но сейчас не активен. Нажмите «Включить», чтобы применить его."
+            snapshot.mode == "imported_wg" && snapshot.wireGuardPresent -> parts += "Рабочий WireGuard-конфиг найден, но интерфейс сейчас не запущен."
+            else -> parts += "Импортированный VPN/WireGuard-файл на сервере не найден."
+        }
+        OutboundDialog.Diagnostics -> Unit
+    }
+    snapshot.routeConflictMessage?.let { parts += it }
+    if (checkedAt.isNotBlank()) parts += "Проверено: $checkedAt."
+    return parts.joinToString(" ")
+}
+
+private fun formatOutboundTimestamp(raw: String): String {
+    val cleaned = raw.trim()
+    if (cleaned.isBlank()) return ""
+    val ru = Locale("ru", "RU")
+    val formatter = DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm", ru)
+    val moscow = ZoneId.of("Europe/Moscow")
+    val deviceZone = runCatching { ZoneId.systemDefault() }.getOrDefault(moscow)
+    val normalized = cleaned.replace(Regex("([+-]\\d{2})(\\d{2})$"), "$1:$2")
+
+    runCatching {
+        val zoned = OffsetDateTime.parse(normalized).atZoneSameInstant(deviceZone)
+        val suffix = if (deviceZone == moscow) " МСК" else " ${zoned.offset}"
+        return formatter.format(zoned) + suffix
+    }
+    runCatching {
+        val zoned = LocalDateTime.parse(normalized).atZone(moscow)
+        return formatter.format(zoned) + " МСК"
+    }
+    return cleaned
+}
+
+private fun formatOutboundCheckTime(millis: Long): String {
+    if (millis <= 0L) return ""
+    val ru = Locale("ru", "RU")
+    val formatter = DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm", ru)
+    val moscow = ZoneId.of("Europe/Moscow")
+    val deviceZone = runCatching { ZoneId.systemDefault() }.getOrDefault(moscow)
+    return runCatching {
+        val zoned = Instant.ofEpochMilli(millis).atZone(deviceZone)
+        val suffix = if (deviceZone == moscow) " МСК" else " ${zoned.offset}"
+        formatter.format(zoned) + suffix
+    }.getOrDefault(
+        formatter.format(Instant.ofEpochMilli(millis).atZone(moscow)) + " МСК"
+    )
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -331,6 +620,8 @@ fun DeployTab(
     var outboundActionTitle by remember { mutableStateOf("") }
     var outboundStatus by rememberSaveable { mutableStateOf("") }
     var outboundStatusOwner by rememberSaveable { mutableStateOf<String?>(null) }
+    var outboundSnapshot by remember { mutableStateOf<OutboundServerSnapshot?>(null) }
+    var outboundSnapshotBusy by remember { mutableStateOf(false) }
     var importedWgConfigText by rememberSaveable { mutableStateOf("") }
     val outboundPrefs = remember { context.getSharedPreferences("wdtt_outbound_forms", Context.MODE_PRIVATE) }
     var localProxyPortInput by rememberSaveable { mutableStateOf(outboundPrefs.getString("local_proxy_port", "1080") ?: "1080") }
@@ -353,6 +644,7 @@ fun DeployTab(
     var wireGuardExitPasswordInput by rememberSaveable { mutableStateOf(outboundPrefs.getString("wg_exit_password", "") ?: "") }
     var wireGuardExitPortInput by rememberSaveable { mutableStateOf(outboundPrefs.getString("wg_exit_port", "51820") ?: "51820") }
     var wireGuardExitDnsInput by rememberSaveable { mutableStateOf(outboundPrefs.getString("wg_exit_dns", "1.1.1.1,8.8.8.8") ?: "1.1.1.1,8.8.8.8") }
+    var freeWarpMtuInput by rememberSaveable { mutableStateOf(outboundPrefs.getString("warp_mtu", "1280") ?: "1280") }
 
     var showSuccessBanner by rememberSaveable { mutableStateOf(false) }
     var successCountdown by rememberSaveable { mutableIntStateOf(5) }
@@ -377,6 +669,9 @@ fun DeployTab(
     LaunchedEffect(savedPassword) { password = savedPassword }
     LaunchedEffect(savedDns1) { dns1 = savedDns1 }
     LaunchedEffect(savedDns2) { dns2 = savedDns2 }
+    LaunchedEffect(ip.trim(), login.trim(), savedSshPort) {
+        outboundSnapshot = null
+    }
     LaunchedEffect(
         localProxyPortInput,
         localProxyLoginInput,
@@ -391,7 +686,8 @@ fun DeployTab(
         wireGuardExitUserInput,
         wireGuardExitPasswordInput,
         wireGuardExitPortInput,
-        wireGuardExitDnsInput
+        wireGuardExitDnsInput,
+        freeWarpMtuInput
     ) {
         outboundPrefs.edit()
             .putString("local_proxy_port", localProxyPortInput)
@@ -408,6 +704,7 @@ fun DeployTab(
             .putString("wg_exit_password", wireGuardExitPasswordInput)
             .putString("wg_exit_port", wireGuardExitPortInput)
             .putString("wg_exit_dns", wireGuardExitDnsInput)
+            .putString("warp_mtu", freeWarpMtuInput)
             .apply()
     }
     val isServerAddressValid = ip.isValidPublicHost()
@@ -479,7 +776,7 @@ fun DeployTab(
                 outboundStatus = ""
                 outboundStatusOwner = OutboundDialog.ImportedWireGuard.name
             } catch (e: Exception) {
-                outboundStatus = "Ошибка чтения VPN/WARP-файла: ${friendlyDeployError(e, "импорт VPN/WARP")}"
+                outboundStatus = "Ошибка чтения VPN/WireGuard-файла: ${friendlyDeployError(e, "импорт VPN/WireGuard")}"
                 outboundStatusOwner = OutboundDialog.ImportedWireGuard.name
             }
         }
@@ -719,10 +1016,43 @@ fun DeployTab(
         )
     }
 
-    fun runOutboundAction(title: String, action: suspend (OutboundSshTarget) -> String) {
+    fun refreshOutboundSnapshot(showStatus: Boolean = true) {
+        val target = currentOutboundTarget() ?: return
+        outboundSnapshotBusy = true
+        if (showStatus) {
+            outboundStatus = "Проверяю, какой выходной IP/прокси сейчас активен на сервере..."
+            outboundStatusOwner = null
+        }
+        scope.launch {
+            try {
+                val snapshot = readOutboundServerSnapshot(context, target)
+                outboundSnapshot = snapshot
+                if (showStatus) {
+                    outboundStatus = outboundServerStateSummary(snapshot)
+                    outboundStatusOwner = null
+                }
+            } catch (e: Exception) {
+                if (showStatus) {
+                    outboundStatus = "Не удалось прочитать состояние выходного IP: ${friendlyDeployError(e, "выходной IP")}"
+                    outboundStatusOwner = null
+                }
+                DeployManager.writeError("Outbound state refresh failed: ${e.message}")
+            } finally {
+                outboundSnapshotBusy = false
+                DeployManager.updateProgress(0f, "")
+            }
+        }
+    }
+
+    fun runOutboundAction(
+        title: String,
+        preflightRouteMode: String? = null,
+        action: suspend (OutboundSshTarget) -> String
+    ) {
         val owner = outboundDialog?.name
         val target = currentOutboundTarget() ?: return
         outboundBusy = true
+        outboundSnapshotBusy = true
         outboundProgressActive = true
         outboundActionTitle = title
         DeployManager.updateProgress(0.02f, title)
@@ -730,7 +1060,29 @@ fun DeployTab(
         outboundStatusOwner = owner
         scope.launch {
             try {
-                outboundStatus = action(target).ifBlank { "$title: готово" }
+                if (preflightRouteMode != null) {
+                    DeployManager.updateProgress(0.04f, "Проверяю текущий выход перед переключением...")
+                    val before = readOutboundServerSnapshot(context, target)
+                    outboundSnapshot = before
+                    before.routeConflictMessage?.let { conflict ->
+                        outboundStatus = "Установка остановлена. $conflict"
+                        outboundStatusOwner = owner
+                        return@launch
+                    }
+                }
+
+                val actionResult = action(target).ifBlank { "$title: готово" }
+                val afterSnapshot = runCatching {
+                    readOutboundServerSnapshot(context, target)
+                }.onSuccess {
+                    outboundSnapshot = it
+                }.getOrNull()
+                val afterWarning = afterSnapshot?.routeConflictMessage
+                    ?: afterSnapshot?.outboundModeMismatchWarning()
+                outboundStatus = listOfNotNull(
+                    actionResult,
+                    afterWarning?.let { "Проверьте сервер: $it" }
+                ).joinToString("\n")
                 outboundStatusOwner = owner
             } catch (e: Exception) {
                 outboundStatus = "$title: ${friendlyDeployError(e, "выходной IP")}"
@@ -738,6 +1090,7 @@ fun DeployTab(
                 DeployManager.writeError("Outbound action failed: ${e.message}")
             } finally {
                 outboundBusy = false
+                outboundSnapshotBusy = false
                 outboundProgressActive = false
                 outboundActionTitle = ""
                 DeployManager.updateProgress(0f, "")
@@ -764,6 +1117,8 @@ fun DeployTab(
         snapshot.wireGuardExitPassword.takeIf { it.isNotBlank() }?.let { wireGuardExitPasswordInput = it }
         snapshot.wireGuardExitPort.takeIf { it.isNotBlank() }?.let { wireGuardExitPortInput = it }
         snapshot.wireGuardExitDns.takeIf { it.isNotBlank() }?.let { wireGuardExitDnsInput = it }
+        snapshot.warpMtu.takeIf { raw -> raw.toIntOrNull()?.let { it in 1280..1500 } == true }
+            ?.let { freeWarpMtuInput = it }
 
         if (snapshot.importedWireGuardConfig.isNotBlank()) {
             importedWgConfigText = snapshot.importedWireGuardConfig
@@ -777,6 +1132,7 @@ fun DeployTab(
     fun restoreOutboundFromServer() {
         val target = currentOutboundTarget() ?: return
         outboundBusy = true
+        outboundSnapshotBusy = true
         outboundProgressActive = true
         outboundActionTitle = "Читаю выходной IP с сервера"
         outboundStatus = "Читаю настройки выходного IP и прокси с сервера..."
@@ -785,6 +1141,7 @@ fun DeployTab(
         scope.launch {
             try {
                 val snapshot = readOutboundServerSnapshot(context, target)
+                outboundSnapshot = snapshot
                 applyOutboundSnapshot(snapshot)
                 outboundStatus = outboundRestoreSummary(snapshot)
             } catch (e: Exception) {
@@ -793,6 +1150,7 @@ fun DeployTab(
                 DeployManager.writeError("Outbound profile restore failed: ${e.message}")
             } finally {
                 outboundBusy = false
+                outboundSnapshotBusy = false
                 outboundProgressActive = false
                 outboundActionTitle = ""
                 DeployManager.updateProgress(0f, "")
@@ -808,6 +1166,39 @@ fun DeployTab(
 
     fun dialogStatus(dialog: OutboundDialog): String =
         if (outboundStatusOwner == dialog.name) outboundStatus else ""
+
+    LaunchedEffect(outboundSectionExpanded) {
+        if (
+            outboundSectionExpanded == true &&
+            outboundSnapshot == null &&
+            !outboundBusy &&
+            !outboundSnapshotBusy &&
+            isServerAddressValid &&
+            password.isNotBlank()
+        ) {
+            val target = OutboundSshTarget(
+                host = ip.trim(),
+                user = login.ifBlank { "root" },
+                pass = password,
+                port = savedSshPort.toIntOrNull() ?: 22
+            )
+            outboundSnapshotBusy = true
+            try {
+                runCatching {
+                    readOutboundServerSnapshot(context, target)
+                }.onSuccess {
+                    outboundSnapshot = it
+                }.onFailure {
+                    outboundStatus = "Не удалось автоматически проверить выходной IP: ${friendlyDeployError(it, "выходной IP")}"
+                    outboundStatusOwner = null
+                    DeployManager.writeError("Outbound auto refresh failed: ${it.message}")
+                }
+            } finally {
+                outboundSnapshotBusy = false
+                DeployManager.updateProgress(0f, "")
+            }
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -1232,9 +1623,12 @@ fun DeployTab(
         outboundSectionExpanded?.let { outboundExpanded ->
             OutboundRoutingSection(
                 busy = outboundBusy,
+                snapshot = outboundSnapshot,
+                snapshotBusy = outboundSnapshotBusy,
                 status = if (outboundDialog == null && outboundStatusOwner == null) outboundStatus else "",
                 actionTitle = outboundActionTitle,
-                enabled = !isDeploying && !migrationBusy && !outboundBusy,
+                enabled = !isDeploying && !migrationBusy && !outboundBusy && !outboundSnapshotBusy,
+                directEnabled = canReturnDirect(outboundSnapshot),
                 expanded = outboundExpanded,
                 modifier = Modifier.onGloballyPositioned { outboundSectionY = it.positionInParent().y },
                 onToggleExpanded = {
@@ -1249,6 +1643,7 @@ fun DeployTab(
                 },
                 onOpen = { openOutboundDialog(it) },
                 onRestore = { restoreOutboundFromServer() },
+                onRefreshState = { refreshOutboundSnapshot(showStatus = true) },
                 onStatus = { runOutboundAction("Проверяю текущий выход WDTT") { readOutboundStatus(it) } },
                 onDirect = { runOutboundAction("Возвращаю прямой выход WDTT") { disableOutboundExit(it) } }
             )
@@ -1262,13 +1657,16 @@ fun DeployTab(
                     actionTitle = outboundActionTitle,
                     progressTitle = if (outboundProgressActive) currentStep else "",
                     progress = deployProgress,
+                    indicator = outboundModeIndicator(outboundSnapshot, OutboundDialog.LocalProxy),
                     portInput = localProxyPortInput,
                     loginInput = localProxyLoginInput,
                     passwordInput = localProxyPasswordInput,
+                    stopEnabled = canStopLocalProxy(outboundSnapshot),
+                    removeEnabled = canRemoveLocalProxy(outboundSnapshot),
                     onPortChanged = { localProxyPortInput = it },
                     onLoginChanged = { localProxyLoginInput = it },
                     onPasswordChanged = { localProxyPasswordInput = it },
-                    onDismiss = { outboundDialog = null },
+                    onDismiss = { if (!outboundBusy) outboundDialog = null },
                     onInstall = { proxyPort, loginValue, passwordValue ->
                         val forms = currentOutboundProfileForms().copy(
                             localProxyPort = proxyPort.toString(),
@@ -1308,11 +1706,13 @@ fun DeployTab(
                     actionTitle = outboundActionTitle,
                     progressTitle = if (outboundProgressActive) currentStep else "",
                     progress = deployProgress,
+                    indicator = outboundModeIndicator(outboundSnapshot, OutboundDialog.ExternalProxy),
                     kind = ProxyKind.entries.firstOrNull { it.name == externalProxyKindName } ?: ProxyKind.Socks5,
                     hostInput = externalProxyHostInput,
                     portInput = externalProxyPortInput,
                     loginInput = externalProxyLoginInput,
                     passwordInput = externalProxyPasswordInput,
+                    disableEnabled = canDisableOutboundDialog(outboundSnapshot, OutboundDialog.ExternalProxy),
                     onKindChanged = { externalProxyKindName = it.name },
                     onHostChanged = { externalProxyHostInput = it },
                     onPortChanged = { externalProxyPortInput = it },
@@ -1332,7 +1732,7 @@ fun DeployTab(
                             externalProxyLogin = loginValue,
                             externalProxyPassword = passwordValue
                         )
-                        runOutboundAction("Проверяю и включаю внешний TCP-прокси") {
+                        runOutboundAction("Проверяю и включаю внешний TCP-прокси", preflightRouteMode = "external_proxy") {
                             val result = enableExternalProxy(context, it, kind, hostValue, proxyPort, loginValue, passwordValue)
                             val saveMessage = saveOutboundProfileMessage(context, it, forms, "Поля внешнего прокси сохранены на сервере для восстановления.")
                             "$result\n$saveMessage"
@@ -1348,12 +1748,15 @@ fun DeployTab(
                     actionTitle = outboundActionTitle,
                     progressTitle = if (outboundProgressActive) currentStep else "",
                     progress = deployProgress,
+                    indicator = outboundModeIndicator(outboundSnapshot, OutboundDialog.WireGuardVps),
                     hostInput = wireGuardExitHostInput,
                     sshPortInput = wireGuardExitSshPortInput,
                     userInput = wireGuardExitUserInput,
                     passwordInput = wireGuardExitPasswordInput,
                     wgPortInput = wireGuardExitPortInput,
                     dnsInput = wireGuardExitDnsInput,
+                    disableEnabled = canDisableOutboundDialog(outboundSnapshot, OutboundDialog.WireGuardVps),
+                    checkEnabled = true,
                     onHostChanged = { wireGuardExitHostInput = it },
                     onSshPortChanged = { wireGuardExitSshPortInput = it },
                     onUserChanged = { wireGuardExitUserInput = it },
@@ -1370,7 +1773,7 @@ fun DeployTab(
                             wireGuardExitPort = wgPort.toString(),
                             wireGuardExitDns = dns
                         )
-                        runOutboundAction("Настраиваю WireGuard-выход через другой сервер") {
+                        runOutboundAction("Настраиваю WireGuard-выход через другой сервер", preflightRouteMode = "wireguard_vps") {
                             val result = installWireGuardExitVps(
                                 context = context,
                                 current = it,
@@ -1387,11 +1790,65 @@ fun DeployTab(
                     },
                     onCheck = {
                         runOutboundAction("Проверяю выход через другой сервер") {
-                            checkWireGuardExit(it, expectedMode = "wireguard_vps")
+                            val snapshot = readOutboundServerSnapshot(context, it)
+                            outboundSnapshot = snapshot
+                            if (snapshot.mode == "wireguard_vps" && snapshot.wireGuardActive) {
+                                checkWireGuardExit(it, expectedMode = "wireguard_vps")
+                            } else {
+                                outboundDialogServerStateSummary(snapshot, OutboundDialog.WireGuardVps)
+                            }
                         }
                     },
                     onDisable = {
                         runOutboundAction("Возвращаю прямой выход WDTT") { disableOutboundExit(it) }
+                    }
+                )
+                OutboundDialog.FreeWarp -> FreeWarpDialog(
+                    busy = outboundBusy,
+                    status = dialogStatus(OutboundDialog.FreeWarp),
+                    actionTitle = outboundActionTitle,
+                    progressTitle = if (outboundProgressActive) currentStep else "",
+                    progress = deployProgress,
+                    indicator = outboundModeIndicator(outboundSnapshot, OutboundDialog.FreeWarp),
+                    mtuInput = freeWarpMtuInput,
+                    disableEnabled = canDisableOutboundDialog(outboundSnapshot, OutboundDialog.FreeWarp),
+                    checkEnabled = true,
+                    restartEnabled = canCheckOutboundDialog(outboundSnapshot, OutboundDialog.FreeWarp),
+                    updateToolEnabled = canUpdateFreeWarp(outboundSnapshot),
+                    deleteEnabled = canDeleteFreeWarp(outboundSnapshot),
+                    onMtuChanged = { freeWarpMtuInput = it },
+                    onDismiss = { if (!outboundBusy) outboundDialog = null },
+                    onInstall = { mtu ->
+                        runOutboundAction("Устанавливаю и проверяю бесплатный WARP", preflightRouteMode = "warp_free") {
+                            installOrRepairFreeWarp(context, it, mtu)
+                        }
+                    },
+                    onCheck = {
+                        runOutboundAction("Проверяю бесплатный WARP") {
+                            val snapshot = readOutboundServerSnapshot(context, it)
+                            outboundSnapshot = snapshot
+                            if (snapshot.mode == "warp_free" && snapshot.wireGuardActive) {
+                                checkFreeWarp(it, restartOnFailure = false)
+                            } else {
+                                outboundDialogServerStateSummary(snapshot, OutboundDialog.FreeWarp)
+                            }
+                        }
+                    },
+                    onRestart = {
+                        runOutboundAction("Перезапускаю и проверяю бесплатный WARP") {
+                            checkFreeWarp(it, restartOnFailure = true)
+                        }
+                    },
+                    onUpdateTool = {
+                        runOutboundAction("Проверяю обновление wgcf") { updateWgcfTool(context, it) }
+                    },
+                    onDisable = {
+                        runOutboundAction("Возвращаю прямой выход WDTT") { disableOutboundExit(it) }
+                    },
+                    onDelete = {
+                        runOutboundAction("Удаляю бесплатный WARP и возвращаю прямой выход") {
+                            deleteFreeWarp(it)
+                        }
                     }
                 )
                 OutboundDialog.ImportedWireGuard -> ImportedWireGuardDialog(
@@ -1400,23 +1857,27 @@ fun DeployTab(
                     actionTitle = outboundActionTitle,
                     progressTitle = if (outboundProgressActive) currentStep else "",
                     progress = deployProgress,
+                    indicator = outboundModeIndicator(outboundSnapshot, OutboundDialog.ImportedWireGuard),
                     initialConfig = importedWgConfigText,
+                    disableEnabled = canDisableOutboundDialog(outboundSnapshot, OutboundDialog.ImportedWireGuard),
+                    serverCheckEnabled = true,
+                    deleteEnabled = canDeleteImportedWireGuard(outboundSnapshot),
                     onConfigChanged = { importedWgConfigText = it },
                     onPickFile = { wgConfigLauncher.launch("*/*") },
                     onDismiss = { outboundDialog = null },
                     onValidate = { config ->
                         outboundStatus = validateWireGuardConfigText(config).fold(
-                            onSuccess = { "Файл подходит: это обычный WireGuard-конфиг. Если он выдан WARP, WDTT Plus применит его как WARP/VPN-выход только для WDTT-пользователей; обычный интернет сервера не изменится." },
-                            onFailure = { "Ошибка VPN/WARP-файла: ${it.message}" }
+                            onSuccess = { "Файл подходит: WDTT Plus применит его как VPN/WireGuard-выход только для WDTT-пользователей, включая собственный WARP/WARP+ WireGuard-конфиг; обычный интернет сервера не изменится." },
+                            onFailure = { "Ошибка VPN/WireGuard-файла: ${it.message}" }
                         )
                         outboundStatusOwner = OutboundDialog.ImportedWireGuard.name
                     },
                     onEnable = { config ->
                         importedWgConfigText = config
                         val forms = currentOutboundProfileForms().copy(importedWireGuardConfig = config)
-                        runOutboundAction("Включаю VPN/WARP-выход из файла") {
+                        runOutboundAction("Включаю VPN/WireGuard-выход из файла", preflightRouteMode = "imported_wg") {
                             val result = enableImportedWireGuardExit(context, it, config)
-                            val saveMessage = saveOutboundProfileMessage(context, it, forms, "VPN/WARP-файл сохранён на сервере для восстановления.")
+                            val saveMessage = saveOutboundProfileMessage(context, it, forms, "VPN/WireGuard-файл сохранён на сервере для восстановления.")
                             "$result\n$saveMessage"
                         }
                     },
@@ -1424,13 +1885,19 @@ fun DeployTab(
                         runOutboundAction("Возвращаю прямой выход WDTT") { disableOutboundExit(it) }
                     },
                     onServerCheck = {
-                        runOutboundAction("Проверяю установленный VPN/WARP-выход") {
-                            checkWireGuardExit(it, expectedMode = "imported_wg")
+                        runOutboundAction("Проверяю установленный VPN/WireGuard-выход") {
+                            val snapshot = readOutboundServerSnapshot(context, it)
+                            outboundSnapshot = snapshot
+                            if (snapshot.mode == "imported_wg" && snapshot.wireGuardActive) {
+                                checkWireGuardExit(it, expectedMode = "imported_wg")
+                            } else {
+                                outboundDialogServerStateSummary(snapshot, OutboundDialog.ImportedWireGuard)
+                            }
                         }
                     },
                     onDelete = {
                         importedWgConfigText = ""
-                        runOutboundAction("Удаляю VPN/WARP-файл и возвращаю прямой выход") { deleteImportedWireGuardExit(it) }
+                        runOutboundAction("Удаляю VPN/WireGuard-файл и возвращаю прямой выход") { deleteImportedWireGuardExit(it) }
                     }
                 )
                 OutboundDialog.Diagnostics -> OutboundDiagnosticsDialog(
@@ -1439,6 +1906,7 @@ fun DeployTab(
                     actionTitle = outboundActionTitle,
                     progressTitle = if (outboundProgressActive) currentStep else "",
                     progress = deployProgress,
+                    cleanupEnabled = canReturnDirect(outboundSnapshot),
                     onDismiss = { outboundDialog = null },
                     onRun = { runOutboundAction("Собираю диагностику выхода WDTT") { readOutboundDiagnostics(it) } },
                     onCleanup = { runOutboundAction("Возвращаю прямой выход WDTT") { disableOutboundExit(it) } }
@@ -1543,7 +2011,7 @@ fun DeployTab(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             Text(
-                "Настройки выходного IP, прокси и VPN/WARP-файлы этим экспортом не переносятся. После переезда включите нужный режим выхода на новом сервере заново.",
+                "Настройки выходного IP, прокси, WARP и VPN/WireGuard-файлы этим экспортом не переносятся. После переезда включите нужный режим выхода на новом сервере заново.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -1861,9 +2329,15 @@ private fun DeployProgressPanel(
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.Top
+                horizontalArrangement = Arrangement.Start,
+                verticalAlignment = Alignment.CenterVertically
             ) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(18.dp),
+                    strokeWidth = 2.dp,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                Spacer(Modifier.width(10.dp))
                 Text(
                     text = visibleTitle,
                     style = MaterialTheme.typography.bodyMedium,
@@ -1973,14 +2447,18 @@ private fun DeploySuccessBanner(successCountdown: Int) {
 @Composable
 private fun OutboundRoutingSection(
     busy: Boolean,
+    snapshot: OutboundServerSnapshot?,
+    snapshotBusy: Boolean,
     status: String,
     actionTitle: String,
     enabled: Boolean,
+    directEnabled: Boolean,
     expanded: Boolean,
     modifier: Modifier = Modifier,
     onToggleExpanded: () -> Unit,
     onOpen: (OutboundDialog) -> Unit,
     onRestore: () -> Unit,
+    onRefreshState: () -> Unit,
     onStatus: () -> Unit,
     onDirect: () -> Unit
 ) {
@@ -2051,21 +2529,55 @@ private fun OutboundRoutingSection(
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 Text(
-                    "Обычная сеть самого сервера не меняется. Для маскировки выходного IP используйте внешний TCP-прокси, другой сервер или VPN/WARP-файл.",
+                    "Обычная сеть самого сервера не меняется. Для маскировки выходного IP используйте бесплатный WARP, внешний TCP-прокси, другой сервер или VPN/WireGuard-файл.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+                OutboundServerStateCard(
+                    snapshot = snapshot,
+                    snapshotBusy = snapshotBusy,
+                    enabled = enabled,
+                    onRefreshState = onRefreshState
+                )
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutboundModeButton("Прокси VPS", "Создаёт SOCKS5/HTTP на этом сервере. IP не скрывает: выход будет через тот же VPS.", enabled) {
+                    OutboundModeButton(
+                        title = "Прокси VPS",
+                        description = "Создаёт SOCKS5/HTTP на этом сервере. IP не скрывает: выход будет через тот же VPS.",
+                        enabled = enabled,
+                        indicator = outboundModeIndicator(snapshot, OutboundDialog.LocalProxy)
+                    ) {
                         onOpen(OutboundDialog.LocalProxy)
                     }
-                    OutboundModeButton("Внешний TCP-прокси", "Скрывает IP для обычного TCP-трафика. UDP, QUIC и часть звонков могут пройти напрямую.", enabled) {
+                    OutboundModeButton(
+                        title = "Внешний TCP-прокси",
+                        description = "Скрывает IP для обычного TCP-трафика. UDP, QUIC и часть звонков могут пройти напрямую.",
+                        enabled = enabled,
+                        indicator = outboundModeIndicator(snapshot, OutboundDialog.ExternalProxy)
+                    ) {
                         onOpen(OutboundDialog.ExternalProxy)
                     }
-                    OutboundModeButton("Другой сервер", "Надёжно выносит выходной IP на отдельный VPS через WireGuard.", enabled) {
+                    OutboundModeButton(
+                        title = "Другой сервер",
+                        description = "Надёжно выносит выходной IP на отдельный VPS через WireGuard.",
+                        enabled = enabled,
+                        indicator = outboundModeIndicator(snapshot, OutboundDialog.WireGuardVps)
+                    ) {
                         onOpen(OutboundDialog.WireGuardVps)
                     }
-                    OutboundModeButton("VPN/WARP-файл", "Принимает WireGuard .conf, в том числе WARP, если он сохранён именно как WireGuard-конфиг.", enabled) {
+                    OutboundModeButton(
+                        title = "Бесплатный WARP",
+                        description = "Автоматически регистрирует WARP и скрывает IP VPS без покупки второго сервера.",
+                        enabled = enabled,
+                        indicator = outboundModeIndicator(snapshot, OutboundDialog.FreeWarp)
+                    ) {
+                        onOpen(OutboundDialog.FreeWarp)
+                    }
+                    OutboundModeButton(
+                        title = "VPN/WireGuard-файл",
+                        description = "Принимает готовый WireGuard .conf от VPN-провайдера, собственного WARP/WARP+ или другой совместимой службы.",
+                        enabled = enabled,
+                        indicator = outboundModeIndicator(snapshot, OutboundDialog.ImportedWireGuard)
+                    ) {
                         onOpen(OutboundDialog.ImportedWireGuard)
                     }
                 }
@@ -2116,7 +2628,7 @@ private fun OutboundRoutingSection(
                 }
                 Button(
                     onClick = onDirect,
-                    enabled = enabled,
+                    enabled = enabled && directEnabled,
                     modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
                     shape = RoundedCornerShape(16.dp),
                     colors = ButtonDefaults.buttonColors(
@@ -2160,10 +2672,73 @@ private fun BetaBadge() {
 }
 
 @Composable
+private fun OutboundServerStateCard(
+    snapshot: OutboundServerSnapshot?,
+    snapshotBusy: Boolean,
+    enabled: Boolean,
+    onRefreshState: () -> Unit
+) {
+    val state = when {
+        snapshot == null -> OutboundModeVisualState.Unknown
+        snapshot.hasRouteConflict -> OutboundModeVisualState.Error
+        snapshot.outboundModeMismatchWarning() != null -> OutboundModeVisualState.Warning
+        snapshot.mode == "direct" && snapshot.activeRouteLabels.isEmpty() -> OutboundModeVisualState.Off
+        snapshot.activeRouteLabels.isNotEmpty() -> OutboundModeVisualState.Active
+        else -> OutboundModeVisualState.Off
+    }
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.40f),
+        border = BorderStroke(1.dp, outboundIndicatorColor(state).copy(alpha = 0.42f))
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                OutboundStateDot(state)
+                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(
+                        text = snapshot?.let { "На сервере: ${outboundServerShortState(it)}" }
+                            ?: "На сервере: состояние ещё не проверено",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Text(
+                        text = snapshot?.let { outboundServerStateHint(it) }
+                            ?: "Откройте блок или нажмите «Обновить состояние», чтобы увидеть, что реально запущено на сервере.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+            TextButton(
+                onClick = onRefreshState,
+                enabled = enabled && !snapshotBusy,
+                modifier = Modifier.align(Alignment.End)
+            ) {
+                if (snapshotBusy) {
+                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                    Spacer(Modifier.width(6.dp))
+                }
+                Text(if (snapshotBusy) "Проверяю..." else "Обновить состояние")
+            }
+        }
+    }
+}
+
+@Composable
 private fun OutboundModeButton(
     title: String,
     description: String,
     enabled: Boolean,
+    indicator: OutboundModeIndicator,
     onClick: () -> Unit
 ) {
     OutlinedButton(
@@ -2173,15 +2748,83 @@ private fun OutboundModeButton(
         shape = RoundedCornerShape(16.dp),
         contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
     ) {
-        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-            Text(title, fontWeight = FontWeight.SemiBold, color = LocalContentColor.current)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            OutboundStateDot(indicator.state)
+            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(title, fontWeight = FontWeight.SemiBold, color = LocalContentColor.current)
+                    Text(
+                        indicator.text,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = outboundIndicatorColor(indicator.state)
+                    )
+                }
+                Text(
+                    description,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = LocalContentColor.current.copy(alpha = 0.72f)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun OutboundStateDot(state: OutboundModeVisualState) {
+    Surface(
+        modifier = Modifier.size(11.dp),
+        shape = CircleShape,
+        color = outboundIndicatorColor(state),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.surface.copy(alpha = 0.55f))
+    ) {}
+}
+
+@Composable
+private fun OutboundDialogStateBanner(indicator: OutboundModeIndicator) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.38f),
+        border = BorderStroke(1.dp, outboundIndicatorColor(indicator.state).copy(alpha = 0.38f))
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 9.dp),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            OutboundStateDot(indicator.state)
             Text(
-                description,
+                "Статус на сервере",
+                modifier = Modifier.weight(1f),
                 style = MaterialTheme.typography.bodySmall,
-                color = LocalContentColor.current.copy(alpha = 0.72f)
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text(
+                indicator.text,
+                style = MaterialTheme.typography.bodySmall,
+                fontWeight = FontWeight.SemiBold,
+                color = outboundIndicatorColor(indicator.state),
+                textAlign = TextAlign.End
             )
         }
     }
+}
+
+@Composable
+private fun outboundIndicatorColor(state: OutboundModeVisualState): Color = when (state) {
+    OutboundModeVisualState.Active -> WDTTColors.connected
+    OutboundModeVisualState.Warning -> WDTTColors.warning
+    OutboundModeVisualState.Error -> MaterialTheme.colorScheme.error
+    OutboundModeVisualState.Off -> MaterialTheme.colorScheme.outline
+    OutboundModeVisualState.Unknown -> MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.55f)
 }
 
 @Composable
@@ -2191,9 +2834,12 @@ private fun LocalProxyDialog(
     actionTitle: String,
     progressTitle: String,
     progress: Float,
+    indicator: OutboundModeIndicator,
     portInput: String,
     loginInput: String,
     passwordInput: String,
+    stopEnabled: Boolean,
+    removeEnabled: Boolean,
     onPortChanged: (String) -> Unit,
     onLoginChanged: (String) -> Unit,
     onPasswordChanged: (String) -> Unit,
@@ -2207,6 +2853,7 @@ private fun LocalProxyDialog(
     var passwordFocused by rememberSaveable { mutableStateOf(false) }
     val port = portInput.toIntOrNull()?.takeIf { it in 1..65533 }
     OutboundDialogFrame("Прокси VPS", status, progressTitle, progress, onDismiss) {
+        OutboundDialogStateBanner(indicator)
         Text(
             "На этом же VPS будут созданы два входа с одним логином и паролем: SOCKS5 и HTTP. Это удобно как прокси, но IP не маскирует: наружу будет виден текущий сервер.",
             style = MaterialTheme.typography.bodySmall,
@@ -2257,11 +2904,12 @@ private fun LocalProxyDialog(
             onPrimary = { onInstall(port ?: 1080, loginInput, passwordInput) },
             secondaryText = "Проверить",
             secondaryBusyText = "Проверка...",
+            secondaryEnabled = port != null && loginInput.isNotBlank() && passwordInput.isNotBlank(),
             onSecondary = { onCheck(port ?: 1080, loginInput, passwordInput) }
         )
         OutlinedButton(
             onClick = { onOpenWeb(port ?: 1080) },
-            enabled = !busy && port != null,
+            enabled = !busy && port != null && stopEnabled,
             modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
             shape = RoundedCornerShape(16.dp),
             contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp)
@@ -2274,7 +2922,7 @@ private fun LocalProxyDialog(
         ) {
             OutlinedButton(
                 onClick = onStop,
-                enabled = !busy,
+                enabled = !busy && stopEnabled,
                 modifier = Modifier.weight(1f).fillMaxHeight().heightIn(min = 48.dp),
                 shape = RoundedCornerShape(16.dp),
                 contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp)
@@ -2288,7 +2936,7 @@ private fun LocalProxyDialog(
             }
             OutlinedButton(
                 onClick = onRemove,
-                enabled = !busy,
+                enabled = !busy && removeEnabled,
                 modifier = Modifier.weight(1f).fillMaxHeight().heightIn(min = 48.dp),
                 shape = RoundedCornerShape(16.dp),
                 contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp)
@@ -2311,11 +2959,13 @@ private fun ExternalProxyDialog(
     actionTitle: String,
     progressTitle: String,
     progress: Float,
+    indicator: OutboundModeIndicator,
     kind: ProxyKind,
     hostInput: String,
     portInput: String,
     loginInput: String,
     passwordInput: String,
+    disableEnabled: Boolean,
     onKindChanged: (ProxyKind) -> Unit,
     onHostChanged: (String) -> Unit,
     onPortChanged: (String) -> Unit,
@@ -2330,6 +2980,7 @@ private fun ExternalProxyDialog(
     val port = portInput.toIntOrNull()?.takeIf { it in 1..65535 }
     val hostValid = hostInput.isValidPublicHost()
     OutboundDialogFrame("Внешний TCP-прокси", status, progressTitle, progress, onDismiss) {
+        OutboundDialogStateBanner(indicator)
         Text(
             "WDTT будет отправлять обычные TCP-подключения пользователей через выбранный прокси. UDP, QUIC и часть голосового/звонкового трафика могут идти напрямую.",
             style = MaterialTheme.typography.bodySmall,
@@ -2397,9 +3048,10 @@ private fun ExternalProxyDialog(
             onPrimary = { onEnable(kind, hostInput.trim(), port ?: 1080, loginInput, passwordInput) },
             secondaryText = "Проверить",
             secondaryBusyText = "Проверка...",
+            secondaryEnabled = hostValid && port != null,
             onSecondary = { onCheck(kind, hostInput.trim(), port ?: 1080, loginInput, passwordInput) }
         )
-        OutlinedButton(onClick = onDisable, enabled = !busy, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp)) {
+        OutlinedButton(onClick = onDisable, enabled = !busy && disableEnabled, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp)) {
             val disabling = actionTitle.contains("Возвращаю", ignoreCase = true)
             if (disabling) {
                 CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
@@ -2417,12 +3069,15 @@ private fun WireGuardExitVpsDialog(
     actionTitle: String,
     progressTitle: String,
     progress: Float,
+    indicator: OutboundModeIndicator,
     hostInput: String,
     sshPortInput: String,
     userInput: String,
     passwordInput: String,
     wgPortInput: String,
     dnsInput: String,
+    disableEnabled: Boolean,
+    checkEnabled: Boolean,
     onHostChanged: (String) -> Unit,
     onSshPortChanged: (String) -> Unit,
     onUserChanged: (String) -> Unit,
@@ -2439,6 +3094,7 @@ private fun WireGuardExitVpsDialog(
     val sshPort = sshPortInput.toIntOrNull()?.takeIf { it in 1..65535 }
     val wgPort = wgPortInput.toIntOrNull()?.takeIf { it in 1..65535 }
     OutboundDialogFrame("Выход через другой сервер", status, progressTitle, progress, onDismiss) {
+        OutboundDialogStateBanner(indicator)
         Text(
             "WDTT Plus подключит текущий сервер к другому VPS по WireGuard и будет выпускать пользователей WDTT в интернет через этот второй сервер. Это самый понятный вариант для отдельного выходного IP.",
             style = MaterialTheme.typography.bodySmall,
@@ -2516,9 +3172,10 @@ private fun WireGuardExitVpsDialog(
             onPrimary = { onInstall(hostInput.trim(), sshPort ?: 22, userInput, passwordInput, wgPort ?: 51820, dnsInput) },
             secondaryText = "Проверить",
             secondaryBusyText = "Проверка...",
+            secondaryEnabled = checkEnabled,
             onSecondary = onCheck
         )
-        OutlinedButton(onClick = onDisable, enabled = !busy, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp)) {
+        OutlinedButton(onClick = onDisable, enabled = !busy && disableEnabled, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp)) {
             val disabling = actionTitle.contains("Возвращаю", ignoreCase = true)
             if (disabling) {
                 CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
@@ -2530,13 +3187,223 @@ private fun WireGuardExitVpsDialog(
 }
 
 @Composable
+private fun FreeWarpDialog(
+    busy: Boolean,
+    status: String,
+    actionTitle: String,
+    progressTitle: String,
+    progress: Float,
+    indicator: OutboundModeIndicator,
+    mtuInput: String,
+    disableEnabled: Boolean,
+    checkEnabled: Boolean,
+    restartEnabled: Boolean,
+    updateToolEnabled: Boolean,
+    deleteEnabled: Boolean,
+    onMtuChanged: (String) -> Unit,
+    onDismiss: () -> Unit,
+    onInstall: (Int) -> Unit,
+    onCheck: () -> Unit,
+    onRestart: () -> Unit,
+    onUpdateTool: () -> Unit,
+    onDisable: () -> Unit,
+    onDelete: () -> Unit
+) {
+    var termsAccepted by rememberSaveable { mutableStateOf(false) }
+    var confirmDelete by rememberSaveable { mutableStateOf(false) }
+    val mtu = mtuInput.toIntOrNull()?.takeIf { it in 1280..1500 }
+    OutboundDialogFrame("Бесплатный WARP", status, progressTitle, progress, onDismiss) {
+        OutboundDialogStateBanner(indicator)
+        Text(
+            "WDTT Plus автоматически зарегистрирует бесплатный Cloudflare WARP и направит через него только трафик WDTT-пользователей. Второй сервер и готовый конфиг не нужны.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Text(
+            "Сайты будут видеть общий выходной IP Cloudflare вместо IP вашего VPS. Адрес может меняться, страну и постоянный IP выбрать нельзя; отдельные сайты могут ограничивать WARP.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Text(
+            "Для регистрации используется неофициальный wgcf $WGCF_VERSION. WDTT Plus скачивает закреплённую Linux amd64-сборку и перед запуском проверяет её SHA-256. Ключи и профиль остаются на сервере с правами 600.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        OutlinedTextField(
+            value = mtuInput,
+            onValueChange = { onMtuChanged(it.filter(Char::isDigit).take(4)) },
+            label = { Text("MTU WARP") },
+            supportingText = {
+                Text(
+                    if (mtu == null) "Допустимо от 1280 до 1500."
+                    else "1280 — максимальная совместимость; 1392/1420 иногда дают лучшую скорость."
+                )
+            },
+            isError = mtu == null,
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(16.dp)
+        )
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            listOf(1280, 1392, 1420).forEach { value ->
+                OutlinedButton(
+                    onClick = { onMtuChanged(value.toString()) },
+                    enabled = !busy,
+                    modifier = Modifier.weight(1f),
+                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 6.dp),
+                    shape = RoundedCornerShape(14.dp)
+                ) {
+                    Text(value.toString())
+                }
+            }
+        }
+        Text(
+            "Изменение MTU применяется при «Установить / восстановить» без создания новой регистрации, если сохранённый аккаунт WARP уже есть на сервере. Остальные параметры WARP защищены от ручного ввода. DNS из профиля не меняет DNS самого VPS.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Text(
+            "Устанавливается только бесплатный WARP, без WARP+ и Zero Trust. При нестабильном первом handshake приложение сделает до трёх попыток; если Cloudflare ограничил WARP в регионе, включение будет отменено и сохранится прямой выход.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.tertiary
+        )
+        Text(
+            "«Отключить» только возвращает прямой выход и оставляет регистрацию WARP на сервере. «Удалить» стирает регистрацию, ключи, профиль и автопроверку; следующая установка создаст WARP заново.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(16.dp))
+                .clickable(enabled = !busy) { termsAccepted = !termsAccepted },
+            shape = RoundedCornerShape(16.dp),
+            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Checkbox(
+                    checked = termsAccepted,
+                    onCheckedChange = { termsAccepted = it },
+                    enabled = !busy
+                )
+                Text(
+                    "Я разрешаю создать WARP-регистрацию и принимаю условия Cloudflare: cloudflare.com/terms",
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+        }
+        val installing = actionTitle.contains("Устанавливаю", ignoreCase = true)
+        Button(
+            onClick = { mtu?.let(onInstall) },
+            enabled = !busy && termsAccepted && mtu != null,
+            modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+            shape = RoundedCornerShape(16.dp)
+        ) {
+            if (installing) {
+                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                Spacer(Modifier.width(8.dp))
+            }
+            Text(if (installing) "Установка..." else "Установить / восстановить", fontWeight = FontWeight.Bold)
+        }
+        OutlinedButton(
+            onClick = onCheck,
+            enabled = !busy && checkEnabled,
+            modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+            shape = RoundedCornerShape(16.dp)
+        ) {
+            val checking = actionTitle == "Проверяю бесплатный WARP"
+            if (checking) {
+                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                Spacer(Modifier.width(6.dp))
+            }
+            Text(if (checking) "Проверка..." else "Проверить", fontWeight = FontWeight.SemiBold)
+        }
+        OutlinedButton(
+            onClick = onRestart,
+            enabled = !busy && restartEnabled,
+            modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+            shape = RoundedCornerShape(16.dp)
+        ) {
+            val restarting = actionTitle.contains("Перезапускаю", ignoreCase = true)
+            if (restarting) {
+                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                Spacer(Modifier.width(6.dp))
+            }
+            Text(if (restarting) "Перезапуск..." else "Перезапустить и проверить", fontWeight = FontWeight.SemiBold)
+        }
+        OutlinedButton(
+            onClick = onUpdateTool,
+            enabled = !busy && updateToolEnabled,
+            modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+            shape = RoundedCornerShape(16.dp)
+        ) {
+            val updating = actionTitle.contains("обновление wgcf", ignoreCase = true)
+            if (updating) {
+                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                Spacer(Modifier.width(6.dp))
+            }
+            Text(if (updating) "Обновление..." else "Проверить обновление wgcf", fontWeight = FontWeight.SemiBold)
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Min),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            OutlinedButton(
+                onClick = onDisable,
+                enabled = !busy && disableEnabled,
+                modifier = Modifier.weight(1f).fillMaxHeight().heightIn(min = 48.dp),
+                shape = RoundedCornerShape(16.dp),
+                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp)
+            ) {
+                Text("Отключить", textAlign = TextAlign.Center)
+            }
+            OutlinedButton(
+                onClick = { confirmDelete = true },
+                enabled = !busy && deleteEnabled,
+                modifier = Modifier.weight(1f).fillMaxHeight().heightIn(min = 48.dp),
+                shape = RoundedCornerShape(16.dp),
+                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp)
+            ) {
+                Text("Удалить", textAlign = TextAlign.Center)
+            }
+        }
+    }
+    if (confirmDelete) {
+        AlertDialog(
+            onDismissRequest = { confirmDelete = false },
+            title = { Text("Удалить бесплатный WARP?") },
+            text = {
+                Text("Регистрация, ключи, WireGuard-профиль и автоматическая проверка WARP будут удалены с сервера. Трафик WDTT вернётся на прямой выход через VPS.")
+            },
+            confirmButton = {
+                Button(onClick = {
+                    confirmDelete = false
+                    onDelete()
+                }) { Text("Удалить") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmDelete = false }) { Text("Отмена") }
+            }
+        )
+    }
+}
+
+@Composable
 private fun ImportedWireGuardDialog(
     busy: Boolean,
     status: String,
     actionTitle: String,
     progressTitle: String,
     progress: Float,
+    indicator: OutboundModeIndicator,
     initialConfig: String,
+    disableEnabled: Boolean,
+    serverCheckEnabled: Boolean,
+    deleteEnabled: Boolean,
     onConfigChanged: (String) -> Unit,
     onPickFile: () -> Unit,
     onDismiss: () -> Unit,
@@ -2548,19 +3415,20 @@ private fun ImportedWireGuardDialog(
 ) {
     var configText by rememberSaveable(initialConfig) { mutableStateOf(initialConfig) }
     val valid = configText.isNotBlank() && validateWireGuardConfigText(configText).isSuccess
-    OutboundDialogFrame("VPN/WARP-файл", status, progressTitle, progress, onDismiss) {
+    OutboundDialogFrame("VPN/WireGuard-файл", status, progressTitle, progress, onDismiss) {
+        OutboundDialogStateBanner(indicator)
         Text(
-            "Можно выбрать обычный WireGuard .conf от VPN-провайдера или WARP. Важно: WARP подходит только как WireGuard-конфиг с [Interface] и [Peer]; профиль warp-cli напрямую сюда не вставляется.",
+            "Можно выбрать готовый WireGuard .conf от VPN-провайдера, собственного WARP/WARP+ или другой совместимой службы. Для автоматической бесплатной регистрации WARP используйте отдельный вариант «Бесплатный WARP».",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
         Text(
-            "WDTT Plus применит файл только к пользователям WDTT и не поменяет обычный интернет самого сервера.",
+            "WDTT Plus применит файл только к пользователям WDTT и не поменяет обычный интернет самого сервера. Перед включением приложение проверит, что на сервере нет конфликтующего выходного маршрута.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
         OutlinedButton(onClick = onPickFile, enabled = !busy, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp)) {
-            Text("Выбрать VPN/WARP-файл")
+            Text("Выбрать VPN/WireGuard-файл")
         }
         OutlinedTextField(
             value = configText,
@@ -2568,7 +3436,7 @@ private fun ImportedWireGuardDialog(
                 configText = it
                 onConfigChanged(it)
             },
-            label = { Text("Содержимое WireGuard/WARP .conf") },
+            label = { Text("Содержимое WireGuard .conf") },
             minLines = 8,
             maxLines = 14,
             modifier = Modifier.fillMaxWidth(),
@@ -2579,9 +3447,14 @@ private fun ImportedWireGuardDialog(
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.error
         )
+        Text(
+            "«Отключить» возвращает прямой выход, но оставляет файл для повторного включения. «Удалить» стирает рабочий файл и сохранённую копию из серверного профиля.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
         DialogButtons(
             busy = busy,
-            primaryBusy = actionTitle.contains("Включаю VPN/WARP", ignoreCase = true),
+            primaryBusy = actionTitle.contains("Включаю VPN/WireGuard", ignoreCase = true),
             secondaryBusy = false,
             primaryText = "Включить",
             primaryBusyText = "Включение...",
@@ -2593,7 +3466,7 @@ private fun ImportedWireGuardDialog(
         )
         OutlinedButton(
             onClick = onServerCheck,
-            enabled = !busy,
+            enabled = !busy && serverCheckEnabled,
             modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
             shape = RoundedCornerShape(16.dp)
         ) {
@@ -2610,7 +3483,7 @@ private fun ImportedWireGuardDialog(
         ) {
             OutlinedButton(
                 onClick = onDisable,
-                enabled = !busy,
+                enabled = !busy && disableEnabled,
                 modifier = Modifier.weight(1f).fillMaxHeight().heightIn(min = 48.dp),
                 shape = RoundedCornerShape(16.dp),
                 contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp)
@@ -2624,7 +3497,7 @@ private fun ImportedWireGuardDialog(
             }
             OutlinedButton(
                 onClick = onDelete,
-                enabled = !busy,
+                enabled = !busy && deleteEnabled,
                 modifier = Modifier.weight(1f).fillMaxHeight().heightIn(min = 48.dp),
                 shape = RoundedCornerShape(16.dp),
                 contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp)
@@ -2647,6 +3520,7 @@ private fun OutboundDiagnosticsDialog(
     actionTitle: String,
     progressTitle: String,
     progress: Float,
+    cleanupEnabled: Boolean,
     onDismiss: () -> Unit,
     onRun: () -> Unit,
     onCleanup: () -> Unit
@@ -2667,6 +3541,7 @@ private fun OutboundDiagnosticsDialog(
             onPrimary = onRun,
             secondaryText = "Вернуть прямой выход",
             secondaryBusyText = "Возврат...",
+            secondaryEnabled = cleanupEnabled,
             onSecondary = onCleanup
         )
     }
@@ -2771,6 +3646,7 @@ private fun DialogButtons(
     onPrimary: () -> Unit,
     secondaryText: String,
     secondaryBusyText: String = busyButtonText(secondaryText),
+    secondaryEnabled: Boolean = true,
     onSecondary: () -> Unit
 ) {
     Row(
@@ -2779,7 +3655,7 @@ private fun DialogButtons(
     ) {
         OutlinedButton(
             onClick = onSecondary,
-            enabled = !busy,
+            enabled = !busy && secondaryEnabled,
             modifier = Modifier.weight(1f).fillMaxHeight().heightIn(min = 48.dp),
             shape = RoundedCornerShape(16.dp),
             contentPadding = PaddingValues(horizontal = if (secondaryBusy) 6.dp else 10.dp, vertical = 8.dp)
@@ -3011,6 +3887,9 @@ private fun outboundShellPrelude(): String = """
     wdtt_ext_iface() {
       ip -o route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if (${'$'}i=="dev") {print ${'$'}(i+1); exit}}'
     }
+    wdtt_test_source() {
+      ip -4 -o addr show dev "${'$'}WDTT_IFACE" scope global 2>/dev/null | awk '{split(${'$'}4, value, "/"); print value[1]; exit}'
+    }
     wdtt_install_pkg() {
       if command -v apt-get >/dev/null 2>&1; then
         apt-get update -y >/dev/null 2>&1 || true
@@ -3048,22 +3927,24 @@ private fun outboundShellPrelude(): String = """
     }
     wdtt_install_wireguard_tools() {
       if command -v apt-get >/dev/null 2>&1; then
-        wdtt_install_pkg wireguard-tools curl iptables iproute2
+        wdtt_install_pkg wireguard-tools curl ca-certificates iptables iproute2
       elif command -v dnf >/dev/null 2>&1; then
-        wdtt_install_pkg wireguard-tools curl iptables iproute
+        wdtt_install_pkg wireguard-tools curl ca-certificates iptables iproute
       elif command -v yum >/dev/null 2>&1; then
-        wdtt_install_pkg wireguard-tools curl iptables iproute
+        wdtt_install_pkg wireguard-tools curl ca-certificates iptables iproute
       elif command -v zypper >/dev/null 2>&1; then
-        wdtt_install_pkg wireguard-tools curl iptables iproute2
+        wdtt_install_pkg wireguard-tools curl ca-certificates iptables iproute2
       elif command -v apk >/dev/null 2>&1; then
-        wdtt_install_pkg wireguard-tools curl iptables iproute2
+        wdtt_install_pkg wireguard-tools curl ca-certificates iptables iproute2
       elif command -v pacman >/dev/null 2>&1; then
-        wdtt_install_pkg wireguard-tools curl iptables iproute2
+        wdtt_install_pkg wireguard-tools curl ca-certificates iptables iproute2
       else
         return 1
       fi
     }
     wdtt_clear_external_out() {
+      systemctl disable --now wdtt-warp-watchdog.timer 2>/dev/null || true
+      systemctl disable --now wdtt-wg-exit.service 2>/dev/null || true
       if command -v iptables >/dev/null 2>&1; then
         iptables -t nat -D PREROUTING -i "${'$'}WDTT_IFACE" -p tcp -j WDTT_PROXY_OUT 2>/dev/null || true
         iptables -t nat -F WDTT_PROXY_OUT 2>/dev/null || true
@@ -3154,7 +4035,8 @@ private fun outboundStatusScript(): String = shellScript(
     case "${'$'}MODE" in
       direct) MODE_LABEL="прямой выход";;
       external_proxy) MODE_LABEL="внешний TCP-прокси";;
-      imported_wg) MODE_LABEL="VPN/WARP-файл";;
+      warp_free) MODE_LABEL="бесплатный WARP";;
+      imported_wg) MODE_LABEL="VPN/WireGuard-файл";;
       wireguard_vps) MODE_LABEL="выход через другой сервер";;
       *) MODE_LABEL="${'$'}MODE";;
     esac
@@ -3167,12 +4049,22 @@ private fun outboundStatusScript(): String = shellScript(
       direct)
         echo "Проверочный выход WDTT: ${'$'}SERVER_IP (прямой выход)"
         ;;
-      imported_wg|wireguard_vps)
-        WDTT_EXIT_IP="${'$'}(curl -4fsS --interface "${'$'}WDTT_WG_IFACE" --max-time 12 https://api.ipify.org 2>/dev/null || true)"
+      warp_free|imported_wg|wireguard_vps)
+        TEST_SOURCE="${'$'}(wdtt_test_source)"
+        WDTT_EXIT_IP=""
+        [ -n "${'$'}TEST_SOURCE" ] && WDTT_EXIT_IP="${'$'}(curl -4fsS --interface "${'$'}TEST_SOURCE" --max-time 12 https://api.ipify.org 2>/dev/null || true)"
         if [ -n "${'$'}WDTT_EXIT_IP" ]; then
           echo "Проверочный выход WDTT: ${'$'}WDTT_EXIT_IP"
         else
           echo "Проверочный выход WDTT: не удалось проверить через ${'$'}WDTT_WG_IFACE"
+        fi
+        if [ "${'$'}MODE" = "warp_free" ]; then
+          WARP_TRACE=""
+          [ -n "${'$'}TEST_SOURCE" ] && WARP_TRACE="${'$'}(curl -4fsS --interface "${'$'}TEST_SOURCE" --max-time 15 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
+          WARP_STATE="${'$'}(printf '%s\n' "${'$'}WARP_TRACE" | sed -n 's/^warp=//p' | head -n 1)"
+          echo "Cloudflare WARP: ${'$'}{WARP_STATE:-проверка не пройдена}"
+          echo "Автопроверка WARP: ${'$'}(systemctl is-active wdtt-warp-watchdog.timer 2>/dev/null || echo не запущена)"
+          echo "wgcf: ${'$'}(cat /etc/wdtt-plus/warp/wgcf-version 2>/dev/null || echo версия неизвестна)"
         fi
         ;;
       external_proxy)
@@ -3417,9 +4309,11 @@ private fun outboundSnapshotScript(): String = shellScript(
     fi
     WG_ENDPOINT=""
     WG_DNS=""
+    WG_MTU=""
     if [ -n "${'$'}WG_CONF" ]; then
       WG_ENDPOINT="${'$'}(sed -n 's/^[[:space:]]*Endpoint[[:space:]]*=[[:space:]]*//Ip' "${'$'}WG_CONF" 2>/dev/null | head -n 1 | tr -d ' ')"
       WG_DNS="${'$'}(sed -n 's/^[[:space:]]*DNS[[:space:]]*=[[:space:]]*//Ip' "${'$'}WG_CONF" 2>/dev/null | head -n 1 | tr -d ' ')"
+      WG_MTU="${'$'}(sed -n 's/^[[:space:]]*MTU[[:space:]]*=[[:space:]]*//Ip' "${'$'}WG_CONF" 2>/dev/null | head -n 1 | tr -d ' ')"
     fi
     WG_ENDPOINT_HOST=""
     WG_ENDPOINT_PORT=""
@@ -3446,6 +4340,10 @@ private fun outboundSnapshotScript(): String = shellScript(
       IMPORTED_WG_CONFIG_B64="${'$'}(wdtt_file_b64 "${'$'}WG_CONF")"
     fi
     [ -n "${'$'}IMPORTED_WG_CONFIG_B64" ] && WG_PRESENT=1
+    WARP_PRESENT=0
+    if [ -f /etc/wdtt-plus/warp/wgcf-account.toml ] || [ -f /etc/wdtt-plus/warp/wgcf-profile.conf ]; then
+      WARP_PRESENT=1
+    fi
 
     printf 'WDTT_OUTBOUND_MODE=%s\n' "${'$'}MODE"
     printf 'WDTT_OUTBOUND_DETAIL_B64=%s\n' "$(wdtt_b64 "${'$'}DETAIL")"
@@ -3471,6 +4369,8 @@ private fun outboundSnapshotScript(): String = shellScript(
     printf 'WDTT_WG_VPS_PASSWORD_B64=%s\n' "${'$'}WG_VPS_PASSWORD_B64"
     printf 'WDTT_WG_VPS_PORT=%s\n' "${'$'}WG_VPS_PORT"
     printf 'WDTT_WG_VPS_DNS_B64=%s\n' "${'$'}WG_VPS_DNS_B64"
+    printf 'WDTT_WARP_PRESENT=%s\n' "${'$'}WARP_PRESENT"
+    printf 'WDTT_WARP_MTU=%s\n' "${'$'}WG_MTU"
     printf 'WDTT_IMPORTED_WG_CONFIG_B64=%s\n' "${'$'}IMPORTED_WG_CONFIG_B64"
     """
 )
@@ -3523,6 +4423,8 @@ private fun parseOutboundServerSnapshot(output: String): OutboundServerSnapshot 
         wireGuardExitPassword = decoded("WDTT_WG_VPS_PASSWORD_B64"),
         wireGuardExitPort = value("WDTT_WG_VPS_PORT"),
         wireGuardExitDns = decoded("WDTT_WG_VPS_DNS_B64"),
+        warpPresent = flag("WDTT_WARP_PRESENT"),
+        warpMtu = value("WDTT_WARP_MTU"),
         importedWireGuardConfig = decoded("WDTT_IMPORTED_WG_CONFIG_B64")
     )
 }
@@ -3540,6 +4442,13 @@ private fun outboundRestoreSummary(snapshot: OutboundServerSnapshot): String {
     }
     if (snapshot.wireGuardPresent) {
         parts += if (snapshot.wireGuardActive) "WireGuard-выход найден и запущен." else "Поля WireGuard-выхода заполнены."
+    }
+    if (snapshot.mode == "warp_free") {
+        parts += if (snapshot.wireGuardActive) {
+            "Бесплатный WARP найден; откройте его окно для проверки Cloudflare и автопроверки."
+        } else {
+            "Профиль бесплатного WARP найден, но WireGuard сейчас не запущен. Нажмите «Установить / восстановить»."
+        }
     }
     if (snapshot.localProxyPresent && snapshot.localProxyPassword.isBlank()) {
         parts += "Пароль прокси не найден в старом серверном конфиге; введите его вручную."
@@ -3561,7 +4470,8 @@ private suspend fun checkWireGuardExit(
         val ssh = SSHClient(session, target.pass)
         val expectedLabel = when (expectedMode) {
             "wireguard_vps" -> "выход через другой сервер"
-            "imported_wg" -> "VPN/WARP-файл"
+            "warp_free" -> "бесплатный WARP"
+            "imported_wg" -> "VPN/WireGuard-файл"
             else -> expectedMode
         }
         val script = shellScript(
@@ -3570,7 +4480,8 @@ private suspend fun checkWireGuardExit(
             MODE="${'$'}(grep -o '"outboundMode"[[:space:]]*:[[:space:]]*"[^"]*"' /etc/wdtt/outbound.json 2>/dev/null | sed 's/.*"outboundMode"[[:space:]]*:[[:space:]]*"//;s/".*//' | head -n 1)"
             [ -n "${'$'}MODE" ] || MODE="direct"
             case "${'$'}MODE" in
-              imported_wg) MODE_LABEL="VPN/WARP-файл";;
+              warp_free) MODE_LABEL="бесплатный WARP";;
+              imported_wg) MODE_LABEL="VPN/WireGuard-файл";;
               wireguard_vps) MODE_LABEL="выход через другой сервер";;
               external_proxy) MODE_LABEL="внешний TCP-прокси";;
               direct) MODE_LABEL="прямой выход";;
@@ -3583,7 +4494,9 @@ private suspend fun checkWireGuardExit(
             command -v wg >/dev/null 2>&1 || { echo WDTT_ERROR=wireguard_tools_required; exit 2; }
             wg show "${'$'}WDTT_WG_IFACE" >/dev/null 2>&1 || { echo WDTT_ERROR=wireguard_not_active; exit 3; }
             echo "WireGuard ${'$'}WDTT_WG_IFACE запущен."
-            EXIT_IP="${'$'}(curl -4fsS --interface "${'$'}WDTT_WG_IFACE" --max-time 12 https://api.ipify.org 2>/dev/null || true)"
+            TEST_SOURCE="${'$'}(wdtt_test_source)"
+            [ -n "${'$'}TEST_SOURCE" ] || { echo WDTT_ERROR=wdtt_test_source_missing; exit 3; }
+            EXIT_IP="${'$'}(curl -4fsS --interface "${'$'}TEST_SOURCE" --max-time 12 https://api.ipify.org 2>/dev/null || true)"
             if [ -n "${'$'}EXIT_IP" ]; then
               echo "Проверка успешна: WDTT-пользователи выходят через WireGuard. Проверочный IP: ${'$'}EXIT_IP"
             else
@@ -4044,8 +4957,10 @@ private suspend fun enableExternalProxy(
     return runRootScript(context, target, script, timeout = CMD_TIMEOUT)
 }
 
-private fun validateWireGuardConfigText(config: String): Result<Unit> = runCatching {
+internal fun validateWireGuardConfigText(config: String): Result<Unit> = runCatching {
     val raw = config.trim()
+    require(raw.toByteArray(Charsets.UTF_8).size <= 64 * 1024) { "файл больше 64 КБ" }
+    require('\u0000' !in raw) { "файл содержит недопустимые нулевые байты" }
     require(raw.contains(Regex("(?im)^\\s*\\[Interface]\\s*$"))) { "не найден раздел с настройками вашего WireGuard-клиента" }
     require(raw.contains(Regex("(?im)^\\s*PrivateKey\\s*=\\s*\\S+"))) { "в файле нет приватного ключа клиента" }
     require(raw.contains(Regex("(?im)^\\s*Address\\s*=\\s*\\S+"))) { "в файле нет адреса клиента" }
@@ -4056,9 +4971,52 @@ private fun validateWireGuardConfigText(config: String): Result<Unit> = runCatch
     require(!raw.contains(Regex("(?im)^\\s*(PreUp|PostUp|PreDown|PostDown)\\s*="))) {
         "команды запуска и остановки запрещены для безопасного импорта"
     }
+    val interfaceKeys = setOf("privatekey", "address", "dns", "mtu", "table", "listenport")
+    val peerKeys = setOf("publickey", "presharedkey", "allowedips", "endpoint", "persistentkeepalive")
+    var section = ""
+    var interfaceCount = 0
+    var peerCount = 0
+    raw.lineSequence().forEachIndexed { index, sourceLine ->
+        val line = sourceLine.trim()
+        if (line.isBlank() || line.startsWith("#") || line.startsWith(";")) return@forEachIndexed
+        if (line.startsWith("[") && line.endsWith("]")) {
+            section = line.substring(1, line.length - 1).trim().lowercase(Locale.ROOT)
+            when (section) {
+                "interface" -> interfaceCount++
+                "peer" -> peerCount++
+                else -> throw IllegalArgumentException("неподдерживаемый раздел в строке ${index + 1}")
+            }
+            return@forEachIndexed
+        }
+        val separator = line.indexOf('=')
+        require(separator in 1 until line.lastIndex) { "неверная строка ${index + 1}" }
+        val key = line.substring(0, separator).trim().lowercase(Locale.ROOT)
+        val value = line.substring(separator + 1).trim()
+        require(value.isNotBlank()) { "пустое значение в строке ${index + 1}" }
+        val allowed = when (section) {
+            "interface" -> interfaceKeys
+            "peer" -> peerKeys
+            else -> emptySet()
+        }
+        require(key in allowed) { "параметр ${line.substring(0, separator).trim()} не разрешён для безопасного импорта" }
+        if (key == "mtu") {
+            val mtuValue = value.toIntOrNull()
+            require(mtuValue != null && mtuValue in 576..9000) { "MTU должен быть от 576 до 9000" }
+        }
+        if (key == "endpoint") {
+            val port = value.substringAfterLast(':', "").toIntOrNull()
+            require(port != null && port in 1..65535 && !value.any(Char::isWhitespace)) { "Endpoint должен содержать адрес и порт от 1 до 65535" }
+        }
+    }
+    require(interfaceCount == 1) { "должен быть ровно один раздел [Interface]" }
+    require(peerCount == 1) { "должен быть ровно один раздел [Peer]" }
+    val allowedIps = Regex("(?im)^\\s*AllowedIPs\\s*=\\s*(.+)$")
+        .find(raw)?.groupValues?.getOrNull(1).orEmpty()
+        .split(',').map(String::trim)
+    require("0.0.0.0/0" in allowedIps) { "для выходного VPN в AllowedIPs должен быть маршрут 0.0.0.0/0" }
 }
 
-private fun sanitizeWireGuardConfigForWdttExit(config: String): String {
+internal fun sanitizeWireGuardConfigForWdttExit(config: String): String {
     validateWireGuardConfigText(config).getOrThrow()
     val lines = config.trim().lines()
     val out = mutableListOf<String>()
@@ -4081,7 +5039,9 @@ private fun sanitizeWireGuardConfigForWdttExit(config: String): String {
             out += trimmed
             return@forEach
         }
-        if (trimmed.startsWith("Table", ignoreCase = true)) return@forEach
+        if (trimmed.startsWith("Table", ignoreCase = true) ||
+            trimmed.startsWith("DNS", ignoreCase = true)
+        ) return@forEach
         if (trimmed.startsWith("PreUp", ignoreCase = true) ||
             trimmed.startsWith("PostUp", ignoreCase = true) ||
             trimmed.startsWith("PreDown", ignoreCase = true) ||
@@ -4099,14 +5059,59 @@ private fun wireGuardPolicyScript(mode: String, detail: String): String = shellS
     [ -d /sys/class/net/"${'$'}WDTT_IFACE" ] || { echo WDTT_ERROR=wdtt_iface_not_found; exit 2; }
     command -v wg-quick >/dev/null 2>&1 || { echo WDTT_ERROR=wireguard_tools_required; exit 2; }
     command -v iptables >/dev/null 2>&1 || { echo WDTT_ERROR=iptables_required; exit 2; }
+    sed -i -E '/^[[:space:]]*DNS[[:space:]]*=/Id' /etc/wireguard/wg-wdtt-exit.conf
     echo "WDTT_PROGRESS|0.72|Отключаю прежний внешний выход WDTT..."
     wdtt_clear_external_out
-    echo "WDTT_PROGRESS|0.80|Поднимаю WireGuard-интерфейс для выхода WDTT..."
+    echo "WDTT_PROGRESS|0.78|Создаю постоянную службу WireGuard-выхода..."
+    mkdir -p /usr/local/lib/wdtt
+    cat >/usr/local/lib/wdtt/wg-exit-up <<'WDTT_WG_UP'
+    #!/bin/sh
+    set -eu
+    WDTT_IFACE=wdtt0
+    WDTT_WG_IFACE=wg-wdtt-exit
+    WDTT_TABLE=100
+    WDTT_SUBNET="${'$'}(ip -4 route show dev "${'$'}WDTT_IFACE" scope link 2>/dev/null | awk '{print ${'$'}1; exit}')"
+    [ -n "${'$'}WDTT_SUBNET" ] || WDTT_SUBNET=10.66.66.0/24
+    wg-quick down "${'$'}WDTT_WG_IFACE" >/dev/null 2>&1 || true
     wg-quick up "${'$'}WDTT_WG_IFACE"
-    echo "WDTT_PROGRESS|0.88|Добавляю маршруты только для WDTT-пользователей..."
-    ip rule add from "${'$'}WDTT_SUBNET" table "${'$'}WDTT_TABLE" priority 100 2>/dev/null || true
+    ip rule del from "${'$'}WDTT_SUBNET" table "${'$'}WDTT_TABLE" priority 100 2>/dev/null || true
+    ip rule add from "${'$'}WDTT_SUBNET" table "${'$'}WDTT_TABLE" priority 100
     ip route replace default dev "${'$'}WDTT_WG_IFACE" table "${'$'}WDTT_TABLE"
-    iptables -t nat -C POSTROUTING -s "${'$'}WDTT_SUBNET" -o "${'$'}WDTT_WG_IFACE" -m comment --comment WDTT_EXIT -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s "${'$'}WDTT_SUBNET" -o "${'$'}WDTT_WG_IFACE" -m comment --comment WDTT_EXIT -j MASQUERADE
+    iptables -t nat -C POSTROUTING -s "${'$'}WDTT_SUBNET" -o "${'$'}WDTT_WG_IFACE" -m comment --comment WDTT_EXIT -j MASQUERADE 2>/dev/null || \
+      iptables -t nat -A POSTROUTING -s "${'$'}WDTT_SUBNET" -o "${'$'}WDTT_WG_IFACE" -m comment --comment WDTT_EXIT -j MASQUERADE
+    WDTT_WG_UP
+    cat >/usr/local/lib/wdtt/wg-exit-down <<'WDTT_WG_DOWN'
+    #!/bin/sh
+    WDTT_IFACE=wdtt0
+    WDTT_WG_IFACE=wg-wdtt-exit
+    WDTT_TABLE=100
+    WDTT_SUBNET="${'$'}(ip -4 route show dev "${'$'}WDTT_IFACE" scope link 2>/dev/null | awk '{print ${'$'}1; exit}')"
+    [ -n "${'$'}WDTT_SUBNET" ] || WDTT_SUBNET=10.66.66.0/24
+    iptables -t nat -D POSTROUTING -s "${'$'}WDTT_SUBNET" -o "${'$'}WDTT_WG_IFACE" -m comment --comment WDTT_EXIT -j MASQUERADE 2>/dev/null || true
+    ip rule del from "${'$'}WDTT_SUBNET" table "${'$'}WDTT_TABLE" priority 100 2>/dev/null || true
+    ip route flush table "${'$'}WDTT_TABLE" 2>/dev/null || true
+    wg-quick down "${'$'}WDTT_WG_IFACE" >/dev/null 2>&1 || true
+    WDTT_WG_DOWN
+    chmod 700 /usr/local/lib/wdtt/wg-exit-up /usr/local/lib/wdtt/wg-exit-down
+    cat >/etc/systemd/system/wdtt-wg-exit.service <<'WDTT_WG_SERVICE'
+    [Unit]
+    Description=WDTT Plus policy-routed WireGuard exit
+    After=network-online.target wdtt.service
+    Wants=network-online.target
+
+    [Service]
+    Type=oneshot
+    RemainAfterExit=yes
+    ExecStart=/usr/local/lib/wdtt/wg-exit-up
+    ExecStop=/usr/local/lib/wdtt/wg-exit-down
+
+    [Install]
+    WantedBy=multi-user.target
+    WDTT_WG_SERVICE
+    systemctl daemon-reload
+    echo "WDTT_PROGRESS|0.84|Поднимаю WireGuard-интерфейс и маршруты WDTT..."
+    systemctl enable --now wdtt-wg-exit.service >/dev/null
+    systemctl is-active --quiet wdtt-wg-exit.service || { echo WDTT_ERROR=wireguard_exit_service_inactive; exit 3; }
     echo "WDTT_PROGRESS|0.95|Сохраняю новый режим выхода WDTT..."
     wdtt_write_mode ${shellQuote(mode)} ${shellQuote(detail)}
     sleep 1
@@ -4116,6 +5121,386 @@ private fun wireGuardPolicyScript(mode: String, detail: String): String = shellS
     wg show "${'$'}WDTT_WG_IFACE" | sed -E 's/(private key: ).*/\1(скрыт)/' || true
     """
 )
+
+private fun wgcfToolManagementScript(): String = """
+    WGCF_BASELINE_VERSION=${shellQuote(WGCF_VERSION)}
+    WGCF_BASELINE_URL=${shellQuote(WGCF_LINUX_AMD64_URL)}
+    WGCF_BASELINE_SHA256=${shellQuote(WGCF_LINUX_AMD64_SHA256)}
+    WGCF_LATEST_API=${shellQuote(WGCF_LATEST_RELEASE_API)}
+    WGCF_BIN=/usr/local/bin/wgcf
+    WGCF_STATE_DIR=/etc/wdtt-plus/warp
+
+    wdtt_wgcf_compatible() {
+      candidate="${'$'}1"
+      [ -x "${'$'}candidate" ] || return 1
+      "${'$'}candidate" register --help 2>&1 | grep -q -- '--accept-tos' || return 1
+      "${'$'}candidate" generate --help 2>&1 | grep -q -- '--profile' || return 1
+      "${'$'}candidate" status --help >/dev/null 2>&1 || return 1
+    }
+
+    wdtt_fetch_wgcf_release() {
+      version="${'$'}1"
+      tag="v${'$'}version"
+      file="wgcf_${'$'}{version}_linux_amd64"
+      base="https://github.com/ViRb3/wgcf/releases/download/${'$'}tag"
+      curl -fsSL --retry 2 --connect-timeout 12 --max-time 180 "${'$'}base/checksums.txt" -o "${'$'}WGCF_TMP/checksums.txt" || return 1
+      curl -fsSL --retry 2 --connect-timeout 12 --max-time 300 "${'$'}base/${'$'}file" -o "${'$'}WGCF_TMP/wgcf.candidate" || return 1
+      expected="${'$'}(awk -v name="${'$'}file" '${'$'}2 == name {print ${'$'}1; exit}' "${'$'}WGCF_TMP/checksums.txt")"
+      [ -n "${'$'}expected" ] || return 1
+      actual="${'$'}(sha256sum "${'$'}WGCF_TMP/wgcf.candidate" | awk '{print ${'$'}1}')"
+      [ "${'$'}actual" = "${'$'}expected" ] || return 1
+      chmod 700 "${'$'}WGCF_TMP/wgcf.candidate"
+      wdtt_wgcf_compatible "${'$'}WGCF_TMP/wgcf.candidate" || return 1
+      WGCF_SELECTED_VERSION="${'$'}version"
+      WGCF_SELECTED_SHA256="${'$'}actual"
+      return 0
+    }
+
+    wdtt_fetch_wgcf_baseline() {
+      curl -fsSL --retry 2 --connect-timeout 12 --max-time 300 "${'$'}WGCF_BASELINE_URL" -o "${'$'}WGCF_TMP/wgcf.candidate" || return 1
+      actual="${'$'}(sha256sum "${'$'}WGCF_TMP/wgcf.candidate" | awk '{print ${'$'}1}')"
+      [ "${'$'}actual" = "${'$'}WGCF_BASELINE_SHA256" ] || return 1
+      chmod 700 "${'$'}WGCF_TMP/wgcf.candidate"
+      wdtt_wgcf_compatible "${'$'}WGCF_TMP/wgcf.candidate" || return 1
+      WGCF_SELECTED_VERSION="${'$'}WGCF_BASELINE_VERSION"
+      WGCF_SELECTED_SHA256="${'$'}actual"
+      return 0
+    }
+
+    wdtt_install_or_update_wgcf() {
+      arch="${'$'}(uname -m)"
+      case "${'$'}arch" in
+        x86_64|amd64) ;;
+        *) echo WDTT_ERROR=warp_unsupported_arch; return 2;;
+      esac
+      command -v curl >/dev/null 2>&1 || { echo WDTT_ERROR=warp_download_tools_missing; return 2; }
+      command -v sha256sum >/dev/null 2>&1 || { echo WDTT_ERROR=warp_checksum_tool_missing; return 2; }
+      mkdir -p "${'$'}WGCF_STATE_DIR"
+      chmod 700 "${'$'}WGCF_STATE_DIR"
+      WGCF_TMP="${'$'}(mktemp -d)"
+      WGCF_SELECTED_VERSION=""
+      WGCF_SELECTED_SHA256=""
+      latest_json="${'$'}WGCF_TMP/latest.json"
+      latest_version=""
+      if curl -fL --retry 1 --connect-timeout 10 --max-time 30 -H 'Accept: application/vnd.github+json' "${'$'}WGCF_LATEST_API" -o "${'$'}latest_json" 2>/dev/null; then
+        latest_tag="${'$'}(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\(v[0-9][0-9.]*\)".*/\1/p' "${'$'}latest_json" | head -n 1)"
+        latest_version="${'$'}{latest_tag#v}"
+        printf '%s' "${'$'}latest_version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+${'$'}' || latest_version=""
+      fi
+      if [ -n "${'$'}latest_version" ]; then
+        wdtt_fetch_wgcf_release "${'$'}latest_version" || true
+      fi
+      if [ -z "${'$'}WGCF_SELECTED_VERSION" ]; then
+        if wdtt_wgcf_compatible "${'$'}WGCF_BIN"; then
+          WGCF_SELECTED_VERSION="${'$'}(cat "${'$'}WGCF_STATE_DIR/wgcf-version" 2>/dev/null || echo установленная)"
+          WGCF_SELECTED_SHA256="${'$'}(sha256sum "${'$'}WGCF_BIN" | awk '{print ${'$'}1}')"
+          printf '%s\n' "${'$'}WGCF_SELECTED_VERSION" >"${'$'}WGCF_STATE_DIR/wgcf-version"
+          printf '%s\n' "${'$'}WGCF_SELECTED_SHA256" >"${'$'}WGCF_STATE_DIR/wgcf-sha256"
+          chmod 600 "${'$'}WGCF_STATE_DIR/wgcf-version" "${'$'}WGCF_STATE_DIR/wgcf-sha256"
+          rm -rf "${'$'}WGCF_TMP"
+          echo "Свежий выпуск wgcf сейчас не проверен; сохранена установленная совместимая версия ${'$'}WGCF_SELECTED_VERSION."
+          return 0
+        fi
+        wdtt_fetch_wgcf_baseline || { rm -rf "${'$'}WGCF_TMP"; echo WDTT_ERROR=warp_wgcf_download_failed; return 2; }
+      fi
+      current_sha=""
+      [ -x "${'$'}WGCF_BIN" ] && current_sha="${'$'}(sha256sum "${'$'}WGCF_BIN" | awk '{print ${'$'}1}')"
+      if [ "${'$'}current_sha" != "${'$'}WGCF_SELECTED_SHA256" ]; then
+        [ -x "${'$'}WGCF_BIN" ] && cp -f "${'$'}WGCF_BIN" "${'$'}WGCF_BIN.previous" || true
+        install -m 700 "${'$'}WGCF_TMP/wgcf.candidate" "${'$'}WGCF_BIN"
+        if [ -f "${'$'}WGCF_STATE_DIR/wgcf-account.toml" ] &&
+           ! "${'$'}WGCF_BIN" --config "${'$'}WGCF_STATE_DIR/wgcf-account.toml" status >/dev/null 2>&1; then
+          if [ -x "${'$'}WGCF_BIN.previous" ]; then
+            install -m 700 "${'$'}WGCF_BIN.previous" "${'$'}WGCF_BIN"
+            rm -rf "${'$'}WGCF_TMP"
+            echo WDTT_ERROR=warp_wgcf_update_rolled_back
+            return 2
+          fi
+        fi
+      fi
+      printf '%s\n' "${'$'}WGCF_SELECTED_VERSION" >"${'$'}WGCF_STATE_DIR/wgcf-version"
+      printf '%s\n' "${'$'}WGCF_SELECTED_SHA256" >"${'$'}WGCF_STATE_DIR/wgcf-sha256"
+      chmod 600 "${'$'}WGCF_STATE_DIR/wgcf-version" "${'$'}WGCF_STATE_DIR/wgcf-sha256"
+      rm -rf "${'$'}WGCF_TMP"
+      echo "Версия wgcf: ${'$'}WGCF_SELECTED_VERSION; SHA-256 проверен."
+    }
+""".trimIndent()
+
+private fun freeWarpWatchdogInstallScript(): String = """
+    mkdir -p /usr/local/lib/wdtt /etc/wdtt-plus/warp
+    cat >/usr/local/lib/wdtt/warp-watchdog <<'WDTT_WARP_WATCHDOG'
+    #!/bin/sh
+    set -u
+    MODE="${'$'}(sed -n 's/.*"outboundMode"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /etc/wdtt/outbound.json 2>/dev/null | head -n 1)"
+    [ "${'$'}MODE" = warp_free ] || exit 0
+    STATE_DIR=/etc/wdtt-plus/warp
+    IFACE=wg-wdtt-exit
+    TEST_SOURCE="${'$'}(ip -4 -o addr show dev wdtt0 scope global 2>/dev/null | awk '{split(${'$'}4, value, "/"); print value[1]; exit}')"
+    check_warp() {
+      [ -n "${'$'}TEST_SOURCE" ] || return 1
+      trace="${'$'}(curl -4fsS --interface "${'$'}TEST_SOURCE" --connect-timeout 8 --max-time 20 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
+      printf '%s\n' "${'$'}trace" | grep -Eq '^warp=(on|plus)${'$'}'
+    }
+    write_state() {
+      status="${'$'}1"
+      printf 'STATUS=%s\nCHECKED_AT=%s\n' "${'$'}status" "${'$'}(date -Is)" >"${'$'}STATE_DIR/health.env"
+      chmod 600 "${'$'}STATE_DIR/health.env"
+    }
+    if check_warp; then
+      write_state healthy
+      exit 0
+    fi
+    systemctl restart wdtt-wg-exit.service >/dev/null 2>&1 || true
+    sleep 8
+    if check_warp; then
+      write_state recovered
+      exit 0
+    fi
+    write_state failed
+    exit 1
+    WDTT_WARP_WATCHDOG
+    chmod 700 /usr/local/lib/wdtt/warp-watchdog
+    cat >/etc/systemd/system/wdtt-warp-watchdog.service <<'WDTT_WARP_WATCHDOG_SERVICE'
+    [Unit]
+    Description=WDTT Plus free WARP health check
+    After=network-online.target wdtt-wg-exit.service
+
+    [Service]
+    Type=oneshot
+    ExecStart=/usr/local/lib/wdtt/warp-watchdog
+    WDTT_WARP_WATCHDOG_SERVICE
+    cat >/etc/systemd/system/wdtt-warp-watchdog.timer <<'WDTT_WARP_WATCHDOG_TIMER'
+    [Unit]
+    Description=Check WDTT Plus free WARP every five minutes
+
+    [Timer]
+    OnBootSec=2min
+    OnUnitActiveSec=5min
+    RandomizedDelaySec=30
+    Persistent=true
+
+    [Install]
+    WantedBy=timers.target
+    WDTT_WARP_WATCHDOG_TIMER
+    systemctl daemon-reload
+    systemctl enable --now wdtt-warp-watchdog.timer >/dev/null
+""".trimIndent()
+
+private suspend fun updateWgcfTool(context: Context, target: OutboundSshTarget): String =
+    runRootScript(
+        context = context,
+        target = target,
+        script = shellScript(
+            outboundShellPrelude(),
+            wgcfToolManagementScript(),
+            """
+            echo "WDTT_PROGRESS|0.15|Проверяю архитектуру и инструменты загрузки..."
+            wdtt_install_wireguard_tools || true
+            echo "WDTT_PROGRESS|0.45|Проверяю свежий выпуск wgcf и контрольную сумму..."
+            wdtt_install_or_update_wgcf
+            echo "WDTT_PROGRESS|1.0|Проверка обновления wgcf завершена."
+            """
+        ),
+        timeout = 8 * 60 * 1000L
+    )
+
+internal fun buildFreeWarpInstallScript(mtu: Int = 1280): String {
+    require(mtu in 1280..1500) { "MTU WARP должен быть от 1280 до 1500" }
+    return shellScript(
+        "WARP_MTU=$mtu",
+        outboundShellPrelude(),
+        wgcfToolManagementScript(),
+        """
+        echo "WDTT_PROGRESS|0.08|Проверяю сервер и устанавливаю WireGuard-инструменты..."
+        [ -d /sys/class/net/"${'$'}WDTT_IFACE" ] || { echo WDTT_ERROR=wdtt_iface_not_found; exit 2; }
+        wdtt_install_wireguard_tools || true
+        command -v wg-quick >/dev/null 2>&1 || { echo WDTT_ERROR=wireguard_tools_required; exit 2; }
+        echo "WDTT_PROGRESS|0.24|Проверяю выпуск и SHA-256 инструмента wgcf..."
+        wdtt_install_or_update_wgcf
+        WARP_DIR=/etc/wdtt-plus/warp
+        ACCOUNT="${'$'}WARP_DIR/wgcf-account.toml"
+        RAW_PROFILE="${'$'}WARP_DIR/wgcf-profile.raw.conf"
+        SAFE_PROFILE="${'$'}WARP_DIR/wgcf-profile.conf"
+        mkdir -p "${'$'}WARP_DIR" /etc/wireguard /etc/wdtt-plus/wg-exit
+        chmod 700 "${'$'}WARP_DIR"
+        umask 077
+        echo "WDTT_PROGRESS|0.38|Проверяю сохранённую регистрацию WARP..."
+        NEED_REGISTER=0
+        if [ -f "${'$'}ACCOUNT" ]; then
+          if ! /usr/local/bin/wgcf --config "${'$'}ACCOUNT" status >/dev/null 2>&1; then
+            mv "${'$'}ACCOUNT" "${'$'}ACCOUNT.invalid-$(date +%s)"
+            NEED_REGISTER=1
+          fi
+        else
+          NEED_REGISTER=1
+        fi
+        if [ "${'$'}NEED_REGISTER" = 1 ]; then
+          echo "WDTT_PROGRESS|0.46|Регистрирую бесплатный профиль Cloudflare WARP..."
+          if ! /usr/local/bin/wgcf --config "${'$'}ACCOUNT" register --accept-tos --name "WDTT Plus" --model "WDTT Plus Server" >/tmp/wdtt-wgcf-register.log 2>&1; then
+            if [ ! -f "${'$'}ACCOUNT" ] || ! /usr/local/bin/wgcf --config "${'$'}ACCOUNT" status >/dev/null 2>&1; then
+              rm -f /tmp/wdtt-wgcf-register.log
+              echo WDTT_ERROR=warp_registration_failed
+              exit 3
+            fi
+            echo "Cloudflare вернул ошибку регистрации, но созданный профиль прошёл повторную проверку; продолжаю."
+          fi
+        fi
+        echo "WDTT_PROGRESS|0.56|Создаю WireGuard-профиль WARP..."
+        /usr/local/bin/wgcf --config "${'$'}ACCOUNT" generate --profile "${'$'}RAW_PROFILE" >/tmp/wdtt-wgcf-generate.log 2>&1 || {
+          rm -f /tmp/wdtt-wgcf-generate.log
+          echo WDTT_ERROR=warp_profile_generation_failed
+          exit 3
+        }
+        rm -f /tmp/wdtt-wgcf-register.log /tmp/wdtt-wgcf-generate.log
+        grep -Eq '^[[:space:]]*\[Interface\][[:space:]]*${'$'}' "${'$'}RAW_PROFILE" || { echo WDTT_ERROR=warp_profile_invalid; exit 3; }
+        grep -Eq '^[[:space:]]*PrivateKey[[:space:]]*=' "${'$'}RAW_PROFILE" || { echo WDTT_ERROR=warp_profile_invalid; exit 3; }
+        grep -Eq '^[[:space:]]*Address[[:space:]]*=' "${'$'}RAW_PROFILE" || { echo WDTT_ERROR=warp_profile_invalid; exit 3; }
+        grep -Eq '^[[:space:]]*\[Peer\][[:space:]]*${'$'}' "${'$'}RAW_PROFILE" || { echo WDTT_ERROR=warp_profile_invalid; exit 3; }
+        grep -Eq '^[[:space:]]*Endpoint[[:space:]]*=' "${'$'}RAW_PROFILE" || { echo WDTT_ERROR=warp_profile_invalid; exit 3; }
+        grep -Eq '^[[:space:]]*AllowedIPs[[:space:]]*=.*0\.0\.0\.0/0' "${'$'}RAW_PROFILE" || { echo WDTT_ERROR=warp_profile_invalid; exit 3; }
+        [ "${'$'}(wc -c <"${'$'}RAW_PROFILE")" -le 65536 ] || { echo WDTT_ERROR=warp_profile_invalid; exit 3; }
+        [ "${'$'}(grep -Eic '^[[:space:]]*\[Interface\][[:space:]]*${'$'}' "${'$'}RAW_PROFILE")" = 1 ] || { echo WDTT_ERROR=warp_profile_invalid; exit 3; }
+        [ "${'$'}(grep -Eic '^[[:space:]]*\[Peer\][[:space:]]*${'$'}' "${'$'}RAW_PROFILE")" = 1 ] || { echo WDTT_ERROR=warp_profile_invalid; exit 3; }
+        ! grep -Eqi '^[[:space:]]*(PreUp|PostUp|PreDown|PostDown)[[:space:]]*=' "${'$'}RAW_PROFILE" || { echo WDTT_ERROR=warp_profile_invalid; exit 3; }
+        printf '%s' "${'$'}WARP_MTU" | grep -Eq '^(12[89][0-9]|1[3-4][0-9][0-9]|1500)${'$'}' || { echo WDTT_ERROR=warp_mtu_invalid; exit 3; }
+        awk -v mtu="${'$'}WARP_MTU" '
+          BEGIN { in_interface=0 }
+          /^[[:space:]]*\[Interface\][[:space:]]*${'$'}/ { print "[Interface]"; print "Table = off"; print "MTU = " mtu; in_interface=1; next }
+          /^[[:space:]]*\[/ { in_interface=0; print; next }
+          /^[[:space:]]*(Table|MTU|DNS|PreUp|PostUp|PreDown|PostDown)[[:space:]]*=/ { next }
+          { print }
+        ' "${'$'}RAW_PROFILE" >"${'$'}SAFE_PROFILE"
+        chmod 600 "${'$'}ACCOUNT" "${'$'}RAW_PROFILE" "${'$'}SAFE_PROFILE"
+        install -m 600 "${'$'}SAFE_PROFILE" /etc/wireguard/wg-wdtt-exit.conf
+        install -m 600 "${'$'}SAFE_PROFILE" /etc/wdtt-plus/wg-exit/wg-wdtt-exit.conf
+        """,
+        wireGuardPolicyScript("warp_free", "бесплатный Cloudflare WARP"),
+        freeWarpWatchdogInstallScript(),
+        """
+        echo "WDTT_PROGRESS|0.96|Проверяю, что трафик действительно выходит через WARP..."
+        TEST_SOURCE="${'$'}(wdtt_test_source)"
+        [ -n "${'$'}TEST_SOURCE" ] || { echo WDTT_ERROR=wdtt_test_source_missing; exit 3; }
+        TRACE=""
+        for attempt in 1 2 3; do
+          TRACE="${'$'}(curl -4fsS --interface "${'$'}TEST_SOURCE" --connect-timeout 8 --max-time 25 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
+          printf '%s\n' "${'$'}TRACE" | grep -Eq '^warp=(on|plus)${'$'}' && break
+          [ "${'$'}attempt" = 3 ] || {
+            echo "WDTT_PROGRESS|0.97|WARP пока не ответил, переподключаю канал (${'$'}attempt/3)..."
+            systemctl restart wdtt-wg-exit.service >/dev/null 2>&1 || true
+            sleep 6
+          }
+        done
+        if ! printf '%s\n' "${'$'}TRACE" | grep -Eq '^warp=(on|plus)${'$'}'; then
+          systemctl disable --now wdtt-warp-watchdog.timer 2>/dev/null || true
+          wdtt_clear_external_out
+          wdtt_write_mode "direct" "rollback after WARP check error"
+          echo WDTT_ERROR=warp_trace_check_failed
+          exit 3
+        fi
+        EXIT_IP="${'$'}(curl -4fsS --interface "${'$'}TEST_SOURCE" --connect-timeout 8 --max-time 20 https://api.ipify.org 2>/dev/null || true)"
+        printf 'STATUS=healthy\nCHECKED_AT=%s\n' "${'$'}(date -Is)" >/etc/wdtt-plus/warp/health.env
+        chmod 600 /etc/wdtt-plus/warp/health.env
+        echo "WDTT_PROGRESS|1.0|Бесплатный WARP установлен и проверен."
+        echo "Бесплатный WARP включён только для WDTT-пользователей."
+        [ -n "${'$'}EXIT_IP" ] && echo "Проверочный выходной IP Cloudflare: ${'$'}EXIT_IP"
+        echo "Автоматическая проверка запускается каждые 5 минут и один раз перезапускает WireGuard при сбое."
+        """
+    )
+}
+
+private suspend fun installOrRepairFreeWarp(
+    context: Context,
+    target: OutboundSshTarget,
+    mtu: Int
+): String = runRootScript(context, target, buildFreeWarpInstallScript(mtu), timeout = CMD_TIMEOUT)
+
+private suspend fun checkFreeWarp(
+    target: OutboundSshTarget,
+    restartOnFailure: Boolean
+): String = withContext(Dispatchers.IO) {
+    var session: Session? = null
+    try {
+        session = createSSHSession(target.host, target.user, target.pass, target.port)
+        val ssh = SSHClient(session, target.pass)
+        val restart = if (restartOnFailure) "1" else "0"
+        val script = shellScript(
+            outboundShellPrelude(),
+            """
+            MODE="${'$'}(sed -n 's/.*"outboundMode"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /etc/wdtt/outbound.json 2>/dev/null | head -n 1)"
+            [ "${'$'}MODE" = "warp_free" ] || { echo WDTT_ERROR=warp_mode_not_active; exit 3; }
+            [ -f /etc/wdtt-plus/warp/wgcf-account.toml ] || { echo WDTT_ERROR=warp_account_missing; exit 3; }
+            [ -f /etc/wireguard/wg-wdtt-exit.conf ] || { echo WDTT_ERROR=warp_profile_missing; exit 3; }
+            command -v wg >/dev/null 2>&1 || { echo WDTT_ERROR=wireguard_tools_required; exit 2; }
+            if [ "$restart" = 1 ]; then
+              systemctl restart wdtt-wg-exit.service >/dev/null 2>&1 || { echo WDTT_ERROR=wireguard_exit_service_inactive; exit 3; }
+              sleep 4
+            fi
+            wg show "${'$'}WDTT_WG_IFACE" >/dev/null 2>&1 || { echo WDTT_ERROR=wireguard_not_active; exit 3; }
+            TEST_SOURCE="${'$'}(wdtt_test_source)"
+            [ -n "${'$'}TEST_SOURCE" ] || { echo WDTT_ERROR=wdtt_test_source_missing; exit 3; }
+            TRACE="${'$'}(curl -4fsS --interface "${'$'}TEST_SOURCE" --connect-timeout 8 --max-time 25 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
+            printf '%s\n' "${'$'}TRACE" | grep -Eq '^warp=(on|plus)${'$'}' || { echo WDTT_ERROR=warp_trace_check_failed; exit 3; }
+            EXIT_IP="${'$'}(curl -4fsS --interface "${'$'}TEST_SOURCE" --connect-timeout 8 --max-time 20 https://api.ipify.org 2>/dev/null || true)"
+            WARP_KIND="${'$'}(printf '%s\n' "${'$'}TRACE" | sed -n 's/^warp=//p' | head -n 1)"
+            VERSION="${'$'}(cat /etc/wdtt-plus/warp/wgcf-version 2>/dev/null || echo неизвестна)"
+            TIMER="${'$'}(systemctl is-active wdtt-warp-watchdog.timer 2>/dev/null || true)"
+            HANDSHAKE="${'$'}(wg show "${'$'}WDTT_WG_IFACE" latest-handshakes 2>/dev/null | awk '{print ${'$'}2}' | sort -nr | head -n 1)"
+            printf 'STATUS=healthy\nCHECKED_AT=%s\n' "${'$'}(date -Is)" >/etc/wdtt-plus/warp/health.env
+            chmod 600 /etc/wdtt-plus/warp/health.env
+            echo "Проверка успешна: Cloudflare сообщает warp=${'$'}WARP_KIND."
+            [ -n "${'$'}EXIT_IP" ] && echo "Выходной IP: ${'$'}EXIT_IP"
+            echo "wgcf: ${'$'}VERSION"
+            echo "Автопроверка: ${'$'}{TIMER:-не запущена}"
+            [ -n "${'$'}HANDSHAKE" ] && [ "${'$'}HANDSHAKE" != 0 ] && echo "Последнее WireGuard-рукопожатие: $(date -d @${'$'}HANDSHAKE -Is 2>/dev/null || echo ${'$'}HANDSHAKE)"
+            """
+        )
+        val output = ssh.exec(rootCommand(script), timeout = 45000L).trim()
+        markerValue(output, "WDTT_ERROR")?.let { throw IllegalStateException(output.take(1200)) }
+        output
+    } finally {
+        try { session?.disconnect() } catch (_: Exception) {}
+    }
+}
+
+private suspend fun deleteFreeWarp(target: OutboundSshTarget): String = withContext(Dispatchers.IO) {
+    var session: Session? = null
+    try {
+        session = createSSHSession(target.host, target.user, target.pass, target.port)
+        val ssh = SSHClient(session, target.pass)
+        val script = shellScript(
+            outboundShellPrelude(),
+            """
+            MODE="${'$'}(sed -n 's/.*"outboundMode"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /etc/wdtt/outbound.json 2>/dev/null | head -n 1)"
+            echo "WDTT_PROGRESS|0.20|Останавливаю автоматическую проверку WARP..."
+            systemctl disable --now wdtt-warp-watchdog.timer wdtt-warp-watchdog.service 2>/dev/null || true
+            if [ "${'$'}MODE" = "warp_free" ]; then
+              echo "WDTT_PROGRESS|0.45|Возвращаю прямой выход WDTT..."
+              wdtt_clear_external_out
+              rm -f /etc/wireguard/wg-wdtt-exit.conf /etc/wdtt-plus/wg-exit/wg-wdtt-exit.conf
+              wdtt_write_mode "direct" "прямой выход"
+            fi
+            echo "WDTT_PROGRESS|0.70|Удаляю регистрацию, ключи и профиль WARP..."
+            rm -rf /etc/wdtt-plus/warp
+            rm -f /usr/local/bin/wgcf /usr/local/bin/wgcf.previous /usr/local/lib/wdtt/warp-watchdog
+            rm -f /etc/systemd/system/wdtt-warp-watchdog.service /etc/systemd/system/wdtt-warp-watchdog.timer
+            systemctl daemon-reload 2>/dev/null || true
+            systemctl reset-failed wdtt-warp-watchdog.service 2>/dev/null || true
+            echo "WDTT_PROGRESS|1.0|Бесплатный WARP удалён."
+            echo "Регистрация, ключи, профиль и автоматическая проверка WARP удалены с сервера."
+            if [ "${'$'}MODE" = "warp_free" ]; then
+              echo "WDTT-пользователи снова выходят напрямую через текущий VPS."
+            else
+              echo "Другой активный режим выхода не изменён."
+            fi
+            """
+        )
+        val output = ssh.exec(rootCommand(script), timeout = 60000L).trim()
+        markerValue(output, "WDTT_ERROR")?.let { throw IllegalStateException(output.take(1200)) }
+        output
+    } finally {
+        try { session?.disconnect() } catch (_: Exception) {}
+    }
+}
 
 private suspend fun enableImportedWireGuardExit(
     context: Context,
@@ -4135,13 +5520,13 @@ private suspend fun enableImportedWireGuardExit(
             """
             echo "WDTT_PROGRESS|0.18|Готовлю инструменты WireGuard на текущем сервере..."
             wdtt_install_wireguard_tools || true
-            echo "WDTT_PROGRESS|0.45|Сохраняю выбранный VPN/WARP-файл без опасных команд..."
+            echo "WDTT_PROGRESS|0.45|Сохраняю выбранный VPN/WireGuard-файл без опасных команд..."
             mkdir -p /etc/wdtt-plus/wg-exit /etc/wireguard
             install -m 600 /tmp/wdtt-imported-wg.conf /etc/wdtt-plus/wg-exit/wg-wdtt-exit.conf
             install -m 600 /tmp/wdtt-imported-wg.conf /etc/wireguard/wg-wdtt-exit.conf
             rm -f /tmp/wdtt-imported-wg.conf
             """,
-            wireGuardPolicyScript("imported_wg", "VPN/WARP-файл")
+            wireGuardPolicyScript("imported_wg", "VPN/WireGuard-файл")
         )
         val output = ssh.exec(rootCommand(script), timeout = CMD_TIMEOUT)
         markerValue(output, "WDTT_ERROR")?.let { throw IllegalStateException(it) }
@@ -4162,12 +5547,18 @@ private suspend fun deleteImportedWireGuardExit(target: OutboundSshTarget): Stri
             """
             echo "WDTT_PROGRESS|0.25|Отключаю WireGuard-выход, если он запущен..."
             wdtt_clear_external_out
-            echo "WDTT_PROGRESS|0.60|Удаляю сохранённый VPN/WARP-файл..."
+            echo "WDTT_PROGRESS|0.60|Удаляю сохранённый VPN/WireGuard-файл..."
             rm -f /etc/wdtt-plus/wg-exit/wg-wdtt-exit.conf /etc/wireguard/wg-wdtt-exit.conf
+            if [ -f /etc/wdtt/outbound-profile.env ]; then
+              tmp_profile=/etc/wdtt/outbound-profile.env.tmp
+              grep -v '^IMPORTED_WG_CONFIG_B64=' /etc/wdtt/outbound-profile.env >"${'$'}tmp_profile" 2>/dev/null || true
+              chmod 600 "${'$'}tmp_profile"
+              mv "${'$'}tmp_profile" /etc/wdtt/outbound-profile.env
+            fi
             echo "WDTT_PROGRESS|0.85|Возвращаю прямой выход через текущий сервер..."
             wdtt_write_mode "direct" "прямой выход"
-            echo "WDTT_PROGRESS|1.0|VPN/WARP-файл удалён."
-            echo "VPN/WARP-файл удалён, выход WDTT возвращён напрямую через текущий сервер."
+            echo "WDTT_PROGRESS|1.0|VPN/WireGuard-файл удалён."
+            echo "VPN/WireGuard-файл удалён, выход WDTT возвращён напрямую через текущий сервер."
             """
         )
         ssh.exec(rootCommand(script), timeout = 30000L).trim()
@@ -4430,12 +5821,42 @@ private fun friendlyDeployError(error: Throwable, operation: String): String {
             "на сервере не найдены правила межсетевого экрана iptables, без них этот режим не включить."
         "wdtt_iface_not_found" in lower ->
             "на сервере не найден интерфейс WDTT. Сначала запустите сервер WDTT Plus и проверьте подключение."
+        "wdtt_test_source_missing" in lower ->
+            "интерфейс WDTT запущен без IPv4-адреса, поэтому безопасно проверить реальный путь клиентского трафика не получилось."
         "wireguard_tools_required" in lower ->
             "на сервере не найдены инструменты WireGuard, без них этот режим не включить."
+        "wireguard_exit_service_inactive" in lower ->
+            "служба WireGuard-выхода не запустилась. Приложение не будет оставлять неполные маршруты; проверьте конфигурацию и журнал systemd."
         "wireguard_not_active" in lower ->
-            "WireGuard-выход wdtt сейчас не запущен. Включите режим «Другой сервер» или «VPN/WARP-файл», затем повторите проверку."
+            "WireGuard-выход WDTT сейчас не запущен. Включите «Бесплатный WARP», «Другой сервер» или «VPN/WireGuard-файл», затем повторите проверку."
         "wireguard_exit_check_failed" in lower ->
             "WireGuard-интерфейс запущен, но проверочный сайт через него не открылся. Проверьте конфиг, endpoint, NAT и доступ второго сервера/VPN к интернету."
+        "warp_unsupported_arch" in lower ->
+            "автоматический WARP поддерживает Linux amd64 — ту же архитектуру, для которой собирается сервер WDTT Plus. На этом сервере определена другая архитектура."
+        "warp_download_tools_missing" in lower ->
+            "на сервере нет curl, поэтому безопасно скачать wgcf не получилось. Проверьте пакетный менеджер и доступ сервера к интернету."
+        "warp_checksum_tool_missing" in lower ->
+            "на сервере нет sha256sum, поэтому приложение отказалось запускать wgcf без проверки контрольной суммы."
+        "warp_wgcf_download_failed" in lower ->
+            "не удалось получить совместимый wgcf с корректной SHA-256. Проверены свежий выпуск и закреплённая резервная версия; ни один файл не был запущен."
+        "warp_wgcf_update_rolled_back" in lower ->
+            "новый wgcf прошёл проверку файла, но не смог прочитать действующую WARP-регистрацию. Приложение вернуло предыдущий бинарник."
+        "warp_registration_failed" in lower ->
+            withTail("Cloudflare не принял регистрацию бесплатного WARP. Проверьте доступ сервера к api.cloudflareclient.com и повторите позже.")
+        "warp_profile_generation_failed" in lower ->
+            withTail("регистрация WARP найдена, но wgcf не смог создать WireGuard-профиль. Существующие ключи сохранены; повторите восстановление.")
+        "warp_profile_invalid" in lower ->
+            "wgcf создал неполный WireGuard-профиль. Он не был применён к серверу."
+        "warp_mtu_invalid" in lower ->
+            "сервер отклонил MTU WARP: допустимо только целое значение от 1280 до 1500."
+        "warp_trace_check_failed" in lower ->
+            "WireGuard запустился, но Cloudflare не подтвердил warp=on/plus. Возможны временный сбой endpoint или региональное ограничение WARP. При установке приложение вернуло прямой выход; при обычной проверке можно попробовать перезапуск или восстановление."
+        "warp_mode_not_active" in lower ->
+            "бесплатный WARP сейчас не выбран как активный выход WDTT. Сначала нажмите «Установить / восстановить»."
+        "warp_account_missing" in lower ->
+            "на сервере не найдена регистрация бесплатного WARP. Нажмите «Установить / восстановить» и подтвердите условия Cloudflare."
+        "warp_profile_missing" in lower ->
+            "регистрация WARP есть, но WireGuard-профиль отсутствует. Нажмите «Установить / восстановить»."
         "foreign_ext_iface_not_found" in lower ->
             "на другом сервере не удалось определить основной сетевой интерфейс."
         "root privileges required" in lower ||

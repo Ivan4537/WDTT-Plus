@@ -468,8 +468,18 @@ func botScriptErrorText(err error, output string) string {
 		return "Не удалось установить компонент перенаправления через внешний прокси. Проверьте доступ сервера к интернету и пакетному менеджеру."
 	case "wdtt_iface_not_found":
 		return "На сервере не найден сетевой интерфейс WDTT. Сначала запустите установленный WDTT-сервер."
+	case "wdtt_test_source_missing":
+		return "Интерфейс WDTT не имеет IPv4-адреса, поэтому проверить реальный путь клиентского трафика не получилось."
 	case "wireguard_tools_required":
 		return "На сервере не найдены инструменты WireGuard. Без них нельзя включить выход через WireGuard."
+	case "warp_mode_not_active":
+		return "Бесплатный WARP сейчас не выбран как активный выход. Установите или восстановите его из Android-приложения."
+	case "warp_account_missing":
+		return "Регистрация бесплатного WARP не найдена. Создайте её из Android-приложения с подтверждением условий Cloudflare."
+	case "warp_profile_missing":
+		return "WireGuard-профиль WARP не найден. Выполните восстановление из Android-приложения."
+	case "warp_trace_check_failed":
+		return "Cloudflare не подтвердил warp=on/plus. Возможны временный сбой endpoint или региональное ограничение WARP. Попробуйте перезапуск, затем восстановление из приложения."
 	default:
 		if strings.TrimSpace(output) != "" {
 			return strings.TrimSpace(output)
@@ -509,7 +519,12 @@ func isFriendlyBotScriptError(err error) bool {
 		"local_proxy_service_still_active",
 		"redsocks_not_installed",
 		"wdtt_iface_not_found",
-		"wireguard_tools_required":
+		"wdtt_test_source_missing",
+		"wireguard_tools_required",
+		"warp_mode_not_active",
+		"warp_account_missing",
+		"warp_profile_missing",
+		"warp_trace_check_failed":
 		return true
 	default:
 		return false
@@ -537,6 +552,9 @@ WDTT_WG_IFACE="wg-wdtt-exit"
 mkdir -p /etc/wdtt /etc/wdtt/outbound /etc/wdtt-plus/wg-exit
 wdtt_ext_iface() {
   ip -o route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}'
+}
+wdtt_test_source() {
+  ip -4 -o addr show dev "$WDTT_IFACE" scope global 2>/dev/null | awk '{split($4, value, "/"); print value[1]; exit}'
 }
 wdtt_install_pkg() {
   if command -v apt-get >/dev/null 2>&1; then
@@ -575,22 +593,24 @@ wdtt_install_redsocks_tools() {
 }
 wdtt_install_wireguard_tools() {
   if command -v apt-get >/dev/null 2>&1; then
-    wdtt_install_pkg wireguard-tools curl iptables iproute2
+    wdtt_install_pkg wireguard-tools curl ca-certificates iptables iproute2
   elif command -v dnf >/dev/null 2>&1; then
-    wdtt_install_pkg wireguard-tools curl iptables iproute
+    wdtt_install_pkg wireguard-tools curl ca-certificates iptables iproute
   elif command -v yum >/dev/null 2>&1; then
-    wdtt_install_pkg wireguard-tools curl iptables iproute
+    wdtt_install_pkg wireguard-tools curl ca-certificates iptables iproute
   elif command -v zypper >/dev/null 2>&1; then
-    wdtt_install_pkg wireguard-tools curl iptables iproute2
+    wdtt_install_pkg wireguard-tools curl ca-certificates iptables iproute2
   elif command -v apk >/dev/null 2>&1; then
-    wdtt_install_pkg wireguard-tools curl iptables iproute2
+    wdtt_install_pkg wireguard-tools curl ca-certificates iptables iproute2
   elif command -v pacman >/dev/null 2>&1; then
-    wdtt_install_pkg wireguard-tools curl iptables iproute2
+    wdtt_install_pkg wireguard-tools curl ca-certificates iptables iproute2
   else
     return 1
   fi
 }
 wdtt_clear_external_out() {
+  systemctl disable --now wdtt-warp-watchdog.timer 2>/dev/null || true
+  systemctl disable --now wdtt-wg-exit.service 2>/dev/null || true
   if command -v iptables >/dev/null 2>&1; then
     iptables -t nat -D PREROUTING -i "$WDTT_IFACE" -p tcp -j WDTT_PROXY_OUT 2>/dev/null || true
     iptables -t nat -F WDTT_PROXY_OUT 2>/dev/null || true
@@ -679,6 +699,7 @@ fi
 case "$MODE" in
   direct) MODE_LABEL="прямой выход";;
   external_proxy) MODE_LABEL="внешний прокси";;
+  warp_free) MODE_LABEL="бесплатный WARP";;
   imported_wg) MODE_LABEL="готовый WireGuard-файл";;
   wireguard_vps) MODE_LABEL="другой сервер через WireGuard";;
   *) MODE_LABEL="$MODE";;
@@ -689,13 +710,28 @@ echo "Описание: $DETAIL"
 echo "Подсеть клиентов WDTT: $WDTT_SUBNET"
 echo "Интерфейс клиентов: $WDTT_IFACE"
 echo "Внешний IP самого сервера: $SERVER_IP"
-	if systemctl is-active wdtt-3proxy >/dev/null 2>&1; then echo "Прокси на этом сервере: служба запущена"; else echo "Прокси на этом сервере: служба остановлена"; fi
-	if systemctl is-active wdtt-redsocks >/dev/null 2>&1; then echo "Внешний прокси для WDTT: включён"; else echo "Внешний прокси для WDTT: выключен"; fi
+if systemctl is-active wdtt-3proxy >/dev/null 2>&1; then echo "Прокси на этом сервере: служба запущена"; else echo "Прокси на этом сервере: служба остановлена"; fi
+EXTERNAL_ACTIVE=0
+if systemctl is-active wdtt-redsocks >/dev/null 2>&1; then EXTERNAL_ACTIVE=1; echo "Внешний прокси для WDTT: включён"; else echo "Внешний прокси для WDTT: выключен"; fi
+WG_ACTIVE=0
 if command -v wg >/dev/null 2>&1 && wg show "$WDTT_WG_IFACE" >/dev/null 2>&1; then
+  WG_ACTIVE=1
   echo "WireGuard $WDTT_WG_IFACE:"
   wg show "$WDTT_WG_IFACE" | sed -E 's/(private key: ).*/\1(скрыт)/'
 else
   echo "WireGuard $WDTT_WG_IFACE: не запущен"
+fi
+if [ "$EXTERNAL_ACTIVE" = 1 ] && [ "$WG_ACTIVE" = 1 ]; then
+  echo "Внимание: одновременно активны внешний TCP-прокси и WireGuard-выход. Верните прямой выход или выполните диагностику перед новым переключением."
+fi
+if [ "$MODE" = "warp_free" ]; then
+  TEST_SOURCE="$(wdtt_test_source)"
+  WARP_TRACE=""
+  [ -n "$TEST_SOURCE" ] && WARP_TRACE="$(curl -4fsS --interface "$TEST_SOURCE" --max-time 15 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
+  WARP_STATE="$(printf '%s\n' "$WARP_TRACE" | sed -n 's/^warp=//p' | head -n 1)"
+  echo "Cloudflare WARP: ${WARP_STATE:-проверка не пройдена}"
+  echo "MTU WARP: $(sed -n 's/^[[:space:]]*MTU[[:space:]]*=[[:space:]]*//Ip' /etc/wireguard/wg-wdtt-exit.conf 2>/dev/null | head -n 1)"
+  echo "Автопроверка WARP: $(systemctl is-active wdtt-warp-watchdog.timer 2>/dev/null || echo не запущена)"
 fi
 `
 }
@@ -777,6 +813,9 @@ func sendOutboundMenu(token string, adminID int64, messageID int) int {
 		},
 		[]map[string]interface{}{
 			inlineButton("🔐 Выход WireGuard", "out_wg"),
+		},
+		[]map[string]interface{}{
+			inlineButton("☁️ Бесплатный WARP", "out_warp"),
 		},
 		[]map[string]interface{}{inlineButton("↩️ Вернуть прямой выход", "out_direct")},
 		[]map[string]interface{}{inlineButton("◀️ Назад", "settings")},
@@ -1177,9 +1216,69 @@ echo "Прокси: $PROXY_KIND://$PROXY_HOST:$PROXY_PORT"
 `, outboundBotPrelude(), botShellQuote(kind), botShellQuote(redsocksType), botShellQuote(host), port, botShellQuote(login), botShellQuote(password))
 }
 
+func sendFreeWarpMenu(token string, adminID int64, messageID int) int {
+	text := "☁️ *Бесплатный WARP*\n\n" +
+		"WARP скрывает выходной IP VPS для WDTT-пользователей без второго сервера. Регистрация и выбор MTU выполняются в Android-приложении, где администратор подтверждает условия Cloudflare.\n\n" +
+		"Бот может проверить уже установленный WARP, перезапустить его или удалить регистрацию. При удалении трафик WDTT вернётся на прямой выход."
+	return sendOrEditTelegram(token, adminID, messageID, text, inlineKeyboard(
+		[]map[string]interface{}{inlineButton("🧪 Проверить WARP", "out_warp_check")},
+		[]map[string]interface{}{inlineButton("🔄 Перезапустить и проверить", "out_warp_restart")},
+		[]map[string]interface{}{inlineButton("🗑 Удалить WARP", "out_warp_delete")},
+		[]map[string]interface{}{inlineButton("◀️ Назад", "settings_outbound")},
+	))
+}
+
+func freeWarpCheckScript(restart bool) string {
+	restartValue := "0"
+	if restart {
+		restartValue = "1"
+	}
+	return fmt.Sprintf(`%s
+MODE="$(sed -n 's/.*"outboundMode"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /etc/wdtt/outbound.json 2>/dev/null | head -n 1)"
+[ "$MODE" = "warp_free" ] || { echo WDTT_ERROR=warp_mode_not_active; exit 3; }
+[ -f /etc/wdtt-plus/warp/wgcf-account.toml ] || { echo WDTT_ERROR=warp_account_missing; exit 3; }
+[ -f /etc/wireguard/wg-wdtt-exit.conf ] || { echo WDTT_ERROR=warp_profile_missing; exit 3; }
+if [ %s = 1 ]; then
+  systemctl restart wdtt-wg-exit.service >/dev/null 2>&1 || { echo WDTT_ERROR=wireguard_not_active; exit 3; }
+  sleep 4
+fi
+wg show "$WDTT_WG_IFACE" >/dev/null 2>&1 || { echo WDTT_ERROR=wireguard_not_active; exit 3; }
+TEST_SOURCE="$(wdtt_test_source)"
+[ -n "$TEST_SOURCE" ] || { echo WDTT_ERROR=wdtt_test_source_missing; exit 3; }
+TRACE="$(curl -4fsS --interface "$TEST_SOURCE" --connect-timeout 8 --max-time 25 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
+printf '%%s\n' "$TRACE" | grep -Eq '^warp=(on|plus)$' || { echo WDTT_ERROR=warp_trace_check_failed; exit 3; }
+EXIT_IP="$(curl -4fsS --interface "$TEST_SOURCE" --connect-timeout 8 --max-time 20 https://api.ipify.org 2>/dev/null || true)"
+WARP_STATE="$(printf '%%s\n' "$TRACE" | sed -n 's/^warp=//p' | head -n 1)"
+MTU="$(sed -n 's/^[[:space:]]*MTU[[:space:]]*=[[:space:]]*//Ip' /etc/wireguard/wg-wdtt-exit.conf | head -n 1)"
+VERSION="$(cat /etc/wdtt-plus/warp/wgcf-version 2>/dev/null || echo неизвестна)"
+echo "Cloudflare подтвердил warp=$WARP_STATE."
+[ -n "$EXIT_IP" ] && echo "Выходной IP: $EXIT_IP"
+echo "MTU: ${MTU:-не указан}"
+echo "wgcf: $VERSION"
+echo "Автопроверка: $(systemctl is-active wdtt-warp-watchdog.timer 2>/dev/null || echo не запущена)"
+`, outboundBotPrelude(), restartValue)
+}
+
+func deleteFreeWarpScript() string {
+	return outboundBotPrelude() + `
+MODE="$(sed -n 's/.*"outboundMode"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /etc/wdtt/outbound.json 2>/dev/null | head -n 1)"
+systemctl disable --now wdtt-warp-watchdog.timer wdtt-warp-watchdog.service 2>/dev/null || true
+if [ "$MODE" = "warp_free" ]; then
+  wdtt_clear_external_out
+  rm -f /etc/wireguard/wg-wdtt-exit.conf /etc/wdtt-plus/wg-exit/wg-wdtt-exit.conf
+  wdtt_write_mode "direct" "прямой выход"
+fi
+rm -rf /etc/wdtt-plus/warp
+rm -f /usr/local/bin/wgcf /usr/local/bin/wgcf.previous /usr/local/lib/wdtt/warp-watchdog
+rm -f /etc/systemd/system/wdtt-warp-watchdog.service /etc/systemd/system/wdtt-warp-watchdog.timer
+systemctl daemon-reload 2>/dev/null || true
+echo "Бесплатный WARP удалён. Если он был активен, WDTT-пользователи возвращены на прямой выход."
+`
+}
+
 func sendWireGuardExitMenu(token string, adminID int64, messageID int) int {
 	text := "🔐 *Выход через WireGuard*\n\n" +
-		"Первичная настройка другого сервера или импорт готового WireGuard-файла выполняется из Android-приложения. В боте можно посмотреть статус, отключить выход через WireGuard или удалить импортированный файл.\n\n" +
+		"Первичная настройка другого сервера или импорт готового WireGuard-файла, включая собственный WARP/WARP+, выполняется из Android-приложения. В боте можно посмотреть статус, отключить выход через WireGuard или удалить импортированный файл.\n\n" +
 		"Отключение возвращает WDTT на прямой выход через текущий сервер и очищает только правила внешнего выхода."
 	return sendOrEditTelegram(token, adminID, messageID, text, inlineKeyboard(
 		[]map[string]interface{}{inlineButton("📊 Статус WireGuard", "out_wg_status")},
@@ -1193,8 +1292,14 @@ func deleteImportedWGScript() string {
 	return outboundBotPrelude() + `
 wdtt_clear_external_out
 rm -f /etc/wdtt-plus/wg-exit/wg-wdtt-exit.conf /etc/wireguard/wg-wdtt-exit.conf
+if [ -f /etc/wdtt/outbound-profile.env ]; then
+  tmp_profile=/etc/wdtt/outbound-profile.env.tmp
+  grep -v '^IMPORTED_WG_CONFIG_B64=' /etc/wdtt/outbound-profile.env >"$tmp_profile" 2>/dev/null || true
+  chmod 600 "$tmp_profile"
+  mv "$tmp_profile" /etc/wdtt/outbound-profile.env
+fi
 wdtt_write_mode "direct" "прямой выход через текущий сервер"
-echo "Готовый WireGuard-файл удалён, выход WDTT возвращён напрямую через текущий сервер."
+echo "Готовый WireGuard-файл и его сохранённая копия удалены, выход WDTT возвращён напрямую через текущий сервер."
 `
 }
 
@@ -2723,6 +2828,28 @@ func botLoop(token string, adminIDstr string, wgDev *device.Device) {
 							[]map[string]interface{}{inlineButton("◀️ Назад", "out_external")},
 						),
 					)
+				} else if data == "out_warp" {
+					promptMessageID = sendFreeWarpMenu(token, adminID, menuMessageID)
+				} else if data == "out_warp_check" {
+					promptMessageID = sendOrEditTelegram(token, adminID, menuMessageID, "🧪 Проверяю Cloudflare WARP и выходной IP...", nil)
+					out, err := runBotScript(freeWarpCheckScript(false), 35*time.Second)
+					promptMessageID = sendBotScriptResult(token, adminID, promptMessageID, "Проверка бесплатного WARP", out, err, "out_warp")
+				} else if data == "out_warp_restart" {
+					promptMessageID = sendOrEditTelegram(token, adminID, menuMessageID, "🔄 Перезапускаю WireGuard-выход и проверяю WARP...", nil)
+					out, err := runBotScript(freeWarpCheckScript(true), 45*time.Second)
+					promptMessageID = sendBotScriptResult(token, adminID, promptMessageID, "WARP перезапущен и проверен", out, err, "out_warp")
+				} else if data == "out_warp_delete" {
+					promptMessageID = sendOrEditTelegram(token, adminID, menuMessageID,
+						"🗑 *Удалить бесплатный WARP?*\n\nБудут удалены регистрация, ключи, профиль и автоматическая проверка. Если WARP активен, WDTT вернётся на прямой выход через VPS.",
+						inlineKeyboard(
+							[]map[string]interface{}{inlineButton("Да, удалить WARP", "confirm_out_warp_delete")},
+							[]map[string]interface{}{inlineButton("◀️ Назад", "out_warp")},
+						),
+					)
+				} else if data == "confirm_out_warp_delete" {
+					promptMessageID = sendOrEditTelegram(token, adminID, menuMessageID, "🗑 Удаляю WARP и возвращаю безопасный выход...", nil)
+					out, err := runBotScript(deleteFreeWarpScript(), 45*time.Second)
+					promptMessageID = sendBotScriptResult(token, adminID, promptMessageID, "Бесплатный WARP удалён", out, err, "settings_outbound")
 				} else if data == "out_wg" {
 					promptMessageID = sendWireGuardExitMenu(token, adminID, menuMessageID)
 				} else if data == "out_wg_status" {
@@ -2731,7 +2858,7 @@ func botLoop(token string, adminIDstr string, wgDev *device.Device) {
 					promptMessageID = sendBotScriptResult(token, adminID, promptMessageID, "Статус выхода через WireGuard", out, err, "out_wg")
 				} else if data == "out_wg_delete_import" {
 					promptMessageID = sendOrEditTelegram(token, adminID, menuMessageID,
-						"🗑 *Удалить готовый WireGuard-файл?*\n\nБудут удалены файлы WireGuard, а выход WDTT вернётся напрямую через текущий сервер. Первичная настройка другого сервера из приложения не удаляется.",
+						"🗑 *Удалить готовый WireGuard-файл?*\n\nБудут удалены рабочие файлы WireGuard и сохранённая копия импортированного конфига, а выход WDTT вернётся напрямую через текущий сервер. Первичная настройка другого сервера из приложения не удаляется.",
 						inlineKeyboard(
 							[]map[string]interface{}{inlineButton("Да, удалить файл", "confirm_out_wg_delete_import")},
 							[]map[string]interface{}{inlineButton("◀️ Назад", "out_wg")},

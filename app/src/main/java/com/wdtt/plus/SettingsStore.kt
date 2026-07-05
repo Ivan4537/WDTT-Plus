@@ -313,6 +313,7 @@ class SettingsStore(context: Context) {
         private val UPDATE_DIALOG_LAST_ACTION_AT = longPreferencesKey("update_dialog_last_action_at")
         private val MIGRATION_NOTICE_V2_SHOWN = booleanPreferencesKey("migration_notice_v2_shown")
         private val MIGRATION_NOTICE_V3_SHOWN = booleanPreferencesKey("migration_notice_v3_shown")
+        private val MIGRATION_NOTICE_V5_SHOWN = booleanPreferencesKey("migration_notice_v5_shown")
         private val DEPLOY_CLIENTS_SECTION_EXPANDED = booleanPreferencesKey("deploy_clients_section_expanded")
         private val DEPLOY_OUTBOUND_SECTION_EXPANDED = booleanPreferencesKey("deploy_outbound_section_expanded")
         private val DEPLOY_MIGRATION_SECTION_EXPANDED = booleanPreferencesKey("deploy_migration_section_expanded")
@@ -537,6 +538,7 @@ class SettingsStore(context: Context) {
     val updateDialogLastActionAt: Flow<Long> = dataStore.data.map { it[UPDATE_DIALOG_LAST_ACTION_AT] ?: 0L }
     val migrationNoticeV2Shown: Flow<Boolean> = dataStore.data.map { it[MIGRATION_NOTICE_V2_SHOWN] ?: false }
     val migrationNoticeV3Shown: Flow<Boolean> = dataStore.data.map { it[MIGRATION_NOTICE_V3_SHOWN] ?: false }
+    val migrationNoticeV5Shown: Flow<Boolean> = dataStore.data.map { it[MIGRATION_NOTICE_V5_SHOWN] ?: false }
     val deployClientsSectionExpanded: Flow<Boolean> = dataStore.data.map { it[DEPLOY_CLIENTS_SECTION_EXPANDED] ?: true }
     val deployOutboundSectionExpanded: Flow<Boolean> = dataStore.data.map { it[DEPLOY_OUTBOUND_SECTION_EXPANDED] ?: false }
     val deployMigrationSectionExpanded: Flow<Boolean> = dataStore.data.map { it[DEPLOY_MIGRATION_SECTION_EXPANDED] ?: false }
@@ -646,6 +648,12 @@ class SettingsStore(context: Context) {
     suspend fun saveMigrationNoticeV3Shown() {
         dataStore.edit { prefs ->
             prefs[MIGRATION_NOTICE_V3_SHOWN] = true
+        }
+    }
+
+    suspend fun saveMigrationNoticeV5Shown() {
+        dataStore.edit { prefs ->
+            prefs[MIGRATION_NOTICE_V5_SHOWN] = true
         }
     }
 
