@@ -123,6 +123,7 @@ import com.wdtt.plus.ServerAdminClient
 import com.wdtt.plus.ServerAdminProfileInfo
 import com.wdtt.plus.ServerAdminState
 import com.wdtt.plus.ServerAdminTarget
+import com.wdtt.plus.SshCredentials
 import com.wdtt.plus.ServerClientCreateRequest
 import com.wdtt.plus.ServerClientInfo
 import com.wdtt.plus.ServerTrafficPeriod
@@ -167,14 +168,29 @@ internal fun serverClientsAccessIssue(
     hostValid: Boolean,
     sshPassword: String,
     sshPort: Int,
-    mainPassword: String
-): String? = when {
-    host.isBlank() -> "Укажите IP-адрес или домен сервера в верхнем блоке «Деплой»."
-    !hostValid -> "Проверьте IP-адрес или домен сервера в верхнем блоке «Деплой»."
-    sshPassword.isBlank() -> "Укажите SSH-пароль сервера в верхнем блоке «Деплой»."
-    sshPort !in 1..65535 -> "Укажите корректный SSH-порт от 1 до 65535."
-    mainPassword.isBlank() -> "Откройте «Секреты» и укажите главный пароль администратора."
-    else -> null
+    mainPassword: String,
+    sshPrivateKey: String = "",
+    allowPasswordAuthentication: Boolean = true
+): String? {
+    if (host.isBlank()) return "Укажите IP-адрес или домен сервера в верхнем блоке «Деплой»."
+    if (!hostValid) return "Проверьте IP-адрес или домен сервера в верхнем блоке «Деплой»."
+    val credentials = SshCredentials(
+        password = sshPassword,
+        privateKey = sshPrivateKey,
+        allowPasswordAuthentication = allowPasswordAuthentication
+    )
+    if (!credentials.hasAuthentication) {
+        return sshAuthenticationIssueForMode(
+            mode = if (allowPasswordAuthentication) "password" else "key",
+            password = sshPassword,
+            privateKey = sshPrivateKey,
+            passwordLabel = "SSH-пароль",
+            privateKeyLabel = "приватный SSH-ключ"
+        ) ?: "Укажите SSH-пароль или приватный SSH-ключ в верхнем блоке «Деплой»."
+    }
+    if (sshPort !in 1..65535) return "Укажите корректный SSH-порт от 1 до 65535."
+    if (mainPassword.isBlank()) return "Откройте «Секреты» и укажите главный пароль администратора."
+    return null
 }
 
 internal fun shouldAutoRefreshServerClients(
@@ -308,6 +324,9 @@ fun ServerClientsSection(
     host: String,
     user: String,
     sshPassword: String,
+    sshPrivateKey: String,
+    sshKeyPassphrase: String,
+    allowPasswordAuthentication: Boolean,
     sshPort: Int,
     mainPassword: String,
     defaultPorts: String,
@@ -362,16 +381,21 @@ fun ServerClientsSection(
         host = host,
         hostValid = hostValid,
         sshPassword = sshPassword,
+        sshPrivateKey = sshPrivateKey,
+        allowPasswordAuthentication = allowPasswordAuthentication,
         sshPort = sshPort,
         mainPassword = mainPassword
     )
     val targetReady = accessIssue == null
-    val targetKey = remember(host, user, sshPassword, sshPort, mainPassword) {
+    val targetKey = remember(host, user, sshPassword, sshPrivateKey, sshKeyPassphrase, allowPasswordAuthentication, sshPort, mainPassword) {
         listOf(
             host.trim(),
             user.ifBlank { "root" },
             sshPort.toString(),
             sshPassword.hashCode().toString(),
+            sshPrivateKey.hashCode().toString(),
+            sshKeyPassphrase.hashCode().toString(),
+            allowPasswordAuthentication.toString(),
             mainPassword.hashCode().toString()
         ).joinToString("\u0000")
     }
@@ -404,6 +428,9 @@ fun ServerClientsSection(
         host = host.trim(),
         user = effectiveUser,
         sshPassword = sshPassword,
+        sshPrivateKey = sshPrivateKey,
+        sshKeyPassphrase = sshKeyPassphrase,
+        allowPasswordAuthentication = allowPasswordAuthentication,
         sshPort = sshPort,
         mainPassword = mainPassword
     )

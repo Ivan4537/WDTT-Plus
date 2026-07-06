@@ -18,6 +18,7 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
@@ -32,6 +33,7 @@ import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.Key
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -42,10 +44,15 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.boundsInWindow
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
@@ -54,22 +61,34 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.jcraft.jsch.ChannelExec
 import com.jcraft.jsch.ChannelSftp
-import com.jcraft.jsch.JSch
 import com.jcraft.jsch.Session
 import com.wdtt.plus.DeployManager
+import com.wdtt.plus.BuildConfig
+import com.wdtt.plus.DeviceCheckItem
+import com.wdtt.plus.DeviceCheckSeverity
+import com.wdtt.plus.DeviceCompatibilityReport
 import com.wdtt.plus.ServerAdminClient
 import com.wdtt.plus.ServerAdminProfileInfo
 import com.wdtt.plus.ServerAdminTarget
 import com.wdtt.plus.SettingsStore
+import com.wdtt.plus.SshCredentials
 import com.wdtt.plus.TunnelManager
 import com.wdtt.plus.WDTTColors
 import com.wdtt.plus.hasMeaningfulAdminProfileFields
+import com.wdtt.plus.hasManagedServerCredentials
+import com.wdtt.plus.latestServerMigrationLevel
+import com.wdtt.plus.createSshSession
+import com.wdtt.plus.normalizeSshPrivateKey
+import com.wdtt.plus.sshPrivateKeyIssue
+import com.wdtt.plus.sshCredentialsForMode
 import com.wdtt.plus.vpnProfileRestorableName
 import com.wdtt.plus.vpnProfileDisplayName
 import com.wdtt.plus.vpnProfileTransferName
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -85,7 +104,6 @@ import java.time.format.DateTimeFormatter
 import java.util.Base64
 import java.util.Date
 import java.util.Locale
-import java.util.Properties
 import org.json.JSONObject
 
 private const val CMD_TIMEOUT = 900000L // 15 minutes
@@ -119,19 +137,57 @@ private enum class OwnerProfileSource {
     LocalOnly
 }
 
+internal fun sshAuthenticationIssueForMode(
+    mode: String,
+    password: String,
+    privateKey: String,
+    passwordLabel: String = "SSH-пароль",
+    privateKeyLabel: String = "приватный SSH-ключ"
+): String? {
+    return if (mode == "key") {
+        when {
+            privateKey.isBlank() -> "Выбран вход по SSH-ключу — добавьте $privateKeyLabel."
+            else -> sshPrivateKeyIssue(privateKey)
+        }
+    } else {
+        if (password.isBlank()) "Укажите $passwordLabel." else null
+    }
+}
+
+internal fun primaryServerSshAccessIssue(
+    host: String,
+    hostValid: Boolean,
+    mode: String,
+    password: String,
+    privateKey: String,
+    sshPort: Int
+): String? {
+    if (host.isBlank()) return "Укажите IP-адрес или домен сервера в верхнем блоке «Деплой»."
+    if (!hostValid) return "Проверьте IP-адрес или домен сервера в верхнем блоке «Деплой»."
+    sshAuthenticationIssueForMode(
+        mode = mode,
+        password = password,
+        privateKey = privateKey,
+        passwordLabel = "SSH-пароль",
+        privateKeyLabel = "приватный SSH-ключ"
+    )?.let { return it }
+    if (sshPort !in 1..65535) return "Откройте «Секреты» и укажите корректный SSH-порт от 1 до 65535."
+    return null
+}
+
 internal fun shouldAutoRefreshOutboundState(
     expanded: Boolean,
     outboundBusy: Boolean,
     snapshotBusy: Boolean,
     hostValid: Boolean,
-    hasSshPassword: Boolean,
+    hasSshAuthentication: Boolean,
     targetKey: String,
     checkedTargetKey: String
 ): Boolean = expanded &&
     !outboundBusy &&
     !snapshotBusy &&
     hostValid &&
-    hasSshPassword &&
+    hasSshAuthentication &&
     checkedTargetKey != targetKey
 
 private enum class ProxyKind(val label: String, val protocol: String) {
@@ -143,8 +199,14 @@ private data class OutboundSshTarget(
     val host: String,
     val user: String,
     val pass: String,
+    val privateKey: String,
+    val keyPassphrase: String,
+    val allowPasswordAuthentication: Boolean,
     val port: Int
-)
+) {
+    val credentials: SshCredentials
+        get() = SshCredentials(pass, privateKey, keyPassphrase, allowPasswordAuthentication)
+}
 
 private data class ServerBackup(
     val passwordsJson: String,
@@ -196,6 +258,9 @@ private data class DeployRequest(
     val host: String,
     val user: String,
     val pass: String,
+    val privateKey: String,
+    val keyPassphrase: String,
+    val allowPasswordAuthentication: Boolean,
     val sshPort: Int,
     val mainPass: String,
     val adminId: String,
@@ -581,7 +646,9 @@ private fun formatOutboundCheckTime(millis: Long): String {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DeployTab(
-    scrollPosition: MutableIntState = rememberSaveable { mutableIntStateOf(0) }
+    scrollPosition: MutableIntState = rememberSaveable { mutableIntStateOf(0) },
+    modifier: Modifier = Modifier,
+    visible: Boolean = true
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -597,8 +664,21 @@ fun DeployTab(
     val savedIp by settingsStore.deployIp.collectAsStateWithLifecycle(initialValue = "")
     val activeProfile by settingsStore.activeProfile.collectAsStateWithLifecycle(initialValue = 0)
     val profileNames by settingsStore.profileNames.collectAsStateWithLifecycle(initialValue = emptyList())
+    val currentActiveProfile by rememberUpdatedState(activeProfile)
     val savedLogin by settingsStore.deployLogin.collectAsStateWithLifecycle(initialValue = "")
     val savedPassword by settingsStore.deployPassword.collectAsStateWithLifecycle(initialValue = "")
+    val savedSshPrivateKey by settingsStore.deploySshPrivateKey.collectAsStateWithLifecycle(initialValue = "")
+    val savedSshKeyPassphrase by settingsStore.deploySshKeyPassphrase.collectAsStateWithLifecycle(initialValue = "")
+    val storedSshAuthMode by produceState<String?>(initialValue = null, settingsStore, activeProfile) {
+        settingsStore.deploySshAuthMode.collect { value = it }
+    }
+    var sshAuthMode by rememberSaveable(activeProfile) { mutableStateOf<String?>(null) }
+    val savedWireGuardExitSshPrivateKey by settingsStore.wireGuardExitSshPrivateKey.collectAsStateWithLifecycle(initialValue = "")
+    val savedWireGuardExitSshKeyPassphrase by settingsStore.wireGuardExitSshKeyPassphrase.collectAsStateWithLifecycle(initialValue = "")
+    val storedWireGuardExitSshAuthMode by produceState<String?>(initialValue = null, settingsStore, activeProfile) {
+        settingsStore.wireGuardExitSshAuthMode.collect { value = it }
+    }
+    var wireGuardExitSshAuthMode by rememberSaveable(activeProfile) { mutableStateOf<String?>(null) }
     val savedPeer by settingsStore.peer.collectAsStateWithLifecycle(initialValue = "")
     val savedConnectionPassword by settingsStore.connectionPassword.collectAsStateWithLifecycle(initialValue = "")
     val savedVkHashes by settingsStore.vkHashes.collectAsStateWithLifecycle(initialValue = "")
@@ -636,8 +716,13 @@ fun DeployTab(
     val migrationSectionExpanded by remember(settingsStore) {
         settingsStore.deployMigrationSectionExpanded.map { it as Boolean? }
     }.collectAsStateWithLifecycle(initialValue = null)
+    val serverMigrationState by settingsStore.serverMigrationState.collectAsStateWithLifecycle(initialValue = null)
 
     var showSecretsDialog by remember { mutableStateOf(false) }
+    var showSshKeyDialog by remember { mutableStateOf(false) }
+    var showSshAuthHelp by remember { mutableStateOf(false) }
+    var showWireGuardExitSshKeyDialog by remember { mutableStateOf(false) }
+    var showWireGuardExitSshHelp by remember { mutableStateOf(false) }
     var showUninstallDialog by remember { mutableStateOf(false) }
     var pendingDeployRequest by remember { mutableStateOf<DeployRequest?>(null) }
     var pendingDeployImportRequest by remember { mutableStateOf<DeployRequest?>(null) }
@@ -653,6 +738,10 @@ fun DeployTab(
     var existingConnectBusy by remember { mutableStateOf(false) }
     var existingConnectStatus by rememberSaveable { mutableStateOf("") }
     var pendingExistingConnectionApply by remember { mutableStateOf<PendingExistingConnectionApply?>(null) }
+    var serverDiagnosticsBusy by remember { mutableStateOf(false) }
+    var serverDiagnosticsReport by remember { mutableStateOf<DeviceCompatibilityReport?>(null) }
+    var serverDiagnosticsJob by remember { mutableStateOf<Job?>(null) }
+    var serverDiagnosticsRunToken by remember { mutableLongStateOf(0L) }
     var outboundDialog by remember { mutableStateOf<OutboundDialog?>(null) }
     var outboundBusy by remember { mutableStateOf(false) }
     var outboundProgressActive by remember { mutableStateOf(false) }
@@ -711,12 +800,80 @@ fun DeployTab(
     LaunchedEffect(savedPassword) { password = savedPassword }
     LaunchedEffect(savedDns1) { dns1 = savedDns1 }
     LaunchedEffect(savedDns2) { dns2 = savedDns2 }
-    val outboundTargetKey = remember(ip, login, password, savedSshPort) {
+    LaunchedEffect(storedSshAuthMode) {
+        storedSshAuthMode?.let { sshAuthMode = it }
+    }
+    LaunchedEffect(storedWireGuardExitSshAuthMode) {
+        storedWireGuardExitSshAuthMode?.let { wireGuardExitSshAuthMode = it }
+    }
+    val selectedSshAuthMode = sshAuthMode ?: storedSshAuthMode ?: "password"
+    val selectedWireGuardExitSshAuthMode = wireGuardExitSshAuthMode
+        ?: storedWireGuardExitSshAuthMode
+        ?: "password"
+    val sshCredentials = remember(password, savedSshPrivateKey, savedSshKeyPassphrase, selectedSshAuthMode) {
+        sshCredentialsForMode(selectedSshAuthMode, password, savedSshPrivateKey, savedSshKeyPassphrase)
+    }
+    val hasSshAuthentication = sshCredentials.hasAuthentication
+    val wireGuardExitSshCredentials = remember(
+        wireGuardExitPasswordInput,
+        savedWireGuardExitSshPrivateKey,
+        savedWireGuardExitSshKeyPassphrase,
+        selectedWireGuardExitSshAuthMode
+    ) {
+        sshCredentialsForMode(
+            selectedWireGuardExitSshAuthMode,
+            wireGuardExitPasswordInput,
+            savedWireGuardExitSshPrivateKey,
+            savedWireGuardExitSshKeyPassphrase
+        )
+    }
+    val isServerAddressValid = ip.isValidPublicHost()
+    val primarySshPort = savedSshPort.toIntOrNull()
+        ?: if (savedSshPort.isBlank()) 22 else 0
+    val primarySshAccessIssue = remember(
+        ip,
+        isServerAddressValid,
+        selectedSshAuthMode,
+        password,
+        savedSshPrivateKey,
+        primarySshPort
+    ) {
+        primaryServerSshAccessIssue(
+            host = ip.trim(),
+            hostValid = isServerAddressValid,
+            mode = selectedSshAuthMode,
+            password = password,
+            privateKey = savedSshPrivateKey,
+            sshPort = primarySshPort
+        )
+    }
+    val primarySshAccessReady = primarySshAccessIssue == null
+
+    LaunchedEffect(selectedSshAuthMode) {
+        if (existingConnectStatus.contains("SSH-ключ", ignoreCase = true) ||
+            existingConnectStatus.contains("приватный", ignoreCase = true)
+        ) {
+            existingConnectStatus = ""
+        }
+    }
+
+    val outboundTargetKey = remember(
+        ip,
+        login,
+        password,
+        savedSshPrivateKey,
+        savedSshKeyPassphrase,
+        primarySshPort,
+        selectedSshAuthMode
+    ) {
         listOf(
             ip.trim(),
             login.ifBlank { "root" },
-            savedSshPort.ifBlank { "22" },
-            password.hashCode().toString()
+            primarySshPort.toString(),
+            selectedSshAuthMode,
+            password.hashCode().toString(),
+            savedSshPrivateKey.hashCode().toString(),
+            savedSshKeyPassphrase.hashCode().toString()
         ).joinToString("\u0000")
     }
     val currentOutboundTargetKey by rememberUpdatedState(outboundTargetKey)
@@ -728,6 +885,9 @@ fun DeployTab(
         outboundAutoCheckedTargetKey = if (cached?.attempted == true) outboundTargetKey else ""
         outboundStatus = ""
         outboundStatusOwner = null
+    }
+    LaunchedEffect(activeProfile, outboundTargetKey) {
+        serverDiagnosticsReport = null
     }
     LaunchedEffect(
         localProxyPortInput,
@@ -742,6 +902,7 @@ fun DeployTab(
         wireGuardExitSshPortInput,
         wireGuardExitUserInput,
         wireGuardExitPasswordInput,
+        selectedWireGuardExitSshAuthMode,
         wireGuardExitPortInput,
         wireGuardExitDnsInput,
         freeWarpMtuInput
@@ -764,7 +925,6 @@ fun DeployTab(
             .putString("warp_mtu", freeWarpMtuInput)
             .apply()
     }
-    val isServerAddressValid = ip.isValidPublicHost()
     val animatedProgress by animateFloatAsState(
         targetValue = deployProgress,
         animationSpec = tween(durationMillis = 1200, easing = androidx.compose.animation.core.FastOutSlowInEasing),
@@ -874,6 +1034,9 @@ fun DeployTab(
         requestHost: String,
         requestUser: String,
         requestPassword: String,
+        requestPrivateKey: String,
+        requestKeyPassphrase: String,
+        requestAllowPasswordAuthentication: Boolean,
         requestSshPort: Int,
         requestMainPassword: String,
         profile: ServerAdminProfileInfo
@@ -884,6 +1047,9 @@ fun DeployTab(
                 host = requestHost,
                 user = requestUser.ifBlank { "root" },
                 sshPassword = requestPassword,
+                sshPrivateKey = requestPrivateKey,
+                sshKeyPassphrase = requestKeyPassphrase,
+                allowPasswordAuthentication = requestAllowPasswordAuthentication,
                 sshPort = requestSshPort,
                 mainPassword = requestMainPassword
             ),
@@ -938,6 +1104,7 @@ fun DeployTab(
         val appContext = context.applicationContext
         val importPlan = selectedImportBackup?.let { ServerImportPlan(it, selectedImportMode) }
         val outboundProfile = currentOutboundProfileForms()
+        val deployProfile = activeProfile
         DeployManager.scope.launch {
             try {
                 DeployManager.startDeploy()
@@ -949,8 +1116,11 @@ fun DeployTab(
                     context = appContext,
                     host = request.host,
                     user = request.user,
-                    pass = request.pass,
-                    port = request.sshPort,
+	                    pass = request.pass,
+	                    privateKey = request.privateKey,
+	                    keyPassphrase = request.keyPassphrase,
+	                    allowPasswordAuthentication = request.allowPasswordAuthentication,
+	                    port = request.sshPort,
                     mainPass = request.mainPass,
                     adminId = request.adminId,
                     botToken = request.botToken,
@@ -964,6 +1134,10 @@ fun DeployTab(
                     onProgress = { p, s -> DeployManager.updateProgress(p, s) }
                 )
                 if (success) {
+                    settingsStore.markProfileServerMigrationComplete(
+                        profile = deployProfile,
+                        level = latestServerMigrationLevel(BuildConfig.VERSION_CODE)
+                    )
                     val ownerProfile = currentOwnerProfile()
                     DeployManager.updateProgress(
                         0.97f,
@@ -977,6 +1151,9 @@ fun DeployTab(
                         requestHost = request.host,
                         requestUser = request.user,
                         requestPassword = request.pass,
+                        requestPrivateKey = request.privateKey,
+                        requestKeyPassphrase = request.keyPassphrase,
+                        requestAllowPasswordAuthentication = request.allowPasswordAuthentication,
                         requestSshPort = request.sshPort,
                         requestMainPassword = request.mainPass,
                         profile = ownerProfile
@@ -991,8 +1168,11 @@ fun DeployTab(
                             target = OutboundSshTarget(
                                 host = request.host,
                                 user = request.user.ifBlank { "root" },
-                                pass = request.pass,
-                                port = request.sshPort
+	                                pass = request.pass,
+	                                privateKey = request.privateKey,
+	                                keyPassphrase = request.keyPassphrase,
+	                                allowPasswordAuthentication = request.allowPasswordAuthentication,
+	                                port = request.sshPort
                             ),
                             forms = outboundProfile
                         )
@@ -1029,7 +1209,12 @@ fun DeployTab(
                 var info = checkExistingInstall(
                     host = request.host,
                     user = request.user,
-                    pass = request.pass,
+                    credentials = SshCredentials(
+                        password = request.pass,
+                        privateKey = request.privateKey,
+                        privateKeyPassphrase = request.keyPassphrase,
+                        allowPasswordAuthentication = request.allowPasswordAuthentication
+                    ),
                     port = request.sshPort
                 )
                 if (info.hasAnyTrace) {
@@ -1074,8 +1259,9 @@ fun DeployTab(
     }
 
     fun currentOutboundTarget(): OutboundSshTarget? {
-        if (!isServerAddressValid || password.isBlank()) {
-            outboundStatus = "Укажите корректный домен/IP сервера без https:// и SSH-пароль в верхнем блоке деплоя."
+        if (!primarySshAccessReady) {
+            outboundStatus = primarySshAccessIssue
+                ?: "Проверьте доступ к серверу в верхнем блоке «Деплой»."
             outboundStatusOwner = outboundDialog?.name
             return null
         }
@@ -1084,7 +1270,10 @@ fun DeployTab(
             host = ip.trim(),
             user = effectiveLogin,
             pass = password,
-            port = savedSshPort.toIntOrNull() ?: 22
+            privateKey = sshCredentials.privateKey,
+            keyPassphrase = sshCredentials.privateKeyPassphrase,
+            allowPasswordAuthentication = sshCredentials.allowPasswordAuthentication,
+            port = primarySshPort
         )
     }
 
@@ -1284,6 +1473,81 @@ fun DeployTab(
         }
     }
 
+    fun runServerDiagnostics() {
+        val issue = primarySshAccessIssue
+        val effectiveLogin = if (login.isBlank()) "root" else login
+        val diagnosticsProfile = activeProfile
+        val diagnosticsProfileName = vpnProfileDisplayName(activeProfile, profileNames)
+        val diagnosticsTargetKey = outboundTargetKey
+        val diagnosticsRunToken = serverDiagnosticsRunToken + 1L
+        serverDiagnosticsRunToken = diagnosticsRunToken
+        if (issue != null) {
+            serverDiagnosticsReport = serverDiagnosticsErrorReport(
+                title = "SSH-доступ",
+                status = "не готов",
+                details = issue,
+                recommendation = "Исправьте адрес, порт или выбранный способ входа в блоке «Установка на сервер», затем повторите диагностику.",
+                profileName = diagnosticsProfileName,
+                profileIndex = diagnosticsProfile
+            )
+            return
+        }
+        serverDiagnosticsJob?.cancel()
+        val target = OutboundSshTarget(
+            host = ip.trim(),
+            user = effectiveLogin,
+            pass = password,
+            privateKey = sshCredentials.privateKey,
+            keyPassphrase = sshCredentials.privateKeyPassphrase,
+            allowPasswordAuthentication = sshCredentials.allowPasswordAuthentication,
+            port = primarySshPort
+        )
+        serverDiagnosticsBusy = true
+        serverDiagnosticsJob = scope.launch {
+            val report = try {
+                collectServerDiagnostics(
+                    target = target,
+                    selectedAuthMode = selectedSshAuthMode,
+                    profileName = diagnosticsProfileName,
+                    profileIndex = diagnosticsProfile,
+                    expectedDtlsPort = savedServerDtlsPort,
+                    expectedWgPort = savedServerWgPort,
+                    expectedClientPort = savedListenPort
+                )
+            } catch (error: Exception) {
+                serverDiagnosticsErrorReport(
+                    title = "SSH-подключение",
+                    status = "не удалось",
+                    details = friendlyDeployError(error, "диагностика сервера"),
+                    recommendation = "Проверьте логин, пароль или SSH-ключ, порт SSH и доступность сервера из сети.",
+                    profileName = diagnosticsProfileName,
+                    profileIndex = diagnosticsProfile
+                )
+            } finally {
+                if (serverDiagnosticsRunToken == diagnosticsRunToken) {
+                    serverDiagnosticsBusy = false
+                    serverDiagnosticsJob = null
+                }
+            }
+            if (
+                serverDiagnosticsRunToken == diagnosticsRunToken &&
+                currentActiveProfile == diagnosticsProfile &&
+                currentOutboundTargetKey == diagnosticsTargetKey
+            ) {
+                serverDiagnosticsReport = report
+            }
+        }
+    }
+
+    fun cancelServerDiagnostics() {
+        if (!serverDiagnosticsBusy) return
+        serverDiagnosticsRunToken += 1L
+        serverDiagnosticsBusy = false
+        serverDiagnosticsJob?.cancel()
+        serverDiagnosticsJob = null
+        Toast.makeText(context, "Диагностика сервера отменена", Toast.LENGTH_SHORT).show()
+    }
+
     fun openOutboundDialog(dialog: OutboundDialog) {
         outboundStatus = ""
         outboundStatusOwner = dialog.name
@@ -1294,20 +1558,20 @@ fun DeployTab(
         if (outboundStatusOwner == dialog.name) outboundStatus else ""
 
     LaunchedEffect(
+        visible,
         outboundSectionExpanded,
         outboundTargetKey,
         outboundBusy,
         outboundSnapshotBusy,
-        isServerAddressValid,
-        password,
+        primarySshAccessReady,
         outboundAutoCheckedTargetKey
     ) {
         if (shouldAutoRefreshOutboundState(
-                expanded = outboundSectionExpanded == true,
+                expanded = visible && outboundSectionExpanded == true,
                 outboundBusy = outboundBusy,
                 snapshotBusy = outboundSnapshotBusy,
                 hostValid = isServerAddressValid,
-                hasSshPassword = password.isNotBlank(),
+                hasSshAuthentication = primarySshAccessReady,
                 targetKey = outboundTargetKey,
                 checkedTargetKey = outboundAutoCheckedTargetKey
             )
@@ -1317,7 +1581,7 @@ fun DeployTab(
     }
 
     Column(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxSize()
             .padding(16.dp)
             .verticalScroll(deployScrollState),
@@ -1328,6 +1592,49 @@ fun DeployTab(
             style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
             color = MaterialTheme.colorScheme.onSurface
         )
+
+        if (
+            serverMigrationState?.profileUpdateRequired == true &&
+            hasManagedServerCredentials(
+                host = savedIp,
+                sshAuthMode = selectedSshAuthMode,
+                sshPassword = savedPassword,
+                mainPassword = savedMainPass,
+                sshPrivateKey = savedSshPrivateKey
+            )
+        ) {
+            AppSectionCard(
+                containerColor = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.72f),
+                contentPadding = PaddingValues(16.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalAlignment = Alignment.Top
+                ) {
+                    Icon(
+                        Icons.Default.CloudUpload,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onTertiaryContainer,
+                        modifier = Modifier.size(22.dp)
+                    )
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(
+                            "Нужно обновить серверную часть",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onTertiaryContainer
+                        )
+                        Text(
+                            "Для профиля «${vpnProfileDisplayName(activeProfile, profileNames)}» выполните установку сервера с сохранением данных. После успешной установки это напоминание исчезнет.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onTertiaryContainer
+                        )
+                    }
+                }
+            }
+        }
 
         val importCanProvideMainPassword = selectedImportMode == ServerImportMode.Replace &&
             selectedImportBackup?.mainPassword?.isNotBlank() == true
@@ -1345,12 +1652,49 @@ fun DeployTab(
             contentPadding = PaddingValues(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            Text(
-                "Установка на сервер",
-                style = MaterialTheme.typography.titleSmall,
-                fontWeight = FontWeight.Bold,
-                color = MaterialTheme.colorScheme.onSurface
-            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    "Установка на сервер",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                val diagnosticsActionEnabled = !isDeploying && !isCheckingExistingInstall && !migrationBusy
+                IconButton(
+                    onClick = {
+                        if (serverDiagnosticsBusy) {
+                            cancelServerDiagnostics()
+                        } else {
+                            runServerDiagnostics()
+                        }
+                    },
+                    enabled = serverDiagnosticsBusy || diagnosticsActionEnabled,
+                    modifier = Modifier.size(40.dp),
+                    colors = IconButtonDefaults.iconButtonColors(
+                        contentColor = MaterialTheme.colorScheme.primary,
+                        disabledContentColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.42f)
+                    )
+                ) {
+                    if (serverDiagnosticsBusy) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(18.dp),
+                            strokeWidth = 2.dp,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    } else {
+                        Icon(
+                            Icons.Default.Search,
+                            contentDescription = "Диагностика сервера",
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(21.dp)
+                        )
+                    }
+                }
+            }
 
             OutlinedTextField(
                 value = ip,
@@ -1373,6 +1717,31 @@ fun DeployTab(
                 shape = RoundedCornerShape(16.dp),
                 enabled = !isDeploying,
             )
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("Способ входа на сервер", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+                IconButton(onClick = { showSshAuthHelp = true }, modifier = Modifier.size(32.dp)) {
+                    Icon(Icons.AutoMirrored.Filled.HelpOutline, contentDescription = "Как работает вход по SSH", modifier = Modifier.size(20.dp))
+                }
+            }
+            SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                listOf("password" to "Пароль", "key" to "SSH-ключ").forEachIndexed { index, (mode, label) ->
+                    SegmentedButton(
+                        selected = selectedSshAuthMode == mode,
+                        onClick = {
+                            sshAuthMode = mode
+                            existingConnectStatus = ""
+                            scope.launch { settingsStore.saveDeploySshAuthMode(mode) }
+                        },
+                        shape = SegmentedButtonDefaults.itemShape(index, 2),
+                        enabled = !isDeploying
+                    ) { Text(label) }
+                }
+            }
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -1399,13 +1768,13 @@ fun DeployTab(
                 OutlinedTextField(
                     value = password,
                     onValueChange = {
-                        password = it.filter { c -> !c.isWhitespace() }
+                        password = it
                         if (ip.isBlank() || ip.isValidPublicHost()) {
                             scope.launch { settingsStore.saveDeploy(ip.trim(), login, password, savedSshPort, dns1, dns2) }
                         }
                     },
-                    label = { Text("Пароль SSH") },
-                    placeholder = { Text("password") },
+                    label = { Text(if (selectedSshAuthMode == "key") "Пароль sudo" else "Пароль SSH") },
+                    placeholder = { Text(if (selectedSshAuthMode == "key") "необязательно" else "password") },
                     singleLine = true,
                     visualTransformation = if (passwordFocused) VisualTransformation.None else PasswordVisualTransformation(),
                     modifier = Modifier
@@ -1414,6 +1783,37 @@ fun DeployTab(
                     shape = RoundedCornerShape(16.dp),
                     enabled = !isDeploying,
                 )
+            }
+
+            if (selectedSshAuthMode == "key") {
+                OutlinedButton(
+                    onClick = { showSshKeyDialog = true },
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        containerColor = if (!hasSshAuthentication) MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.surface,
+                        contentColor = if (!hasSshAuthentication) MaterialTheme.colorScheme.onErrorContainer else MaterialTheme.colorScheme.onSurface
+                    ),
+                    border = BorderStroke(
+                        1.dp,
+                        if (!hasSshAuthentication) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)
+                    )
+                ) {
+                    Icon(Icons.Default.Key, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        when {
+                            savedSshPrivateKey.isNotBlank() && password.isNotBlank() -> "SSH-ключ добавлен · пароль sudo указан"
+                            savedSshPrivateKey.isNotBlank() -> "SSH-ключ добавлен"
+                            else -> "Добавить приватный SSH-ключ"
+                        },
+                        modifier = Modifier.weight(1f),
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+            }
+            if (primarySshPort !in 1..65535) {
+                InlineActionMessage("Откройте «Секреты» и укажите корректный SSH-порт от 1 до 65535.")
             }
 
             OutlinedButton(
@@ -1444,7 +1844,7 @@ fun DeployTab(
             ) {
                 Button(
                     onClick = {
-                        if (!isServerAddressValid || password.isBlank() || !deploySecretsReady) return@Button
+                        if (!primarySshAccessReady || !deploySecretsReady) return@Button
                         val effectiveLogin = if (login.isBlank()) "root" else login
                         val effectiveDtlsPort = if (savedManualPorts) savedServerDtlsPort.coerceIn(1, 65535) else 56000
                         val effectiveWgPort = if (savedManualPorts) savedServerWgPort.coerceIn(1, 65535) else 56001
@@ -1457,7 +1857,10 @@ fun DeployTab(
                             host = ip.trim(),
                             user = effectiveLogin,
                             pass = password,
-                            sshPort = savedSshPort.toIntOrNull() ?: 22,
+                            privateKey = sshCredentials.privateKey,
+                            keyPassphrase = sshCredentials.privateKeyPassphrase,
+                            allowPasswordAuthentication = sshCredentials.allowPasswordAuthentication,
+                            sshPort = primarySshPort,
                             mainPass = effectiveMainPass,
                             adminId = savedAdminId,
                             botToken = savedBotToken,
@@ -1476,7 +1879,7 @@ fun DeployTab(
                     modifier = Modifier.weight(1f).fillMaxHeight().heightIn(min = 50.dp),
                     shape = RoundedCornerShape(16.dp),
                     colors = ButtonDefaults.buttonColors(contentColor = MaterialTheme.colorScheme.onPrimary),
-                    enabled = !isDeploying && !isCheckingExistingInstall && !migrationBusy && isServerAddressValid && password.isNotBlank() && deploySecretsReady,
+                    enabled = !isDeploying && !isCheckingExistingInstall && !migrationBusy && primarySshAccessReady && deploySecretsReady,
                     contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp)
                 ) {
                     if (isDeploying || isCheckingExistingInstall) {
@@ -1498,7 +1901,7 @@ fun DeployTab(
 
                 Button(
                     onClick = {
-                        if (!isServerAddressValid || password.isBlank()) return@Button
+                        if (!primarySshAccessReady) return@Button
                         showUninstallDialog = true
                     },
                     modifier = Modifier.weight(1f).fillMaxHeight().heightIn(min = 50.dp),
@@ -1507,7 +1910,7 @@ fun DeployTab(
                         containerColor = MaterialTheme.colorScheme.error,
                         contentColor = MaterialTheme.colorScheme.onError
                     ),
-                    enabled = !isDeploying && isServerAddressValid && password.isNotBlank(),
+                    enabled = !isDeploying && primarySshAccessReady,
                     contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp)
                 ) {
                     Icon(Icons.Default.Delete, null, Modifier.size(18.dp))
@@ -1561,7 +1964,11 @@ fun DeployTab(
             )
             OutlinedButton(
                 onClick = {
-	                    if (!isServerAddressValid || password.isBlank()) return@OutlinedButton
+	                    if (!primarySshAccessReady) {
+                        existingConnectStatus = primarySshAccessIssue
+                            ?: "Проверьте доступ к серверу в верхнем блоке «Деплой»."
+                        return@OutlinedButton
+                    }
                     if (savedMainPass.isBlank()) {
                         existingConnectStatus = "Укажите главный пароль администратора в «Секретах», затем повторите подключение."
                         return@OutlinedButton
@@ -1574,8 +1981,8 @@ fun DeployTab(
                             val connection = readExistingServerConnection(
 	                                host = ip.trim(),
                                 user = effectiveLogin,
-                                pass = password,
-                                port = savedSshPort.toIntOrNull() ?: 22,
+                                credentials = sshCredentials,
+	                                port = primarySshPort,
                                 adminMainPassword = savedMainPass
                             )
                             val localProfile = currentOwnerProfile()
@@ -1612,7 +2019,7 @@ fun DeployTab(
                         }
                     }
                 },
-                enabled = !isDeploying && !isCheckingExistingInstall && !migrationBusy && !existingConnectBusy && isServerAddressValid && password.isNotBlank(),
+                enabled = !isDeploying && !isCheckingExistingInstall && !migrationBusy && !existingConnectBusy,
                 modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
                 shape = RoundedCornerShape(16.dp)
             ) {
@@ -1625,11 +2032,7 @@ fun DeployTab(
                 Text("Подключиться (без установки)", fontWeight = FontWeight.SemiBold)
             }
             if (existingConnectStatus.isNotBlank()) {
-                Text(
-                    existingConnectStatus,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = if (existingConnectStatus.startsWith("Ошибка")) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
-                )
+                InlineActionMessage(existingConnectStatus)
             }
         }
 
@@ -1709,12 +2112,15 @@ fun DeployTab(
                 host = ip.trim(),
                 user = if (login.isBlank()) "root" else login,
                 sshPassword = password,
-                sshPort = savedSshPort.toIntOrNull() ?: 22,
+                sshPrivateKey = sshCredentials.privateKey,
+                sshKeyPassphrase = sshCredentials.privateKeyPassphrase,
+                allowPasswordAuthentication = sshCredentials.allowPasswordAuthentication,
+                sshPort = primarySshPort,
                 mainPassword = savedMainPass,
                 defaultPorts = "${if (savedManualPorts) savedServerDtlsPort else 56000},${if (savedManualPorts) savedServerWgPort else 56001},${if (savedManualPorts) savedListenPort else 9000}",
                 adminProfile = currentOwnerProfile(),
                 sourceProfileName = vpnProfileTransferName(activeProfile, profileNames),
-                enabled = !isDeploying && !isCheckingExistingInstall && !migrationBusy && !outboundBusy && isServerAddressValid,
+                enabled = visible && !isDeploying && !isCheckingExistingInstall && !migrationBusy && !outboundBusy,
                 hostValid = isServerAddressValid,
                 expanded = clientsExpanded,
                 modifier = Modifier.onGloballyPositioned { clientsSectionY = it.positionInParent().y },
@@ -1739,6 +2145,7 @@ fun DeployTab(
                 lastCheckError = outboundLastCheckError,
                 status = if (outboundDialog == null && outboundStatusOwner == null) outboundStatus else "",
                 actionTitle = outboundActionTitle,
+                accessIssue = primarySshAccessIssue,
                 enabled = !isDeploying && !migrationBusy && !outboundBusy && !outboundSnapshotBusy,
                 directEnabled = canReturnDirect(outboundSnapshot),
                 expanded = outboundExpanded,
@@ -1865,6 +2272,9 @@ fun DeployTab(
                     sshPortInput = wireGuardExitSshPortInput,
                     userInput = wireGuardExitUserInput,
                     passwordInput = wireGuardExitPasswordInput,
+                    sshAuthMode = selectedWireGuardExitSshAuthMode,
+                    privateKeyConfigured = savedWireGuardExitSshPrivateKey.isNotBlank(),
+                    hasSshAuthentication = wireGuardExitSshCredentials.hasAuthentication,
                     wgPortInput = wireGuardExitPortInput,
                     dnsInput = wireGuardExitDnsInput,
                     disableEnabled = canDisableOutboundDialog(outboundSnapshot, OutboundDialog.WireGuardVps),
@@ -1873,6 +2283,12 @@ fun DeployTab(
                     onSshPortChanged = { wireGuardExitSshPortInput = it },
                     onUserChanged = { wireGuardExitUserInput = it },
                     onPasswordChanged = { wireGuardExitPasswordInput = it },
+                    onSshAuthModeChanged = { mode ->
+                        wireGuardExitSshAuthMode = mode
+                        scope.launch { settingsStore.saveWireGuardExitSshAuthMode(mode) }
+                    },
+                    onEditSshKey = { showWireGuardExitSshKeyDialog = true },
+                    onSshHelp = { showWireGuardExitSshHelp = true },
                     onWgPortChanged = { wireGuardExitPortInput = it },
                     onDnsChanged = { wireGuardExitDnsInput = it },
                     onDismiss = { outboundDialog = null },
@@ -1892,7 +2308,7 @@ fun DeployTab(
                                 foreignHost = foreignHost,
                                 foreignPort = foreignPort,
                                 foreignUser = foreignUser,
-                                foreignPassword = foreignPassword,
+                                foreignCredentials = wireGuardExitSshCredentials,
                                 wgPort = wgPort,
                                 dns = dns
                             )
@@ -1928,6 +2344,7 @@ fun DeployTab(
                     restartEnabled = canCheckOutboundDialog(outboundSnapshot, OutboundDialog.FreeWarp),
                     updateToolEnabled = canUpdateFreeWarp(outboundSnapshot),
                     deleteEnabled = canDeleteFreeWarp(outboundSnapshot),
+                    resetRegistrationEnabled = canDeleteFreeWarp(outboundSnapshot),
                     onMtuChanged = { freeWarpMtuInput = it },
                     onDismiss = { if (!outboundBusy) outboundDialog = null },
                     onInstall = { mtu ->
@@ -1953,6 +2370,9 @@ fun DeployTab(
                     },
                     onUpdateTool = {
                         runOutboundAction("Проверяю обновление wgcf") { updateWgcfTool(context, it) }
+                    },
+                    onResetRegistration = {
+                        runOutboundAction("Сбрасываю регистрацию WARP") { resetFreeWarpRegistration(it) }
                     },
                     onDisable = {
                         runOutboundAction("Возвращаю прямой выход WDTT") { disableOutboundExit(it) }
@@ -2043,6 +2463,26 @@ fun DeployTab(
                 deployPassword = password,
                 onSaved = { _, _ -> },
                 onDismiss = { showSecretsDialog = false }
+            )
+        }
+
+        serverDiagnosticsReport?.let { report ->
+            DeviceCompatibilityDialog(
+                report = report,
+                title = "Диагностика сервера",
+                subtitle = "Проверка подключается к серверу выбранным способом SSH и собирает безопасные сведения об ОС, systemd, сети, диске, памяти, WDTT-службах и компонентах внешнего выхода.",
+                note = "Пароли, приватные ключи, токены бота, WireGuard private key и содержимое конфигов не выводятся. Если какая-то команда отсутствует на конкретной Linux-системе, пункт помечается как недоступный, а не считается утечкой или ошибкой.",
+                onDismiss = { serverDiagnosticsReport = null },
+                onCopy = {
+                    val clipboard = context.getSystemService(ClipboardManager::class.java)
+                    clipboard?.setPrimaryClip(
+                        ClipData.newPlainText(
+                            "WDTT Server Diagnostics",
+                            serverDiagnosticsPlainText(report)
+                        )
+                    )
+                    Toast.makeText(context, "Диагностика сервера скопирована", Toast.LENGTH_SHORT).show()
+                }
             )
         }
 
@@ -2168,12 +2608,13 @@ fun DeployTab(
             ) {
                 OutlinedButton(
                     onClick = {
-                        if (!isServerAddressValid || password.isBlank()) {
-                            migrationStatus = "Для экспорта укажите корректный домен/IP сервера без https:// и без порта, а также SSH-пароль"
+                        if (!primarySshAccessReady) {
+                            migrationStatus = primarySshAccessIssue
+                                ?: "Для экспорта проверьте доступ к серверу."
                             return@OutlinedButton
                         }
                         val effectiveLogin = if (login.isBlank()) "root" else login
-                        val sshPort = savedSshPort.toIntOrNull() ?: 22
+                        val sshPort = primarySshPort
                         val includeKeys = exportIncludeWgKeys
                         migrationBusy = true
                         migrationStatus = "Проверяю сервер и готовлю экспорт..."
@@ -2182,7 +2623,7 @@ fun DeployTab(
                                 val backup = readServerBackup(
                                     host = ip.trim(),
                                     user = effectiveLogin,
-                                    pass = password,
+                                    credentials = sshCredentials,
                                     port = sshPort,
                                     includeWgKeys = includeKeys
                                 )
@@ -2201,7 +2642,7 @@ fun DeployTab(
                     },
                     modifier = Modifier.weight(1f).heightIn(min = 48.dp),
                     shape = RoundedCornerShape(16.dp),
-                    enabled = !migrationBusy && !isDeploying && isServerAddressValid && password.isNotBlank()
+                    enabled = !migrationBusy && !isDeploying
                 ) {
                     Text("Экспорт", fontWeight = FontWeight.SemiBold)
                 }
@@ -2213,6 +2654,12 @@ fun DeployTab(
                 ) {
                     Text("Импорт", fontWeight = FontWeight.SemiBold)
                 }
+            }
+
+            if (migrationBusy || migrationStatus.isNotBlank()) {
+                InlineActionMessage(migrationStatus.ifBlank { "Операция выполняется..." })
+            } else if (primarySshAccessIssue != null) {
+                InlineActionMessage("Экспорт и применение импорта пока недоступны: $primarySshAccessIssue")
             }
 
             selectedImportBackup?.let { backup ->
@@ -2266,7 +2713,11 @@ fun DeployTab(
                         }
                         Button(
                             onClick = {
-                                if (!isServerAddressValid || password.isBlank()) return@Button
+                                if (!primarySshAccessReady) {
+                                    migrationStatus = primarySshAccessIssue
+                                        ?: "Для импорта проверьте доступ к серверу."
+                                    return@Button
+                                }
                                 val effectiveLogin = if (login.isBlank()) "root" else login
                                 val effectiveDtlsPort = if (savedManualPorts) savedServerDtlsPort.coerceIn(1, 65535) else 56000
                                 val effectiveWgPort = if (savedManualPorts) savedServerWgPort.coerceIn(1, 65535) else 56001
@@ -2277,8 +2728,11 @@ fun DeployTab(
                                 pendingDirectImportRequest = DeployRequest(
                                     host = ip.trim(),
                                     user = effectiveLogin,
-                                    pass = password,
-                                    sshPort = savedSshPort.toIntOrNull() ?: 22,
+	                                    pass = password,
+	                                    privateKey = sshCredentials.privateKey,
+	                                    keyPassphrase = sshCredentials.privateKeyPassphrase,
+	                                    allowPasswordAuthentication = sshCredentials.allowPasswordAuthentication,
+	                                    sshPort = primarySshPort,
                                     mainPass = effectiveMainPass,
                                     adminId = savedAdminId,
                                     botToken = savedBotToken,
@@ -2289,7 +2743,7 @@ fun DeployTab(
                                     dns2 = dns2
                                 )
                             },
-                            enabled = !migrationBusy && !isDeploying && isServerAddressValid && password.isNotBlank(),
+                            enabled = !migrationBusy && !isDeploying,
                             modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
                             shape = RoundedCornerShape(16.dp)
                         ) {
@@ -2307,16 +2761,58 @@ fun DeployTab(
                 )
             }
 
-            if (migrationBusy || migrationStatus.isNotBlank()) {
-                Text(
-                    text = migrationStatus.ifBlank { "Операция выполняется..." },
-                    style = MaterialTheme.typography.bodySmall,
-                    color = if (migrationStatus.startsWith("Ошибка")) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
                 }
             }
         }
+        }
+
+        if (showSshKeyDialog) {
+            SshPrivateKeyDialog(
+                title = "SSH-ключ основного сервера",
+                initialPrivateKey = savedSshPrivateKey,
+                initialPassphrase = savedSshKeyPassphrase,
+                host = ip.trim(),
+                user = login.ifBlank { "root" },
+                port = primarySshPort,
+                onSave = { privateKey, passphrase ->
+                    scope.launch {
+                        settingsStore.saveDeploySshKey(privateKey, passphrase)
+                        if (privateKey.isNotBlank()) settingsStore.saveDeploySshAuthMode("key")
+                        showSshKeyDialog = false
+                    }
+                },
+                onDismiss = { showSshKeyDialog = false }
+            )
+        }
+        if (showWireGuardExitSshKeyDialog) {
+            SshPrivateKeyDialog(
+                title = "SSH-ключ дополнительного VPS",
+                initialPrivateKey = savedWireGuardExitSshPrivateKey,
+                initialPassphrase = savedWireGuardExitSshKeyPassphrase,
+                host = wireGuardExitHostInput.trim(),
+                user = wireGuardExitUserInput.ifBlank { "root" },
+                port = wireGuardExitSshPortInput.toIntOrNull() ?: 22,
+                onSave = { privateKey, passphrase ->
+                    scope.launch {
+                        settingsStore.saveWireGuardExitSshKey(privateKey, passphrase)
+                        if (privateKey.isNotBlank()) {
+                            wireGuardExitSshAuthMode = "key"
+                            settingsStore.saveWireGuardExitSshAuthMode("key")
+                        }
+                        showWireGuardExitSshKeyDialog = false
+                    }
+                },
+                onDismiss = { showWireGuardExitSshKeyDialog = false }
+            )
+        }
+        if (showSshAuthHelp) {
+            SshAuthenticationHelpDialog(onDismiss = { showSshAuthHelp = false })
+        }
+        if (showWireGuardExitSshHelp) {
+            SshAuthenticationHelpDialog(
+                additionalServer = true,
+                onDismiss = { showWireGuardExitSshHelp = false }
+            )
         }
 
         if (showUninstallDialog) {
@@ -2331,7 +2827,7 @@ fun DeployTab(
                         try {
                             DeployManager.startDeploy()
                             performUninstall(
-	                                host = ip.trim(), user = effectiveLogin, pass = password, port = savedSshPort.toIntOrNull() ?: 22,
+                                host = ip.trim(), user = effectiveLogin, credentials = sshCredentials, port = primarySshPort,
                                 dtlsPort = effectiveDtlsPort, wgPort = effectiveWgPort,
                                 onProgress = { p, s -> DeployManager.updateProgress(p, s) }
                             )
@@ -2567,6 +3063,7 @@ private fun OutboundRoutingSection(
     lastCheckError: String,
     status: String,
     actionTitle: String,
+    accessIssue: String?,
     enabled: Boolean,
     directEnabled: Boolean,
     expanded: Boolean,
@@ -2654,7 +3151,8 @@ private fun OutboundRoutingSection(
                     snapshotBusy = snapshotBusy,
                     lastCheckAttemptAt = lastCheckAttemptAt,
                     lastCheckError = lastCheckError,
-                    enabled = enabled,
+                    accessIssue = accessIssue,
+                    enabled = enabled && accessIssue == null,
                     onRefreshState = onRefreshState
                 )
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -2736,6 +3234,9 @@ private fun OutboundRoutingSection(
                         Text(if (readingStatus) "Читаю..." else "Статус", fontWeight = FontWeight.SemiBold)
                     }
                 }
+                if (status.isNotBlank()) {
+                    InlineActionMessage(status)
+                }
                 OutlinedButton(
                     onClick = { onOpen(OutboundDialog.Diagnostics) },
                     enabled = enabled,
@@ -2746,7 +3247,7 @@ private fun OutboundRoutingSection(
                 }
                 Button(
                     onClick = onDirect,
-                    enabled = enabled && directEnabled,
+                    enabled = enabled && accessIssue == null && directEnabled,
                     modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
                     shape = RoundedCornerShape(16.dp),
                     colors = ButtonDefaults.buttonColors(
@@ -2760,9 +3261,6 @@ private fun OutboundRoutingSection(
                         Spacer(Modifier.width(8.dp))
                     }
                     Text(if (returningDirect) "Возврат..." else "Вернуть прямой выход", fontWeight = FontWeight.Bold)
-                }
-                if (status.isNotBlank()) {
-                    OutboundStatusMessage(status)
                 }
             }
         }
@@ -2795,10 +3293,12 @@ private fun OutboundServerStateCard(
     snapshotBusy: Boolean,
     lastCheckAttemptAt: Long,
     lastCheckError: String,
+    accessIssue: String?,
     enabled: Boolean,
     onRefreshState: () -> Unit
 ) {
     val state = when {
+        accessIssue != null -> OutboundModeVisualState.Unknown
         lastCheckError.isNotBlank() -> OutboundModeVisualState.Error
         snapshot == null -> OutboundModeVisualState.Unknown
         snapshot.hasRouteConflict -> OutboundModeVisualState.Error
@@ -2827,6 +3327,7 @@ private fun OutboundServerStateCard(
                     Text(
                         text = when {
                             snapshotBusy -> "Проверяю состояние на сервере..."
+                            accessIssue != null -> "Обновление пока недоступно"
                             lastCheckError.isNotBlank() -> "Не удалось проверить выходной IP"
                             snapshot != null -> "На сервере: ${outboundServerShortState(snapshot)}"
                             else -> "На сервере: состояние ещё не проверено"
@@ -2838,6 +3339,7 @@ private fun OutboundServerStateCard(
                     Text(
                         text = when {
                             snapshotBusy -> "Читаю активный режим и проверяю конфликтующие маршруты."
+                            accessIssue != null -> accessIssue
                             lastCheckError.isNotBlank() -> buildString {
                                 if (lastCheckAttemptAt > 0L) {
                                     append("Последняя попытка: ${formatOutboundCheckTime(lastCheckAttemptAt)}. ")
@@ -3208,6 +3710,9 @@ private fun WireGuardExitVpsDialog(
     sshPortInput: String,
     userInput: String,
     passwordInput: String,
+    sshAuthMode: String,
+    privateKeyConfigured: Boolean,
+    hasSshAuthentication: Boolean,
     wgPortInput: String,
     dnsInput: String,
     disableEnabled: Boolean,
@@ -3216,6 +3721,9 @@ private fun WireGuardExitVpsDialog(
     onSshPortChanged: (String) -> Unit,
     onUserChanged: (String) -> Unit,
     onPasswordChanged: (String) -> Unit,
+    onSshAuthModeChanged: (String) -> Unit,
+    onEditSshKey: () -> Unit,
+    onSshHelp: () -> Unit,
     onWgPortChanged: (String) -> Unit,
     onDnsChanged: (String) -> Unit,
     onDismiss: () -> Unit,
@@ -3234,6 +3742,26 @@ private fun WireGuardExitVpsDialog(
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("Вход на дополнительный VPS", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+            IconButton(onClick = onSshHelp, modifier = Modifier.size(32.dp)) {
+                Icon(Icons.AutoMirrored.Filled.HelpOutline, contentDescription = "Как работает вход по SSH", modifier = Modifier.size(20.dp))
+            }
+        }
+        SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+            listOf("password" to "Пароль", "key" to "SSH-ключ").forEachIndexed { index, (mode, label) ->
+                SegmentedButton(
+                    selected = sshAuthMode == mode,
+                    onClick = { onSshAuthModeChanged(mode) },
+                    shape = SegmentedButtonDefaults.itemShape(index, 2),
+                    enabled = !busy
+                ) { Text(label) }
+            }
+        }
         OutlinedTextField(
             value = hostInput,
             onValueChange = { onHostChanged(it.filter { c -> !c.isWhitespace() }) },
@@ -3265,7 +3793,7 @@ private fun WireGuardExitVpsDialog(
         OutlinedTextField(
             value = passwordInput,
             onValueChange = { onPasswordChanged(it) },
-            label = { Text("SSH-пароль другого сервера") },
+            label = { Text(if (sshAuthMode == "key") "Пароль sudo" else "SSH-пароль другого сервера") },
             singleLine = true,
             visualTransformation = if (passwordFocused) VisualTransformation.None else PasswordVisualTransformation(),
             modifier = Modifier
@@ -3273,6 +3801,21 @@ private fun WireGuardExitVpsDialog(
                 .onFocusChanged { passwordFocused = it.isFocused },
             shape = RoundedCornerShape(16.dp)
         )
+        if (sshAuthMode == "key") {
+            OutlinedButton(
+                onClick = onEditSshKey,
+                enabled = !busy,
+                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                shape = RoundedCornerShape(16.dp),
+                colors = ButtonDefaults.outlinedButtonColors(
+                    containerColor = if (!hasSshAuthentication) MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.surface
+                )
+            ) {
+                Icon(Icons.Default.Key, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text(if (privateKeyConfigured) "Приватный SSH-ключ добавлен" else "Добавить приватный SSH-ключ")
+            }
+        }
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
             OutlinedTextField(
                 value = wgPortInput,
@@ -3292,7 +3835,7 @@ private fun WireGuardExitVpsDialog(
             )
         }
         Text(
-            "Если настройка не получится, WDTT Plus попытается вернуть прямой выход через текущий сервер. Приватные ключи остаются на серверах и не показываются в обычном логе.",
+            "Если настройка не получится, WDTT Plus попытается вернуть прямой выход через текущий сервер. Приватный SSH-ключ дополнительного VPS хранится только на этом Android-устройстве; после переустановки приложения его потребуется добавить снова.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.error
         )
@@ -3302,7 +3845,7 @@ private fun WireGuardExitVpsDialog(
             secondaryBusy = actionTitle.contains("Проверяю выход", ignoreCase = true),
             primaryText = "Настроить выход",
             primaryBusyText = "Настройка...",
-            primaryEnabled = hostValid && sshPort != null && wgPort != null && userInput.isNotBlank() && passwordInput.isNotBlank(),
+            primaryEnabled = hostValid && sshPort != null && wgPort != null && userInput.isNotBlank() && hasSshAuthentication,
             onPrimary = { onInstall(hostInput.trim(), sshPort ?: 22, userInput, passwordInput, wgPort ?: 51820, dnsInput) },
             secondaryText = "Проверить",
             secondaryBusyText = "Проверка...",
@@ -3334,17 +3877,20 @@ private fun FreeWarpDialog(
     restartEnabled: Boolean,
     updateToolEnabled: Boolean,
     deleteEnabled: Boolean,
+    resetRegistrationEnabled: Boolean,
     onMtuChanged: (String) -> Unit,
     onDismiss: () -> Unit,
     onInstall: (Int) -> Unit,
     onCheck: () -> Unit,
     onRestart: () -> Unit,
     onUpdateTool: () -> Unit,
+    onResetRegistration: () -> Unit,
     onDisable: () -> Unit,
     onDelete: () -> Unit
 ) {
     var termsAccepted by rememberSaveable { mutableStateOf(false) }
     var confirmDelete by rememberSaveable { mutableStateOf(false) }
+    var confirmReset by rememberSaveable { mutableStateOf(false) }
     val mtu = mtuInput.toIntOrNull()?.takeIf { it in 1280..1500 }
     OutboundDialogFrame("Бесплатный WARP", status, progressTitle, progress, onDismiss) {
         OutboundDialogStateBanner(indicator)
@@ -3397,7 +3943,7 @@ private fun FreeWarpDialog(
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
         Text(
-            "Устанавливается только бесплатный WARP, без WARP+ и Zero Trust. При нестабильном первом handshake приложение сделает до трёх попыток; если Cloudflare ограничил WARP в регионе, включение будет отменено и сохранится прямой выход.",
+            "Устанавливается только бесплатный WARP, без WARP+ и Zero Trust. Если первый запуск нестабилен, приложение само попробует несколько MTU и endpoint WARP; если Cloudflare ограничил WARP в регионе, включение будет отменено и сохранится прямой выход.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.tertiary
         )
@@ -3482,6 +4028,19 @@ private fun FreeWarpDialog(
             }
             Text(if (updating) "Обновление..." else "Проверить обновление wgcf", fontWeight = FontWeight.SemiBold)
         }
+        OutlinedButton(
+            onClick = { confirmReset = true },
+            enabled = !busy && resetRegistrationEnabled,
+            modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+            shape = RoundedCornerShape(16.dp)
+        ) {
+            val resetting = actionTitle.contains("Сбрасываю регистрацию", ignoreCase = true)
+            if (resetting) {
+                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                Spacer(Modifier.width(6.dp))
+            }
+            Text(if (resetting) "Сброс..." else "Сбросить регистрацию WARP", fontWeight = FontWeight.SemiBold)
+        }
         Row(
             modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Min),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -3505,6 +4064,24 @@ private fun FreeWarpDialog(
                 Text("Удалить", textAlign = TextAlign.Center)
             }
         }
+    }
+    if (confirmReset) {
+        AlertDialog(
+            onDismissRequest = { confirmReset = false },
+            title = { Text("Сбросить регистрацию WARP?") },
+            text = {
+                Text("Приложение отключит WARP, удалит текущую бесплатную регистрацию, ключи и профиль, но оставит проверенный инструмент wgcf. Следующая установка создаст новую регистрацию Cloudflare WARP.")
+            },
+            confirmButton = {
+                Button(onClick = {
+                    confirmReset = false
+                    onResetRegistration()
+                }) { Text("Сбросить") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmReset = false }) { Text("Отмена") }
+            }
+        )
     }
     if (confirmDelete) {
         AlertDialog(
@@ -3682,12 +4259,23 @@ private fun OutboundDiagnosticsDialog(
 }
 
 @Composable
-private fun OutboundStatusMessage(status: String) {
+private fun InlineActionMessage(status: String, modifier: Modifier = Modifier) {
     val isError = status.startsWith("Ошибка", true) ||
+        status.startsWith("Укажите", true) ||
+        status.startsWith("Выбран публичный", true) ||
+        status.startsWith("Формат ключа", true) ||
+        status.contains("добавьте приватный", true) ||
+        status.contains("обрезан", true) ||
         status.contains("не удалось", true) ||
+        status.contains("недоступ", true) ||
         status.contains("запрещ", true) ||
+        status.contains("отклонил", true) ||
+        status.contains("повреж", true) ||
+        status.contains("превыш", true) ||
+        status.contains("нет текста", true) ||
         status.startsWith("error:", true)
     Surface(
+        modifier = modifier,
         shape = RoundedCornerShape(14.dp),
         color = if (isError) {
             MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.55f)
@@ -3714,6 +4302,37 @@ private fun OutboundDialogFrame(
     onDismiss: () -> Unit,
     content: @Composable ColumnScope.() -> Unit
 ) {
+    val scrollState = rememberScrollState()
+    val density = LocalDensity.current
+    var viewportBounds by remember { mutableStateOf<androidx.compose.ui.geometry.Rect?>(null) }
+    var progressBounds by remember { mutableStateOf<androidx.compose.ui.geometry.Rect?>(null) }
+    var statusBounds by remember { mutableStateOf<androidx.compose.ui.geometry.Rect?>(null) }
+    LaunchedEffect(status, progressTitle.isNotBlank()) {
+        if (status.isNotBlank() || progressTitle.isNotBlank()) {
+            kotlinx.coroutines.delay(80)
+            val bounds = if (status.isNotBlank()) statusBounds else progressBounds
+            val viewport = viewportBounds
+            if (bounds != null && viewport != null) {
+                val marginPx = with(density) { 12.dp.toPx() }
+                val delta = when {
+                    bounds.bottom > viewport.bottom - marginPx ->
+                        bounds.bottom - (viewport.bottom - marginPx)
+                    bounds.top < viewport.top + marginPx ->
+                        bounds.top - (viewport.top + marginPx)
+                    else -> 0f
+                }
+                if (kotlin.math.abs(delta) >= 1f) {
+                    scrollState.animateScrollTo(
+                        value = (scrollState.value + delta.toInt()).coerceIn(0, scrollState.maxValue),
+                        animationSpec = tween(
+                            durationMillis = 320,
+                            easing = androidx.compose.animation.core.FastOutSlowInEasing
+                        )
+                    )
+                }
+            }
+        }
+    }
     androidx.compose.ui.window.Dialog(onDismissRequest = onDismiss) {
         BoxWithConstraints(
             modifier = Modifier.fillMaxSize().padding(8.dp),
@@ -3733,7 +4352,8 @@ private fun OutboundDialogFrame(
                     modifier = Modifier
                         .padding(24.dp)
                         .fillMaxWidth()
-                        .verticalScroll(rememberScrollState()),
+                        .onGloballyPositioned { viewportBounds = it.boundsInWindow() }
+                        .verticalScroll(scrollState),
                     verticalArrangement = Arrangement.spacedBy(14.dp)
                 ) {
                     Row(
@@ -3753,14 +4373,23 @@ private fun OutboundDialogFrame(
                     }
                     content()
                     if (progressTitle.isNotBlank()) {
-                        DeployProgressPanel(
-                            title = progressTitle,
-                            progress = progress,
-                            determinate = true
-                        )
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .onGloballyPositioned { progressBounds = it.boundsInWindow() }
+                        ) {
+                            DeployProgressPanel(
+                                title = progressTitle,
+                                progress = progress,
+                                determinate = true
+                            )
+                        }
                     }
                     if (status.isNotBlank()) {
-                        OutboundStatusMessage(status)
+                        InlineActionMessage(
+                            status = status,
+                            modifier = Modifier.onGloballyPositioned { statusBounds = it.boundsInWindow() }
+                        )
                     }
                     Spacer(Modifier.height(4.dp))
                 }
@@ -3834,6 +4463,669 @@ private fun busyButtonText(text: String): String = when {
     text.contains("Вернуть", ignoreCase = true) -> "Возврат..."
     text.contains("Показать", ignoreCase = true) -> "Проверка..."
     else -> "Выполняю..."
+}
+
+internal fun serverDiagnosticsScript(
+    expectedDtlsPort: Int? = null,
+    expectedWgPort: Int? = null,
+    expectedClientPort: Int? = null
+): String {
+    val dtlsPort = expectedDtlsPort?.takeIf { it in 1..65535 } ?: 56000
+    val wgPort = expectedWgPort?.takeIf { it in 1..65535 } ?: 56001
+    val clientPort = expectedClientPort?.takeIf { it in 1..65535 } ?: 9000
+    return """
+    set +e
+    WDTT_EXPECTED_DTLS_PORT="$dtlsPort"
+    WDTT_EXPECTED_WG_PORT="$wgPort"
+    WDTT_EXPECTED_CLIENT_PORT="$clientPort"
+    WDTT_WGCF_URL="$WGCF_LINUX_AMD64_URL"
+    WDTT_WGCF_API="$WGCF_LATEST_RELEASE_API"
+    wdtt_diag_safe() {
+      printf '%s' "${'$'}1" | tr '\n\r|' '   ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ ${'$'}//' | cut -c1-700
+    }
+    wdtt_diag_emit() {
+      severity="${'$'}1"
+      title="${'$'}(wdtt_diag_safe "${'$'}2")"
+      status="${'$'}(wdtt_diag_safe "${'$'}3")"
+      details="${'$'}(wdtt_diag_safe "${'$'}4")"
+      recommendation="${'$'}(wdtt_diag_safe "${'$'}5")"
+      printf 'WDTT_SERVER_DIAG|%s|%s|%s|%s|%s\n' "${'$'}severity" "${'$'}title" "${'$'}status" "${'$'}details" "${'$'}recommendation"
+    }
+    wdtt_diag_cmd() {
+      command -v "${'$'}1" >/dev/null 2>&1
+    }
+    wdtt_diag_service_state() {
+      unit="${'$'}1"
+      if wdtt_diag_cmd systemctl; then
+        systemctl is-active "${'$'}unit" 2>/dev/null || echo "inactive"
+      else
+        echo "systemctl отсутствует"
+      fi
+    }
+    wdtt_diag_file_state() {
+      path="${'$'}1"
+      if [ -e "${'$'}path" ]; then
+        echo "есть"
+      else
+        echo "нет"
+      fi
+    }
+    wdtt_diag_pkg_manager() {
+      for tool in apt-get dnf yum zypper apk pacman; do
+        if wdtt_diag_cmd "${'$'}tool"; then
+          printf '%s' "${'$'}tool"
+          return 0
+        fi
+      done
+      printf 'не найден'
+    }
+    wdtt_diag_missing_installable_tools() {
+      missing_tools=""
+      for tool in bash curl ip ss iptables nft wg wg-quick free df sha256sum; do
+        if ! wdtt_diag_cmd "${'$'}tool"; then
+          missing_tools="${'$'}missing_tools ${'$'}tool"
+        fi
+      done
+      printf '%s' "${'$'}missing_tools"
+    }
+    wdtt_diag_install_dependencies() {
+      manager="${'$'}1"
+      case "${'$'}manager" in
+        apt-get)
+          apt-get update -y >/dev/null 2>&1 || true
+          DEBIAN_FRONTEND=noninteractive apt-get install -y bash ca-certificates curl iproute2 iptables procps coreutils util-linux >/dev/null 2>&1 || return 1
+          DEBIAN_FRONTEND=noninteractive apt-get install -y nftables wireguard-tools >/dev/null 2>&1 || true
+          ;;
+        dnf)
+          dnf install -y bash ca-certificates curl iproute iptables procps-ng coreutils util-linux >/dev/null 2>&1 || return 1
+          dnf install -y nftables wireguard-tools >/dev/null 2>&1 || true
+          ;;
+        yum)
+          yum install -y bash ca-certificates curl iproute iptables procps-ng coreutils util-linux >/dev/null 2>&1 || return 1
+          yum install -y nftables wireguard-tools >/dev/null 2>&1 || true
+          ;;
+        zypper)
+          zypper --non-interactive install -y bash ca-certificates curl iproute2 iptables procps coreutils util-linux >/dev/null 2>&1 || return 1
+          zypper --non-interactive install -y nftables wireguard-tools >/dev/null 2>&1 || true
+          ;;
+        apk)
+          apk add --no-cache bash ca-certificates curl iproute2 iptables procps coreutils util-linux >/dev/null 2>&1 || return 1
+          apk add --no-cache nftables wireguard-tools >/dev/null 2>&1 || true
+          ;;
+        pacman)
+          pacman -Sy --noconfirm --needed bash ca-certificates curl iproute2 iptables procps-ng coreutils util-linux >/dev/null 2>&1 || return 1
+          pacman -Sy --noconfirm --needed nftables wireguard-tools >/dev/null 2>&1 || true
+          ;;
+        *)
+          return 1
+          ;;
+      esac
+      return 0
+    }
+    wdtt_diag_os_name() {
+      if [ -r /etc/os-release ]; then
+        awk -F= '
+          ${'$'}1=="PRETTY_NAME" {
+            value=${'$'}2
+            gsub(/^"/, "", value)
+            gsub(/"$/, "", value)
+            print value
+            exit
+          }
+        ' /etc/os-release
+      else
+        uname -s 2>/dev/null
+      fi
+    }
+    wdtt_diag_os_id() {
+      if [ -r /etc/os-release ]; then
+        awk -F= '
+          ${'$'}1=="ID" { id=${'$'}2; gsub(/"/, "", id) }
+          ${'$'}1=="VERSION_ID" { version=${'$'}2; gsub(/"/, "", version) }
+          END {
+            if (id != "" && version != "") print id " " version
+            else if (id != "") print id
+          }
+        ' /etc/os-release
+      fi
+    }
+    wdtt_diag_public_ip() {
+      if wdtt_diag_cmd curl; then
+        curl -4fsS --connect-timeout 5 --max-time 10 https://api.ipify.org 2>/dev/null
+      fi
+    }
+    wdtt_diag_resolve_host() {
+      host="${'$'}1"
+      case "${'$'}host" in
+        [0-9]*.[0-9]*.[0-9]*.[0-9]*) printf '%s' "${'$'}host"; return 0 ;;
+      esac
+      if wdtt_diag_cmd getent; then
+        getent ahostsv4 "${'$'}host" 2>/dev/null | awk '{print ${'$'}1; exit}'
+      elif wdtt_diag_cmd nslookup; then
+        nslookup "${'$'}host" 2>/dev/null | awk '/^Address: / {print ${'$'}2; exit}'
+      elif wdtt_diag_cmd ping; then
+        ping -4 -c 1 -W 2 "${'$'}host" >/dev/null 2>&1 && printf 'ping-ok'
+      fi
+    }
+    wdtt_diag_http_probe() {
+      url="${'$'}1"
+      if ! wdtt_diag_cmd curl; then
+        echo "curl отсутствует"
+        return 2
+      fi
+      errfile="/tmp/wdtt-diag-curl-${'$'}${'$'}.err"
+      code="${'$'}(curl -4sS -o /dev/null -w '%{http_code}' --connect-timeout 6 --max-time 12 "${'$'}url" 2>"${'$'}errfile")"
+      exit_code="${'$'}?"
+      err="${'$'}(tr '\n\r|' '   ' <"${'$'}errfile" 2>/dev/null | cut -c1-180)"
+      rm -f "${'$'}errfile"
+      if [ "${'$'}exit_code" = "0" ] && [ "${'$'}code" != "000" ] && [ -n "${'$'}code" ]; then
+        echo "HTTP ${'$'}code"
+        return 0
+      fi
+      echo "ошибка curl ${'$'}exit_code${'$'}{err:+: ${'$'}err}"
+      return 1
+    }
+    wdtt_diag_udp_probe() {
+      host="${'$'}1"
+      port="${'$'}2"
+      if wdtt_diag_cmd nc; then
+        if nc -4 -u -z -w 3 "${'$'}host" "${'$'}port" >/dev/null 2>&1; then
+          echo "UDP-проба отправлена через nc"
+          return 0
+        fi
+        echo "UDP-проба через nc не подтвердилась"
+        return 1
+      elif wdtt_diag_cmd bash; then
+        if bash -c 'printf x >"/dev/udp/${'$'}1/${'$'}2"' sh "${'$'}host" "${'$'}port" >/dev/null 2>&1; then
+          echo "UDP-пакет отправлен через bash /dev/udp"
+          return 0
+        fi
+        echo "UDP-отправка через bash /dev/udp не удалась"
+        return 1
+      fi
+      echo "не проверено: нет nc или bash"
+      return 2
+    }
+    wdtt_diag_udp_listen_port() {
+      port="${'$'}1"
+      if wdtt_diag_cmd ss; then
+        ss -H -lunu 2>/dev/null | awk -v needle=":${'$'}port" 'index(${'$'}0, needle) {found=1} END {exit found ? 0 : 1}'
+        return "${'$'}?"
+      fi
+      return 2
+    }
+    wdtt_diag_wireguard_kernel() {
+      if [ -d /sys/module/wireguard ] || grep -qw wireguard /proc/modules 2>/dev/null; then
+        echo "wireguard в ядре найден"
+        return 0
+      fi
+      if wdtt_diag_cmd modprobe && modprobe -n wireguard >/dev/null 2>&1; then
+        echo "модуль wireguard доступен для загрузки"
+        return 0
+      fi
+      echo "поддержка wireguard в ядре не подтверждена"
+      return 1
+    }
+    wdtt_diag_outbound_mode() {
+      if [ -r /etc/wdtt/outbound.json ]; then
+        sed -n 's/.*"outboundMode"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /etc/wdtt/outbound.json 2>/dev/null | head -n 1
+      fi
+    }
+
+    OS_NAME="${'$'}(wdtt_diag_os_name)"
+    OS_ID="${'$'}(wdtt_diag_os_id)"
+    KERNEL="${'$'}(uname -srmo 2>/dev/null)"
+    ARCH="${'$'}(uname -m 2>/dev/null)"
+    wdtt_diag_emit "OK" "Операционная система" "${'$'}{OS_NAME:-не определена}" "ID/версия: ${'$'}{OS_ID:-не указано}. Ядро: ${'$'}{KERNEL:-не определено}. Архитектура: ${'$'}{ARCH:-не определена}." ""
+
+    INIT_STATUS="не определён"
+    INIT_DETAILS=""
+    INIT_SEVERITY="INFO"
+    if wdtt_diag_cmd systemctl; then
+      INIT_STATUS="systemd доступен"
+      INIT_DETAILS="${'$'}(systemctl --version 2>/dev/null | head -n 1)"
+      INIT_SEVERITY="OK"
+    else
+      PID1="${'$'}(ps -p 1 -o comm= 2>/dev/null | head -n 1)"
+      INIT_STATUS="systemctl не найден"
+      INIT_DETAILS="PID 1: ${'$'}{PID1:-не определён}. Деплой WDTT Plus управляет службами через systemd; на такой системе установка может быть ограничена."
+      INIT_SEVERITY="WARNING"
+    fi
+    wdtt_diag_emit "${'$'}INIT_SEVERITY" "Init и службы" "${'$'}INIT_STATUS" "${'$'}INIT_DETAILS" "Для полной автоматической установки нужен systemd/systemctl."
+
+    if [ "${'$'}(id -u 2>/dev/null)" = "0" ]; then
+      ROOT_STATUS="root"
+      ROOT_SEVERITY="OK"
+      ROOT_DETAILS="Диагностический скрипт выполняется с правами root."
+    else
+      ROOT_STATUS="не root"
+      ROOT_SEVERITY="WARNING"
+      ROOT_DETAILS="id -u=${'$'}(id -u 2>/dev/null). Для установки нужны root-права или sudo."
+    fi
+    if wdtt_diag_cmd sudo; then
+      ROOT_DETAILS="${'$'}ROOT_DETAILS sudo найден."
+    else
+      ROOT_DETAILS="${'$'}ROOT_DETAILS sudo не найден."
+    fi
+    wdtt_diag_emit "${'$'}ROOT_SEVERITY" "Права администратора" "${'$'}ROOT_STATUS" "${'$'}ROOT_DETAILS" "Если установка падает на правах, войдите под root или настройте sudo для SSH-пользователя."
+
+    PKG_MANAGER="${'$'}(wdtt_diag_pkg_manager)"
+    if [ "${'$'}PKG_MANAGER" = "не найден" ]; then
+      wdtt_diag_emit "WARNING" "Пакетный менеджер" "не найден" "Не найдены apt-get, dnf, yum, zypper, apk или pacman. Автоустановка зависимостей может не сработать на этой ОС." "Установите зависимости вручную или используйте распространённый Linux-дистрибутив с поддерживаемым пакетным менеджером."
+    else
+      wdtt_diag_emit "OK" "Пакетный менеджер" "${'$'}PKG_MANAGER" "Будет использоваться для установки curl, WireGuard tools, iproute/iptables и других зависимостей, если они отсутствуют." ""
+    fi
+
+    MISSING_BEFORE="${'$'}(wdtt_diag_missing_installable_tools)"
+    if [ "${'$'}PKG_MANAGER" = "не найден" ]; then
+      wdtt_diag_emit "WARNING" "Подготовка диагностики" "пакетный менеджер не найден" "Не удалось автоматически доустановить диагностические инструменты. До установки отсутствовали:${'$'}{MISSING_BEFORE:- нет}." "На нестандартной ОС установите недостающие утилиты вручную или используйте поддерживаемый пакетный менеджер."
+    elif [ -z "${'$'}MISSING_BEFORE" ]; then
+      wdtt_diag_emit "OK" "Подготовка диагностики" "доустановка не нужна" "Все основные диагностические инструменты уже доступны." ""
+    else
+      if wdtt_diag_install_dependencies "${'$'}PKG_MANAGER"; then
+        MISSING_AFTER="${'$'}(wdtt_diag_missing_installable_tools)"
+        if [ -z "${'$'}MISSING_AFTER" ]; then
+          wdtt_diag_emit "OK" "Подготовка диагностики" "инструменты доустановлены" "До установки отсутствовали:${'$'}MISSING_BEFORE. После установки основные инструменты доступны." ""
+        else
+          wdtt_diag_emit "WARNING" "Подготовка диагностики" "частично доустановлено" "До установки отсутствовали:${'$'}MISSING_BEFORE. После попытки установки всё ещё отсутствуют:${'$'}MISSING_AFTER." "Некоторые пакеты могут называться иначе в этом дистрибутиве или отсутствовать в репозиториях."
+        fi
+      else
+        MISSING_AFTER="${'$'}(wdtt_diag_missing_installable_tools)"
+        wdtt_diag_emit "WARNING" "Подготовка диагностики" "доустановка не удалась" "Пакетный менеджер: ${'$'}PKG_MANAGER. До установки отсутствовали:${'$'}MISSING_BEFORE. Сейчас отсутствуют:${'$'}MISSING_AFTER." "Проверьте репозитории, сеть сервера и права root/sudo; диагностика продолжится с доступными командами."
+      fi
+    fi
+
+    TOOLS=""
+    MISSING=""
+    for tool in bash sh curl ip ss wg wg-quick iptables nft systemctl awk sed grep sha256sum; do
+      if wdtt_diag_cmd "${'$'}tool"; then
+        TOOLS="${'$'}TOOLS ${'$'}tool"
+      else
+        MISSING="${'$'}MISSING ${'$'}tool"
+      fi
+    done
+    if [ -n "${'$'}MISSING" ]; then
+      wdtt_diag_emit "WARNING" "Системные инструменты" "часть отсутствует" "Найдены:${'$'}{TOOLS:- нет}. Отсутствуют:${'$'}MISSING." "Отсутствующие команды могут ограничить деплой, WARP, прокси или диагностику на этой Linux-системе."
+    else
+      wdtt_diag_emit "OK" "Системные инструменты" "всё основное найдено" "Найдены:${'$'}TOOLS." ""
+    fi
+
+    STACK_SEVERITY="OK"
+    STACK_STATUS="готов"
+    TUN_STATE="не найден"
+    if [ -c /dev/net/tun ]; then
+      TUN_STATE="/dev/net/tun есть"
+    else
+      STACK_SEVERITY="WARNING"
+      STACK_STATUS="есть ограничения"
+    fi
+    IP_FORWARD="${'$'}(sysctl -n net.ipv4.ip_forward 2>/dev/null || cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)"
+    if [ "${'$'}IP_FORWARD" != "1" ]; then
+      STACK_SEVERITY="WARNING"
+      STACK_STATUS="есть ограничения"
+    fi
+    WG_KERNEL="${'$'}(wdtt_diag_wireguard_kernel)"
+    WG_KERNEL_CODE="${'$'}?"
+    if [ "${'$'}WG_KERNEL_CODE" != "0" ]; then
+      STACK_SEVERITY="WARNING"
+      STACK_STATUS="есть ограничения"
+    fi
+    STACK_DETAILS="TUN: ${'$'}TUN_STATE. net.ipv4.ip_forward=${'$'}{IP_FORWARD:-не прочитано}. ${'$'}WG_KERNEL. wg: ${'$'}(wdtt_diag_cmd wg && echo есть || echo нет), wg-quick: ${'$'}(wdtt_diag_cmd wg-quick && echo есть || echo нет)."
+    wdtt_diag_emit "${'$'}STACK_SEVERITY" "Сетевой стек WDTT" "${'$'}STACK_STATUS" "${'$'}STACK_DETAILS" "Для WDTT и режимов выхода нужны TUN, маршрутизация IPv4 и рабочий WireGuard-стек. На VPS с урезанным ядром WARP/VPN-выход может не подняться."
+
+    MEM_INFO=""
+    if wdtt_diag_cmd free; then
+      MEM_INFO="${'$'}(free -h 2>/dev/null | awk '/^Mem:/ {print "RAM всего " ${'$'}2 ", свободно " ${'$'}4 ", доступно " ${'$'}7} /^Swap:/ {print "Swap всего " ${'$'}2 ", свободно " ${'$'}4}')"
+    elif [ -r /proc/meminfo ]; then
+      MEM_INFO="${'$'}(awk '/MemTotal|MemAvailable|SwapTotal/ {printf "%s=%s %s; ", ${'$'}1, ${'$'}2, ${'$'}3}' /proc/meminfo)"
+    fi
+    wdtt_diag_emit "INFO" "Память" "${'$'}{MEM_INFO:-не удалось прочитать}" "Память важна для стабильной работы сервера, WireGuard/WARP и прокси-компонентов." ""
+
+    DISK_INFO=""
+    if wdtt_diag_cmd df; then
+      DISK_INFO="${'$'}(df -h / /etc /tmp 2>/dev/null | awk 'NR>1 {printf "%s: свободно %s из %s; ", ${'$'}6, ${'$'}4, ${'$'}2}')"
+    fi
+    wdtt_diag_emit "INFO" "Диск" "${'$'}{DISK_INFO:-не удалось прочитать}" "Для установки нужны место под бинарник сервера, временные файлы, WireGuard/WARP-профили и журналы systemd." ""
+
+    PUBLIC_IP="${'$'}(wdtt_diag_public_ip)"
+    DEFAULT_ROUTE=""
+    if wdtt_diag_cmd ip; then
+      DEFAULT_ROUTE="${'$'}(ip -4 route show default 2>/dev/null | head -n 1)"
+    fi
+    NET_DETAILS="Публичный IPv4 самого сервера: ${'$'}{PUBLIC_IP:-не удалось определить}. Default route: ${'$'}{DEFAULT_ROUTE:-не определён}."
+    if [ -n "${'$'}PUBLIC_IP" ]; then
+      wdtt_diag_emit "OK" "Сеть сервера" "интернет доступен" "${'$'}NET_DETAILS" ""
+    else
+      wdtt_diag_emit "WARNING" "Сеть сервера" "публичный IPv4 не проверен" "${'$'}NET_DETAILS" "Проверьте исходящий HTTPS-доступ с сервера; он нужен для wgcf, WARP-проверок и обновлений."
+    fi
+
+    VK_WARN=0
+    VK_DETAILS=""
+    for host in vk.com api.vk.me calls.okcdn.ru id.vk.com static.vk.com static.vk.ru; do
+      resolved="${'$'}(wdtt_diag_resolve_host "${'$'}host")"
+      if [ -n "${'$'}resolved" ]; then
+        VK_DETAILS="${'$'}VK_DETAILS ${'$'}host DNS: ${'$'}resolved;"
+      else
+        VK_WARN=1
+        VK_DETAILS="${'$'}VK_DETAILS ${'$'}host DNS: не разрешается;"
+      fi
+    done
+    VK_HTTP="${'$'}(wdtt_diag_http_probe https://vk.com/)"; VK_HTTP_CODE="${'$'}?"
+    [ "${'$'}VK_HTTP_CODE" = "0" ] || VK_WARN=1
+    VK_DETAILS="${'$'}VK_DETAILS vk.com HTTPS: ${'$'}VK_HTTP;"
+    VK_API_HTTP="${'$'}(wdtt_diag_http_probe 'https://api.vk.me/method/users.get?v=5.131')"; VK_API_HTTP_CODE="${'$'}?"
+    [ "${'$'}VK_API_HTTP_CODE" = "0" ] || VK_WARN=1
+    VK_DETAILS="${'$'}VK_DETAILS api.vk.me HTTPS: ${'$'}VK_API_HTTP;"
+    OK_HTTP="${'$'}(wdtt_diag_http_probe https://calls.okcdn.ru/fb.do)"; OK_HTTP_CODE="${'$'}?"
+    [ "${'$'}OK_HTTP_CODE" = "0" ] || VK_WARN=1
+    VK_DETAILS="${'$'}VK_DETAILS calls.okcdn.ru HTTPS: ${'$'}OK_HTTP;"
+    CAPTCHA_HTTP="${'$'}(wdtt_diag_http_probe https://id.vk.com/)"; CAPTCHA_HTTP_CODE="${'$'}?"
+    [ "${'$'}CAPTCHA_HTTP_CODE" = "0" ] || VK_WARN=1
+    VK_DETAILS="${'$'}VK_DETAILS id.vk.com HTTPS: ${'$'}CAPTCHA_HTTP."
+    if [ "${'$'}VK_WARN" = "0" ]; then
+      wdtt_diag_emit "OK" "VK / TURN-зависимости" "базовая доступность есть" "${'$'}VK_DETAILS Реальные TURN-адреса выдаются VK/OK только для конкретного живого VK-хеша, поэтому TURN Allocate без хеша здесь не выполняется." "Если туннель не стартует, дополнительно проверьте VK-хеш на телефоне: там проверяется получение TURN credentials и возможная капча."
+    else
+      wdtt_diag_emit "WARNING" "VK / TURN-зависимости" "есть риск недоступности" "${'$'}VK_DETAILS Реальные TURN-адреса выдаются VK/OK только для конкретного живого VK-хеша, поэтому TURN Allocate без хеша здесь не выполняется." "Проверьте DNS/HTTPS-доступ к VK и OK CDN с VPS, регион VPS и состояние VK-хеша на телефоне."
+    fi
+
+    TELEGRAM_CONFIGURED=0
+    if [ -r /etc/wdtt/access.json ] && grep -Eq '"bot_token"[[:space:]]*:[[:space:]]*"[^"]{10,}"' /etc/wdtt/access.json 2>/dev/null; then
+      TELEGRAM_CONFIGURED=1
+    fi
+    TG_HTTP="${'$'}(wdtt_diag_http_probe https://api.telegram.org/)"; TG_HTTP_CODE="${'$'}?"
+    if [ "${'$'}TG_HTTP_CODE" = "0" ]; then
+      wdtt_diag_emit "INFO" "Telegram API" "доступен" "api.telegram.org: ${'$'}TG_HTTP. Настроен ли бот на сервере: ${'$'}([ "${'$'}TELEGRAM_CONFIGURED" = "1" ] && echo да || echo нет)." ""
+    elif [ "${'$'}TELEGRAM_CONFIGURED" = "1" ]; then
+      wdtt_diag_emit "WARNING" "Telegram API" "недоступен" "На сервере найден признак настроенного Telegram-бота, но api.telegram.org не отвечает: ${'$'}TG_HTTP." "Если бот нужен, проверьте DNS/HTTPS-доступ к Telegram API с VPS или ограничения региона/провайдера."
+    else
+      wdtt_diag_emit "INFO" "Telegram API" "не проверен как обязательный" "api.telegram.org не отвечает: ${'$'}TG_HTTP. Бот на сервере не выглядит настроенным, поэтому это не мешает основному туннелю." ""
+    fi
+
+    WARP_WARN=0
+    WARP_DETAILS=""
+    CF_TRACE="${'$'}(curl -4fsS --connect-timeout 6 --max-time 12 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)"
+    if [ -n "${'$'}CF_TRACE" ]; then
+      CF_WARP="${'$'}(printf '%s\n' "${'$'}CF_TRACE" | sed -n 's/^warp=//p' | head -n 1)"
+      CF_COLO="${'$'}(printf '%s\n' "${'$'}CF_TRACE" | sed -n 's/^colo=//p' | head -n 1)"
+      WARP_DETAILS="${'$'}WARP_DETAILS Cloudflare trace доступен: warp=${'$'}{CF_WARP:-не указано}, colo=${'$'}{CF_COLO:-не указано};"
+    else
+      WARP_WARN=1
+      WARP_DETAILS="${'$'}WARP_DETAILS Cloudflare trace недоступен;"
+    fi
+    WGCF_HTTP="${'$'}(wdtt_diag_http_probe "${'$'}WDTT_WGCF_URL")"; WGCF_HTTP_CODE="${'$'}?"
+    [ "${'$'}WGCF_HTTP_CODE" = "0" ] || WARP_WARN=1
+    WARP_DETAILS="${'$'}WARP_DETAILS wgcf download: ${'$'}WGCF_HTTP;"
+    WGCF_API_HTTP="${'$'}(wdtt_diag_http_probe "${'$'}WDTT_WGCF_API")"; WGCF_API_HTTP_CODE="${'$'}?"
+    [ "${'$'}WGCF_API_HTTP_CODE" = "0" ] || WARP_WARN=1
+    WARP_DETAILS="${'$'}WARP_DETAILS GitHub API wgcf: ${'$'}WGCF_API_HTTP;"
+    ENGAGE_IP="${'$'}(wdtt_diag_resolve_host engage.cloudflareclient.com)"
+    if [ -n "${'$'}ENGAGE_IP" ]; then
+      WARP_DETAILS="${'$'}WARP_DETAILS engage.cloudflareclient.com DNS: ${'$'}ENGAGE_IP;"
+    else
+      WARP_WARN=1
+      WARP_DETAILS="${'$'}WARP_DETAILS engage.cloudflareclient.com DNS: не разрешается;"
+    fi
+    WARP_UDP_2408="${'$'}(wdtt_diag_udp_probe engage.cloudflareclient.com 2408)"; WARP_UDP_2408_CODE="${'$'}?"
+    [ "${'$'}WARP_UDP_2408_CODE" = "1" ] && WARP_WARN=1
+    WARP_DETAILS="${'$'}WARP_DETAILS UDP 2408: ${'$'}WARP_UDP_2408;"
+    WARP_UDP_500="${'$'}(wdtt_diag_udp_probe engage.cloudflareclient.com 500)"; WARP_UDP_500_CODE="${'$'}?"
+    [ "${'$'}WARP_UDP_500_CODE" = "1" ] && WARP_WARN=1
+    WARP_DETAILS="${'$'}WARP_DETAILS UDP 500: ${'$'}WARP_UDP_500;"
+    WARP_STACK="${'$'}(wdtt_diag_wireguard_kernel)"
+    WARP_STACK_CODE="${'$'}?"
+    [ "${'$'}WARP_STACK_CODE" = "0" ] || WARP_WARN=1
+    WARP_DETAILS="${'$'}WARP_DETAILS ${'$'}WARP_STACK; wg=${'$'}(wdtt_diag_cmd wg && echo есть || echo нет); wg-quick=${'$'}(wdtt_diag_cmd wg-quick && echo есть || echo нет)."
+    if [ "${'$'}WARP_WARN" = "0" ]; then
+      wdtt_diag_emit "OK" "Бесплатный WARP" "предпосылки выглядят рабочими" "${'$'}WARP_DETAILS" "Это не гарантирует регистрацию WARP: Cloudflare может временно ограничивать регион/VPS, но базовая сеть и инструменты выглядят пригодными."
+    else
+      wdtt_diag_emit "WARNING" "Бесплатный WARP" "есть риск, что не заработает" "${'$'}WARP_DETAILS" "Проверьте исходящий HTTPS к Cloudflare/GitHub, UDP к WARP endpoint, WireGuard-стек ядра и попробуйте другой MTU/endpoint или регион VPS."
+    fi
+
+    FIREWALL_DETAILS=""
+    if wdtt_diag_cmd iptables; then
+      NAT_RULES="${'$'}(iptables -t nat -S 2>/dev/null | grep -c 'WDTT\\|wdtt\\|MASQUERADE' 2>/dev/null)"
+      FIREWALL_DETAILS="iptables найден; NAT-правил WDTT/MASQUERADE: ${'$'}NAT_RULES."
+      FIREWALL_SEVERITY="OK"
+      FIREWALL_STATUS="iptables доступен"
+    elif wdtt_diag_cmd nft; then
+      FIREWALL_DETAILS="iptables не найден, nft найден. Часть скриптов WDTT Plus ожидает iptables-совместимый интерфейс."
+      FIREWALL_SEVERITY="WARNING"
+      FIREWALL_STATUS="только nft"
+    else
+      FIREWALL_DETAILS="Не найдены iptables и nft."
+      FIREWALL_SEVERITY="WARNING"
+      FIREWALL_STATUS="не найден"
+    fi
+    if wdtt_diag_cmd ip; then
+      RULES="${'$'}(ip rule show 2>/dev/null | grep -c 'lookup 100\\|from .* table 100' 2>/dev/null)"
+      ROUTE100="${'$'}(ip route show table 100 2>/dev/null | head -n 2 | tr '\n' '; ')"
+      FIREWALL_DETAILS="${'$'}FIREWALL_DETAILS Policy routing table 100 rules: ${'$'}RULES. table 100: ${'$'}{ROUTE100:-пусто}."
+    fi
+    wdtt_diag_emit "${'$'}FIREWALL_SEVERITY" "Маршрутизация и NAT" "${'$'}FIREWALL_STATUS" "${'$'}FIREWALL_DETAILS" "Для внешнего выхода WDTT через WARP/VPN/прокси нужны ip rule/ip route и NAT."
+
+    WDTT_SERVICE="${'$'}(wdtt_diag_service_state wdtt.service)"
+    WDTT_BIN="${'$'}(wdtt_diag_file_state /usr/local/bin/wdtt-server)"
+    WDTT_CONFIG="${'$'}(wdtt_diag_file_state /etc/wdtt)"
+    WDTT_ACCESS="${'$'}(wdtt_diag_file_state /etc/wdtt/access.json)"
+    if [ -S /run/wdtt/admin.sock ]; then
+      WDTT_ADMIN_SOCKET="/run/wdtt/admin.sock есть"
+    elif [ -S /etc/wdtt/admin.sock ]; then
+      WDTT_ADMIN_SOCKET="/etc/wdtt/admin.sock есть"
+    else
+      WDTT_ADMIN_SOCKET="не найден"
+    fi
+    WDTT_DETAILS="wdtt.service: ${'$'}WDTT_SERVICE. /usr/local/bin/wdtt-server: ${'$'}WDTT_BIN. /etc/wdtt: ${'$'}WDTT_CONFIG. access.json: ${'$'}WDTT_ACCESS. admin socket: ${'$'}WDTT_ADMIN_SOCKET."
+    case "${'$'}WDTT_SERVICE" in
+      active)
+        if [ "${'$'}WDTT_ADMIN_SOCKET" = "не найден" ]; then
+          wdtt_diag_emit "WARNING" "WDTT сервер" "служба активна, admin-сокет не найден" "${'$'}WDTT_DETAILS" "Управление клиентами из приложения может не работать. Выполните обновление сервера с сохранением данных или проверьте журналы wdtt.service."
+        else
+          wdtt_diag_emit "OK" "WDTT сервер" "служба активна" "${'$'}WDTT_DETAILS" ""
+        fi
+        ;;
+      inactive|failed) wdtt_diag_emit "WARNING" "WDTT сервер" "служба не активна" "${'$'}WDTT_DETAILS" "Если сервер уже установлен, проверьте установку или журналы systemd. Если установка ещё не выполнялась — это нормально." ;;
+      *) wdtt_diag_emit "INFO" "WDTT сервер" "${'$'}WDTT_SERVICE" "${'$'}WDTT_DETAILS" "Если установка ещё не выполнялась — это нормально." ;;
+    esac
+
+    PORT_EXPECT_DETAILS="Активный профиль приложения ожидает DTLS UDP ${'$'}WDTT_EXPECTED_DTLS_PORT и серверный WireGuard UDP ${'$'}WDTT_EXPECTED_WG_PORT. Локальный порт Android-клиента ${'$'}WDTT_EXPECTED_CLIENT_PORT проверяется на телефоне, а не на VPS."
+    PORT_EXPECT_SEVERITY="INFO"
+    PORT_EXPECT_STATUS="проверено частично"
+    if wdtt_diag_udp_listen_port "${'$'}WDTT_EXPECTED_DTLS_PORT"; then
+      PORT_EXPECT_DETAILS="${'$'}PORT_EXPECT_DETAILS DTLS-порт слушается на сервере."
+      [ "${'$'}WDTT_SERVICE" = "active" ] && PORT_EXPECT_SEVERITY="OK" && PORT_EXPECT_STATUS="порты совпадают"
+    else
+      PORT_LISTEN_CODE="${'$'}?"
+      if [ "${'$'}PORT_LISTEN_CODE" = "2" ]; then
+        PORT_EXPECT_DETAILS="${'$'}PORT_EXPECT_DETAILS Не удалось проверить UDP listening: ss отсутствует."
+      else
+        PORT_EXPECT_DETAILS="${'$'}PORT_EXPECT_DETAILS DTLS-порт ${'$'}WDTT_EXPECTED_DTLS_PORT не найден среди UDP listening sockets."
+        [ "${'$'}WDTT_SERVICE" = "active" ] && PORT_EXPECT_SEVERITY="WARNING" && PORT_EXPECT_STATUS="порт не слушается"
+      fi
+    fi
+    if wdtt_diag_udp_listen_port "${'$'}WDTT_EXPECTED_WG_PORT"; then
+      PORT_EXPECT_DETAILS="${'$'}PORT_EXPECT_DETAILS WireGuard-порт ${'$'}WDTT_EXPECTED_WG_PORT слушается."
+    else
+      WG_LISTEN_CODE="${'$'}?"
+      if [ "${'$'}WG_LISTEN_CODE" = "2" ]; then
+        PORT_EXPECT_DETAILS="${'$'}PORT_EXPECT_DETAILS Не удалось проверить WireGuard UDP listening: ss отсутствует."
+      else
+        PORT_EXPECT_DETAILS="${'$'}PORT_EXPECT_DETAILS WireGuard-порт ${'$'}WDTT_EXPECTED_WG_PORT не найден среди UDP listening sockets."
+        [ "${'$'}WDTT_SERVICE" = "active" ] && PORT_EXPECT_SEVERITY="WARNING" && PORT_EXPECT_STATUS="часть портов не слушается"
+      fi
+    fi
+    wdtt_diag_emit "${'$'}PORT_EXPECT_SEVERITY" "Порты активного профиля" "${'$'}PORT_EXPECT_STATUS" "${'$'}PORT_EXPECT_DETAILS" "Если порты не совпадают, выполните установку/обновление с сохранением данных или проверьте ручные порты в «Секретах»."
+
+    LISTEN_INFO=""
+    if wdtt_diag_cmd ss; then
+      LISTEN_INFO="${'$'}(ss -lntu 2>/dev/null | awk 'NR>1 && (${'$'}5 ~ /:(22|56000|56001|9000|1080|12345|51820)${'$'}/) {printf "%s %s; ", ${'$'}1, ${'$'}5}' | head -c 600)"
+    fi
+    wdtt_diag_emit "INFO" "Порты" "${'$'}{LISTEN_INFO:-не удалось проверить}" "Показаны только типичные порты SSH/WDTT/WireGuard/прокси без имён процессов и без секретов." ""
+
+    WG_TOOLS="wg: ${'$'}(wdtt_diag_cmd wg && echo есть || echo нет), wg-quick: ${'$'}(wdtt_diag_cmd wg-quick && echo есть || echo нет)"
+    WG_IFACES=""
+    if wdtt_diag_cmd wg; then
+      WG_IFACES="${'$'}(wg show interfaces 2>/dev/null)"
+    fi
+    wdtt_diag_emit "INFO" "WireGuard" "${'$'}WG_TOOLS" "Интерфейсы wg: ${'$'}{WG_IFACES:-нет или недоступно}. /etc/wireguard/wg-wdtt-exit.conf: ${'$'}(wdtt_diag_file_state /etc/wireguard/wg-wdtt-exit.conf)." "PrivateKey и содержимое конфигов не читаются."
+
+    OUT_MODE="${'$'}(wdtt_diag_outbound_mode)"
+    WG_EXIT="${'$'}(wdtt_diag_service_state wdtt-wg-exit.service)"
+    WARP_TIMER="${'$'}(wdtt_diag_service_state wdtt-warp-watchdog.timer)"
+    PROXY_SERVICE="${'$'}(wdtt_diag_service_state wdtt-3proxy.service)"
+    REDSOCKS_SERVICE="${'$'}(wdtt_diag_service_state wdtt-redsocks.service)"
+    OUT_DETAILS="mode=${'$'}{OUT_MODE:-direct/не задан}. wg-exit=${'$'}WG_EXIT. warp-watchdog=${'$'}WARP_TIMER. 3proxy=${'$'}PROXY_SERVICE. redsocks=${'$'}REDSOCKS_SERVICE."
+    if [ -r /etc/wdtt-plus/warp/selected.env ]; then
+      WARP_SELECTED="${'$'}(sed -n 's/^WARP_MTU=/MTU /p;s/^WARP_ENDPOINT=/endpoint /p' /etc/wdtt-plus/warp/selected.env 2>/dev/null | tr '\n' '; ')"
+      OUT_DETAILS="${'$'}OUT_DETAILS WARP подбор: ${'$'}WARP_SELECTED"
+    fi
+    wdtt_diag_emit "INFO" "Выходной IP / прокси" "${'$'}{OUT_MODE:-direct/не задан}" "${'$'}OUT_DETAILS" "Этот пункт помогает понять, включён ли WARP, внешний WireGuard, локальный или внешний прокси."
+
+    if wdtt_diag_cmd timedatectl; then
+      TIME_INFO="${'$'}(timedatectl 2>/dev/null | awk -F: '/Time zone|System clock synchronized|NTP service/ {gsub(/^[ \t]+/, "", ${'$'}2); printf "%s: %s; ", ${'$'}1, ${'$'}2}')"
+    else
+      TIME_INFO="date: ${'$'}(date -Is 2>/dev/null)"
+    fi
+    wdtt_diag_emit "INFO" "Время сервера" "${'$'}{TIME_INFO:-не удалось проверить}" "Сильно неверное время может ломать TLS, загрузки и часть внешних проверок." ""
+
+    VIRT_INFO=""
+    if wdtt_diag_cmd systemd-detect-virt; then
+      VIRT_INFO="${'$'}(systemd-detect-virt 2>/dev/null || echo physical/unknown)"
+    fi
+    wdtt_diag_emit "INFO" "Виртуализация" "${'$'}{VIRT_INFO:-не определена}" "Некоторые VPS-провайдеры или регионы могут ограничивать WARP/UDP; этот пункт помогает сопоставлять отчёты." ""
+    """.trimIndent()
+}
+
+private fun serverDiagnosticSeverity(value: String): DeviceCheckSeverity = when (value.uppercase(Locale.ROOT)) {
+    "OK" -> DeviceCheckSeverity.Ok
+    "WARNING" -> DeviceCheckSeverity.Warning
+    "ERROR" -> DeviceCheckSeverity.Error
+    else -> DeviceCheckSeverity.Info
+}
+
+private fun parseServerDiagnosticsItems(output: String): List<DeviceCheckItem> =
+    output.lineSequence()
+        .filter { it.startsWith("WDTT_SERVER_DIAG|") }
+        .mapNotNull { line ->
+            val parts = line.split("|", limit = 6)
+            if (parts.size < 6) return@mapNotNull null
+            DeviceCheckItem(
+                title = parts[2].ifBlank { "Пункт диагностики" },
+                status = parts[3].ifBlank { "нет данных" },
+                details = parts[4].ifBlank { "Сервер не вернул подробности по этому пункту." },
+                recommendation = parts[5],
+                severity = serverDiagnosticSeverity(parts[1])
+            )
+        }
+        .toList()
+
+private fun serverDiagnosticsErrorReport(
+    title: String,
+    status: String,
+    details: String,
+    recommendation: String,
+    profileName: String? = null,
+    profileIndex: Int? = null
+): DeviceCompatibilityReport = DeviceCompatibilityReport(
+    checkedAt = System.currentTimeMillis(),
+    items = listOfNotNull(
+        profileName?.let { serverProfileDiagnosticItem(it, profileIndex) },
+        DeviceCheckItem(
+            title = title,
+            status = status,
+            details = details,
+            recommendation = recommendation,
+            severity = DeviceCheckSeverity.Error
+        )
+    )
+)
+
+private fun serverProfileDiagnosticItem(profileName: String, profileIndex: Int?): DeviceCheckItem {
+    val number = profileIndex?.let { (it + 1).coerceAtLeast(1).toString() } ?: "?"
+    return DeviceCheckItem(
+        title = "Активный VPN-профиль",
+        status = "профиль $number — $profileName",
+        details = "Диагностика собрана строго из текущего активного профиля приложения: его адреса сервера, логина, SSH-порта и выбранного способа входа.",
+        recommendation = "Если нужно проверить другой сервер, сначала переключите VPN-профиль в приложении и запустите диагностику заново.",
+        severity = DeviceCheckSeverity.Info
+    )
+}
+
+private fun serverDiagnosticsPlainText(report: DeviceCompatibilityReport): String {
+    val formatter = SimpleDateFormat("dd.MM.yyyy HH:mm:ss", Locale.ROOT)
+    fun label(severity: DeviceCheckSeverity): String = when (severity) {
+        DeviceCheckSeverity.Ok -> "OK"
+        DeviceCheckSeverity.Info -> "INFO"
+        DeviceCheckSeverity.Warning -> "WARN"
+        DeviceCheckSeverity.Error -> "ERROR"
+    }
+    return buildString {
+        appendLine("Диагностика сервера WDTT Plus")
+        appendLine("Проверено: ${formatter.format(Date(report.checkedAt))}")
+        appendLine("Итог: ${report.overallStatus}")
+        report.items.forEach { item ->
+            appendLine()
+            appendLine("[${label(item.severity)}] ${item.title}: ${item.status}")
+            appendLine(item.details)
+            if (item.recommendation.isNotBlank()) {
+                appendLine("Рекомендация: ${item.recommendation}")
+            }
+        }
+    }.trim()
+}
+
+private suspend fun collectServerDiagnostics(
+    target: OutboundSshTarget,
+    selectedAuthMode: String,
+    profileName: String,
+    profileIndex: Int,
+    expectedDtlsPort: Int,
+    expectedWgPort: Int,
+    expectedClientPort: Int
+): DeviceCompatibilityReport = withContext(Dispatchers.IO) {
+    val checkedAt = System.currentTimeMillis()
+    val authLabel = if (selectedAuthMode == "key") "SSH-ключ" else "логин/пароль"
+    val localItems = mutableListOf(
+        serverProfileDiagnosticItem(profileName, profileIndex),
+        DeviceCheckItem(
+            title = "SSH-подключение",
+            status = "подключено",
+            details = "Подключение выполнено к ${target.host}:${target.port} пользователем ${target.user.ifBlank { "root" }}. Способ входа: $authLabel. Ожидаемые порты активного профиля: DTLS $expectedDtlsPort, WG $expectedWgPort, локальный Android $expectedClientPort.",
+            recommendation = "Пароли, приватные ключи и пароль ключа не включаются в диагностику.",
+            severity = DeviceCheckSeverity.Ok
+        )
+    )
+    var session: Session? = null
+    try {
+        session = createSshSession(target.host, target.user, target.credentials, target.port)
+        val ssh = SSHClient(session, target.pass)
+        val output = ssh.exec(
+            rootShCommand(
+                serverDiagnosticsScript(
+                    expectedDtlsPort = expectedDtlsPort,
+                    expectedWgPort = expectedWgPort,
+                    expectedClientPort = expectedClientPort
+                )
+            ),
+            timeout = 150000L
+        ).trim()
+        val remoteItems = parseServerDiagnosticsItems(output)
+        if (remoteItems.isNotEmpty()) {
+            DeviceCompatibilityReport(checkedAt = checkedAt, items = localItems + remoteItems)
+        } else {
+            localItems += DeviceCheckItem(
+                title = "Root/sudo диагностика",
+                status = "не выполнена",
+                details = compactRemoteTail(output).ifBlank {
+                    "SSH подключился, но сервер не вернул диагностические строки. Вероятно, не сработали root-права, sudo, bash или выполнение удалённой команды."
+                },
+                recommendation = "Для полной диагностики и установки нужны root-права или рабочий sudo для выбранного SSH-пользователя. Серверы без bash/systemd могут потребовать ручной настройки.",
+                severity = DeviceCheckSeverity.Warning
+            )
+            DeviceCompatibilityReport(checkedAt = checkedAt, items = localItems)
+        }
+    } finally {
+        try { session?.disconnect() } catch (_: Exception) {}
+    }
 }
 
 // ==================== SSH ====================
@@ -3939,21 +5231,6 @@ private class SSHClient(private val session: Session, private val pass: String) 
     }
 }
 
-private fun createSSHSession(host: String, user: String, pass: String, port: Int = 22): Session {
-    val jsch = JSch()
-    val session = jsch.getSession(user, host, port)
-    session.setPassword(pass)
-    session.setConfig(Properties().apply {
-        put("StrictHostKeyChecking", "no")
-        put("ServerAliveInterval", "10")
-        put("ServerAliveCountMax", "6")
-        put("ConnectTimeout", "15000")
-        put("PreferredAuthentications", "password,keyboard-interactive")
-    })
-    session.connect(20000)
-    return session
-}
-
 private fun shellQuote(value: String): String {
     return "'" + value.replace("'", "'\"'\"'") + "'"
 }
@@ -3962,6 +5239,13 @@ private fun rootCommand(command: String): String {
     val quoted = shellQuote(command)
     return "if command -v sudo >/dev/null 2>&1; then sudo bash -c $quoted; " +
         "elif [ \"\$(id -u)\" = \"0\" ]; then bash -c $quoted; " +
+        "else echo 'error: root privileges required and sudo not found'; exit 1; fi"
+}
+
+private fun rootShCommand(command: String): String {
+    val quoted = shellQuote(command)
+    return "if command -v sudo >/dev/null 2>&1; then sudo -S sh -c $quoted; " +
+        "elif [ \"\$(id -u)\" = \"0\" ]; then sh -c $quoted; " +
         "else echo 'error: root privileges required and sudo not found'; exit 1; fi"
 }
 
@@ -3992,7 +5276,7 @@ private suspend fun runRootScript(
     val remotePath = "/tmp/${scriptFile.name}"
     try {
         scriptFile.writeText(script.trimIndent() + "\n")
-        session = createSSHSession(target.host, target.user, target.pass, target.port)
+        session = createSshSession(target.host, target.user, target.credentials, target.port)
         val ssh = SSHClient(session, target.pass)
         ssh.upload(scriptFile, remotePath)
         val output = ssh.exec(
@@ -4199,6 +5483,11 @@ private fun outboundStatusScript(): String = shellScript(
           echo "Cloudflare WARP: ${'$'}{WARP_STATE:-проверка не пройдена}"
           echo "Автопроверка WARP: ${'$'}(systemctl is-active wdtt-warp-watchdog.timer 2>/dev/null || echo не запущена)"
           echo "wgcf: ${'$'}(cat /etc/wdtt-plus/warp/wgcf-version 2>/dev/null || echo версия неизвестна)"
+          WARP_SELECTED_MTU="${'$'}(sed -n 's/^WARP_MTU=//p' /etc/wdtt-plus/warp/selected.env 2>/dev/null | head -n 1)"
+          WARP_SELECTED_ENDPOINT="${'$'}(sed -n 's/^WARP_ENDPOINT=//p' /etc/wdtt-plus/warp/selected.env 2>/dev/null | head -n 1)"
+          if [ -n "${'$'}WARP_SELECTED_MTU" ] || [ -n "${'$'}WARP_SELECTED_ENDPOINT" ]; then
+            echo "Подбор WARP: MTU ${'$'}{WARP_SELECTED_MTU:-неизвестно}, endpoint ${'$'}{WARP_SELECTED_ENDPOINT:-неизвестен}"
+          fi
         fi
         ;;
       external_proxy)
@@ -4223,7 +5512,7 @@ private suspend fun readOutboundStatus(target: OutboundSshTarget): String = with
     var session: Session? = null
     try {
         DeployManager.updateProgress(0.25f, "Подключаюсь к серверу и читаю текущий режим выхода...")
-        session = createSSHSession(target.host, target.user, target.pass, target.port)
+        session = createSshSession(target.host, target.user, target.credentials, target.port)
         val ssh = SSHClient(session, target.pass)
         DeployManager.updateProgress(0.70f, "Проверяю службы прокси и WireGuard...")
         val output = ssh.exec(rootCommand(outboundStatusScript()), timeout = 30000L).trim()
@@ -4588,7 +5877,7 @@ private fun outboundRestoreSummary(snapshot: OutboundServerSnapshot): String {
         parts += "Пароль прокси не найден в старом серверном конфиге; введите его вручную."
     }
     if (snapshot.mode == "wireguard_vps" && snapshot.wireGuardExitPassword.isBlank()) {
-        parts += "SSH-пароль второго сервера можно восстановить только из сохранённого профиля; если его нет, введите пароль вручную."
+        parts += "SSH-пароль второго сервера в сохранённом профиле не найден; введите пароль или локально добавьте приватный SSH-ключ."
     }
     return parts.joinToString(" ")
 }
@@ -4600,7 +5889,7 @@ private suspend fun checkWireGuardExit(
     var session: Session? = null
     try {
         DeployManager.updateProgress(0.25f, "Подключаюсь к серверу и проверяю WireGuard-выход...")
-        session = createSSHSession(target.host, target.user, target.pass, target.port)
+        session = createSshSession(target.host, target.user, target.credentials, target.port)
         val ssh = SSHClient(session, target.pass)
         val expectedLabel = when (expectedMode) {
             "wireguard_vps" -> "выход через другой сервер"
@@ -4654,7 +5943,7 @@ private suspend fun readOutboundDiagnostics(target: OutboundSshTarget): String =
     var session: Session? = null
     try {
         DeployManager.updateProgress(0.20f, "Подключаюсь к серверу для диагностики...")
-        session = createSSHSession(target.host, target.user, target.pass, target.port)
+        session = createSshSession(target.host, target.user, target.credentials, target.port)
         val ssh = SSHClient(session, target.pass)
         DeployManager.updateProgress(0.45f, "Читаю режим выхода, службы и внешний IP...")
         val script = shellScript(
@@ -4719,7 +6008,7 @@ private suspend fun readOutboundDiagnostics(target: OutboundSshTarget): String =
 private suspend fun disableOutboundExit(target: OutboundSshTarget): String = withContext(Dispatchers.IO) {
     var session: Session? = null
     try {
-        session = createSSHSession(target.host, target.user, target.pass, target.port)
+        session = createSshSession(target.host, target.user, target.credentials, target.port)
         val ssh = SSHClient(session, target.pass)
         val script = shellScript(
             outboundShellPrelude(),
@@ -4923,7 +6212,7 @@ private suspend fun checkLocalProxy(
 private suspend fun stopLocalProxy(target: OutboundSshTarget): String = withContext(Dispatchers.IO) {
     var session: Session? = null
     try {
-        session = createSSHSession(target.host, target.user, target.pass, target.port)
+        session = createSshSession(target.host, target.user, target.credentials, target.port)
         val ssh = SSHClient(session, target.pass)
         val script = """
             echo "WDTT_PROGRESS|0.35|Останавливаю службу прокси на этом сервере..."
@@ -4945,7 +6234,7 @@ private suspend fun stopLocalProxy(target: OutboundSshTarget): String = withCont
 private suspend fun removeLocalProxy(target: OutboundSshTarget): String = withContext(Dispatchers.IO) {
     var session: Session? = null
     try {
-        session = createSSHSession(target.host, target.user, target.pass, target.port)
+        session = createSshSession(target.host, target.user, target.credentials, target.port)
         val ssh = SSHClient(session, target.pass)
         val script = shellScript(
             """
@@ -5420,6 +6709,229 @@ private fun freeWarpWatchdogInstallScript(): String = """
     systemctl enable --now wdtt-warp-watchdog.timer >/dev/null
 """.trimIndent()
 
+private fun freeWarpAutoTuneScript(): String = """
+    WARP_LAST_REASON=""
+    WARP_LAST_STATE=""
+    WARP_LAST_HANDSHAKE=""
+    WARP_LAST_EXIT_IP=""
+    WARP_SELECTED_MTU=""
+    WARP_SELECTED_ENDPOINT=""
+    WARP_ENDPOINT_CANDIDATES=""
+    WARP_ENDPOINT_COUNT=0
+    WARP_MTU_CANDIDATES=""
+
+    wdtt_warp_endpoint_valid() {
+      local value="${'$'}1"
+      local port
+      [ -n "${'$'}value" ] || return 1
+      printf '%s' "${'$'}value" | grep -Eq '^[A-Za-z0-9._-]+:[0-9]{1,5}${'$'}' || return 1
+      port="${'$'}{value##*:}"
+      [ "${'$'}port" -ge 1 ] 2>/dev/null && [ "${'$'}port" -le 65535 ] || return 1
+      return 0
+    }
+
+    wdtt_warp_add_endpoint() {
+      local candidate="${'$'}1"
+      wdtt_warp_endpoint_valid "${'$'}candidate" || return 0
+      case " ${'$'}WARP_ENDPOINT_CANDIDATES " in
+        *" ${'$'}candidate "*) return 0;;
+      esac
+      [ "${'$'}WARP_ENDPOINT_COUNT" -lt 10 ] || return 0
+      WARP_ENDPOINT_CANDIDATES="${'$'}WARP_ENDPOINT_CANDIDATES ${'$'}candidate"
+      WARP_ENDPOINT_COUNT=${'$'}((WARP_ENDPOINT_COUNT + 1))
+    }
+
+    wdtt_warp_profile_endpoint() {
+      awk -F= 'tolower(${'$'}1) ~ /^[[:space:]]*endpoint[[:space:]]*${'$'}/ { value=${'$'}2; sub(/^[[:space:]]*/, "", value); sub(/[[:space:]]*${'$'}/, "", value); print value; exit }' "${'$'}RAW_PROFILE"
+    }
+
+    wdtt_warp_build_endpoint_candidates() {
+      local original host port p ip
+      WARP_ENDPOINT_CANDIDATES=""
+      WARP_ENDPOINT_COUNT=0
+      original="${'$'}(wdtt_warp_profile_endpoint || true)"
+      wdtt_warp_add_endpoint "${'$'}original"
+      wdtt_warp_add_endpoint "engage.cloudflareclient.com:2408"
+      wdtt_warp_add_endpoint "engage.cloudflareclient.com:500"
+      if wdtt_warp_endpoint_valid "${'$'}original"; then
+        host="${'$'}{original%:*}"
+        port="${'$'}{original##*:}"
+        for p in "${'$'}port" 2408 500 1701 4500; do
+          wdtt_warp_add_endpoint "${'$'}host:${'$'}p"
+        done
+        if command -v getent >/dev/null 2>&1; then
+          for ip in ${'$'}(getent ahostsv4 "${'$'}host" 2>/dev/null | awk '{print ${'$'}1}' | grep -E '^[0-9.]+${'$'}' | awk '!seen[${'$'}0]++' | head -n 4); do
+            for p in 2408 500; do
+              wdtt_warp_add_endpoint "${'$'}ip:${'$'}p"
+            done
+          done
+        fi
+      fi
+      wdtt_warp_add_endpoint "162.159.192.1:2408"
+      wdtt_warp_add_endpoint "162.159.193.1:2408"
+      wdtt_warp_add_endpoint "162.159.192.1:500"
+      wdtt_warp_add_endpoint "162.159.193.1:500"
+    }
+
+    wdtt_warp_add_mtu() {
+      local value="${'$'}1"
+      printf '%s' "${'$'}value" | grep -Eq '^(12[89][0-9]|1[3-4][0-9][0-9]|1500)${'$'}' || return 0
+      case " ${'$'}WARP_MTU_CANDIDATES " in
+        *" ${'$'}value "*) return 0;;
+      esac
+      WARP_MTU_CANDIDATES="${'$'}WARP_MTU_CANDIDATES ${'$'}value"
+    }
+
+    wdtt_warp_build_mtu_candidates() {
+      local value
+      WARP_MTU_CANDIDATES=""
+      for value in "${'$'}WARP_MTU" 1420 1392 1360 1280; do
+        wdtt_warp_add_mtu "${'$'}value"
+      done
+    }
+
+    wdtt_warp_write_profile() {
+      local mtu="${'$'}1"
+      local endpoint="${'$'}2"
+      local tmp="${'$'}SAFE_PROFILE.tmp"
+      printf '%s' "${'$'}mtu" | grep -Eq '^(12[89][0-9]|1[3-4][0-9][0-9]|1500)${'$'}' || { WARP_LAST_REASON="invalid_mtu"; return 2; }
+      wdtt_warp_endpoint_valid "${'$'}endpoint" || { WARP_LAST_REASON="invalid_endpoint"; return 2; }
+      awk -v mtu="${'$'}mtu" -v endpoint="${'$'}endpoint" '
+        BEGIN { in_interface=0; in_peer=0; endpoint_written=0 }
+        /^[[:space:]]*\[Interface\][[:space:]]*${'$'}/ {
+          print "[Interface]"
+          print "Table = off"
+          print "MTU = " mtu
+          in_interface=1
+          in_peer=0
+          next
+        }
+        /^[[:space:]]*\[Peer\][[:space:]]*${'$'}/ {
+          print "[Peer]"
+          in_interface=0
+          in_peer=1
+          next
+        }
+        /^[[:space:]]*\[/ {
+          in_interface=0
+          in_peer=0
+          print
+          next
+        }
+        in_interface && /^[[:space:]]*(Table|MTU|DNS|PreUp|PostUp|PreDown|PostDown)[[:space:]]*=/ { next }
+        in_peer && /^[[:space:]]*Endpoint[[:space:]]*=/ {
+          if (!endpoint_written) {
+            print "Endpoint = " endpoint
+            endpoint_written=1
+          }
+          next
+        }
+        /^[[:space:]]*(PreUp|PostUp|PreDown|PostDown)[[:space:]]*=/ { next }
+        { print }
+      ' "${'$'}RAW_PROFILE" >"${'$'}tmp"
+      grep -Eq '^[[:space:]]*\[Interface\][[:space:]]*${'$'}' "${'$'}tmp" || { rm -f "${'$'}tmp"; WARP_LAST_REASON="profile_without_interface"; return 2; }
+      grep -Eq '^[[:space:]]*\[Peer\][[:space:]]*${'$'}' "${'$'}tmp" || { rm -f "${'$'}tmp"; WARP_LAST_REASON="profile_without_peer"; return 2; }
+      grep -Eq '^[[:space:]]*PrivateKey[[:space:]]*=' "${'$'}tmp" || { rm -f "${'$'}tmp"; WARP_LAST_REASON="profile_without_private_key"; return 2; }
+      grep -Eq '^[[:space:]]*Endpoint[[:space:]]*=[[:space:]]*[^[:space:]]+:[0-9]+' "${'$'}tmp" || { rm -f "${'$'}tmp"; WARP_LAST_REASON="profile_without_endpoint"; return 2; }
+      grep -Eq '^[[:space:]]*AllowedIPs[[:space:]]*=.*0\.0\.0\.0/0' "${'$'}tmp" || { rm -f "${'$'}tmp"; WARP_LAST_REASON="profile_without_default_route"; return 2; }
+      ! grep -Eqi '^[[:space:]]*(DNS|PreUp|PostUp|PreDown|PostDown)[[:space:]]*=' "${'$'}tmp" || { rm -f "${'$'}tmp"; WARP_LAST_REASON="profile_has_unsafe_lines"; return 2; }
+      chmod 600 "${'$'}tmp"
+      install -m 600 "${'$'}tmp" /etc/wireguard/wg-wdtt-exit.conf
+      install -m 600 "${'$'}tmp" /etc/wdtt-plus/wg-exit/wg-wdtt-exit.conf
+      mv -f "${'$'}tmp" "${'$'}SAFE_PROFILE"
+    }
+
+    wdtt_warp_trace_state() {
+      printf '%s\n' "${'$'}1" | sed -n 's/^warp=//p' | head -n 1
+    }
+
+    wdtt_warp_latest_handshake() {
+      wg show "${'$'}WDTT_WG_IFACE" latest-handshakes 2>/dev/null | awk '{print ${'$'}2}' | sort -nr | head -n 1
+    }
+
+    wdtt_warp_check_current() {
+      local source="${'$'}1"
+      local trace
+      [ -n "${'$'}source" ] || { WARP_LAST_REASON="wdtt_test_source_missing"; return 1; }
+      trace="${'$'}(curl -4fsS --interface "${'$'}source" --connect-timeout 6 --max-time 12 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
+      WARP_LAST_STATE="${'$'}(wdtt_warp_trace_state "${'$'}trace")"
+      WARP_LAST_HANDSHAKE="${'$'}(wdtt_warp_latest_handshake || true)"
+      case "${'$'}WARP_LAST_STATE" in
+        on|plus) return 0;;
+      esac
+      if [ -z "${'$'}trace" ]; then
+        WARP_LAST_REASON="trace_empty"
+      elif [ -n "${'$'}WARP_LAST_STATE" ]; then
+        WARP_LAST_REASON="trace_warp_${'$'}WARP_LAST_STATE"
+      else
+        WARP_LAST_REASON="trace_without_warp_state"
+      fi
+      return 1
+    }
+
+    wdtt_warp_save_selected() {
+      local endpoint_safe
+      endpoint_safe="${'$'}(printf '%s' "${'$'}WARP_SELECTED_ENDPOINT" | tr -cd 'A-Za-z0-9._:-')"
+      printf 'WARP_MTU=%s\nWARP_ENDPOINT=%s\nWARP_STATE=%s\nCHECKED_AT=%s\n' \
+        "${'$'}WARP_SELECTED_MTU" "${'$'}endpoint_safe" "${'$'}WARP_LAST_STATE" "${'$'}(date -Is)" >"${'$'}WARP_DIR/selected.env"
+      printf 'STATUS=healthy\nCHECKED_AT=%s\n' "${'$'}(date -Is)" >"${'$'}WARP_DIR/health.env"
+      chmod 600 "${'$'}WARP_DIR/selected.env" "${'$'}WARP_DIR/health.env"
+    }
+
+    wdtt_warp_try_candidate() {
+      local mtu="${'$'}1"
+      local endpoint="${'$'}2"
+      local source="${'$'}3"
+      local attempt
+      echo "WDTT_PROGRESS|0.97|Пробую WARP: MTU ${'$'}mtu, endpoint ${'$'}endpoint..."
+      wdtt_warp_write_profile "${'$'}mtu" "${'$'}endpoint" || return 1
+      if ! systemctl restart wdtt-wg-exit.service >/dev/null 2>&1; then
+        WARP_LAST_REASON="wireguard_exit_service_inactive"
+        return 1
+      fi
+      sleep 3
+      if ! wg show "${'$'}WDTT_WG_IFACE" >/dev/null 2>&1; then
+        WARP_LAST_REASON="wireguard_not_active"
+        return 1
+      fi
+      for attempt in 1 2; do
+        if wdtt_warp_check_current "${'$'}source"; then
+          WARP_SELECTED_MTU="${'$'}mtu"
+          WARP_SELECTED_ENDPOINT="${'$'}endpoint"
+          WARP_LAST_EXIT_IP="${'$'}(curl -4fsS --interface "${'$'}source" --connect-timeout 6 --max-time 12 https://api.ipify.org 2>/dev/null || true)"
+          wdtt_warp_save_selected
+          return 0
+        fi
+        [ "${'$'}attempt" = 2 ] || sleep 4
+      done
+      return 1
+    }
+
+    wdtt_warp_autotune() {
+      local source primary mtu endpoint attempted
+      source="${'$'}(wdtt_test_source)"
+      [ -n "${'$'}source" ] || { WARP_LAST_REASON="wdtt_test_source_missing"; return 1; }
+      primary="${'$'}(wdtt_warp_profile_endpoint || true)"
+      wdtt_warp_build_mtu_candidates
+      wdtt_warp_build_endpoint_candidates
+      [ -n "${'$'}WARP_ENDPOINT_CANDIDATES" ] || { WARP_LAST_REASON="no_endpoint_candidates"; return 1; }
+      attempted=0
+      if wdtt_warp_endpoint_valid "${'$'}primary"; then
+        for mtu in ${'$'}WARP_MTU_CANDIDATES; do
+          attempted=${'$'}((attempted + 1))
+          wdtt_warp_try_candidate "${'$'}mtu" "${'$'}primary" "${'$'}source" && return 0
+        done
+      fi
+      for endpoint in ${'$'}WARP_ENDPOINT_CANDIDATES; do
+        [ "${'$'}endpoint" = "${'$'}primary" ] && continue
+        attempted=${'$'}((attempted + 1))
+        wdtt_warp_try_candidate "1280" "${'$'}endpoint" "${'$'}source" && return 0
+      done
+      WARP_LAST_REASON="${'$'}{WARP_LAST_REASON:-all_candidates_failed}; attempts=${'$'}attempted"
+      return 1
+    }
+""".trimIndent()
+
 private suspend fun updateWgcfTool(context: Context, target: OutboundSshTarget): String =
     runRootScript(
         context = context,
@@ -5508,35 +7020,24 @@ internal fun buildFreeWarpInstallScript(mtu: Int = 1280): String {
         install -m 600 "${'$'}SAFE_PROFILE" /etc/wireguard/wg-wdtt-exit.conf
         install -m 600 "${'$'}SAFE_PROFILE" /etc/wdtt-plus/wg-exit/wg-wdtt-exit.conf
         """,
+        freeWarpAutoTuneScript(),
         wireGuardPolicyScript("warp_free", "бесплатный Cloudflare WARP"),
         freeWarpWatchdogInstallScript(),
         """
-        echo "WDTT_PROGRESS|0.96|Проверяю, что трафик действительно выходит через WARP..."
-        TEST_SOURCE="${'$'}(wdtt_test_source)"
-        [ -n "${'$'}TEST_SOURCE" ] || { echo WDTT_ERROR=wdtt_test_source_missing; exit 3; }
-        TRACE=""
-        for attempt in 1 2 3; do
-          TRACE="${'$'}(curl -4fsS --interface "${'$'}TEST_SOURCE" --connect-timeout 8 --max-time 25 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
-          printf '%s\n' "${'$'}TRACE" | grep -Eq '^warp=(on|plus)${'$'}' && break
-          [ "${'$'}attempt" = 3 ] || {
-            echo "WDTT_PROGRESS|0.97|WARP пока не ответил, переподключаю канал (${'$'}attempt/3)..."
-            systemctl restart wdtt-wg-exit.service >/dev/null 2>&1 || true
-            sleep 6
-          }
-        done
-        if ! printf '%s\n' "${'$'}TRACE" | grep -Eq '^warp=(on|plus)${'$'}'; then
+        echo "WDTT_PROGRESS|0.96|Подбираю MTU/endpoint и проверяю выход через WARP..."
+        if ! wdtt_warp_autotune; then
           systemctl disable --now wdtt-warp-watchdog.timer 2>/dev/null || true
           wdtt_clear_external_out
           wdtt_write_mode "direct" "rollback after WARP check error"
+          echo "Диагностика WARP: ${'$'}{WARP_LAST_REASON:-проверка Cloudflare не прошла}."
           echo WDTT_ERROR=warp_trace_check_failed
           exit 3
         fi
-        EXIT_IP="${'$'}(curl -4fsS --interface "${'$'}TEST_SOURCE" --connect-timeout 8 --max-time 20 https://api.ipify.org 2>/dev/null || true)"
-        printf 'STATUS=healthy\nCHECKED_AT=%s\n' "${'$'}(date -Is)" >/etc/wdtt-plus/warp/health.env
-        chmod 600 /etc/wdtt-plus/warp/health.env
         echo "WDTT_PROGRESS|1.0|Бесплатный WARP установлен и проверен."
         echo "Бесплатный WARP включён только для WDTT-пользователей."
-        [ -n "${'$'}EXIT_IP" ] && echo "Проверочный выходной IP Cloudflare: ${'$'}EXIT_IP"
+        echo "Подобрано: MTU ${'$'}WARP_SELECTED_MTU, endpoint ${'$'}WARP_SELECTED_ENDPOINT."
+        [ -n "${'$'}WARP_LAST_EXIT_IP" ] && echo "Проверочный выходной IP Cloudflare: ${'$'}WARP_LAST_EXIT_IP"
+        [ -n "${'$'}WARP_LAST_HANDSHAKE" ] && [ "${'$'}WARP_LAST_HANDSHAKE" != 0 ] && echo "WireGuard-рукопожатие WARP получено."
         echo "Автоматическая проверка запускается каждые 5 минут и один раз перезапускает WireGuard при сбое."
         """
     )
@@ -5554,38 +7055,67 @@ private suspend fun checkFreeWarp(
 ): String = withContext(Dispatchers.IO) {
     var session: Session? = null
     try {
-        session = createSSHSession(target.host, target.user, target.pass, target.port)
+        session = createSshSession(target.host, target.user, target.credentials, target.port)
         val ssh = SSHClient(session, target.pass)
         val restart = if (restartOnFailure) "1" else "0"
         val script = shellScript(
             outboundShellPrelude(),
             """
+            WARP_DIR=/etc/wdtt-plus/warp
+            ACCOUNT="${'$'}WARP_DIR/wgcf-account.toml"
+            RAW_PROFILE="${'$'}WARP_DIR/wgcf-profile.raw.conf"
+            SAFE_PROFILE="${'$'}WARP_DIR/wgcf-profile.conf"
+            CURRENT_MTU="${'$'}(sed -n 's/^[[:space:]]*MTU[[:space:]]*=[[:space:]]*//Ip' /etc/wireguard/wg-wdtt-exit.conf 2>/dev/null | head -n 1)"
+            printf '%s' "${'$'}CURRENT_MTU" | grep -Eq '^(12[89][0-9]|1[3-4][0-9][0-9]|1500)${'$'}' || CURRENT_MTU=1280
+            WARP_MTU="${'$'}CURRENT_MTU"
+            """,
+            freeWarpAutoTuneScript(),
+            """
             MODE="${'$'}(sed -n 's/.*"outboundMode"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /etc/wdtt/outbound.json 2>/dev/null | head -n 1)"
             [ "${'$'}MODE" = "warp_free" ] || { echo WDTT_ERROR=warp_mode_not_active; exit 3; }
-            [ -f /etc/wdtt-plus/warp/wgcf-account.toml ] || { echo WDTT_ERROR=warp_account_missing; exit 3; }
+            [ -f "${'$'}ACCOUNT" ] || { echo WDTT_ERROR=warp_account_missing; exit 3; }
             [ -f /etc/wireguard/wg-wdtt-exit.conf ] || { echo WDTT_ERROR=warp_profile_missing; exit 3; }
             command -v wg >/dev/null 2>&1 || { echo WDTT_ERROR=wireguard_tools_required; exit 2; }
             if [ "$restart" = 1 ]; then
-              systemctl restart wdtt-wg-exit.service >/dev/null 2>&1 || { echo WDTT_ERROR=wireguard_exit_service_inactive; exit 3; }
-              sleep 4
+              [ -f "${'$'}RAW_PROFILE" ] || { echo WDTT_ERROR=warp_profile_missing; exit 3; }
+              BACKUP_PROFILE="${'$'}(mktemp)"
+              cp -f /etc/wireguard/wg-wdtt-exit.conf "${'$'}BACKUP_PROFILE"
+              echo "WDTT_PROGRESS|0.30|Перезапускаю WARP и подбираю MTU/endpoint..."
+              if ! wdtt_warp_autotune; then
+                install -m 600 "${'$'}BACKUP_PROFILE" /etc/wireguard/wg-wdtt-exit.conf 2>/dev/null || true
+                install -m 600 "${'$'}BACKUP_PROFILE" /etc/wdtt-plus/wg-exit/wg-wdtt-exit.conf 2>/dev/null || true
+                rm -f "${'$'}BACKUP_PROFILE"
+                systemctl restart wdtt-wg-exit.service >/dev/null 2>&1 || true
+                echo "Диагностика WARP: ${'$'}{WARP_LAST_REASON:-проверка Cloudflare не прошла}."
+                echo WDTT_ERROR=warp_trace_check_failed
+                exit 3
+              fi
+              rm -f "${'$'}BACKUP_PROFILE"
+            else
+              wg show "${'$'}WDTT_WG_IFACE" >/dev/null 2>&1 || { echo WDTT_ERROR=wireguard_not_active; exit 3; }
+              TEST_SOURCE="${'$'}(wdtt_test_source)"
+              [ -n "${'$'}TEST_SOURCE" ] || { echo WDTT_ERROR=wdtt_test_source_missing; exit 3; }
+              echo "WDTT_PROGRESS|0.60|Проверяю текущий WARP без изменения настроек..."
+              if ! wdtt_warp_check_current "${'$'}TEST_SOURCE"; then
+                echo "Диагностика WARP: ${'$'}{WARP_LAST_REASON:-проверка Cloudflare не прошла}."
+                echo WDTT_ERROR=warp_trace_check_failed
+                exit 3
+              fi
+              WARP_LAST_EXIT_IP="${'$'}(curl -4fsS --interface "${'$'}TEST_SOURCE" --connect-timeout 8 --max-time 20 https://api.ipify.org 2>/dev/null || true)"
             fi
-            wg show "${'$'}WDTT_WG_IFACE" >/dev/null 2>&1 || { echo WDTT_ERROR=wireguard_not_active; exit 3; }
-            TEST_SOURCE="${'$'}(wdtt_test_source)"
-            [ -n "${'$'}TEST_SOURCE" ] || { echo WDTT_ERROR=wdtt_test_source_missing; exit 3; }
-            TRACE="${'$'}(curl -4fsS --interface "${'$'}TEST_SOURCE" --connect-timeout 8 --max-time 25 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
-            printf '%s\n' "${'$'}TRACE" | grep -Eq '^warp=(on|plus)${'$'}' || { echo WDTT_ERROR=warp_trace_check_failed; exit 3; }
-            EXIT_IP="${'$'}(curl -4fsS --interface "${'$'}TEST_SOURCE" --connect-timeout 8 --max-time 20 https://api.ipify.org 2>/dev/null || true)"
-            WARP_KIND="${'$'}(printf '%s\n' "${'$'}TRACE" | sed -n 's/^warp=//p' | head -n 1)"
-            VERSION="${'$'}(cat /etc/wdtt-plus/warp/wgcf-version 2>/dev/null || echo неизвестна)"
+            WARP_KIND="${'$'}WARP_LAST_STATE"
+            VERSION="${'$'}(cat "${'$'}WARP_DIR/wgcf-version" 2>/dev/null || echo неизвестна)"
             TIMER="${'$'}(systemctl is-active wdtt-warp-watchdog.timer 2>/dev/null || true)"
-            HANDSHAKE="${'$'}(wg show "${'$'}WDTT_WG_IFACE" latest-handshakes 2>/dev/null | awk '{print ${'$'}2}' | sort -nr | head -n 1)"
             printf 'STATUS=healthy\nCHECKED_AT=%s\n' "${'$'}(date -Is)" >/etc/wdtt-plus/warp/health.env
             chmod 600 /etc/wdtt-plus/warp/health.env
             echo "Проверка успешна: Cloudflare сообщает warp=${'$'}WARP_KIND."
-            [ -n "${'$'}EXIT_IP" ] && echo "Выходной IP: ${'$'}EXIT_IP"
+            [ -n "${'$'}WARP_LAST_EXIT_IP" ] && echo "Выходной IP: ${'$'}WARP_LAST_EXIT_IP"
+            if [ -n "${'$'}WARP_SELECTED_MTU" ]; then
+              echo "Подобрано: MTU ${'$'}WARP_SELECTED_MTU, endpoint ${'$'}WARP_SELECTED_ENDPOINT."
+            fi
             echo "wgcf: ${'$'}VERSION"
             echo "Автопроверка: ${'$'}{TIMER:-не запущена}"
-            [ -n "${'$'}HANDSHAKE" ] && [ "${'$'}HANDSHAKE" != 0 ] && echo "Последнее WireGuard-рукопожатие: $(date -d @${'$'}HANDSHAKE -Is 2>/dev/null || echo ${'$'}HANDSHAKE)"
+            [ -n "${'$'}WARP_LAST_HANDSHAKE" ] && [ "${'$'}WARP_LAST_HANDSHAKE" != 0 ] && echo "Последнее WireGuard-рукопожатие: $(date -d @${'$'}WARP_LAST_HANDSHAKE -Is 2>/dev/null || echo ${'$'}WARP_LAST_HANDSHAKE)"
             """
         )
         val output = ssh.exec(rootCommand(script), timeout = 45000L).trim()
@@ -5596,10 +7126,52 @@ private suspend fun checkFreeWarp(
     }
 }
 
+private suspend fun resetFreeWarpRegistration(target: OutboundSshTarget): String = withContext(Dispatchers.IO) {
+    var session: Session? = null
+    try {
+        session = createSshSession(target.host, target.user, target.credentials, target.port)
+        val ssh = SSHClient(session, target.pass)
+        val script = shellScript(
+            outboundShellPrelude(),
+            """
+            WARP_DIR=/etc/wdtt-plus/warp
+            MODE="${'$'}(sed -n 's/.*"outboundMode"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /etc/wdtt/outbound.json 2>/dev/null | head -n 1)"
+            echo "WDTT_PROGRESS|0.20|Останавливаю WARP и автопроверку..."
+            systemctl disable --now wdtt-warp-watchdog.timer wdtt-warp-watchdog.service 2>/dev/null || true
+            if [ "${'$'}MODE" = "warp_free" ]; then
+              echo "WDTT_PROGRESS|0.45|Возвращаю прямой выход WDTT..."
+              wdtt_clear_external_out
+              rm -f /etc/wireguard/wg-wdtt-exit.conf /etc/wdtt-plus/wg-exit/wg-wdtt-exit.conf
+              wdtt_write_mode "direct" "WARP registration reset"
+            fi
+            echo "WDTT_PROGRESS|0.75|Удаляю текущую регистрацию и профиль WARP..."
+            mkdir -p "${'$'}WARP_DIR"
+            rm -f "${'$'}WARP_DIR"/wgcf-account.toml "${'$'}WARP_DIR"/wgcf-account.toml.invalid-* \
+              "${'$'}WARP_DIR"/wgcf-profile.raw.conf "${'$'}WARP_DIR"/wgcf-profile.conf \
+              "${'$'}WARP_DIR"/selected.env "${'$'}WARP_DIR"/health.env
+            chmod 700 "${'$'}WARP_DIR" 2>/dev/null || true
+            systemctl reset-failed wdtt-warp-watchdog.service wdtt-wg-exit.service 2>/dev/null || true
+            echo "WDTT_PROGRESS|1.0|Регистрация WARP сброшена."
+            echo "Текущая регистрация, ключи и профиль WARP удалены. Проверенный wgcf оставлен на сервере."
+            if [ "${'$'}MODE" = "warp_free" ]; then
+              echo "WDTT-пользователи снова выходят напрямую через текущий VPS. Для новой регистрации нажмите «Установить / восстановить»."
+            else
+              echo "Активный режим выхода WDTT не был WARP; он не изменён."
+            fi
+            """
+        )
+        val output = ssh.exec(rootCommand(script), timeout = 60000L).trim()
+        markerValue(output, "WDTT_ERROR")?.let { throw IllegalStateException(output.take(1200)) }
+        output
+    } finally {
+        try { session?.disconnect() } catch (_: Exception) {}
+    }
+}
+
 private suspend fun deleteFreeWarp(target: OutboundSshTarget): String = withContext(Dispatchers.IO) {
     var session: Session? = null
     try {
-        session = createSSHSession(target.host, target.user, target.pass, target.port)
+        session = createSshSession(target.host, target.user, target.credentials, target.port)
         val ssh = SSHClient(session, target.pass)
         val script = shellScript(
             outboundShellPrelude(),
@@ -5646,7 +7218,7 @@ private suspend fun enableImportedWireGuardExit(
     val configFile = File(context.cacheDir, "wdtt-imported-wg.conf")
     try {
         configFile.writeText(sanitized)
-        session = createSSHSession(target.host, target.user, target.pass, target.port)
+        session = createSshSession(target.host, target.user, target.credentials, target.port)
         val ssh = SSHClient(session, target.pass)
         ssh.upload(configFile, "/tmp/wdtt-imported-wg.conf")
         val script = shellScript(
@@ -5674,7 +7246,7 @@ private suspend fun enableImportedWireGuardExit(
 private suspend fun deleteImportedWireGuardExit(target: OutboundSshTarget): String = withContext(Dispatchers.IO) {
     var session: Session? = null
     try {
-        session = createSSHSession(target.host, target.user, target.pass, target.port)
+        session = createSshSession(target.host, target.user, target.credentials, target.port)
         val ssh = SSHClient(session, target.pass)
         val script = shellScript(
             outboundShellPrelude(),
@@ -5707,7 +7279,7 @@ private suspend fun installWireGuardExitVps(
     foreignHost: String,
     foreignPort: Int,
     foreignUser: String,
-    foreignPassword: String,
+    foreignCredentials: SshCredentials,
     wgPort: Int,
     dns: String
 ): String = withContext(Dispatchers.IO) {
@@ -5715,11 +7287,16 @@ private suspend fun installWireGuardExitVps(
     var foreignSession: Session? = null
     try {
         DeployManager.updateProgress(0.10f, "Подключаюсь к текущему серверу WDTT...")
-        currentSession = createSSHSession(current.host, current.user, current.pass, current.port)
+        currentSession = createSshSession(current.host, current.user, current.credentials, current.port)
         DeployManager.updateProgress(0.18f, "Подключаюсь к другому серверу для WireGuard-выхода...")
-        foreignSession = createSSHSession(foreignHost, foreignUser, foreignPassword, foreignPort)
+        foreignSession = createSshSession(
+            foreignHost,
+            foreignUser,
+            foreignCredentials,
+            foreignPort
+        )
         val currentSsh = SSHClient(currentSession, current.pass)
-        val foreignSsh = SSHClient(foreignSession, foreignPassword)
+        val foreignSsh = SSHClient(foreignSession, foreignCredentials.password)
 
         val prepareKeys = """
             echo "WDTT_PROGRESS|0.26|Готовлю WireGuard-инструменты и ключи..."
@@ -5848,13 +7425,13 @@ private fun isUnsafeLegacyServerAsset(serverFile: File): Boolean {
 private suspend fun checkExistingInstall(
 	host: String,
 	user: String,
-	pass: String,
+	credentials: SshCredentials,
 	port: Int
 ): ExistingInstallInfo = withContext(Dispatchers.IO) {
 	var session: Session? = null
 	try {
-		session = createSSHSession(host, user, pass, port)
-		val ssh = SSHClient(session, pass)
+		session = createSshSession(host, user, credentials, port)
+		val ssh = SSHClient(session, credentials.password)
 		val output = ssh.exec(
 			rootCommand(
 				"printf 'SERVICE=%s\\n' \"$([ -f /etc/systemd/system/wdtt.service ] && echo 1 || echo 0)\"; " +
@@ -5984,7 +7561,7 @@ private fun friendlyDeployError(error: Throwable, operation: String): String {
         "warp_mtu_invalid" in lower ->
             "сервер отклонил MTU WARP: допустимо только целое значение от 1280 до 1500."
         "warp_trace_check_failed" in lower ->
-            "WireGuard запустился, но Cloudflare не подтвердил warp=on/plus. Возможны временный сбой endpoint или региональное ограничение WARP. При установке приложение вернуло прямой выход; при обычной проверке можно попробовать перезапуск или восстановление."
+            withTail("WireGuard запустился, но Cloudflare не подтвердил warp=on/plus даже после безопасного подбора MTU/endpoint. Возможны временный сбой endpoint, блокировка WARP у провайдера VPS или региональное ограничение Cloudflare. При установке приложение вернуло прямой выход; можно попробовать «Сбросить регистрацию WARP» и затем «Установить / восстановить».")
         "warp_mode_not_active" in lower ->
             "бесплатный WARP сейчас не выбран как активный выход WDTT. Сначала нажмите «Установить / восстановить»."
         "warp_account_missing" in lower ->
@@ -5993,6 +7570,11 @@ private fun friendlyDeployError(error: Throwable, operation: String): String {
             "регистрация WARP есть, но WireGuard-профиль отсутствует. Нажмите «Установить / восстановить»."
         "foreign_ext_iface_not_found" in lower ->
             "на другом сервере не удалось определить основной сетевой интерфейс."
+        "ssh-сервер отклонил приватный ключ" in lower ||
+            "ssh-сервер отклонил пароль" in lower ||
+            "не удалось расшифровать приватный ssh-ключ" in lower ||
+            "приватный ssh-ключ повреждён" in lower ->
+            error.message.orEmpty().take(260).ifBlank { raw.take(260) }
         "root privileges required" in lower ||
             "sudo not found" in lower ->
             "для операции нужны права администратора на сервере: войдите под root или установите sudo."
@@ -6000,7 +7582,7 @@ private fun friendlyDeployError(error: Throwable, operation: String): String {
             "authentication failed" in lower ||
             "auth cancel" in lower ||
             "permission denied" in lower ->
-            "не удалось войти по SSH. Проверьте логин, SSH-пароль и порт."
+            "не удалось войти по SSH. Проверьте логин, SSH-пароль или приватный ключ, пароль ключа и порт."
         "connection refused" in lower ->
             "сервер доступен, но SSH-порт отклоняет подключение. Проверьте SSH-порт и правила межсетевого экрана."
         "unknownhost" in lower ||
@@ -6308,14 +7890,14 @@ private suspend fun writeServerBackupToUri(context: Context, outputUri: Uri, bac
 private suspend fun readServerBackup(
     host: String,
     user: String,
-    pass: String,
+    credentials: SshCredentials,
     port: Int,
     includeWgKeys: Boolean
 ): ServerBackup = withContext(Dispatchers.IO) {
     var session: Session? = null
     try {
-        session = createSSHSession(host, user, pass, port)
-        val ssh = SSHClient(session, pass)
+        session = createSshSession(host, user, credentials, port)
+        val ssh = SSHClient(session, credentials.password)
         val command = buildString {
             append("[ -f /etc/wdtt/passwords.json ] || { echo WDTT_ERROR=no_passwords_json; exit 2; }; ")
             append("printf 'WDTT_DB_B64='; base64 /etc/wdtt/passwords.json | tr -d '\\n'; printf '\\n'; ")
@@ -6628,7 +8210,17 @@ private suspend fun compareDeployWithServer(
             withContext(Dispatchers.IO) {
                 var session: Session? = null
                 try {
-                    session = createSSHSession(request.host, request.user, request.pass, request.sshPort)
+                    session = createSshSession(
+                        request.host,
+                        request.user,
+                        SshCredentials(
+                            password = request.pass,
+                            privateKey = request.privateKey,
+                            privateKeyPassphrase = request.keyPassphrase,
+                            allowPasswordAuthentication = request.allowPasswordAuthentication
+                        ),
+                        request.sshPort
+                    )
                     val ssh = SSHClient(session, request.pass)
                     val raw = readRemotePasswordsJson(ssh)
                         ?: throw IllegalStateException("на сервере не найдена база доступа")
@@ -6678,6 +8270,9 @@ private suspend fun compareDeployWithServer(
             host = request.host,
             user = request.user.ifBlank { "root" },
             pass = request.pass,
+            privateKey = request.privateKey,
+            keyPassphrase = request.keyPassphrase,
+            allowPasswordAuthentication = request.allowPasswordAuthentication,
             port = request.sshPort
         )
         val output = runRootScript(
@@ -6746,14 +8341,14 @@ private fun selectExistingServerConnection(
 private suspend fun readExistingServerConnection(
     host: String,
     user: String,
-    pass: String,
+    credentials: SshCredentials,
     port: Int,
     adminMainPassword: String
 ): ExistingServerConnection = withContext(Dispatchers.IO) {
     var session: Session? = null
     try {
-        session = createSSHSession(host, user, pass, port)
-        val ssh = SSHClient(session, pass)
+        session = createSshSession(host, user, credentials, port)
+        val ssh = SSHClient(session, credentials.password)
         val dbJson = readRemotePasswordsJson(ssh) ?: throw IllegalStateException("на сервере не найден /etc/wdtt/passwords.json")
         selectExistingServerConnection(dbJson, host, adminMainPassword)
     } finally {
@@ -6911,7 +8506,17 @@ private suspend fun performServerImportNow(
     var rollbackPrepared = false
     try {
         onProgress(0.05f, "Подключение...")
-        session = createSSHSession(request.host, request.user, request.pass, request.sshPort)
+        session = createSshSession(
+            request.host,
+            request.user,
+            SshCredentials(
+                password = request.pass,
+                privateKey = request.privateKey,
+                privateKeyPassphrase = request.keyPassphrase,
+                allowPasswordAuthentication = request.allowPasswordAuthentication
+            ),
+            request.sshPort
+        )
         DeployManager.activeSession = session
         val ssh = SSHClient(session, request.pass)
         sshClient = ssh
@@ -7100,7 +8705,8 @@ internal fun validateImportedServerState(
 
 private suspend fun performDeploy(
 	context: Context,
-	host: String, user: String, pass: String, port: Int,
+	host: String, user: String, pass: String, privateKey: String, keyPassphrase: String,
+	allowPasswordAuthentication: Boolean, port: Int,
 	mainPass: String, adminId: String, botToken: String,
 	dtlsPort: Int, wgPort: Int, localPort: Int, dns1: String, dns2: String,
 	mode: DeployMode,
@@ -7114,7 +8720,12 @@ private suspend fun performDeploy(
     var preImportDbJson: String? = null
     try {
         onProgress(0.02f, "Подключение...")
-        session = createSSHSession(host, user, pass, port)
+	        session = createSshSession(
+	            host,
+	            user,
+	            SshCredentials(pass, privateKey, keyPassphrase, allowPasswordAuthentication),
+	            port
+	        )
         DeployManager.activeSession = session
         val ssh = SSHClient(session, pass)
         sshClient = ssh
@@ -7185,8 +8796,11 @@ private suspend fun performDeploy(
                 request = DeployRequest(
                     host = host,
                     user = user,
-                    pass = pass,
-                    sshPort = port,
+	                    pass = pass,
+	                    privateKey = privateKey,
+	                    keyPassphrase = keyPassphrase,
+	                    allowPasswordAuthentication = allowPasswordAuthentication,
+	                    sshPort = port,
                     mainPass = mainPass,
                     adminId = adminId,
                     botToken = botToken,
@@ -7269,7 +8883,7 @@ private suspend fun performDeploy(
 			rollbackPrepared = false
 		}
 		DeployManager.writeError("Deploy critical: ${e.message}\n${e.stackTraceToString().take(500)}")
-        DeployManager.failDeploy(e.message?.take(120) ?: "неизвестная ошибка")
+        DeployManager.failDeploy(friendlyDeployError(e, "установка сервера"))
         return@withContext false
     } finally {
         try { session?.disconnect() } catch (_: Exception) {}
@@ -7281,16 +8895,16 @@ private suspend fun performDeploy(
 // ==================== Uninstall ====================
 
 private suspend fun performUninstall(
-    host: String, user: String, pass: String, port: Int,
+    host: String, user: String, credentials: SshCredentials, port: Int,
     dtlsPort: Int, wgPort: Int,
     onProgress: (Float, String) -> Unit
 ) = withContext(Dispatchers.IO) {
     var session: Session? = null
     try {
         onProgress(0.05f, "Подключение...")
-        session = createSSHSession(host, user, pass, port)
+        session = createSshSession(host, user, credentials, port)
         DeployManager.activeSession = session
-        val ssh = SSHClient(session, pass)
+        val ssh = SSHClient(session, credentials.password)
 
         onProgress(0.15f, "Остановка сервиса...")
         ssh.exec(
@@ -7355,7 +8969,7 @@ private suspend fun performUninstall(
 
     } catch (e: Exception) {
         DeployManager.writeError("Uninstall error: ${e.message}")
-        DeployManager.stopDeploy("Ошибка: ${e.message?.take(100)}")
+        DeployManager.stopDeploy("Ошибка: ${friendlyDeployError(e, "удаление сервера")}")
     } finally {
         try { session?.disconnect() } catch (_: Exception) {}
         DeployManager.activeSession = null
@@ -7505,6 +9119,298 @@ private fun ConfirmLine(label: String, value: String) {
             modifier = Modifier.weight(1.1f)
         )
     }
+}
+
+@Composable
+private fun SshAuthenticationHelpDialog(
+    additionalServer: Boolean = false,
+    onDismiss: () -> Unit
+) {
+    androidx.compose.ui.window.Dialog(onDismissRequest = onDismiss) {
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(24.dp),
+            color = MaterialTheme.colorScheme.surface,
+            tonalElevation = 8.dp
+        ) {
+            Column(modifier = Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Вход по SSH", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                    IconButton(onClick = onDismiss) {
+                        Icon(Icons.Default.Close, contentDescription = "Закрыть")
+                    }
+                }
+                Text(
+                    if (additionalServer) {
+                        "Выберите, как текущий WDTT-сервер войдёт на дополнительный VPS во время настройки WireGuard-выхода."
+                    } else {
+                        "Выбранный способ используется для установки, подключения без установки и всех инструментов управления этим WDTT-сервером."
+                    },
+                    style = MaterialTheme.typography.bodyMedium
+                )
+                Text("• «Пароль» — обычный вход по логину и SSH-паролю.", style = MaterialTheme.typography.bodySmall)
+                Text(
+                    "• «SSH-ключ» — вход по приватному ключу; соответствующий публичный ключ должен находиться на сервере в authorized_keys.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Text(
+                    "В режиме ключа пароль необязателен для root или passwordless sudo. Если sudo требует пароль, укажите его в поле «Пароль sudo».",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                if (!additionalServer) {
+                    Text(
+                        "«Пароль туннеля» требуется отдельно: SSH открывает доступ к системе, а пароль туннеля подтверждает владельца WDTT.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SshPrivateKeyDialog(
+    title: String,
+    initialPrivateKey: String,
+    initialPassphrase: String,
+    host: String,
+    user: String,
+    port: Int,
+    onSave: (String, String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val context = LocalContext.current
+    val focusManager = LocalFocusManager.current
+    val keyboardController = LocalSoftwareKeyboardController.current
+    val configuration = LocalConfiguration.current
+    val scope = rememberCoroutineScope()
+    var privateKey by remember(initialPrivateKey) { mutableStateOf(initialPrivateKey) }
+    var passphrase by remember(initialPassphrase) { mutableStateOf(initialPassphrase) }
+    var status by remember { mutableStateOf("") }
+    var statusNearCheck by remember { mutableStateOf(false) }
+    var checking by remember { mutableStateOf(false) }
+    val keyIssue = privateKey.takeIf { it.isNotBlank() }?.let(::sshPrivateKeyIssue)
+    val maxDialogHeight = (configuration.screenHeightDp * 0.86f).dp
+
+    val fileLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            scope.launch {
+                runCatching { readSshPrivateKeyFromUri(context, uri) }
+                    .onSuccess {
+                        privateKey = it
+                        statusNearCheck = false
+                        status = "Приватный ключ загружен из файла."
+                    }
+                    .onFailure {
+                        statusNearCheck = false
+                        status = "Ошибка файла: ${it.message ?: "не удалось прочитать ключ"}"
+                    }
+            }
+        }
+    }
+
+    androidx.compose.ui.window.Dialog(onDismissRequest = { if (!checking) onDismiss() }) {
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(max = maxDialogHeight)
+                .pointerInput(focusManager, keyboardController) {
+                    detectTapGestures {
+                        focusManager.clearFocus(force = true)
+                        keyboardController?.hide()
+                    }
+                },
+            shape = RoundedCornerShape(24.dp),
+            color = MaterialTheme.colorScheme.surface,
+            tonalElevation = 8.dp
+        ) {
+            Column(
+                modifier = Modifier.padding(20.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        title,
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.weight(1f)
+                    )
+                    IconButton(onClick = onDismiss, enabled = !checking) {
+                        Icon(Icons.Default.Close, contentDescription = "Закрыть")
+                    }
+                }
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f, fill = false)
+                        .verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Text(
+                        "Вставьте приватный ключ OpenSSH/PEM или выберите файл. Соответствующий публичный ключ уже должен быть добавлен на сервер в authorized_keys. Приватный ключ и его пароль сохраняются только на этом устройстве в зашифрованном хранилище Android и не входят в передачу настроек администратора.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    OutlinedTextField(
+                        value = privateKey,
+                        onValueChange = {
+                            if (it.length <= com.wdtt.plus.MAX_SSH_PRIVATE_KEY_CHARS) {
+                                privateKey = it
+                                status = ""
+                            }
+                        },
+                        label = { Text("Приватный ключ") },
+                        placeholder = { Text("-----BEGIN OPENSSH PRIVATE KEY-----") },
+                        minLines = 5,
+                        maxLines = 9,
+                        isError = keyIssue != null,
+                        supportingText = {
+                            keyIssue?.let { Text(it) }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(16.dp)
+                    )
+                    OutlinedTextField(
+                        value = passphrase,
+                        onValueChange = { if (it.length <= 4096) passphrase = it },
+                        label = { Text("Пароль ключа — если ключ зашифрован") },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(16.dp)
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedButton(
+                            onClick = {
+                                focusManager.clearFocus()
+                                fileLauncher.launch(
+                                    arrayOf("application/x-pem-file", "application/octet-stream", "text/plain", "*/*")
+                                )
+                            },
+                            modifier = Modifier.weight(1f),
+                            enabled = !checking
+                        ) { Text("Выбрать файл", textAlign = TextAlign.Center) }
+                        OutlinedButton(
+                            onClick = {
+                                focusManager.clearFocus()
+                                statusNearCheck = false
+                                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                val text = clipboard.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString().orEmpty()
+                                if (text.isBlank()) {
+                                    status = "В буфере обмена нет текста."
+                                } else if (text.length > com.wdtt.plus.MAX_SSH_PRIVATE_KEY_CHARS) {
+                                    status = "Ключ из буфера превышает 128 КБ."
+                                } else {
+                                    privateKey = text
+                                    status = "Текст вставлен из буфера обмена."
+                                }
+                            },
+                            modifier = Modifier.weight(1f),
+                            enabled = !checking
+                        ) { Text("Из буфера", textAlign = TextAlign.Center) }
+                    }
+                    if (status.isNotBlank() && !statusNearCheck) {
+                        InlineActionMessage(status)
+                    }
+                    Text(
+                        "При входе по ключу поле «Пароль SSH / sudo» можно оставить пустым для root или passwordless sudo. Если sudo требует пароль, оставьте его заполненным.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Button(
+                        onClick = {
+                            focusManager.clearFocus()
+                            onSave(normalizeSshPrivateKey(privateKey), passphrase)
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = !checking && (privateKey.isBlank() || keyIssue == null)
+                    ) { Text("Сохранить", textAlign = TextAlign.Center) }
+                    OutlinedButton(
+                        onClick = {
+                            focusManager.clearFocus()
+                            checking = true
+                            statusNearCheck = true
+                            status = "Проверяю вход по SSH-ключу..."
+                            scope.launch {
+                                runCatching {
+                                    withContext(Dispatchers.IO) {
+                                        createSshSession(
+                                            host = host,
+                                            user = user,
+                                            credentials = SshCredentials(
+                                                privateKey = normalizeSshPrivateKey(privateKey),
+                                                privateKeyPassphrase = passphrase
+                                            ),
+                                            port = port
+                                        ).disconnect()
+                                    }
+                                }.onSuccess {
+                                    status = "Вход по приватному ключу успешно проверен."
+                                }.onFailure {
+                                    status = "Ошибка проверки: ${it.message ?: "подключение отклонено"}"
+                                }
+                                checking = false
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = !checking && host.isNotBlank() && privateKey.isNotBlank() && keyIssue == null
+                    ) {
+                        if (checking) {
+                            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                            Spacer(Modifier.width(6.dp))
+                        }
+                        Text(if (checking) "Проверяю..." else "Проверить", textAlign = TextAlign.Center)
+                    }
+                    if (status.isNotBlank() && statusNearCheck) {
+                        InlineActionMessage(status)
+                    }
+                    TextButton(
+                        onClick = {
+                            focusManager.clearFocus()
+                            privateKey = ""
+                            passphrase = ""
+                            statusNearCheck = true
+                            status = "Ключ будет удалён после сохранения."
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = !checking && (privateKey.isNotBlank() || initialPrivateKey.isNotBlank())
+                    ) { Text("Очистить", textAlign = TextAlign.Center) }
+                }
+            }
+        }
+    }
+}
+
+private suspend fun readSshPrivateKeyFromUri(context: Context, uri: Uri): String = withContext(Dispatchers.IO) {
+    val bytes = context.contentResolver.openInputStream(uri)?.use { input ->
+        val output = java.io.ByteArrayOutputStream()
+        val buffer = ByteArray(8 * 1024)
+        while (true) {
+            val read = input.read(buffer)
+            if (read < 0) break
+            output.write(buffer, 0, read)
+            if (output.size() > com.wdtt.plus.MAX_SSH_PRIVATE_KEY_CHARS) {
+                throw IllegalArgumentException("Файл ключа превышает 128 КБ.")
+            }
+        }
+        output.toByteArray()
+    } ?: throw IllegalArgumentException("Не удалось открыть файл ключа.")
+    val text = normalizeSshPrivateKey(bytes.toString(Charsets.UTF_8))
+    sshPrivateKeyIssue(text)?.let { throw IllegalArgumentException(it) }
+    text
 }
 
 @OptIn(ExperimentalMaterial3Api::class)

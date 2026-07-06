@@ -1,19 +1,20 @@
 package com.wdtt.plus
 
 import com.jcraft.jsch.ChannelExec
-import com.jcraft.jsch.JSch
 import com.jcraft.jsch.Session
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
-import java.util.Properties
 
 data class ServerAdminTarget(
     val host: String,
     val user: String,
     val sshPassword: String,
     val sshPort: Int,
-    val mainPassword: String
+    val mainPassword: String,
+    val sshPrivateKey: String = "",
+    val sshKeyPassphrase: String = "",
+    val allowPasswordAuthentication: Boolean
 )
 
 data class ServerAdminProfileInfo(
@@ -486,17 +487,17 @@ object ServerAdminClient {
     )
 
     private fun createSession(target: ServerAdminTarget): Session {
-        val session = JSch().getSession(target.user.ifBlank { "root" }, target.host, target.sshPort)
-        session.setPassword(target.sshPassword)
-        session.setConfig(Properties().apply {
-            put("StrictHostKeyChecking", "no")
-            put("ServerAliveInterval", "10")
-            put("ServerAliveCountMax", "6")
-            put("ConnectTimeout", "15000")
-            put("PreferredAuthentications", "password,keyboard-interactive")
-        })
-        session.connect(20_000)
-        return session
+        return createSshSession(
+            host = target.host,
+            user = target.user,
+            credentials = SshCredentials(
+                password = target.sshPassword,
+                privateKey = target.sshPrivateKey,
+                privateKeyPassphrase = target.sshKeyPassphrase,
+                allowPasswordAuthentication = target.allowPasswordAuthentication
+            ),
+            port = target.sshPort
+        )
     }
 
     private fun shellQuote(value: String): String =
@@ -534,7 +535,7 @@ object ServerAdminClient {
             "no such file" in lower || "not found" in lower && "wdtt-server" in lower ->
                 "на сервере старый wdtt-server без admin-команд. Переустановите сервер из этой версии WDTT Plus."
             "permission denied" in lower || "authentication failed" in lower || "auth fail" in lower ->
-                "не удалось войти по SSH. Проверьте логин, пароль и порт."
+                "не удалось войти по SSH. Проверьте логин, SSH-пароль или приватный ключ, пароль ключа и порт."
             "root privileges required" in lower || "sudo not found" in lower ->
                 "для управления нужны root-права или sudo на сервере."
             "connection refused" in lower ->

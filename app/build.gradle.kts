@@ -5,7 +5,7 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
-val appVersionName = "8"
+val appVersionName = "9"
 val releaseApkBaseName = "WDTT-Plus"
 
 val localProperties = Properties()
@@ -22,7 +22,7 @@ android {
         applicationId = "com.wdtt.plus"
         minSdk = 28
         targetSdk = 35
-        versionCode = 8
+        versionCode = 9
         versionName = appVersionName
         buildConfigField("String", "MOD_RELEASE_DATE", "\"06.07.2026\"")
 

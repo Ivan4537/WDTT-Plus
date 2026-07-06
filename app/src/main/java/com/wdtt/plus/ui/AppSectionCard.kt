@@ -42,13 +42,14 @@ private fun appSectionCardBorderColor(): Color {
 @Composable
 fun AppSectionCard(
     modifier: Modifier = Modifier,
+    containerColor: Color? = null,
     contentPadding: PaddingValues = PaddingValues(horizontal = 18.dp, vertical = 18.dp),
     verticalArrangement: Arrangement.Vertical = Arrangement.spacedBy(16.dp),
     content: @Composable ColumnScope.() -> Unit
 ) {
     Surface(
         shape = RoundedCornerShape(28.dp),
-        color = appSectionCardColor(),
+        color = containerColor ?: appSectionCardColor(),
         contentColor = MaterialTheme.colorScheme.onSurface,
         border = BorderStroke(1.dp, appSectionCardBorderColor()),
         shadowElevation = 0.dp,

@@ -13,7 +13,13 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import org.json.JSONArray
@@ -229,6 +235,23 @@ object WdttDeepLink {
 
 class SettingsStore(context: Context) {
     private val appContext = context.applicationContext
+    private val storeScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val preferencesState: StateFlow<Preferences?> = appContext.dataStore.data.stateIn(
+        storeScope,
+        SharingStarted.Eagerly,
+        null
+    )
+    private val preferencesFlow: Flow<Preferences> = preferencesState.filterNotNull()
+    private val _settingsReady = MutableStateFlow(false)
+    val settingsReady: StateFlow<Boolean> = _settingsReady.asStateFlow()
+
+    init {
+        storeScope.launch {
+            preferencesFlow.first()
+            _settingsReady.value = true
+        }
+    }
+
     companion object {
         private val Context.dataStore by preferencesDataStore("settings")
         private val ACTIVE_PROFILE = intPreferencesKey("active_profile")
@@ -258,6 +281,16 @@ class SettingsStore(context: Context) {
         private val DEPLOY_LOGIN = stringPreferencesKey("deploy_login")
         private val DEPLOY_PASSWORD = stringPreferencesKey("deploy_password")
         private val DEPLOY_PASSWORD_ENCRYPTED = stringPreferencesKey("deploy_password_encrypted")
+        private val DEPLOY_SSH_PRIVATE_KEY = stringPreferencesKey("deploy_ssh_private_key")
+        private val DEPLOY_SSH_PRIVATE_KEY_ENCRYPTED = stringPreferencesKey("deploy_ssh_private_key_encrypted")
+        private val DEPLOY_SSH_KEY_PASSPHRASE = stringPreferencesKey("deploy_ssh_key_passphrase")
+        private val DEPLOY_SSH_KEY_PASSPHRASE_ENCRYPTED = stringPreferencesKey("deploy_ssh_key_passphrase_encrypted")
+        private val DEPLOY_SSH_AUTH_MODE = stringPreferencesKey("deploy_ssh_auth_mode")
+        private val WG_EXIT_SSH_PRIVATE_KEY = stringPreferencesKey("wg_exit_ssh_private_key")
+        private val WG_EXIT_SSH_PRIVATE_KEY_ENCRYPTED = stringPreferencesKey("wg_exit_ssh_private_key_encrypted")
+        private val WG_EXIT_SSH_KEY_PASSPHRASE = stringPreferencesKey("wg_exit_ssh_key_passphrase")
+        private val WG_EXIT_SSH_KEY_PASSPHRASE_ENCRYPTED = stringPreferencesKey("wg_exit_ssh_key_passphrase_encrypted")
+        private val WG_EXIT_SSH_AUTH_MODE = stringPreferencesKey("wg_exit_ssh_auth_mode")
         private val DEPLOY_SSH_PORT = stringPreferencesKey("deploy_ssh_port")
         private val DEPLOY_DNS1 = stringPreferencesKey("deploy_dns1")
         private val DEPLOY_DNS2 = stringPreferencesKey("deploy_dns2")
@@ -314,6 +347,11 @@ class SettingsStore(context: Context) {
         private val MIGRATION_NOTICE_V2_SHOWN = booleanPreferencesKey("migration_notice_v2_shown")
         private val MIGRATION_NOTICE_V3_SHOWN = booleanPreferencesKey("migration_notice_v3_shown")
         private val MIGRATION_NOTICE_V5_SHOWN = booleanPreferencesKey("migration_notice_v5_shown")
+        private val SERVER_MIGRATION_STATE_INITIALIZED = booleanPreferencesKey("server_migration_state_initialized")
+        private val LAST_SEEN_APP_VERSION_CODE = intPreferencesKey("last_seen_app_version_code")
+        private val SERVER_MIGRATION_PENDING_LEVEL = intPreferencesKey("server_migration_pending_level")
+        private val SERVER_MIGRATION_NOTICE_ACK_LEVEL = intPreferencesKey("server_migration_notice_ack_level")
+        private val SERVER_MIGRATION_COMPLETED_LEVEL = intPreferencesKey("server_migration_completed_level")
         private val DEVICE_COMPATIBILITY_CHECK_COMPLETE = booleanPreferencesKey("device_compatibility_check_complete")
         private val DEPLOY_CLIENTS_SECTION_EXPANDED = booleanPreferencesKey("deploy_clients_section_expanded")
         private val DEPLOY_OUTBOUND_SECTION_EXPANDED = booleanPreferencesKey("deploy_outbound_section_expanded")
@@ -329,7 +367,7 @@ class SettingsStore(context: Context) {
             val newName = "${baseKey.name}_$profile"
             @Suppress("UNCHECKED_CAST")
             return when (baseKey) {
-                PROFILE_NAME, PEER, VK_HASHES, SECONDARY_VK_HASH, PROTOCOL, SNI, USER_AGENT, DEPLOY_IP, DEPLOY_LOGIN, DEPLOY_PASSWORD, DEPLOY_PASSWORD_ENCRYPTED, DEPLOY_SSH_PORT, DEPLOY_DNS1, DEPLOY_DNS2, EXCLUDED_APPS, BLACKLIST_APPS, WHITELIST_APPS, CONNECTION_PASSWORD, CONNECTION_PASSWORD_ENCRYPTED, DEPLOY_MAIN_PASSWORD, DEPLOY_MAIN_PASSWORD_ENCRYPTED, DEPLOY_ADMIN_ID, DEPLOY_ADMIN_ID_ENCRYPTED, DEPLOY_BOT_TOKEN, DEPLOY_BOT_TOKEN_ENCRYPTED, PROXY_MODE, PROXY_HOST, CAPTCHA_MODE, CAPTCHA_SOLVE_METHOD, CAPTCHA_WBV_SOLVE_METHOD, WDTT_LINK, SELECTED_FINGERPRINT, ACTIVE_CLIENT_IDS -> stringPreferencesKey(newName) as Preferences.Key<T>
+                PROFILE_NAME, PEER, VK_HASHES, SECONDARY_VK_HASH, PROTOCOL, SNI, USER_AGENT, DEPLOY_IP, DEPLOY_LOGIN, DEPLOY_PASSWORD, DEPLOY_PASSWORD_ENCRYPTED, DEPLOY_SSH_PRIVATE_KEY, DEPLOY_SSH_PRIVATE_KEY_ENCRYPTED, DEPLOY_SSH_KEY_PASSPHRASE, DEPLOY_SSH_KEY_PASSPHRASE_ENCRYPTED, DEPLOY_SSH_AUTH_MODE, WG_EXIT_SSH_PRIVATE_KEY, WG_EXIT_SSH_PRIVATE_KEY_ENCRYPTED, WG_EXIT_SSH_KEY_PASSPHRASE, WG_EXIT_SSH_KEY_PASSPHRASE_ENCRYPTED, WG_EXIT_SSH_AUTH_MODE, DEPLOY_SSH_PORT, DEPLOY_DNS1, DEPLOY_DNS2, EXCLUDED_APPS, BLACKLIST_APPS, WHITELIST_APPS, CONNECTION_PASSWORD, CONNECTION_PASSWORD_ENCRYPTED, DEPLOY_MAIN_PASSWORD, DEPLOY_MAIN_PASSWORD_ENCRYPTED, DEPLOY_ADMIN_ID, DEPLOY_ADMIN_ID_ENCRYPTED, DEPLOY_BOT_TOKEN, DEPLOY_BOT_TOKEN_ENCRYPTED, PROXY_MODE, PROXY_HOST, CAPTCHA_MODE, CAPTCHA_SOLVE_METHOD, CAPTCHA_WBV_SOLVE_METHOD, WDTT_LINK, SELECTED_FINGERPRINT, ACTIVE_CLIENT_IDS -> stringPreferencesKey(newName) as Preferences.Key<T>
                 WORKERS_PER_HASH, VK_HASH_NEXT_SLOT, LISTEN_PORT, SERVER_DTLS_PORT, SERVER_WG_PORT, PROXY_PORT -> intPreferencesKey(newName) as Preferences.Key<T>
                 MANUAL_PORTS_ENABLED, NO_DTLS, NO_DNS, IS_WHITELIST, WDTT_LINK_MODE, VKCALLS_PREFLIGHT, DETAILED_LOGS -> booleanPreferencesKey(newName) as Preferences.Key<T>
                 else -> throw IllegalArgumentException("Unsupported key type: ${baseKey.name}")
@@ -343,101 +381,130 @@ class SettingsStore(context: Context) {
     init {
         CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
             migrateSecretsToKeystore()
+            migrateWireGuardExitSshAuthMode()
             migrateVpnAppLists()
         }
     }
 
-    val activeProfile: Flow<Int> = dataStore.data.map { it[ACTIVE_PROFILE] ?: 0 }
-    val profileNames: Flow<List<String>> = dataStore.data.map { prefs ->
+    val activeProfile: Flow<Int> = preferencesFlow.map { it[ACTIVE_PROFILE] ?: 0 }
+    val profileNames: Flow<List<String>> = preferencesFlow.map { prefs ->
         (0 until VPN_PROFILE_COUNT).map { profile ->
             prefs[getProfileKey(PROFILE_NAME, profile)].orEmpty()
         }
     }
-    val showSystemApps: Flow<Boolean> = dataStore.data.map { it[SHOW_SYSTEM_APPS] ?: false }
-    val loggingEnabled: Flow<Boolean> = dataStore.data.map { it[LOGGING_ENABLED] ?: true }
-    val wdttLink: Flow<String> = dataStore.data.map { prefs ->
+    val showSystemApps: Flow<Boolean> = preferencesFlow.map { it[SHOW_SYSTEM_APPS] ?: false }
+    val loggingEnabled: Flow<Boolean> = preferencesFlow.map { it[LOGGING_ENABLED] ?: true }
+    val wdttLink: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(WDTT_LINK, profile)] ?: ""
     }
-    val wdttLinkMode: Flow<Boolean> = dataStore.data.map { prefs ->
+    val wdttLinkMode: Flow<Boolean> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(WDTT_LINK_MODE, profile)] ?: false
     }
 
-    val peer: Flow<String> = dataStore.data.map { prefs ->
+    val peer: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(PEER, profile)] ?: ""
     }
-    val vkHashes: Flow<String> = dataStore.data.map { prefs ->
+    val vkHashes: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(VK_HASHES, profile)] ?: ""
     }
-    val secondaryVkHash: Flow<String> = dataStore.data.map { prefs ->
+    val secondaryVkHash: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(SECONDARY_VK_HASH, profile)] ?: ""
     }
-    val workersPerHash: Flow<Int> = dataStore.data.map { prefs ->
+    val workersPerHash: Flow<Int> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(WORKERS_PER_HASH, profile)] ?: 16
     }
-    val protocol: Flow<String> = dataStore.data.map { prefs ->
+    val protocol: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(PROTOCOL, profile)] ?: "udp"
     }
-    val listenPort: Flow<Int> = dataStore.data.map { prefs ->
+    val listenPort: Flow<Int> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(LISTEN_PORT, profile)] ?: 9000
     }
-    val manualPortsEnabled: Flow<Boolean> = dataStore.data.map { prefs ->
+    val manualPortsEnabled: Flow<Boolean> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(MANUAL_PORTS_ENABLED, profile)] ?: false
     }
-    val serverDtlsPort: Flow<Int> = dataStore.data.map { prefs ->
+    val serverDtlsPort: Flow<Int> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(SERVER_DTLS_PORT, profile)] ?: 56000
     }
-    val serverWgPort: Flow<Int> = dataStore.data.map { prefs ->
+    val serverWgPort: Flow<Int> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(SERVER_WG_PORT, profile)] ?: 56001
     }
-    val sni: Flow<String> = dataStore.data.map { prefs ->
+    val sni: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(SNI, profile)] ?: ""
     }
-    val noDns: Flow<Boolean> = dataStore.data.map { prefs ->
+    val noDns: Flow<Boolean> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(NO_DNS, profile)] ?: false
     }
-    val userAgent: Flow<String> = dataStore.data.map { prefs ->
+    val userAgent: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(USER_AGENT, profile)] ?: ""
     }
 
-    val deployIp: Flow<String> = dataStore.data.map { prefs ->
+    val deployIp: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(DEPLOY_IP, profile)] ?: ""
     }
-    val deployLogin: Flow<String> = dataStore.data.map { prefs ->
+    val deployLogin: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(DEPLOY_LOGIN, profile)] ?: ""
     }
-    val deployPassword: Flow<String> = dataStore.data.map { prefs ->
+    val deployPassword: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         readSecret(prefs, DEPLOY_PASSWORD_ENCRYPTED, DEPLOY_PASSWORD, profile)
     }
-    val deploySshPort: Flow<String> = dataStore.data.map { prefs ->
+    val deploySshPrivateKey: Flow<String> = preferencesFlow.map { prefs ->
+        val profile = prefs[ACTIVE_PROFILE] ?: 0
+        readSecret(prefs, DEPLOY_SSH_PRIVATE_KEY_ENCRYPTED, DEPLOY_SSH_PRIVATE_KEY, profile)
+    }
+    val deploySshKeyPassphrase: Flow<String> = preferencesFlow.map { prefs ->
+        val profile = prefs[ACTIVE_PROFILE] ?: 0
+        readSecret(prefs, DEPLOY_SSH_KEY_PASSPHRASE_ENCRYPTED, DEPLOY_SSH_KEY_PASSPHRASE, profile)
+    }
+    val deploySshAuthMode: Flow<String> = preferencesFlow.map { prefs ->
+        val profile = prefs[ACTIVE_PROFILE] ?: 0
+        prefs[getProfileKey(DEPLOY_SSH_AUTH_MODE, profile)]
+            ?.takeIf { it == "password" || it == "key" }
+            ?: if (readSecret(prefs, DEPLOY_SSH_PRIVATE_KEY_ENCRYPTED, DEPLOY_SSH_PRIVATE_KEY, profile).isNotBlank()) "key" else "password"
+    }
+    val wireGuardExitSshPrivateKey: Flow<String> = preferencesFlow.map { prefs ->
+        val profile = prefs[ACTIVE_PROFILE] ?: 0
+        readSecret(prefs, WG_EXIT_SSH_PRIVATE_KEY_ENCRYPTED, WG_EXIT_SSH_PRIVATE_KEY, profile)
+    }
+    val wireGuardExitSshKeyPassphrase: Flow<String> = preferencesFlow.map { prefs ->
+        val profile = prefs[ACTIVE_PROFILE] ?: 0
+        readSecret(prefs, WG_EXIT_SSH_KEY_PASSPHRASE_ENCRYPTED, WG_EXIT_SSH_KEY_PASSPHRASE, profile)
+    }
+    val wireGuardExitSshAuthMode: Flow<String> = preferencesFlow.map { prefs ->
+        val profile = prefs[ACTIVE_PROFILE] ?: 0
+        prefs[getProfileKey(WG_EXIT_SSH_AUTH_MODE, profile)]
+            ?.takeIf { it == "password" || it == "key" }
+            ?: if (readSecret(prefs, WG_EXIT_SSH_PRIVATE_KEY_ENCRYPTED, WG_EXIT_SSH_PRIVATE_KEY, profile).isNotBlank()) "key" else "password"
+    }
+    val deploySshPort: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(DEPLOY_SSH_PORT, profile)] ?: ""
     }
-    val deployDns1: Flow<String> = dataStore.data.map { prefs ->
+    val deployDns1: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(DEPLOY_DNS1, profile)] ?: "1.1.1.1"
     }
-    val deployDns2: Flow<String> = dataStore.data.map { prefs ->
+    val deployDns2: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(DEPLOY_DNS2, profile)] ?: "1.0.0.1"
     }
-    val vpnAppPackages: Flow<String> = dataStore.data.map { prefs ->
+    val vpnAppPackages: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         val baseKey = if (prefs[getProfileKey(IS_WHITELIST, profile)] == true) {
             WHITELIST_APPS
@@ -447,109 +514,118 @@ class SettingsStore(context: Context) {
         prefs[getProfileKey(baseKey, profile)] ?: ""
     }
     
-    val detailedLogs: Flow<Boolean> = dataStore.data.map { prefs ->
+    val detailedLogs: Flow<Boolean> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(DETAILED_LOGS, profile)] ?: false
     }
     
     // ═══ Пароли и Управление ═══
-    val connectionPassword: Flow<String> = dataStore.data.map { prefs ->
+    val connectionPassword: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         readSecret(prefs, CONNECTION_PASSWORD_ENCRYPTED, CONNECTION_PASSWORD, profile)
     }
-    val deployMainPassword: Flow<String> = dataStore.data.map { prefs ->
+    val deployMainPassword: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         readSecret(prefs, DEPLOY_MAIN_PASSWORD_ENCRYPTED, DEPLOY_MAIN_PASSWORD, profile)
     }
-    val deployAdminId: Flow<String> = dataStore.data.map { prefs ->
+    val deployAdminId: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         readSecret(prefs, DEPLOY_ADMIN_ID_ENCRYPTED, DEPLOY_ADMIN_ID, profile)
     }
-    val deployBotToken: Flow<String> = dataStore.data.map { prefs ->
+    val deployBotToken: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         readSecret(prefs, DEPLOY_BOT_TOKEN_ENCRYPTED, DEPLOY_BOT_TOKEN, profile)
     }
 
     // ═══ Proxy Mode ═══
-    val proxyMode: Flow<String> = dataStore.data.map { prefs ->
+    val proxyMode: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(PROXY_MODE, profile)] ?: "tun"
     }
-    val proxyHost: Flow<String> = dataStore.data.map { prefs ->
+    val proxyHost: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(PROXY_HOST, profile)] ?: "127.0.0.1"
     }
-    val proxyPort: Flow<Int> = dataStore.data.map { prefs ->
+    val proxyPort: Flow<Int> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(PROXY_PORT, profile)] ?: 1080
     }
 
     // ═══ Captcha Solve Mode ═══
-    val vkCallsPreflight: Flow<Boolean> = dataStore.data.map { prefs ->
+    val vkCallsPreflight: Flow<Boolean> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(VKCALLS_PREFLIGHT, profile)] ?: true
     }
-    val captchaMode: Flow<String> = dataStore.data.map { prefs ->
+    val captchaMode: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(CAPTCHA_MODE, profile)] ?: "auto"
     }
-    val captchaSolveMethod: Flow<String> = dataStore.data.map { prefs ->
+    val captchaSolveMethod: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(CAPTCHA_SOLVE_METHOD, profile)] ?: "auto"
     }
-    val captchaWbvSolveMethod: Flow<String> = dataStore.data.map { prefs ->
+    val captchaWbvSolveMethod: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(CAPTCHA_WBV_SOLVE_METHOD, profile)] ?: "auto"
     }
 
     // ═══ VPN Exclusions Mode ═══
-    val isWhitelist: Flow<Boolean> = dataStore.data.map { prefs ->
+    val isWhitelist: Flow<Boolean> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(IS_WHITELIST, profile)] ?: false
     }
 
     // ═══ Theme Mode ═══
-    val themeMode: Flow<String> = dataStore.data.map { it[THEME_MODE] ?: "system" }
-    val isDynamicColor: Flow<Boolean> = dataStore.data.map { it[IS_DYNAMIC_COLOR] ?: (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) }
-    val themePalette: Flow<String> = dataStore.data.map { it[THEME_PALETTE] ?: "indigo" }
+    val themeMode: Flow<String> = preferencesFlow.map { it[THEME_MODE] ?: "system" }
+    val isDynamicColor: Flow<Boolean> = preferencesFlow.map { it[IS_DYNAMIC_COLOR] ?: (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) }
+    val themePalette: Flow<String> = preferencesFlow.map { it[THEME_PALETTE] ?: "indigo" }
 
     // ═══ Fingerprint & Client IDs ═══
-    val selectedFingerprint: Flow<String> = dataStore.data.map { prefs ->
+    val selectedFingerprint: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(SELECTED_FINGERPRINT, profile)] ?: "firefox"
     }
-    val activeClientIds: Flow<String> = dataStore.data.map { prefs ->
+    val activeClientIds: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(ACTIVE_CLIENT_IDS, profile)] ?: "6287487,8202606"
     }
-    val clientIdCheckResults: Flow<String> = dataStore.data.map { prefs ->
+    val clientIdCheckResults: Flow<String> = preferencesFlow.map { prefs ->
         prefs[CLIENT_ID_CHECK_RESULTS] ?: "{}"
     }
 
-    val updateLastCheckAt: Flow<Long> = dataStore.data.map { it[UPDATE_LAST_CHECK_AT] ?: 0L }
-    val updateLatestVersion: Flow<String> = dataStore.data.map { it[UPDATE_LATEST_VERSION] ?: "" }
-    val updateLastError: Flow<String> = dataStore.data.map { it[UPDATE_LAST_ERROR] ?: "" }
-    val updateCheckIntervalMinutes: Flow<Int> = dataStore.data.map {
+    val updateLastCheckAt: Flow<Long> = preferencesFlow.map { it[UPDATE_LAST_CHECK_AT] ?: 0L }
+    val updateLatestVersion: Flow<String> = preferencesFlow.map { it[UPDATE_LATEST_VERSION] ?: "" }
+    val updateLastError: Flow<String> = preferencesFlow.map { it[UPDATE_LAST_ERROR] ?: "" }
+    val updateCheckIntervalMinutes: Flow<Int> = preferencesFlow.map {
         normalizeUpdateCheckIntervalMinutes(it[UPDATE_CHECK_INTERVAL_MINUTES] ?: DEFAULT_UPDATE_CHECK_INTERVAL_MINUTES)
     }
-    val updatePostponeUntil: Flow<Long> = dataStore.data.map { it[UPDATE_POSTPONE_UNTIL] ?: 0L }
-    val updatePostponeVersion: Flow<String> = dataStore.data.map { it[UPDATE_POSTPONE_VERSION] ?: "" }
-    val updateDialogLastShownVersion: Flow<String> = dataStore.data.map { it[UPDATE_DIALOG_LAST_SHOWN_VERSION] ?: "" }
-    val updateDialogLastShownAt: Flow<Long> = dataStore.data.map { it[UPDATE_DIALOG_LAST_SHOWN_AT] ?: 0L }
-    val updateDialogLastActionVersion: Flow<String> = dataStore.data.map { it[UPDATE_DIALOG_LAST_ACTION_VERSION] ?: "" }
-    val updateDialogLastAction: Flow<String> = dataStore.data.map { it[UPDATE_DIALOG_LAST_ACTION] ?: "" }
-    val updateDialogLastActionAt: Flow<Long> = dataStore.data.map { it[UPDATE_DIALOG_LAST_ACTION_AT] ?: 0L }
-    val migrationNoticeV2Shown: Flow<Boolean> = dataStore.data.map { it[MIGRATION_NOTICE_V2_SHOWN] ?: false }
-    val migrationNoticeV3Shown: Flow<Boolean> = dataStore.data.map { it[MIGRATION_NOTICE_V3_SHOWN] ?: false }
-    val migrationNoticeV5Shown: Flow<Boolean> = dataStore.data.map { it[MIGRATION_NOTICE_V5_SHOWN] ?: false }
-    val deviceCompatibilityCheckComplete: Flow<Boolean> = dataStore.data.map {
+    val updatePostponeUntil: Flow<Long> = preferencesFlow.map { it[UPDATE_POSTPONE_UNTIL] ?: 0L }
+    val updatePostponeVersion: Flow<String> = preferencesFlow.map { it[UPDATE_POSTPONE_VERSION] ?: "" }
+    val updateDialogLastShownVersion: Flow<String> = preferencesFlow.map { it[UPDATE_DIALOG_LAST_SHOWN_VERSION] ?: "" }
+    val updateDialogLastShownAt: Flow<Long> = preferencesFlow.map { it[UPDATE_DIALOG_LAST_SHOWN_AT] ?: 0L }
+    val updateDialogLastActionVersion: Flow<String> = preferencesFlow.map { it[UPDATE_DIALOG_LAST_ACTION_VERSION] ?: "" }
+    val updateDialogLastAction: Flow<String> = preferencesFlow.map { it[UPDATE_DIALOG_LAST_ACTION] ?: "" }
+    val updateDialogLastActionAt: Flow<Long> = preferencesFlow.map { it[UPDATE_DIALOG_LAST_ACTION_AT] ?: 0L }
+    val serverMigrationState: Flow<ServerMigrationState?> = preferencesFlow.map { prefs ->
+        if (prefs[SERVER_MIGRATION_STATE_INITIALIZED] != true) {
+            null
+        } else {
+            val profile = prefs[ACTIVE_PROFILE] ?: 0
+            ServerMigrationState(
+                pendingLevel = prefs[SERVER_MIGRATION_PENDING_LEVEL] ?: 0,
+                acknowledgedLevel = prefs[SERVER_MIGRATION_NOTICE_ACK_LEVEL] ?: 0,
+                completedLevel = prefs[serverMigrationCompletedKey(profile)] ?: 0
+            )
+        }
+    }
+    val deviceCompatibilityCheckComplete: Flow<Boolean> = preferencesFlow.map {
         it[DEVICE_COMPATIBILITY_CHECK_COMPLETE] ?: false
     }
-    val deployClientsSectionExpanded: Flow<Boolean> = dataStore.data.map { it[DEPLOY_CLIENTS_SECTION_EXPANDED] ?: false }
-    val deployOutboundSectionExpanded: Flow<Boolean> = dataStore.data.map { it[DEPLOY_OUTBOUND_SECTION_EXPANDED] ?: false }
-    val deployMigrationSectionExpanded: Flow<Boolean> = dataStore.data.map { it[DEPLOY_MIGRATION_SECTION_EXPANDED] ?: false }
-    val interfaceRole: Flow<String> = dataStore.data.map { it[INTERFACE_ROLE] ?: "" }
-    val permissionOnboardingComplete: Flow<Boolean> = dataStore.data.map { prefs ->
+    val deployClientsSectionExpanded: Flow<Boolean> = preferencesFlow.map { it[DEPLOY_CLIENTS_SECTION_EXPANDED] ?: false }
+    val deployOutboundSectionExpanded: Flow<Boolean> = preferencesFlow.map { it[DEPLOY_OUTBOUND_SECTION_EXPANDED] ?: false }
+    val deployMigrationSectionExpanded: Flow<Boolean> = preferencesFlow.map { it[DEPLOY_MIGRATION_SECTION_EXPANDED] ?: false }
+    val interfaceRole: Flow<String> = preferencesFlow.map { it[INTERFACE_ROLE] ?: "" }
+    val permissionOnboardingComplete: Flow<Boolean> = preferencesFlow.map { prefs ->
         prefs[PERMISSION_ONBOARDING_COMPLETE] ?: !prefs[INTERFACE_ROLE].isNullOrBlank()
     }
 
@@ -645,21 +721,44 @@ class SettingsStore(context: Context) {
         }
     }
 
-    suspend fun saveMigrationNoticeV2Shown() {
+    suspend fun initializeServerMigrationState(currentVersionCode: Int, isUpdatedInstall: Boolean) {
         dataStore.edit { prefs ->
-            prefs[MIGRATION_NOTICE_V2_SHOWN] = true
+            val legacyAcknowledgedLevel = when {
+                prefs[MIGRATION_NOTICE_V5_SHOWN] == true -> 5
+                prefs[MIGRATION_NOTICE_V3_SHOWN] == true -> 3
+                prefs[MIGRATION_NOTICE_V2_SHOWN] == true -> 2
+                else -> 0
+            }
+            val result = resolveServerMigrationInitialization(
+                currentVersionCode = currentVersionCode,
+                isUpdatedInstall = isUpdatedInstall,
+                storedLastSeenAppVersionCode = prefs[LAST_SEEN_APP_VERSION_CODE],
+                storedPendingLevel = prefs[SERVER_MIGRATION_PENDING_LEVEL] ?: 0,
+                storedAcknowledgedLevel = prefs[SERVER_MIGRATION_NOTICE_ACK_LEVEL],
+                legacyAcknowledgedLevel = legacyAcknowledgedLevel
+            )
+            prefs[LAST_SEEN_APP_VERSION_CODE] = result.lastSeenAppVersionCode
+            prefs[SERVER_MIGRATION_PENDING_LEVEL] = result.pendingLevel
+            prefs[SERVER_MIGRATION_NOTICE_ACK_LEVEL] = result.acknowledgedLevel
+            prefs[SERVER_MIGRATION_STATE_INITIALIZED] = true
         }
     }
 
-    suspend fun saveMigrationNoticeV3Shown() {
+    suspend fun acknowledgeServerMigrationNotice(level: Int) {
+        if (level <= 0) return
         dataStore.edit { prefs ->
-            prefs[MIGRATION_NOTICE_V3_SHOWN] = true
+            prefs[SERVER_MIGRATION_NOTICE_ACK_LEVEL] = maxOf(
+                prefs[SERVER_MIGRATION_NOTICE_ACK_LEVEL] ?: 0,
+                level
+            )
         }
     }
 
-    suspend fun saveMigrationNoticeV5Shown() {
+    suspend fun markProfileServerMigrationComplete(profile: Int, level: Int) {
+        if (level <= 0) return
         dataStore.edit { prefs ->
-            prefs[MIGRATION_NOTICE_V5_SHOWN] = true
+            val key = serverMigrationCompletedKey(profile.coerceIn(0, VPN_PROFILE_COUNT - 1))
+            prefs[key] = maxOf(prefs[key] ?: 0, level)
         }
     }
 
@@ -668,6 +767,10 @@ class SettingsStore(context: Context) {
             prefs[DEVICE_COMPATIBILITY_CHECK_COMPLETE] = complete
         }
     }
+
+    private fun serverMigrationCompletedKey(profile: Int): Preferences.Key<Int> =
+        if (profile == 0) SERVER_MIGRATION_COMPLETED_LEVEL
+        else intPreferencesKey("${SERVER_MIGRATION_COMPLETED_LEVEL.name}_$profile")
 
     suspend fun saveDeployClientsSectionExpanded(expanded: Boolean) {
         dataStore.edit { prefs ->
@@ -733,7 +836,7 @@ class SettingsStore(context: Context) {
     suspend fun createWdttDeepLinkApplyPlan(link: String): WdttDeepLinkApplyPlan? {
         WdttDeepLink.parse(link) ?: return null
         val cleanLink = link.trim()
-        return dataStore.data.map { prefs ->
+        return appContext.dataStore.data.map { prefs ->
             val activeProfile = (prefs[ACTIVE_PROFILE] ?: 0).coerceIn(0, VPN_PROFILE_COUNT - 1)
             val freeProfile = (0 until VPN_PROFILE_COUNT).firstOrNull { profile ->
                 prefs.isTunnelProfileEmpty(profile)
@@ -749,7 +852,7 @@ class SettingsStore(context: Context) {
 
     suspend fun connectionLinkForProfile(profileIndex: Int): String {
         val profile = profileIndex.coerceIn(0, VPN_PROFILE_COUNT - 1)
-        return dataStore.data.map { prefs ->
+        return appContext.dataStore.data.map { prefs ->
             val storedLink = prefs[getProfileKey(WDTT_LINK, profile)].orEmpty()
             val storedParts = WdttDeepLink.parse(storedLink)
             val parts = storedParts ?: WdttLinkParts(
@@ -775,7 +878,7 @@ class SettingsStore(context: Context) {
         }.first()
     }
 
-    suspend fun exportAdminSettings(): String = dataStore.data.map { prefs ->
+    suspend fun exportAdminSettings(): String = appContext.dataStore.data.map { prefs ->
         val profiles = JSONArray()
         repeat(VPN_PROFILE_COUNT) { profile ->
             profiles.put(JSONObject().apply {
@@ -874,6 +977,12 @@ class SettingsStore(context: Context) {
                 prefs[getProfileKey(DEPLOY_IP, profile)] = item.optString("deployIp")
                 prefs[getProfileKey(DEPLOY_LOGIN, profile)] = item.optString("deployLogin")
                 prefs.putSecret(DEPLOY_PASSWORD_ENCRYPTED, DEPLOY_PASSWORD, item.optString("deployPassword"), profile)
+                prefs.putSecret(DEPLOY_SSH_PRIVATE_KEY_ENCRYPTED, DEPLOY_SSH_PRIVATE_KEY, "", profile)
+                prefs.putSecret(DEPLOY_SSH_KEY_PASSPHRASE_ENCRYPTED, DEPLOY_SSH_KEY_PASSPHRASE, "", profile)
+                prefs[getProfileKey(DEPLOY_SSH_AUTH_MODE, profile)] = "password"
+                prefs.putSecret(WG_EXIT_SSH_PRIVATE_KEY_ENCRYPTED, WG_EXIT_SSH_PRIVATE_KEY, "", profile)
+                prefs.putSecret(WG_EXIT_SSH_KEY_PASSPHRASE_ENCRYPTED, WG_EXIT_SSH_KEY_PASSPHRASE, "", profile)
+                prefs[getProfileKey(WG_EXIT_SSH_AUTH_MODE, profile)] = "password"
                 prefs[getProfileKey(DEPLOY_SSH_PORT, profile)] = item.optString("deploySshPort")
                 prefs[getProfileKey(DEPLOY_DNS1, profile)] = item.optString("deployDns1", "1.1.1.1")
                 prefs[getProfileKey(DEPLOY_DNS2, profile)] = item.optString("deployDns2", "1.0.0.1")
@@ -1060,6 +1169,55 @@ class SettingsStore(context: Context) {
         }
     }
 
+    suspend fun saveDeploySshKey(privateKey: String, passphrase: String) {
+        dataStore.edit { prefs ->
+            val profile = prefs[ACTIVE_PROFILE] ?: 0
+            val normalizedKey = normalizeSshPrivateKey(privateKey)
+            prefs.putSecret(
+                DEPLOY_SSH_PRIVATE_KEY_ENCRYPTED,
+                DEPLOY_SSH_PRIVATE_KEY,
+                normalizedKey,
+                profile
+            )
+            prefs.putSecret(
+                DEPLOY_SSH_KEY_PASSPHRASE_ENCRYPTED,
+                DEPLOY_SSH_KEY_PASSPHRASE,
+                passphrase.takeIf { normalizedKey.isNotBlank() }.orEmpty(),
+                profile
+            )
+        }
+    }
+
+    suspend fun saveDeploySshAuthMode(mode: String) {
+        require(mode == "password" || mode == "key")
+        dataStore.edit { prefs ->
+            val profile = prefs[ACTIVE_PROFILE] ?: 0
+            prefs[getProfileKey(DEPLOY_SSH_AUTH_MODE, profile)] = mode
+        }
+    }
+
+    suspend fun saveWireGuardExitSshKey(privateKey: String, passphrase: String) {
+        dataStore.edit { prefs ->
+            val profile = prefs[ACTIVE_PROFILE] ?: 0
+            val normalizedKey = normalizeSshPrivateKey(privateKey)
+            prefs.putSecret(WG_EXIT_SSH_PRIVATE_KEY_ENCRYPTED, WG_EXIT_SSH_PRIVATE_KEY, normalizedKey, profile)
+            prefs.putSecret(
+                WG_EXIT_SSH_KEY_PASSPHRASE_ENCRYPTED,
+                WG_EXIT_SSH_KEY_PASSPHRASE,
+                passphrase.takeIf { normalizedKey.isNotBlank() }.orEmpty(),
+                profile
+            )
+        }
+    }
+
+    suspend fun saveWireGuardExitSshAuthMode(mode: String) {
+        require(mode == "password" || mode == "key")
+        dataStore.edit { prefs ->
+            val profile = prefs[ACTIVE_PROFILE] ?: 0
+            prefs[getProfileKey(WG_EXIT_SSH_AUTH_MODE, profile)] = mode
+        }
+    }
+
     suspend fun toggleVpnAppSelected(packageName: String, whitelist: Boolean) {
         dataStore.edit { prefs ->
             val profile = prefs[ACTIVE_PROFILE] ?: 0
@@ -1174,12 +1332,30 @@ class SettingsStore(context: Context) {
         dataStore.edit { prefs ->
             for (profile in 0..2) {
                 prefs.migrateSecret(getProfileKey(DEPLOY_PASSWORD_ENCRYPTED, profile), getProfileKey(DEPLOY_PASSWORD, profile))
+                prefs.migrateSecret(getProfileKey(DEPLOY_SSH_PRIVATE_KEY_ENCRYPTED, profile), getProfileKey(DEPLOY_SSH_PRIVATE_KEY, profile))
+                prefs.migrateSecret(getProfileKey(DEPLOY_SSH_KEY_PASSPHRASE_ENCRYPTED, profile), getProfileKey(DEPLOY_SSH_KEY_PASSPHRASE, profile))
+                prefs.migrateSecret(getProfileKey(WG_EXIT_SSH_PRIVATE_KEY_ENCRYPTED, profile), getProfileKey(WG_EXIT_SSH_PRIVATE_KEY, profile))
+                prefs.migrateSecret(getProfileKey(WG_EXIT_SSH_KEY_PASSPHRASE_ENCRYPTED, profile), getProfileKey(WG_EXIT_SSH_KEY_PASSPHRASE, profile))
                 prefs.migrateSecret(getProfileKey(CONNECTION_PASSWORD_ENCRYPTED, profile), getProfileKey(CONNECTION_PASSWORD, profile))
                 prefs.migrateSecret(getProfileKey(DEPLOY_MAIN_PASSWORD_ENCRYPTED, profile), getProfileKey(DEPLOY_MAIN_PASSWORD, profile))
                 prefs.migrateSecret(getProfileKey(DEPLOY_ADMIN_ID_ENCRYPTED, profile), getProfileKey(DEPLOY_ADMIN_ID, profile))
                 prefs.migrateSecret(getProfileKey(DEPLOY_BOT_TOKEN_ENCRYPTED, profile), getProfileKey(DEPLOY_BOT_TOKEN, profile))
             }
         }
+    }
+
+    private suspend fun migrateWireGuardExitSshAuthMode() {
+        val legacyPrefs = appContext.getSharedPreferences("wdtt_outbound_forms", Context.MODE_PRIVATE)
+        val legacyMode = legacyPrefs.getString("wg_exit_auth_mode", null)
+            ?.takeIf { it == "password" || it == "key" }
+            ?: return
+        dataStore.edit { prefs ->
+            for (profile in 0 until VPN_PROFILE_COUNT) {
+                val key = getProfileKey(WG_EXIT_SSH_AUTH_MODE, profile)
+                if (prefs[key] == null) prefs[key] = legacyMode
+            }
+        }
+        legacyPrefs.edit().remove("wg_exit_auth_mode").apply()
     }
 
     private suspend fun migrateVpnAppLists() {

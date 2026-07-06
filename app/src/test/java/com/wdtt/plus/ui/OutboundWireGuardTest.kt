@@ -56,8 +56,41 @@ class OutboundWireGuardTest {
         assertTrue("sha256sum" in script)
         assertTrue("--accept-tos" in script)
         assertTrue("wdtt-warp-watchdog.timer" in script)
-        assertTrue("for attempt in 1 2 3" in script)
+        assertTrue("wdtt_warp_autotune" in script)
+        assertTrue("WARP_ENDPOINT_CANDIDATES" in script)
+        assertTrue("engage.cloudflareclient.com:2408" in script)
+        assertTrue("rollback after WARP check error" in script)
         assertShellSyntax(script)
+    }
+
+    @Test
+    fun serverDiagnosticsScript_hasPortableChecksAndValidShellSyntax() {
+        val script = serverDiagnosticsScript()
+
+        assertTrue("WDTT_SERVER_DIAG" in script)
+        assertTrue("apt-get dnf yum zypper apk pacman" in script)
+        assertTrue("wdtt_diag_install_dependencies" in script)
+        assertTrue("DEBIAN_FRONTEND=noninteractive apt-get install" in script)
+        assertTrue("dnf install -y" in script)
+        assertTrue("yum install -y" in script)
+        assertTrue("zypper --non-interactive install" in script)
+        assertTrue("apk add --no-cache" in script)
+        assertTrue("pacman -Sy --noconfirm --needed" in script)
+        assertTrue("systemctl" in script)
+        assertTrue("iptables" in script)
+        assertTrue("nft" in script)
+        assertTrue("VK / TURN-зависимости" in script)
+        assertTrue("api.vk.me" in script)
+        assertTrue("calls.okcdn.ru" in script)
+        assertTrue("api.telegram.org" in script)
+        assertTrue("Бесплатный WARP" in script)
+        assertTrue("engage.cloudflareclient.com" in script)
+        assertTrue("WDTT_EXPECTED_DTLS_PORT" in script)
+        assertTrue("wdtt_diag_udp_probe" in script)
+        assertTrue("/dev/net/tun" in script)
+        assertTrue("admin.sock" in script)
+        assertFalse("PrivateKey =" in script)
+        assertShellSyntax(script, shell = "sh")
     }
 
     @Test(expected = IllegalArgumentException::class)
@@ -65,16 +98,16 @@ class OutboundWireGuardTest {
         buildFreeWarpInstallScript(1600)
     }
 
-    private fun assertShellSyntax(script: String) {
+    private fun assertShellSyntax(script: String, shell: String = "bash") {
         val file = File.createTempFile("wdtt-warp-", ".sh")
         try {
             file.writeText(script)
-            val process = ProcessBuilder("bash", "-n", file.absolutePath)
+            val process = ProcessBuilder(shell, "-n", file.absolutePath)
                 .redirectErrorStream(true)
                 .start()
             val output = process.inputStream.bufferedReader().readText()
             val code = process.waitFor()
-            assertTrue("bash -n завершился с кодом $code: $output", code == 0)
+            assertTrue("$shell -n завершился с кодом $code: $output", code == 0)
         } finally {
             file.delete()
         }

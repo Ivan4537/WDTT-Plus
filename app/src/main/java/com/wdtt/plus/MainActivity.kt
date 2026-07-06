@@ -50,9 +50,11 @@ import androidx.compose.material.icons.outlined.VpnKey
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shape
@@ -69,6 +71,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
 import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
@@ -656,14 +659,24 @@ fun MainScreen(
     val lifecycleOwner = LocalLifecycleOwner.current
     val scope = rememberCoroutineScope()
     val updateCheckMutex = remember { Mutex() }
+    val settingsReady by settingsStore.settingsReady.collectAsStateWithLifecycle(initialValue = false)
+    if (!settingsReady) {
+        Box(modifier = Modifier.fillMaxSize()) {
+            AppBackdrop(modifier = Modifier.matchParentSize())
+        }
+        return
+    }
     val activeProfile by settingsStore.activeProfile.collectAsStateWithLifecycle(initialValue = 0)
     val profileNames by settingsStore.profileNames.collectAsStateWithLifecycle(initialValue = emptyList())
     val wdttLinkMode by settingsStore.wdttLinkMode.collectAsStateWithLifecycle(initialValue = false)
+    val migrationDeployHost by settingsStore.deployIp.collectAsStateWithLifecycle(initialValue = "")
+    val migrationSshPassword by settingsStore.deployPassword.collectAsStateWithLifecycle(initialValue = "")
+    val migrationSshPrivateKey by settingsStore.deploySshPrivateKey.collectAsStateWithLifecycle(initialValue = "")
+    val migrationSshAuthMode by settingsStore.deploySshAuthMode.collectAsStateWithLifecycle(initialValue = "password")
+    val migrationMainPassword by settingsStore.deployMainPassword.collectAsStateWithLifecycle(initialValue = "")
     val interfaceRole by settingsStore.interfaceRole.collectAsStateWithLifecycle(initialValue = "")
     val permissionOnboardingComplete by settingsStore.permissionOnboardingComplete.collectAsStateWithLifecycle(initialValue = false)
-    val migrationNoticeV2Shown by settingsStore.migrationNoticeV2Shown.collectAsStateWithLifecycle(initialValue = true)
-    val migrationNoticeV3Shown by settingsStore.migrationNoticeV3Shown.collectAsStateWithLifecycle(initialValue = true)
-    val migrationNoticeV5Shown by settingsStore.migrationNoticeV5Shown.collectAsStateWithLifecycle(initialValue = true)
+    val serverMigrationState by settingsStore.serverMigrationState.collectAsStateWithLifecycle(initialValue = null)
     val deviceCompatibilityCheckComplete by settingsStore.deviceCompatibilityCheckComplete.collectAsStateWithLifecycle(
         initialValue = true
     )
@@ -674,6 +687,12 @@ fun MainScreen(
                 info.lastUpdateTime > info.firstInstallTime
             }
         }.getOrDefault(false)
+    }
+    LaunchedEffect(settingsStore, isUpdatedInstall) {
+        settingsStore.initializeServerMigrationState(
+            currentVersionCode = BuildConfig.VERSION_CODE,
+            isUpdatedInstall = isUpdatedInstall
+        )
     }
     var selectedTab by rememberSaveable { mutableIntStateOf(0) }
     val tunnelScrollPosition = rememberSaveable { mutableIntStateOf(0) }
@@ -815,6 +834,7 @@ fun MainScreen(
     }
     val actionsExpanded = rememberSaveable { mutableStateOf(false) }
     val projectExpanded = rememberSaveable { mutableStateOf(false) }
+    val tabStateHolder = rememberSaveableStateHolder()
 
 
 
@@ -1010,8 +1030,24 @@ fun MainScreen(
                         }
                     }
             ) {
+                val deployVisible = selectedTab == 1 && !wdttLinkMode
+                val deployAvailable = activeNavItems.any { it.id == 1 } && !wdttLinkMode
+                if (deployAvailable) {
+                    tabStateHolder.SaveableStateProvider("deploy_persistent") {
+                        DeployTab(
+                            scrollPosition = deployScrollPosition,
+                            visible = deployVisible,
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(bottom = navOverlayReserve)
+                                .graphicsLayer { alpha = if (deployVisible) 1f else 0f }
+                                .zIndex(if (deployVisible) 1f else -1f)
+                        )
+                    }
+                }
+
                 AnimatedContent(
-                    targetState = selectedTab,
+                    targetState = if (deployVisible) -1 else selectedTab,
                     transitionSpec = {
                         fadeIn(tween(300)) togetherWith fadeOut(tween(225))
                     },
@@ -1020,22 +1056,25 @@ fun MainScreen(
                         .padding(bottom = navOverlayReserve),
                     label = "tab_content"
                 ) { tab ->
-                    when (tab) {
-                        0 -> SettingsTab(scrollPosition = tunnelScrollPosition)
-                        1 -> if (!wdttLinkMode) DeployTab(scrollPosition = deployScrollPosition) else Spacer(modifier = Modifier.fillMaxSize())
-                        2 -> ExceptionsTab(
-                            firstVisibleItemIndex = exceptionsFirstVisibleItemIndex,
-                            firstVisibleItemScrollOffset = exceptionsFirstVisibleItemScrollOffset
-                        )
-                        3 -> LogsTab(
-                            firstVisibleItemIndex = logsFirstVisibleItemIndex,
-                            firstVisibleItemScrollOffset = logsFirstVisibleItemScrollOffset
-                        )
-                        4 -> InfoTab(
-                            actionsExpandedState = actionsExpanded,
-                            projectExpandedState = projectExpanded,
-                            scrollPosition = infoScrollPosition
-                        )
+                    tabStateHolder.SaveableStateProvider(tab) {
+                        when (tab) {
+                            -1 -> Spacer(modifier = Modifier.fillMaxSize())
+                            0 -> SettingsTab(scrollPosition = tunnelScrollPosition)
+                            1 -> Spacer(modifier = Modifier.fillMaxSize())
+                            2 -> ExceptionsTab(
+                                firstVisibleItemIndex = exceptionsFirstVisibleItemIndex,
+                                firstVisibleItemScrollOffset = exceptionsFirstVisibleItemScrollOffset
+                            )
+                            3 -> LogsTab(
+                                firstVisibleItemIndex = logsFirstVisibleItemIndex,
+                                firstVisibleItemScrollOffset = logsFirstVisibleItemScrollOffset
+                            )
+                            4 -> InfoTab(
+                                actionsExpandedState = actionsExpanded,
+                                projectExpandedState = projectExpanded,
+                                scrollPosition = infoScrollPosition
+                            )
+                        }
                     }
                 }
 
@@ -1088,75 +1127,20 @@ fun MainScreen(
         )
     }
 
+    val migrationNotice = serverMigrationState
+    val activeProfileManagesServer = hasManagedServerCredentials(
+        host = migrationDeployHost,
+        sshAuthMode = migrationSshAuthMode,
+        sshPassword = migrationSshPassword,
+        mainPassword = migrationMainPassword,
+        sshPrivateKey = migrationSshPrivateKey
+    )
     if (
-        BuildConfig.VERSION_CODE == 2 &&
         isAdminInterface &&
-        isUpdatedInstall &&
-        !migrationNoticeV2Shown
-    ) {
-        AlertDialog(
-            onDismissRequest = {},
-            properties = DialogProperties(
-                dismissOnBackPress = false,
-                dismissOnClickOutside = false
-            ),
-            title = { Text("Требуется обновление сервера") },
-            text = {
-                Text(
-                    "Это крупное обновление WDTT Plus. Для корректной работы новых функций необходимо выполнить установку сервера во вкладке «Деплой».\n\n" +
-                        "Выберите установку с сохранением данных. Настройки, клиенты и выданные доступы сохранятся — будет обновлена только серверная часть.\n\n" +
-                        "Установку с нуля выполнять не нужно."
-                )
-            },
-            confirmButton = {
-                Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
-                    Button(
-                        onClick = { scope.launch { settingsStore.saveMigrationNoticeV2Shown() } }
-                    ) {
-                        Text("Хорошо")
-                    }
-                }
-            }
-        )
-    }
-
-    if (
-        BuildConfig.VERSION_CODE == 3 &&
-        isAdminInterface &&
-        isUpdatedInstall &&
-        !migrationNoticeV3Shown
-    ) {
-        AlertDialog(
-            onDismissRequest = {},
-            properties = DialogProperties(
-                dismissOnBackPress = false,
-                dismissOnClickOutside = false
-            ),
-            title = { Text("Требуется обновление сервера") },
-            text = {
-                Text(
-                    "Для корректной работы новых функций необходимо обновить установку серверной части во вкладке «Деплой».\n\n" +
-                        "Выберите установку с сохранением данных. Настройки, клиенты и выданные доступы сохранятся — будет обновлена только серверная часть.\n\n" +
-                        "Установку с нуля выполнять не нужно."
-                )
-            },
-            confirmButton = {
-                Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
-                    Button(
-                        onClick = { scope.launch { settingsStore.saveMigrationNoticeV3Shown() } }
-                    ) {
-                        Text("Хорошо")
-                    }
-                }
-            }
-        )
-    }
-
-    if (
-        BuildConfig.VERSION_CODE == 5 &&
-        isAdminInterface &&
-        isUpdatedInstall &&
-        !migrationNoticeV5Shown
+        activeProfileManagesServer &&
+        migrationNotice?.noticeRequired == true &&
+        pendingUpdateCandidate == null &&
+        startupDeviceReport == null
     ) {
         AlertDialog(
             onDismissRequest = {},
@@ -1166,19 +1150,39 @@ fun MainScreen(
             ),
             title = { Text("Обновите серверную часть") },
             text = {
-                Text(
-                    "Чтобы управление выходным IP, бесплатным WARP и новыми проверками корректно работало в приложении и Telegram-боте, выполните установку сервера во вкладке «Деплой».\n\n" +
-                        "Выберите установку с сохранением данных. Клиенты, доступы и настройки сохранятся.\n\n" +
-                        "Установку с нуля выполнять не нужно."
-                )
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text(
+                        "В новых версиях WDTT Plus была изменена серверная часть. Для корректной работы приложения с сервером выполните установку сервера с сохранением данных во вкладке «Деплой».\n\n" +
+                            "Клиенты, выданные доступы и настройки сохранятся. Установку с нуля выполнять не нужно."
+                    )
+                    Text(
+                        "После успешной установки приложение отметит обновление для выбранного VPN-профиля.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
             },
             confirmButton = {
-                Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
-                    Button(
-                        onClick = { scope.launch { settingsStore.saveMigrationNoticeV5Shown() } }
-                    ) {
-                        Text("Хорошо")
+                Button(
+                    onClick = {
+                        scope.launch {
+                            settingsStore.acknowledgeServerMigrationNotice(migrationNotice.pendingLevel)
+                            selectedTab = 1
+                        }
                     }
+                ) {
+                    Text("Перейти в Деплой")
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        scope.launch {
+                            settingsStore.acknowledgeServerMigrationNotice(migrationNotice.pendingLevel)
+                        }
+                    }
+                ) {
+                    Text("Позже")
                 }
             }
         )
