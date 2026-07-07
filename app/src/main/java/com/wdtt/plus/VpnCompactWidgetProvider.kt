@@ -40,6 +40,7 @@ class VpnCompactWidgetProvider : AppWidgetProvider() {
         appWidgetIds: IntArray
     ) {
         val running = TunnelManager.running.value
+        val waiting = TrustedWifiManager.state.value.waiting
         scope.launch {
             val settingsStore = SettingsStore(context)
             val activeProfile = settingsStore.activeProfile.first().coerceIn(0, 2)
@@ -51,9 +52,12 @@ class VpnCompactWidgetProvider : AppWidgetProvider() {
                 views.setInt(
                     R.id.compact_widget_toggle,
                     "setBackgroundResource",
-                    if (running) R.drawable.bg_widget_button_active else R.drawable.bg_widget_button_inactive
+                    if (running && !waiting) R.drawable.bg_widget_button_active else R.drawable.bg_widget_button_inactive
                 )
-                views.setTextViewText(R.id.compact_widget_profile, profileName)
+                views.setTextViewText(
+                    R.id.compact_widget_profile,
+                    if (waiting) "Ожидание" else profileName
+                )
 
                 val toggleIntent = Intent(context, VpnWidgetProvider::class.java).apply {
                     action = VpnWidgetProvider.ACTION_WIDGET_TOGGLE

@@ -191,7 +191,7 @@ fun DeviceCompatibilityDialog(
                             ) {
                                 Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(18.dp))
                                 Spacer(modifier = Modifier.size(8.dp))
-                                Text("Скопировать")
+                                Text("Скопировать отчёт")
                             }
                         }
                         Button(

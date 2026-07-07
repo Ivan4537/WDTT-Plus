@@ -43,9 +43,10 @@ class WdttApplication : Application() {
             try {
                 combine(
                     TunnelManager.running,
+                    TrustedWifiManager.state,
                     settingsStore.activeProfile,
                     settingsStore.profileNames
-                ) { _, _, _ -> Unit }.collect {
+                ) { _, _, _, _ -> Unit }.collect {
                     VpnWidgetProvider.updateAllWidgets(this@WdttApplication)
                 }
             } catch (e: Exception) {

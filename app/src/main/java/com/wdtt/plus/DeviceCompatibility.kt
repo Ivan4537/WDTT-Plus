@@ -49,7 +49,8 @@ data class DeviceCheckItem(
 
 data class DeviceCompatibilityReport(
     val checkedAt: Long,
-    val items: List<DeviceCheckItem>
+    val items: List<DeviceCheckItem>,
+    val summaryLines: List<String> = emptyList()
 ) {
     val problemItems: List<DeviceCheckItem>
         get() = items.filter { it.severity == DeviceCheckSeverity.Warning || it.severity == DeviceCheckSeverity.Error }
@@ -79,6 +80,11 @@ data class DeviceCompatibilityReport(
             appendLine("Проверка устройства WDTT Plus")
             appendLine("Проверено: ${formatter.format(Date(checkedAt))}")
             appendLine("Итог: $overallStatus")
+            if (summaryLines.isNotEmpty()) {
+                appendLine()
+                appendLine("Сводка")
+                summaryLines.forEach { line -> appendLine(line) }
+            }
             items.forEach { item ->
                 appendLine()
                 appendLine("[${item.severity.label()}] ${item.title}: ${item.status}")
@@ -107,6 +113,7 @@ object DeviceCompatibility {
             add(androidVersionItem())
             add(abiItem())
             add(nativeClientItem(appContext))
+            nativeRuntimeSafetyItem()?.let(::add)
             add(pageSizeItem())
             add(memoryClassItem(appContext, workersPerHash))
             add(webViewItem(includeRuntimeChecks))
@@ -198,7 +205,7 @@ object DeviceCompatibility {
                 title = "Архитектура CPU",
                 status = "32-bit ARM / armeabi-v7a",
                 details = "Эта ABI поддерживается, но на старых 32-битных устройствах запас по памяти и потокам обычно ниже, чем на arm64.",
-                recommendation = "Если туннель нестабилен, уменьшите мощность до 4–8 потоков и приложите отчёт из Инфо.",
+                recommendation = "Если туннель нестабилен, уменьшите мощность до минимальных 9 потоков и скопируйте отчёт через «Проверить устройство».",
                 severity = DeviceCheckSeverity.Info,
                 firstLaunchRelevant = false
             )
@@ -210,6 +217,18 @@ object DeviceCompatibility {
                 firstLaunchRelevant = true
             )
         }
+    }
+
+    private fun nativeRuntimeSafetyItem(): DeviceCheckItem? {
+        val primary = Build.SUPPORTED_ABIS.firstOrNull().orEmpty()
+        if (primary != "armeabi-v7a") return null
+        return DeviceCheckItem(
+            title = "32-bit нативный режим",
+            status = "безопасные atomic-счётчики",
+            details = "В этой сборке Android Go-клиент использует выровненные typed atomics для трафика, активных каналов и health-monitor. Это защищает старые ARMv7-устройства от остановки транспорта из-за 64-bit atomic-доступов.",
+            severity = DeviceCheckSeverity.Ok,
+            firstLaunchRelevant = true
+        )
     }
 
     private fun nativeClientItem(context: Context): DeviceCheckItem {
@@ -249,7 +268,7 @@ object DeviceCompatibility {
                 title = "Страница памяти",
                 status = "не удалось определить",
                 details = "Android не вернул размер страницы памяти.",
-                recommendation = "Если VPN не стартует на новом устройстве, приложите отчёт из Инфо.",
+                recommendation = "Если VPN не стартует на новом устройстве, скопируйте отчёт через «Проверить устройство».",
                 severity = DeviceCheckSeverity.Info,
                 firstLaunchRelevant = false
             )
@@ -257,7 +276,7 @@ object DeviceCompatibility {
                 title = "Страница памяти",
                 status = "$pageSize байт",
                 details = "Устройство использует страницу памяти больше 4 KB. Для новых Android-устройств с 16 KB page size нужна отдельная проверка нативной библиотеки.",
-                recommendation = "Запуск не блокируется. Если туннель не стартует, отправьте отчёт из Инфо — это важный сценарий для будущей совместимости.",
+                recommendation = "Запуск не блокируется. Если туннель не стартует, отправьте отчёт из «Проверить устройство» — это важный сценарий для будущей совместимости.",
                 severity = DeviceCheckSeverity.Warning,
                 firstLaunchRelevant = true
             )
@@ -284,7 +303,7 @@ object DeviceCompatibility {
                 title = "Память устройства",
                 status = "low-RAM, мощность $workersPerHash",
                 details = "Android помечает устройство как low-RAM. Большое число потоков может не успевать стабильно подняться.",
-                recommendation = "Для таких устройств начните с 4–8 потоков. Это не ошибка подключения к профилю VPN.",
+                recommendation = "Для таких устройств начните с минимальных 9 потоков. Это не ошибка подключения к профилю VPN.",
                 severity = DeviceCheckSeverity.Warning,
                 firstLaunchRelevant = true
             )
@@ -292,7 +311,7 @@ object DeviceCompatibility {
                 title = "Память устройства",
                 status = "low-RAM / Android Go возможен",
                 details = "Устройство относится к классу с ограниченной памятью. Приложение может работать, но высокая мощность будет менее предсказуемой.",
-                recommendation = "Если активные потоки не появляются, уменьшите мощность до 4–8 и проверьте логи.",
+                recommendation = "Если активные потоки не появляются, уменьшите мощность до минимальных 9 потоков и проверьте логи.",
                 severity = DeviceCheckSeverity.Warning,
                 firstLaunchRelevant = true
             )
@@ -433,9 +452,17 @@ object DeviceCompatibility {
 
     private fun tunnelStateItem(): DeviceCheckItem {
         val running = TunnelManager.running.value
+        val trustedWifi = TrustedWifiManager.state.value
         val activeWorkers = TunnelManager.activeWorkers.value
         val issue = TunnelManager.connectionIssue.value
-        return if (running) {
+        return if (trustedWifi.waiting) {
+            DeviceCheckItem(
+                title = "Текущее подключение VPN",
+                status = "ожидание доверенной Wi-Fi сети",
+                details = "VPN сейчас выключен автоматикой доверенных сетей и восстановится после выхода из Wi-Fi.",
+                severity = DeviceCheckSeverity.Ok
+            )
+        } else if (running) {
             DeviceCheckItem(
                 title = "Текущее подключение VPN",
                 status = "активно",

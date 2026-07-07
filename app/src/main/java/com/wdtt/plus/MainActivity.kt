@@ -20,6 +20,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
@@ -1032,6 +1033,11 @@ fun MainScreen(
             ) {
                 val deployVisible = selectedTab == 1 && !wdttLinkMode
                 val deployAvailable = activeNavItems.any { it.id == 1 } && !wdttLinkMode
+                val deployAlpha by animateFloatAsState(
+                    targetValue = if (deployVisible) 1f else 0f,
+                    animationSpec = tween(durationMillis = if (deployVisible) 300 else 225),
+                    label = "deploy_tab_fade"
+                )
                 if (deployAvailable) {
                     tabStateHolder.SaveableStateProvider("deploy_persistent") {
                         DeployTab(
@@ -1040,8 +1046,8 @@ fun MainScreen(
                             modifier = Modifier
                                 .fillMaxSize()
                                 .padding(bottom = navOverlayReserve)
-                                .graphicsLayer { alpha = if (deployVisible) 1f else 0f }
-                                .zIndex(if (deployVisible) 1f else -1f)
+                                .graphicsLayer { alpha = deployAlpha }
+                                .zIndex(if (deployVisible || deployAlpha > 0f) 1f else -1f)
                         )
                     }
                 }

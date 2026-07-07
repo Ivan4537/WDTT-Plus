@@ -31,12 +31,13 @@ class QuickToggleTileService : TileService() {
                 val settingsStore = SettingsStore(this@QuickToggleTileService)
                 combine(
                     TunnelManager.running,
+                    TrustedWifiManager.state,
                     settingsStore.activeProfile,
                     settingsStore.profileNames
-                ) { running, activeProfile, profileNames ->
-                    Triple(running, activeProfile, profileNames)
-                }.collect { (running, activeProfile, profileNames) ->
-                    updateTile(running, activeProfile, profileNames)
+                ) { running, trustedWifi, activeProfile, profileNames ->
+                    TileUiState(running, trustedWifi, activeProfile, profileNames)
+                }.collect { uiState ->
+                    updateTile(uiState)
                 }
             } catch (e: Exception) {
                 Log.e("QuickToggleTile", "Error collecting running state", e)
@@ -52,7 +53,7 @@ class QuickToggleTileService : TileService() {
     override fun onClick() {
         super.onClick()
         runCatching {
-            if (TunnelManager.running.value) {
+            if (TunnelManager.running.value || TrustedWifiManager.state.value.waiting) {
                 // Если запущен — останавливаем. Состояние плитки изменится автоматически,
                 // когда TunnelManager остановит процессы и обновит статус running в false.
                 val stopIntent = Intent(this, TunnelService::class.java).apply { action = "STOP" }
@@ -97,22 +98,31 @@ class QuickToggleTileService : TileService() {
         super.onDestroy()
     }
 
-    private fun updateTile(running: Boolean, activeProfile: Int, profileNames: List<String>) {
+    private fun updateTile(uiState: TileUiState) {
         runCatching {
+            val running = uiState.running
+            val waiting = uiState.trustedWifi.waiting
+            val activeProfile = uiState.activeProfile
+            val profileNames = uiState.profileNames
             val profile = activeProfile.coerceIn(0, 2)
             val profileLabel = vpnProfileDisplayName(profile, profileNames)
             val defaultProfileLabel = vpnProfileDefaultName(profile)
             val profileIsDefault = profileLabel == defaultProfileLabel
             qsTile?.apply {
                 label = when {
+                    waiting -> "Ожидание"
                     !running -> "WDTT Plus"
                     profileIsDefault -> "WDTT Plus $profileLabel"
                     else -> profileLabel
                 }
                 icon = Icon.createWithResource(this@QuickToggleTileService, R.drawable.ic_tile_logo)
-                state = if (running) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
+                state = if (running && !waiting) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
                 if (Build.VERSION.SDK_INT >= 29) {
-                    subtitle = if (running) "" else "Отключено"
+                    subtitle = when {
+                        waiting -> uiState.trustedWifi.ssid.ifBlank { "Wi-Fi" }
+                        running -> ""
+                        else -> "Отключено"
+                    }
                 }
                 updateTile()
             }
@@ -120,6 +130,13 @@ class QuickToggleTileService : TileService() {
             Log.e("QuickToggleTile", "Failed to update QS tile state", e)
         }
     }
+
+    private data class TileUiState(
+        val running: Boolean,
+        val trustedWifi: TrustedWifiRuntimeState,
+        val activeProfile: Int,
+        val profileNames: List<String>
+    )
 
     private fun openMainActivity() {
         runCatching {

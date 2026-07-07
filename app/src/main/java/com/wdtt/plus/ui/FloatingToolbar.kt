@@ -79,6 +79,11 @@ fun FloatingToolbar(
     onTransferRequested: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val context = LocalContext.current
+    val settingsStore = remember { SettingsStore(context) }
+    val trustedWifiEnabled by settingsStore.trustedWifiEnabled.collectAsStateWithLifecycle(initialValue = false)
+    val trustedWifiSsids by settingsStore.trustedWifiSsids.collectAsStateWithLifecycle(initialValue = emptyList())
+    val trustedWifiRuntime by com.wdtt.plus.TrustedWifiManager.state.collectAsStateWithLifecycle()
     val configuration = LocalConfiguration.current
     val density = LocalDensity.current
     val screenHeightPx = remember(configuration.screenHeightDp, density) {
@@ -98,6 +103,7 @@ fun FloatingToolbar(
     var panelHeightPx by remember { mutableFloatStateOf(0f) }
     var renamingProfile by remember { mutableStateOf<Int?>(null) }
     var profileNameInput by rememberSaveable { mutableStateOf("") }
+    var showTrustedWifiSettings by rememberSaveable { mutableStateOf(false) }
 
     val tabWidthDp = 42.dp
     val tabHeightDp = 52.dp
@@ -275,6 +281,45 @@ fun FloatingToolbar(
                     ) {
                         Icon(Icons.Filled.Share, contentDescription = null, modifier = Modifier.size(18.dp))
                         Text(" Передать или получить", fontSize = 12.sp)
+                    }
+
+                    HorizontalDivider(
+                        modifier = Modifier.padding(vertical = 4.dp),
+                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
+                    )
+
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { showTrustedWifiSettings = true }
+                            .padding(horizontal = 4.dp, vertical = 4.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f).padding(end = 10.dp)) {
+                            Text(
+                                "Доверенные сети Wi‑Fi",
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.SemiBold,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                            Text(
+                                when {
+                                    trustedWifiRuntime.waiting -> "VPN ожидает выхода из сети"
+                                    !trustedWifiEnabled -> "Выключено"
+                                    trustedWifiSsids.isEmpty() -> "Сети не добавлены"
+                                    else -> "Добавлено: ${trustedWifiSsids.size}"
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                lineHeight = 15.sp
+                            )
+                        }
+                        Switch(
+                            checked = trustedWifiEnabled,
+                            onCheckedChange = null,
+                            modifier = Modifier.scale(0.85f)
+                        )
                     }
 
                     HorizontalDivider(
@@ -467,8 +512,6 @@ fun FloatingToolbar(
                     val scope = rememberCoroutineScope()
                     val clientIdsList = activeClientIds.split(",").map { it.trim() }.filter { it.isNotEmpty() }
                     
-                    val context = LocalContext.current
-                    val settingsStore = remember { SettingsStore(context) }
                     val checkResultsJson by settingsStore.clientIdCheckResults.collectAsStateWithLifecycle(initialValue = "{}")
                     
                     var checkResults by remember(checkResultsJson) { 
@@ -586,6 +629,13 @@ fun FloatingToolbar(
                     Text("Сохранить")
                 }
             }
+        )
+    }
+
+    if (showTrustedWifiSettings) {
+        TrustedWifiSettingsDialog(
+            settingsStore = settingsStore,
+            onDismiss = { showTrustedWifiSettings = false }
         )
     }
 }

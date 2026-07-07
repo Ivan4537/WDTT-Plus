@@ -62,6 +62,7 @@ enum class TunnelStopReason(val displayText: String) {
     WakeRecoveryFailed("VPN не восстановился после пробуждения"),
     CriticalError("критическая ошибка подключения"),
     CaptchaCancelled("проверка отменена пользователем"),
+    TrustedWifi("подключена доверенная сеть Wi-Fi"),
     RestoreFailed("не удалось восстановить VPN"),
     ServiceDestroyed("служба VPN остановлена системой")
 }
@@ -73,7 +74,13 @@ private val stoppedStatsTrafficPairRegex = Regex(
 internal fun buildStoppedSessionStats(previousStats: String, reason: TunnelStopReason): String {
     val traffic = stoppedStatsTrafficPairRegex.find(previousStats)?.value
     return buildString {
-        append("VPN отключён · Причина: ")
+        append(
+            if (reason == TunnelStopReason.TrustedWifi) {
+                "VPN в ожидании · Причина: "
+            } else {
+                "VPN отключён · Причина: "
+            }
+        )
         append(reason.displayText)
         append(" · Активных: 0")
         if (!traffic.isNullOrBlank()) {

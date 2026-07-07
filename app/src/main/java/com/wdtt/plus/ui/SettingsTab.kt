@@ -54,6 +54,7 @@ import com.wdtt.plus.ManlCaptchaWebViewManager
 import com.wdtt.plus.SettingsStore
 import com.wdtt.plus.TunnelManager
 import com.wdtt.plus.TunnelService
+import com.wdtt.plus.TrustedWifiManager
 import com.wdtt.plus.VkJoinLink
 import com.wdtt.plus.WDTTColors
 import com.wdtt.plus.WdttDeepLink
@@ -63,6 +64,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.CancellationException
 import android.content.Intent
@@ -127,13 +129,17 @@ fun SettingsTabContent(
     val profileNames by settingsStore.profileNames.collectAsStateWithLifecycle(initialValue = emptyList())
     val wdttLinkMode by settingsStore.wdttLinkMode.collectAsStateWithLifecycle(initialValue = false)
     val wdttLink by settingsStore.wdttLink.collectAsStateWithLifecycle(initialValue = "")
-    val savedVkHashes by settingsStore.vkHashes.collectAsStateWithLifecycle(initialValue = "")
+    val savedVkHashesState by remember(settingsStore) {
+        settingsStore.vkHashes.map<String, String?> { hashes -> hashes }
+    }.collectAsStateWithLifecycle(initialValue = null)
 
     val activeFingerprint by settingsStore.selectedFingerprint.collectAsStateWithLifecycle(initialValue = "firefox")
     val activeClientIds by settingsStore.activeClientIds.collectAsStateWithLifecycle(initialValue = "6287487,8202606")
     val vkCallsPreflight by settingsStore.vkCallsPreflight.collectAsStateWithLifecycle(initialValue = true)
 
     val tunnelRunning by TunnelManager.running.collectAsStateWithLifecycle()
+    val trustedWifiState by TrustedWifiManager.state.collectAsStateWithLifecycle()
+    val trustedWifiWaiting = trustedWifiState.waiting
     val connectionIssue by TunnelManager.connectionIssue.collectAsStateWithLifecycle()
 
     val cooldownActive by TunnelManager.cooldownActive.collectAsStateWithLifecycle()
@@ -160,6 +166,7 @@ fun SettingsTabContent(
     var showAutoCaptchaHelp by rememberSaveable { mutableStateOf(false) }
     var serverDtlsPortInput by rememberSaveable { mutableStateOf("56000") }
     var serverWgPortInput by rememberSaveable { mutableStateOf("56001") }
+    var initialized by remember { mutableStateOf(false) }
 
     val allHashes = remember(vkHash1, vkHash2, vkHash3, vkHash4) {
         listOf(vkHash1, vkHash2, vkHash3, vkHash4).map { stripVkUrlStatic(it) }
@@ -176,15 +183,9 @@ fun SettingsTabContent(
     val hashSlotsForStorage = remember(vkHash1, vkHash2, vkHash3, vkHash4) {
         encodeVkHashSlots(vkHash1, vkHash2, vkHash3, vkHash4)
     }
-    val dynamicMaxWorkers = remember(filledHashCount) { (filledHashCount.coerceAtLeast(1) * 27).toFloat() }
+    val dynamicMaxWorkers = remember(filledHashCount) { maxWorkersForHashCount(filledHashCount) }
     var portInput by rememberSaveable { mutableStateOf("9000") }
     var sniInput by rememberSaveable { mutableStateOf("") }
-
-    LaunchedEffect(dynamicMaxWorkers) {
-        if (workersInput > dynamicMaxWorkers) {
-            workersInput = dynamicMaxWorkers
-        }
-    }
 
     val currentWorkers = workersInput.coerceIn(WORKERS_PER_GROUP.toFloat(), dynamicMaxWorkers)
 
@@ -200,26 +201,11 @@ fun SettingsTabContent(
     val hasInputHashErrors = remember(vkHash1, vkHash2, vkHash3, vkHash4) { hashErrors.isNotEmpty() }
 
     var showSecretsDialog by rememberSaveable { mutableStateOf(false) }
-    var initialized by remember { mutableStateOf(false) }
-
-    fun parseHashes(raw: String) {
-        val parts = parseVkHashSlots(raw)
-        vkHash1 = parts.getOrElse(0) { "" }
-        vkHash2 = parts.getOrElse(1) { "" }
-        vkHash3 = parts.getOrElse(2) { "" }
-        vkHash4 = parts.getOrElse(3) { "" }
-    }
-
-    fun normalizeHashes(vararg hashes: String): String {
-        return hashes
-            .map { stripVkUrlStatic(it) }
-            .filter { it.isNotBlank() && it.length >= 16 }
-            .distinct()
-            .joinToString(",")
-    }
 
     LaunchedEffect(activeProfile) {
+        initialized = false
         val peer = settingsStore.peer.first()
+        val hashes = settingsStore.vkHashes.first()
         val workers = settingsStore.workersPerHash.first()
         val port = settingsStore.listenPort.first()
         val manualPorts = settingsStore.manualPortsEnabled.first()
@@ -228,10 +214,17 @@ fun SettingsTabContent(
         val sni = settingsStore.sni.first()
         val captchaMode = settingsStore.captchaMode.first()
         val captchaMethod = settingsStore.captchaSolveMethod.first()
+        val hashSlots = parseVkHashSlots(hashes)
         
         peerInput = peer
-        parseHashes(savedVkHashes)
-        workersInput = roundToGroup(workers.toFloat(), (listOf(vkHash1, vkHash2, vkHash3, vkHash4).count { it.isNotBlank() }.coerceAtLeast(1) * 27).toFloat())
+        vkHash1 = hashSlots.getOrElse(0) { "" }
+        vkHash2 = hashSlots.getOrElse(1) { "" }
+        vkHash3 = hashSlots.getOrElse(2) { "" }
+        vkHash4 = hashSlots.getOrElse(3) { "" }
+        workersInput = roundToGroup(
+            workers.toFloat(),
+            maxWorkersForHashSlots(hashSlots)
+        )
         portInput = port.toString()
         manualPortsEnabled = manualPorts
         serverDtlsPortInput = serverDtlsPort.toString()
@@ -245,9 +238,20 @@ fun SettingsTabContent(
         initialized = true
     }
 
-    LaunchedEffect(savedVkHashes) {
-        if (initialized && savedVkHashes != hashSlotsForStorage) {
-            parseHashes(savedVkHashes)
+    LaunchedEffect(savedVkHashesState) {
+        val savedVkHashes = savedVkHashesState ?: return@LaunchedEffect
+        if (initialized && normalizeVkHashSlots(savedVkHashes) != hashSlotsForStorage) {
+            val hashSlots = parseVkHashSlots(savedVkHashes)
+            vkHash1 = hashSlots.getOrElse(0) { "" }
+            vkHash2 = hashSlots.getOrElse(1) { "" }
+            vkHash3 = hashSlots.getOrElse(2) { "" }
+            vkHash4 = hashSlots.getOrElse(3) { "" }
+            val maxWorkers = maxWorkersForHashSlots(hashSlots)
+            if (workersInput > maxWorkers) {
+                val clamped = roundToGroup(workersInput, maxWorkers)
+                workersInput = clamped
+                settingsStore.saveWorkersPerHash(clamped.toInt())
+            }
         }
     }
 
@@ -276,15 +280,25 @@ fun SettingsTabContent(
 
     var saveJob by remember { mutableStateOf<Job?>(null) }
 
-    fun saveTunnelSettingsNow(hashes: String = hashSlotsForStorage, onSaved: (() -> Unit)? = null) {
+    fun saveTunnelSettingsNow(
+        hashes: String = hashSlotsForStorage,
+        workers: Float = workersInput,
+        onSaved: (() -> Unit)? = null
+    ) {
         saveJob?.cancel()
         scope.launch {
             val savedLocalPort = if (manualPortsEnabled) portInput.toIntOrNull()?.coerceIn(1, 65535) ?: 9000 else 9000
             settingsStore.save(
                 peerInput, hashes, "",
-                workersInput.toInt(), "udp", savedLocalPort, sniInput, false
+                workers.toInt(), "udp", savedLocalPort, sniInput, false
             )
             onSaved?.invoke()
+        }
+    }
+
+    fun saveWorkersNow(workers: Float) {
+        scope.launch {
+            settingsStore.saveWorkersPerHash(workers.toInt())
         }
     }
 
@@ -425,7 +439,16 @@ fun SettingsTabContent(
                 vkHash2 = cleaned2
                 vkHash3 = cleaned3
                 vkHash4 = cleaned4
-                saveTunnelSettingsNow(encodeVkHashSlots(cleaned1, cleaned2, cleaned3, cleaned4)) {
+                val maxWorkers = maxWorkersForHashSlots(listOf(cleaned1, cleaned2, cleaned3, cleaned4))
+                val savedWorkers = if (workersInput > maxWorkers) {
+                    roundToGroup(workersInput, maxWorkers).also { workersInput = it }
+                } else {
+                    workersInput
+                }
+                saveTunnelSettingsNow(
+                    hashes = encodeVkHashSlots(cleaned1, cleaned2, cleaned3, cleaned4),
+                    workers = savedWorkers
+                ) {
                     showHashesDialog = false
                 }
             },
@@ -554,8 +577,9 @@ fun SettingsTabContent(
                     CompactSteppedSlider(
                         value = currentWorkersVal,
                         onValueChange = { raw ->
-                            workersInput = roundToGroup(raw, maxWorkers)
-                            scheduleSave()
+                            val rounded = roundToGroup(raw, maxWorkers)
+                            workersInput = rounded
+                            saveWorkersNow(rounded)
                         },
                         valueRange = minWorkers..maxWorkers,
                         stepSize = WORKERS_PER_GROUP.toFloat(),
@@ -751,14 +775,14 @@ fun SettingsTabContent(
             }
 
             val buttonColor by animateColorAsState(
-                targetValue = if (tunnelRunning) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+                targetValue = if (tunnelRunning || trustedWifiWaiting) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
                 animationSpec = tween(400),
                 label = "btn_color"
             )
 
             Button(
                 onClick = {
-                    if (tunnelRunning) {
+                    if (tunnelRunning || trustedWifiWaiting) {
                         context.startService(
                             Intent(context, TunnelService::class.java).apply { action = "STOP" }
                         )
@@ -767,7 +791,7 @@ fun SettingsTabContent(
                         requestVpnAndStart()
                     }
                 },
-                enabled = (isValid && !cooldownActive) || tunnelRunning,
+                enabled = (isValid && !cooldownActive) || tunnelRunning || trustedWifiWaiting,
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxHeight()
@@ -780,7 +804,7 @@ fun SettingsTabContent(
                 )
             ) {
                 Icon(
-                    imageVector = if (tunnelRunning) Icons.Default.Stop else Icons.Default.PowerSettingsNew,
+                    imageVector = if (tunnelRunning || trustedWifiWaiting) Icons.Default.Stop else Icons.Default.PowerSettingsNew,
                     contentDescription = null,
                     modifier = Modifier.size(20.dp)
                 )
@@ -788,11 +812,40 @@ fun SettingsTabContent(
                 FlexibleButtonText(
                     text = when {
                         tunnelRunning -> "Остановить"
+                        trustedWifiWaiting -> "Отменить ожидание"
                         cooldownActive -> "Подождите..."
                         else -> "Подключить"
                     },
                     fontWeight = FontWeight.Bold
                 )
+            }
+        }
+
+        if (trustedWifiWaiting) {
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.72f),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.secondary.copy(alpha = 0.35f))
+            ) {
+                Column(
+                    modifier = Modifier.fillMaxWidth().padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(5.dp)
+                ) {
+                    Text(
+                        "Ожидание доверенной сети",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer
+                    )
+                    Text(
+                        trustedWifiState.status.ifBlank {
+                            "VPN выключен в сети «${trustedWifiState.ssid}» и восстановится после выхода из неё."
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer
+                    )
+                }
             }
         }
 
@@ -1238,6 +1291,19 @@ private fun roundToGroup(value: Float, maxW: Float = 96f): Float {
     return rounded.coerceIn(WORKERS_PER_GROUP.toFloat(), maxW)
 }
 
+private fun maxWorkersForHashCount(hashCount: Int): Float {
+    return (hashCount.coerceAtLeast(1) * 27).toFloat()
+}
+
+private fun maxWorkersForHashSlots(hashSlots: List<String>): Float {
+    return maxWorkersForHashCount(
+        hashSlots.count { slot ->
+            val hash = stripVkUrlStatic(slot)
+            hash.isNotBlank() && hash.length >= 16
+        }
+    )
+}
+
 /** Извлекает хеш из VK ссылки */
 private fun stripVkUrlStatic(input: String): String {
     return VkJoinLink.extractHash(input)
@@ -1261,6 +1327,10 @@ private fun encodeVkHashSlots(vararg hashes: String): String {
         .take(4)
         .let { values -> values + List((4 - values.size).coerceAtLeast(0)) { "" } }
     return slots.joinToString(",")
+}
+
+private fun normalizeVkHashSlots(raw: String): String {
+    return encodeVkHashSlots(*parseVkHashSlots(raw).toTypedArray())
 }
 
 private fun copyVkHashesToClipboard(context: android.content.Context, label: String, value: String) {

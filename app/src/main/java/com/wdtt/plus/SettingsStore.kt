@@ -258,6 +258,10 @@ class SettingsStore(context: Context) {
         private val PROFILE_NAME = stringPreferencesKey("profile_name")
         private val SHOW_SYSTEM_APPS = booleanPreferencesKey("show_system_apps")
         private val LOGGING_ENABLED = booleanPreferencesKey("logging_enabled")
+        private val TRUSTED_WIFI_ENABLED = booleanPreferencesKey("trusted_wifi_enabled")
+        private val TRUSTED_WIFI_SSIDS = stringPreferencesKey("trusted_wifi_ssids")
+        private val TRUSTED_WIFI_WAITING = booleanPreferencesKey("trusted_wifi_waiting")
+        private val TRUSTED_WIFI_WAITING_SSID = stringPreferencesKey("trusted_wifi_waiting_ssid")
         private val WDTT_LINK = stringPreferencesKey("wdtt_link")
         private val WDTT_LINK_MODE = booleanPreferencesKey("wdtt_link_mode")
 
@@ -394,6 +398,14 @@ class SettingsStore(context: Context) {
     }
     val showSystemApps: Flow<Boolean> = preferencesFlow.map { it[SHOW_SYSTEM_APPS] ?: false }
     val loggingEnabled: Flow<Boolean> = preferencesFlow.map { it[LOGGING_ENABLED] ?: true }
+    val trustedWifiEnabled: Flow<Boolean> = preferencesFlow.map { it[TRUSTED_WIFI_ENABLED] ?: false }
+    val trustedWifiSsids: Flow<List<String>> = preferencesFlow.map { prefs ->
+        parseTrustedWifiSsids(prefs[TRUSTED_WIFI_SSIDS].orEmpty())
+    }
+    val trustedWifiWaiting: Flow<Boolean> = preferencesFlow.map { it[TRUSTED_WIFI_WAITING] ?: false }
+    val trustedWifiWaitingSsid: Flow<String> = preferencesFlow.map {
+        sanitizeTrustedWifiSsid(it[TRUSTED_WIFI_WAITING_SSID].orEmpty())
+    }
     val wdttLink: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(WDTT_LINK, profile)] ?: ""
@@ -821,6 +833,53 @@ class SettingsStore(context: Context) {
         }
     }
 
+    suspend fun saveTrustedWifiEnabled(enabled: Boolean) {
+        dataStore.edit { prefs ->
+            prefs[TRUSTED_WIFI_ENABLED] = enabled
+            if (!enabled) {
+                prefs.remove(TRUSTED_WIFI_WAITING)
+                prefs.remove(TRUSTED_WIFI_WAITING_SSID)
+            }
+        }
+    }
+
+    suspend fun addTrustedWifiSsid(ssid: String): Boolean {
+        val clean = sanitizeTrustedWifiSsid(ssid)
+        if (clean.isBlank()) return false
+        var added = false
+        dataStore.edit { prefs ->
+            val values = parseTrustedWifiSsids(prefs[TRUSTED_WIFI_SSIDS].orEmpty()).toMutableList()
+            if (clean !in values) {
+                values.add(clean)
+                added = true
+            }
+            prefs[TRUSTED_WIFI_SSIDS] = JSONArray(values).toString()
+        }
+        return added
+    }
+
+    suspend fun removeTrustedWifiSsid(ssid: String) {
+        val clean = sanitizeTrustedWifiSsid(ssid)
+        dataStore.edit { prefs ->
+            val values = parseTrustedWifiSsids(prefs[TRUSTED_WIFI_SSIDS].orEmpty())
+                .filterNot { it == clean }
+            if (values.isEmpty()) prefs.remove(TRUSTED_WIFI_SSIDS)
+            else prefs[TRUSTED_WIFI_SSIDS] = JSONArray(values).toString()
+        }
+    }
+
+    suspend fun saveTrustedWifiWaiting(waiting: Boolean, ssid: String = "") {
+        dataStore.edit { prefs ->
+            if (waiting) {
+                prefs[TRUSTED_WIFI_WAITING] = true
+                prefs[TRUSTED_WIFI_WAITING_SSID] = sanitizeTrustedWifiSsid(ssid)
+            } else {
+                prefs.remove(TRUSTED_WIFI_WAITING)
+                prefs.remove(TRUSTED_WIFI_WAITING_SSID)
+            }
+        }
+    }
+
     suspend fun saveWdttLink(link: String) {
         dataStore.edit { prefs ->
             val profile = prefs[ACTIVE_PROFILE] ?: 0
@@ -1089,6 +1148,13 @@ class SettingsStore(context: Context) {
             prefs[getProfileKey(LISTEN_PORT, profile)] = listenPort
             prefs[getProfileKey(SNI, profile)] = sni
             prefs[getProfileKey(NO_DNS, profile)] = noDns
+        }
+    }
+
+    suspend fun saveWorkersPerHash(workersPerHash: Int) {
+        dataStore.edit { prefs ->
+            val profile = prefs[ACTIVE_PROFILE] ?: 0
+            prefs[getProfileKey(WORKERS_PER_HASH, profile)] = workersPerHash.coerceIn(1, 128)
         }
     }
 
@@ -1482,6 +1548,19 @@ class SettingsStore(context: Context) {
 }
 
 fun vpnProfileDefaultName(profile: Int): String = "VPN ${profile.coerceIn(0, 2) + 1}"
+
+private fun parseTrustedWifiSsids(raw: String): List<String> {
+    if (raw.isBlank()) return emptyList()
+    return runCatching {
+        val json = JSONArray(raw)
+        buildList {
+            for (index in 0 until json.length()) {
+                val ssid = sanitizeTrustedWifiSsid(json.optString(index))
+                if (ssid.isNotBlank() && ssid !in this) add(ssid)
+            }
+        }
+    }.getOrDefault(emptyList())
+}
 
 fun sanitizeVpnProfileNameInput(name: String): String {
     val safe = buildString {

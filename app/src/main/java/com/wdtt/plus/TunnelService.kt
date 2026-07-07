@@ -25,8 +25,12 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 private const val TUNNEL_NOTIFICATION_CHANNEL_ID = "wdtt_tunnel_v4"
 private const val TUNNEL_ALERT_CHANNEL_ID = "wdtt_tunnel_alert_v1"
@@ -40,6 +44,11 @@ private const val STABLE_NETWORK_RECONNECT_MIN_INTERVAL_MS = 2 * 60_000L
 private const val WAKE_RESCUE_GRACE_MS = 60_000L
 private const val WAKE_RESCUE_FAIL_OPEN_MS = 2 * 60_000L
 private const val INITIAL_VPN_START_GRACE_MS = 90_000L
+private const val TRUSTED_WIFI_ENTER_DELAY_MS = 2_000L
+private const val TRUSTED_WIFI_EXIT_DELAY_MS = 5_000L
+private const val TRUSTED_WIFI_FAST_RESUME_RETRY_COUNT = 12
+private const val TRUSTED_WIFI_SLOW_RESUME_RETRY_MS = 30_000L
+private const val TRUSTED_WIFI_RESUME_START_TIMEOUT_MS = 30_000L
 
 class TunnelService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
@@ -62,7 +71,21 @@ class TunnelService : Service() {
     private var lastStableNetworkReconnectAt = 0L
     private var stableNetworkWasLost = false
     private var screenStateReceiver: BroadcastReceiver? = null
+    private var trustedWifiStateReceiver: BroadcastReceiver? = null
     private var wakeRescueJob: Job? = null
+    private var trustedWifiNetworkCallback: ConnectivityManager.NetworkCallback? = null
+    private var trustedWifiSettingsJob: Job? = null
+    private var trustedWifiEvaluationJob: Job? = null
+    private val trustedWifiEvaluationScheduleLock = Any()
+    private var trustedWifiPendingEvaluationDelayMs: Long? = null
+    private var trustedWifiResumeRetryJob: Job? = null
+    private var trustedWifiResumeRetryCount = 0
+    private var trustedWifiResumeInProgress = false
+    private var trustedWifiResumeStartedAt = 0L
+    private val trustedWifiTransitionMutex = Mutex()
+    private var trustedWifiWaiting = false
+    private var trustedWifiWaitingSsid = ""
+    private var lastStartParams: TunnelParams? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -70,7 +93,9 @@ class TunnelService : Service() {
         // Сразу берем лок при создании
         acquireWakeLock()
         setupNetworkCallback()
+        setupTrustedWifiMonitoring()
         registerScreenStateReceiver()
+        registerTrustedWifiStateReceiver()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -99,7 +124,10 @@ class TunnelService : Service() {
                     fingerprint = intent.getStringExtra("fingerprint") ?: "firefox",
                     clientIds = intent.getStringExtra("client_ids") ?: "6287487,8202606"
                 )
-                startTunnel(params)
+                lastStartParams = params
+                TunnelManager.scope.launch(Dispatchers.Main) {
+                    startOrWaitForTrustedWifi(params)
+                }
             }
             "STOP" -> stopTunnel(TunnelStopReason.User)
             "DEPLOY_START" -> {
@@ -110,14 +138,31 @@ class TunnelService : Service() {
             "DEPLOY_CANCEL" -> {
                 com.wdtt.plus.DeployManager.writeError("[!] ❌ Установка отменена пользователем")
                 com.wdtt.plus.DeployManager.stopDeploy("error: Отменена пользователем")
-                stopForeground(STOP_FOREGROUND_REMOVE)
+                if (trustedWifiWaiting) updateTrustedWifiNotification()
+                else if (TunnelManager.running.value) updateNotification("Туннель активен")
+                else stopForeground(STOP_FOREGROUND_REMOVE)
+                scheduleTrustedWifiEvaluation(delayMs = 0L)
             }
             "DEPLOY_STOP" -> {
-                if (!TunnelManager.running.value) {
+                if (trustedWifiWaiting) {
+                    updateTrustedWifiNotification()
+                } else if (!TunnelManager.running.value) {
                     stopTunnel()
                 } else {
                     updateNotification("Туннель активен")
                 }
+                scheduleTrustedWifiEvaluation(delayMs = 0L)
+            }
+            "TRUSTED_WIFI_RECHECK" -> {
+                val restoredState = TrustedWifiManager.state.value
+                if (!trustedWifiWaiting && restoredState.waiting) {
+                    trustedWifiWaiting = true
+                    trustedWifiWaitingSsid = restoredState.ssid
+                    startPersistentForeground(createNotification("Проверка доверенной Wi-Fi сети..."))
+                    startNotificationProfileWatcher()
+                    startStatsUpdater()
+                }
+                scheduleTrustedWifiEvaluation(delayMs = 0L)
             }
         }
         return START_STICKY
@@ -130,10 +175,22 @@ class TunnelService : Service() {
         val appContext = applicationContext
         TunnelManager.scope.launch {
             try {
+                val store = SettingsStore(appContext)
                 val params = buildTunnelParamsFromSettings(appContext)
                 if (params != null) {
                     launch(Dispatchers.Main) {
-                        startTunnel(params)
+                        lastStartParams = params
+                        val restoreWaiting = store.trustedWifiEnabled.first() && store.trustedWifiWaiting.first()
+                        if (restoreWaiting) {
+                            trustedWifiWaiting = true
+                            trustedWifiWaitingSsid = store.trustedWifiWaitingSsid.first()
+                            TrustedWifiManager.setWaiting(trustedWifiWaitingSsid)
+                            startNotificationProfileWatcher()
+                            startStatsUpdater()
+                            scheduleTrustedWifiEvaluation(delayMs = 0L)
+                        } else {
+                            startOrWaitForTrustedWifi(params)
+                        }
                     }
                 } else {
                     launch(Dispatchers.Main) {
@@ -148,7 +205,19 @@ class TunnelService : Service() {
         }
     }
 
-    private fun startTunnel(params: TunnelParams) {
+    private fun startTunnel(params: TunnelParams, fromTrustedWifiResume: Boolean = false) {
+        trustedWifiResumeRetryJob?.cancel()
+        trustedWifiResumeRetryJob = null
+        trustedWifiResumeRetryCount = 0
+        trustedWifiResumeInProgress = fromTrustedWifiResume
+        trustedWifiResumeStartedAt = if (fromTrustedWifiResume) System.currentTimeMillis() else 0L
+        trustedWifiWaiting = false
+        trustedWifiWaitingSsid = ""
+        lastStartParams = params
+        TrustedWifiManager.clear()
+        TunnelManager.scope.launch {
+            SettingsStore(applicationContext).saveTrustedWifiWaiting(false)
+        }
         requestedStopReason = null
         updateNotification("Подключение...")
         acquireWakeLock()
@@ -170,9 +239,22 @@ class TunnelService : Service() {
         profileNameJob?.cancel()
         networkChangeJob?.cancel()
         wakeRescueJob?.cancel()
+        trustedWifiResumeRetryJob?.cancel()
         profileNameJob = null
         networkChangeJob = null
         wakeRescueJob = null
+        trustedWifiResumeRetryJob = null
+        trustedWifiResumeRetryCount = 0
+        trustedWifiResumeInProgress = false
+        trustedWifiResumeStartedAt = 0L
+        cancelTrustedWifiEvaluations()
+        trustedWifiWaiting = false
+        trustedWifiWaitingSsid = ""
+        lastStartParams = null
+        TrustedWifiManager.clear()
+        TunnelManager.scope.launch {
+            SettingsStore(applicationContext).saveTrustedWifiWaiting(false)
+        }
 
         // Уничтожаем текущий WebView (если капча решается) и чистим контекст
         CaptchaWebViewManager.onTunnelStop()
@@ -201,7 +283,9 @@ class TunnelService : Service() {
                 "WDTT Plus · $profileLabel"
             }.collect { prefix ->
                 notificationProfileTitle = prefix
-                if (TunnelManager.running.value && !isTunnelPaused) {
+                if (trustedWifiWaiting) {
+                    updateTrustedWifiNotification()
+                } else if (TunnelManager.running.value && !isTunnelPaused) {
                     updateNotification(buildTunnelNotificationText())
                 }
             }
@@ -213,7 +297,10 @@ class TunnelService : Service() {
         screenStateReceiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) {
                 when (intent?.action) {
-                    Intent.ACTION_SCREEN_ON -> scheduleWakeRescueCheck()
+                    Intent.ACTION_SCREEN_ON -> {
+                        scheduleWakeRescueCheck()
+                        scheduleTrustedWifiEvaluation(delayMs = 0L)
+                    }
                     Intent.ACTION_SCREEN_OFF -> {
                         wakeRescueJob?.cancel()
                         wakeRescueJob = null
@@ -230,6 +317,52 @@ class TunnelService : Service() {
         } else {
             @Suppress("DEPRECATION")
             registerReceiver(screenStateReceiver, filter)
+        }
+    }
+
+    private fun registerTrustedWifiStateReceiver() {
+        if (trustedWifiStateReceiver != null) return
+        trustedWifiStateReceiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                val runtimeState = TrustedWifiManager.state.value
+                if (!trustedWifiWaiting && runtimeState.waiting) {
+                    trustedWifiWaiting = true
+                    trustedWifiWaitingSsid = runtimeState.ssid
+                }
+                if (!trustedWifiWaiting) return
+                when (intent?.action) {
+                    WifiManager.WIFI_STATE_CHANGED_ACTION -> {
+                        val state = intent.getIntExtra(
+                            WifiManager.EXTRA_WIFI_STATE,
+                            WifiManager.WIFI_STATE_UNKNOWN
+                        )
+                        when (state) {
+                            WifiManager.WIFI_STATE_DISABLING,
+                            WifiManager.WIFI_STATE_DISABLED,
+                            WifiManager.WIFI_STATE_UNKNOWN -> {
+                                keepTrustedWifiForeground("Ожидание рабочей сети")
+                                scheduleTrustedWifiEvaluation(delayMs = 0L)
+                                scheduleTrustedWifiResumeRetry()
+                            }
+                            else -> scheduleTrustedWifiEvaluation(TRUSTED_WIFI_ENTER_DELAY_MS)
+                        }
+                    }
+                    WifiManager.NETWORK_STATE_CHANGED_ACTION -> {
+                        keepTrustedWifiForeground()
+                        scheduleTrustedWifiEvaluation(delayMs = 0L)
+                    }
+                }
+            }
+        }
+        val filter = IntentFilter().apply {
+            addAction(WifiManager.WIFI_STATE_CHANGED_ACTION)
+            addAction(WifiManager.NETWORK_STATE_CHANGED_ACTION)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(trustedWifiStateReceiver, filter, RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("DEPRECATION")
+            registerReceiver(trustedWifiStateReceiver, filter)
         }
     }
 
@@ -274,6 +407,269 @@ class TunnelService : Service() {
         }
     }
 
+    private suspend fun startOrWaitForTrustedWifi(params: TunnelParams) {
+        val store = SettingsStore(applicationContext)
+        val enabled = store.trustedWifiEnabled.first()
+        val trustedSsids = store.trustedWifiSsids.first().toSet()
+        val wifi = readConnectedWifiState(applicationContext)
+        if (isWdttAlwaysOnVpn(applicationContext) && wifi.ssidAvailable && wifi.ssid in trustedSsids) {
+            startTunnel(params)
+            TunnelManager.scope.launch {
+                delay(300L)
+                TunnelManager.reportConnectionIssue(
+                    "Доверенная сеть не применена",
+                    "Для WDTT Plus включён системный режим «Всегда включённый VPN». Отключите его в настройках Android, если хотите использовать сети без VPN.",
+                    isError = false
+                )
+            }
+            return
+        }
+        if (
+            decideTrustedWifiTransition(
+                enabled = enabled,
+                tunnelRunning = true,
+                waiting = false,
+                wifi = wifi,
+                trustedSsids = trustedSsids
+            ) == TrustedWifiTransition.EnterWaiting
+        ) {
+            lastStartParams = params
+            enterTrustedWifiWaiting(wifi.ssid)
+        } else {
+            startTunnel(params)
+        }
+    }
+
+    private fun setupTrustedWifiMonitoring() {
+        val manager = connectivityManager
+            ?: (getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager).also {
+                connectivityManager = it
+            }
+        trustedWifiNetworkCallback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                scheduleTrustedWifiEvaluation(TRUSTED_WIFI_ENTER_DELAY_MS)
+            }
+
+            override fun onLost(network: Network) {
+                scheduleTrustedWifiEvaluation(TRUSTED_WIFI_EXIT_DELAY_MS)
+            }
+
+            override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
+                scheduleTrustedWifiEvaluation(
+                    if (trustedWifiWaiting) TRUSTED_WIFI_EXIT_DELAY_MS else TRUSTED_WIFI_ENTER_DELAY_MS
+                )
+            }
+        }
+        val request = NetworkRequest.Builder()
+            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+            .build()
+        runCatching { manager.registerNetworkCallback(request, trustedWifiNetworkCallback!!) }
+            .onFailure { Log.w("TunnelService", "Не удалось включить наблюдение доверенных Wi-Fi: ${it.message}") }
+
+        val store = SettingsStore(applicationContext)
+        trustedWifiSettingsJob = TunnelManager.scope.launch {
+            combine(store.trustedWifiEnabled, store.trustedWifiSsids) { enabled, ssids ->
+                enabled to ssids
+            }.collect { (enabled, _) ->
+                if (!enabled && trustedWifiWaiting) {
+                    withContext(Dispatchers.Main) {
+                        stopTunnel(TunnelStopReason.User)
+                    }
+                } else {
+                    scheduleTrustedWifiEvaluation(delayMs = 0L)
+                }
+            }
+        }
+    }
+
+    private fun scheduleTrustedWifiEvaluation(delayMs: Long) {
+        val safeDelayMs = delayMs.coerceAtLeast(0L)
+        synchronized(trustedWifiEvaluationScheduleLock) {
+            trustedWifiPendingEvaluationDelayMs = trustedWifiPendingEvaluationDelayMs
+                ?.let { current -> minOf(current, safeDelayMs) }
+                ?: safeDelayMs
+            if (trustedWifiEvaluationJob?.isActive == true) return
+            trustedWifiEvaluationJob = TunnelManager.scope.launch {
+                runTrustedWifiEvaluationLoop()
+            }
+        }
+    }
+
+    private suspend fun runTrustedWifiEvaluationLoop() {
+        while (true) {
+            val delayMs = synchronized(trustedWifiEvaluationScheduleLock) {
+                val pending = trustedWifiPendingEvaluationDelayMs
+                if (pending == null) {
+                    trustedWifiEvaluationJob = null
+                    return
+                }
+                trustedWifiPendingEvaluationDelayMs = null
+                pending
+            }
+            if (delayMs > 0L) delay(delayMs)
+            evaluateTrustedWifiState()
+        }
+    }
+
+    private fun cancelTrustedWifiEvaluations() {
+        synchronized(trustedWifiEvaluationScheduleLock) {
+            trustedWifiPendingEvaluationDelayMs = null
+            trustedWifiEvaluationJob?.cancel()
+            trustedWifiEvaluationJob = null
+        }
+    }
+
+    private fun scheduleTrustedWifiResumeRetry() {
+        trustedWifiResumeRetryJob?.cancel()
+        val delayMs = if (trustedWifiResumeRetryCount < TRUSTED_WIFI_FAST_RESUME_RETRY_COUNT) {
+            TRUSTED_WIFI_EXIT_DELAY_MS
+        } else {
+            TRUSTED_WIFI_SLOW_RESUME_RETRY_MS
+        }
+        trustedWifiResumeRetryCount += 1
+        trustedWifiResumeRetryJob = TunnelManager.scope.launch {
+            delay(delayMs)
+            if (trustedWifiWaiting) {
+                evaluateTrustedWifiState()
+            }
+        }
+    }
+
+    private suspend fun evaluateTrustedWifiState() {
+        if (DeployManager.isDeploying.value) return
+        val store = SettingsStore(applicationContext)
+        val enabled = store.trustedWifiEnabled.first()
+        val trustedSsids = store.trustedWifiSsids.first().toSet()
+        if (!enabled) return
+
+        val wifi = readConnectedWifiState(applicationContext)
+        if (isWdttAlwaysOnVpn(applicationContext) && !trustedWifiWaiting) {
+            if (wifi.ssidAvailable && wifi.ssid in trustedSsids && TunnelManager.running.value) {
+                TunnelManager.reportConnectionIssue(
+                    "Доверенная сеть не применена",
+                    "Системный режим «Всегда включённый VPN» несовместим с автоматическим отключением VPN.",
+                    isError = false
+                )
+            }
+            return
+        }
+        when (
+            decideTrustedWifiTransition(
+                enabled = enabled,
+                tunnelRunning = TunnelManager.running.value,
+                waiting = trustedWifiWaiting,
+                wifi = wifi,
+                trustedSsids = trustedSsids
+            )
+        ) {
+            TrustedWifiTransition.EnterWaiting -> enterTrustedWifiWaiting(wifi.ssid)
+            TrustedWifiTransition.ResumeVpn -> resumeFromTrustedWifiWaiting()
+            TrustedWifiTransition.None -> {
+                if (trustedWifiWaiting && wifi.accessProblem != null) {
+                    val status = when (wifi.accessProblem) {
+                        TrustedWifiAccessProblem.ForegroundPermission,
+                        TrustedWifiAccessProblem.BackgroundPermission ->
+                            "Нужен доступ к имени Wi-Fi. Откройте настройки доверенных сетей."
+                        TrustedWifiAccessProblem.LocationDisabled ->
+                            "Включите определение местоположения, чтобы распознать Wi-Fi."
+                    }
+                    TrustedWifiManager.setStatus(status)
+                    withContext(Dispatchers.Main) { updateNotification(status) }
+                } else if (trustedWifiWaiting && wifi.ssidAvailable && wifi.ssid in trustedSsids) {
+                    trustedWifiWaitingSsid = wifi.ssid
+                    TrustedWifiManager.setWaiting(wifi.ssid)
+                    store.saveTrustedWifiWaiting(true, wifi.ssid)
+                    withContext(Dispatchers.Main) { updateTrustedWifiNotification() }
+                }
+            }
+        }
+    }
+
+    private suspend fun enterTrustedWifiWaiting(ssid: String) {
+        trustedWifiTransitionMutex.withLock {
+            if (trustedWifiWaiting) return
+            val cleanSsid = sanitizeTrustedWifiSsid(ssid)
+            if (cleanSsid.isBlank()) return
+
+            val params = lastStartParams ?: buildTunnelParamsFromSettings(applicationContext) ?: return
+            lastStartParams = params
+            trustedWifiWaiting = true
+            trustedWifiWaitingSsid = cleanSsid
+            isTunnelPaused = false
+            trustedWifiResumeRetryCount = 0
+            networkChangeJob?.cancel()
+            wakeRescueJob?.cancel()
+            trustedWifiResumeRetryJob?.cancel()
+            trustedWifiResumeRetryJob = null
+
+            TunnelManager.stopAndWait(TunnelStopReason.TrustedWifi)
+            WireGuardHelper(applicationContext).stopTunnel()
+            TrustedWifiManager.setWaiting(cleanSsid)
+            SettingsStore(applicationContext).saveTrustedWifiWaiting(true, cleanSsid)
+            withContext(Dispatchers.Main) {
+                releaseWakeLock()
+                releaseWifiLock()
+                startNotificationProfileWatcher()
+                startStatsUpdater()
+                updateTrustedWifiNotification()
+                VpnWidgetProvider.updateAllWidgets(applicationContext)
+            }
+        }
+    }
+
+    private suspend fun resumeFromTrustedWifiWaiting() {
+        trustedWifiTransitionMutex.withLock {
+            if (!trustedWifiWaiting) return
+            if (!hasUsableRealNetworkForTrustedWifiResume()) {
+                val status = "Ожидание рабочей сети"
+                TrustedWifiManager.setStatus(status)
+                withContext(Dispatchers.Main) {
+                    keepTrustedWifiForeground(status)
+                    VpnWidgetProvider.updateAllWidgets(applicationContext)
+                }
+                scheduleTrustedWifiResumeRetry()
+                return
+            }
+            if (android.net.VpnService.prepare(applicationContext) != null) {
+                val status = "VPN-разрешение недоступно. Откройте WDTT Plus для восстановления."
+                TrustedWifiManager.setStatus(status)
+                withContext(Dispatchers.Main) { updateNotification(status) }
+                return
+            }
+
+            val params = lastStartParams ?: buildTunnelParamsFromSettings(applicationContext)
+            if (params == null) {
+                val status = "Не удалось прочитать профиль VPN. Откройте WDTT Plus."
+                TrustedWifiManager.setStatus(status)
+                withContext(Dispatchers.Main) { updateNotification(status) }
+                return
+            }
+
+            withContext(Dispatchers.Main) {
+                Log.i("TunnelService", "Доверенная Wi-Fi покинута, запускаем VPN на рабочей сети")
+                // startTunnel синхронно включает защитный resumeInProgress до снятия waiting.
+                // Поэтому очередной сетевой callback уже не может оставить сервис между
+                // состояниями: без VPN, без ожидания и с удалённым уведомлением.
+                startTunnel(params, fromTrustedWifiResume = true)
+                VpnWidgetProvider.updateAllWidgets(applicationContext)
+            }
+        }
+    }
+
+    private fun updateTrustedWifiNotification() {
+        keepTrustedWifiForeground()
+    }
+
+    private fun keepTrustedWifiForeground(statusOverride: String? = null) {
+        val networkName = trustedWifiWaitingSsid.ifBlank { "доверенная Wi-Fi" }
+        val text = statusOverride ?: "VPN выключен в сети «$networkName» · ожидание выхода"
+        val title = notificationProfileTitle
+        lastNotificationTitle = title
+        lastNotificationText = text
+        startPersistentForeground(createNotification(text))
+    }
+
     private fun setupNetworkCallback() {
         connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         activeNetworks.clear()
@@ -281,6 +677,9 @@ class TunnelService : Service() {
         networkCallback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 super.onAvailable(network)
+                if (trustedWifiWaiting) {
+                    scheduleTrustedWifiEvaluation(TRUSTED_WIFI_EXIT_DELAY_MS)
+                }
                 val wasEmpty = activeNetworks.isEmpty()
                 activeNetworks.add(network)
                 if (AMNEZIA_STYLE_RECOVERY) {
@@ -299,6 +698,9 @@ class TunnelService : Service() {
 
             override fun onLost(network: Network) {
                 super.onLost(network)
+                if (trustedWifiWaiting) {
+                    scheduleTrustedWifiEvaluation(TRUSTED_WIFI_EXIT_DELAY_MS)
+                }
                 activeNetworks.remove(network)
                 if (AMNEZIA_STYLE_RECOVERY) {
                     if (lastValidatedNetwork == network) {
@@ -324,6 +726,9 @@ class TunnelService : Service() {
 
             override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
                 super.onCapabilitiesChanged(network, networkCapabilities)
+                if (trustedWifiWaiting) {
+                    scheduleTrustedWifiEvaluation(TRUSTED_WIFI_EXIT_DELAY_MS)
+                }
                 if (AMNEZIA_STYLE_RECOVERY) {
                     handleStableNetworkCapabilities(network, networkCapabilities)
                     return
@@ -417,6 +822,20 @@ class TunnelService : Service() {
             val caps = cm.getNetworkCapabilities(network) ?: return@any false
             caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
                 caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun hasUsableRealNetworkForTrustedWifiResume(): Boolean {
+        val cm = connectivityManager
+            ?: (getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager).also {
+                connectivityManager = it
+            }
+        return cm.allNetworks.any { network ->
+            val caps = cm.getNetworkCapabilities(network) ?: return@any false
+            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN) &&
+                caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
         }
     }
 
@@ -544,7 +963,35 @@ class TunnelService : Service() {
         updateJob = TunnelManager.scope.launch(Dispatchers.Main) {
             delay(1000)
             while (isActive) {
-                if (!TunnelManager.running.value && !isTunnelPaused) {
+                if (trustedWifiResumeInProgress) {
+                    when {
+                        TunnelManager.running.value -> {
+                            trustedWifiResumeInProgress = false
+                            trustedWifiResumeStartedAt = 0L
+                        }
+                        trustedWifiResumeStartedAt > 0L &&
+                            System.currentTimeMillis() - trustedWifiResumeStartedAt >=
+                            TRUSTED_WIFI_RESUME_START_TIMEOUT_MS -> {
+                            trustedWifiResumeInProgress = false
+                            trustedWifiResumeStartedAt = 0L
+                            trustedWifiWaiting = true
+                            val status = "VPN не запустился, повторяем восстановление"
+                            Log.w("TunnelService", status)
+                            TrustedWifiManager.setWaiting("", status)
+                            SettingsStore(applicationContext).saveTrustedWifiWaiting(true)
+                            keepTrustedWifiForeground(status)
+                            scheduleTrustedWifiResumeRetry()
+                        }
+                    }
+                }
+                if (
+                    !shouldKeepTunnelServiceAlive(
+                        tunnelRunning = TunnelManager.running.value,
+                        tunnelPaused = isTunnelPaused,
+                        trustedWifiWaiting = trustedWifiWaiting,
+                        trustedWifiResumeInProgress = trustedWifiResumeInProgress
+                    )
+                ) {
                     // Туннель полностью остановлен (не на паузе) — убиваем сервис
                     stopSelf()
                     break
@@ -591,7 +1038,7 @@ class TunnelService : Service() {
                         }
                     }
                 }
-                if (!isTunnelPaused) {
+                if (!isTunnelPaused && !trustedWifiWaiting) {
                     updateNotification(buildTunnelNotificationText())
                 }
                 delay(2000)
@@ -684,7 +1131,11 @@ class TunnelService : Service() {
             .setOngoing(true)
             .setLocalOnly(true)
             .setContentIntent(openIntent)
-            .addAction(R.drawable.ic_stop, actionTitle, stopIntent)
+            .addAction(
+                R.drawable.ic_stop,
+                if (trustedWifiWaiting && actionName == "STOP") "Отменить ожидание" else actionTitle,
+                stopIntent
+            )
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_DEFAULT)
             // ВАЖНО: Делаем уведомление публичным (видимым на локскрине)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
@@ -724,10 +1175,26 @@ class TunnelService : Service() {
             runCatching { unregisterReceiver(it) }
         }
         screenStateReceiver = null
+        trustedWifiStateReceiver?.let {
+            runCatching { unregisterReceiver(it) }
+        }
+        trustedWifiStateReceiver = null
         networkCallback?.let {
             connectivityManager?.unregisterNetworkCallback(it)
         }
-        stopTunnel(TunnelStopReason.ServiceDestroyed)
+        trustedWifiNetworkCallback?.let {
+            runCatching { connectivityManager?.unregisterNetworkCallback(it) }
+        }
+        trustedWifiSettingsJob?.cancel()
+        cancelTrustedWifiEvaluations()
+        trustedWifiResumeRetryJob?.cancel()
+        if (trustedWifiWaiting || trustedWifiResumeInProgress) {
+            releaseWakeLock()
+            releaseWifiLock()
+            TrustedWifiManager.setStatus("Служба ожидания будет восстановлена Android")
+        } else {
+            stopTunnel(TunnelStopReason.ServiceDestroyed)
+        }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null

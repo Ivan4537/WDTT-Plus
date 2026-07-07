@@ -147,7 +147,8 @@ fun LogLine(entry: LogEntry, sessionActive: Boolean) {
         entry.priority == 3 -> if (isDark) WDTTColors.terminalBlue else MaterialTheme.colorScheme.primary
         else -> if (isDark) WDTTColors.terminalText else MaterialTheme.colorScheme.onSurface
     }
-    val isStoppedStats = entry.key == "stats" && entry.message.contains("VPN отключён")
+    val isStoppedStats = entry.key == "stats" &&
+        (entry.message.contains("VPN отключён") || entry.message.contains("VPN в ожидании"))
     val color = when {
         sessionActive -> activeColor
         isStoppedStats -> MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.9f)

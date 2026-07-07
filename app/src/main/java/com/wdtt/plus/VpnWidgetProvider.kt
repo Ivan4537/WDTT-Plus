@@ -42,6 +42,7 @@ class VpnWidgetProvider : AppWidgetProvider() {
 
     override fun onUpdate(context: Context, appWidgetManager: AppWidgetManager, appWidgetIds: IntArray) {
         val running = TunnelManager.running.value
+        val trustedWifi = TrustedWifiManager.state.value
         scope.launch {
             val settingsStore = SettingsStore(context)
             val activeProfile = settingsStore.activeProfile.first().coerceIn(0, 2)
@@ -52,6 +53,7 @@ class VpnWidgetProvider : AppWidgetProvider() {
                     appWidgetManager = appWidgetManager,
                     appWidgetId = appWidgetId,
                     running = running,
+                    trustedWifi = trustedWifi,
                     activeProfile = activeProfile,
                     profileNames = profileNames
                 )
@@ -63,7 +65,7 @@ class VpnWidgetProvider : AppWidgetProvider() {
         super.onReceive(context, intent)
         if (intent.action == ACTION_WIDGET_TOGGLE) {
             runCatching {
-                if (TunnelManager.running.value) {
+                if (TunnelManager.running.value || TrustedWifiManager.state.value.waiting) {
                     // Останавливаем туннель
                     val stopIntent = Intent(context, TunnelService::class.java).apply { action = "STOP" }
                     context.startService(stopIntent)
@@ -108,13 +110,19 @@ class VpnWidgetProvider : AppWidgetProvider() {
         appWidgetManager: AppWidgetManager,
         appWidgetId: Int,
         running: Boolean,
+        trustedWifi: TrustedWifiRuntimeState,
         activeProfile: Int,
         profileNames: List<String>
     ) {
         val views = RemoteViews(context.packageName, R.layout.vpn_widget)
 
         // Обновляем текст статуса и неоновую иконку кнопки
-        if (running) {
+        if (trustedWifi.waiting) {
+            val networkName = trustedWifi.ssid.ifBlank { "Wi-Fi" }
+            views.setTextViewText(R.id.widget_status, "Ожидание: $networkName")
+            views.setTextColor(R.id.widget_status, 0xFFFFB74D.toInt())
+            views.setInt(R.id.widget_toggle_btn, "setBackgroundResource", R.drawable.bg_widget_button_inactive)
+        } else if (running) {
             val profileName = vpnProfileDisplayName(activeProfile, profileNames)
             val status = "Подключено к $profileName"
             views.setTextViewText(R.id.widget_status, status)

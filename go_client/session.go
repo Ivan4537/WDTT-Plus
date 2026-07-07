@@ -296,10 +296,10 @@ func RunSession(
 	}
 	log.Printf("[ВОРКЕР #%d] [DTLS] Соединение установлено ✓", sessionID)
 
-	atomic.AddInt32(&stats.ActiveConnections, 1)
+	stats.ActiveConnections.Add(1)
 	globalActiveConnections.Add(1)
 	defer func() {
-		atomic.AddInt32(&stats.ActiveConnections, -1)
+		stats.ActiveConnections.Add(-1)
 		globalActiveConnections.Add(-1)
 	}()
 
@@ -336,9 +336,10 @@ func RunSession(
 	d.Register(slot)
 	defer d.Unregister(slot)
 
-	lastServerRxAt := time.Now().UnixNano()
-	var lastUserTrafficAt int64
-	var keepalivePongSeen int32
+	var lastServerRxAt atomic.Int64
+	lastServerRxAt.Store(time.Now().UnixNano())
+	var lastUserTrafficAt atomic.Int64
+	var keepalivePongSeen atomic.Int32
 
 	// Proxy DTLS ↔ Dispatcher
 	var proxyWg sync.WaitGroup
@@ -380,16 +381,16 @@ func RunSession(
 				return
 			case <-t.C:
 				now := time.Now()
-				lastRxUnix := atomic.LoadInt64(&lastServerRxAt)
+				lastRxUnix := lastServerRxAt.Load()
 				lastRx := time.Unix(0, lastRxUnix)
 
-				if atomic.LoadInt32(&keepalivePongSeen) != 0 && now.Sub(lastRx) > keepalivePongTimeout {
+				if keepalivePongSeen.Load() != 0 && now.Sub(lastRx) > keepalivePongTimeout {
 					log.Printf("[ВОРКЕР #%d] [HEALTH] сервер не отвечает на keepalive %.0f сек, перезапуск воркера", sessionID, now.Sub(lastRx).Seconds())
 					sessCancel()
 					return
 				}
 
-				lastTxUnix := atomic.LoadInt64(&lastUserTrafficAt)
+				lastTxUnix := lastUserTrafficAt.Load()
 				if lastTxUnix > lastRxUnix &&
 					now.Sub(time.Unix(0, lastTxUnix)) > unansweredUserTrafficTimeout &&
 					now.Sub(lastRx) > unansweredUserTrafficTimeout {
@@ -420,7 +421,7 @@ func RunSession(
 					log.Printf("[ВОРКЕР #%d] Ошибка Writer: %v", sessionID, writeErr)
 					return
 				}
-				atomic.StoreInt64(&lastUserTrafficAt, time.Now().UnixNano())
+				lastUserTrafficAt.Store(time.Now().UnixNano())
 			}
 		}
 	}()
@@ -445,11 +446,11 @@ func RunSession(
 				return
 			}
 
-			atomic.StoreInt64(&lastServerRxAt, time.Now().UnixNano())
+			lastServerRxAt.Store(time.Now().UnixNano())
 
 			// Skip keepalive pong from server
 			if n == 1 && pkt[0] == keepaliveByte {
-				atomic.StoreInt32(&keepalivePongSeen, 1)
+				keepalivePongSeen.Store(1)
 				putPktBuf(pkt)
 				continue
 			}

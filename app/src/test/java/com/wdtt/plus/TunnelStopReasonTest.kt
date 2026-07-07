@@ -26,4 +26,18 @@ class TunnelStopReasonTest {
         assertEquals("VPN отключён · Причина: отключено пользователем · Активных: 0", result)
         assertFalse(result.contains("↓"))
     }
+
+    @Test
+    fun trustedWifiSessionUsesWaitingText() {
+        val result = buildStoppedSessionStats(
+            "Активных: 2 | ↓1.00 МБ / ↑0.50 МБ",
+            TunnelStopReason.TrustedWifi
+        )
+
+        assertEquals(
+            "VPN в ожидании · Причина: подключена доверенная сеть Wi-Fi · " +
+                "Активных: 0 · ↓1.00 МБ / ↑0.50 МБ",
+            result
+        )
+    }
 }

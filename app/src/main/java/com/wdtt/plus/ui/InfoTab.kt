@@ -58,7 +58,6 @@ import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.automirrored.filled.HelpOutline
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Code
-import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.KeyboardArrowDown
@@ -107,6 +106,8 @@ import com.wdtt.plus.DeviceCompatibility
 import com.wdtt.plus.R
 import com.wdtt.plus.SettingsStore
 import com.wdtt.plus.TunnelManager
+import com.wdtt.plus.TrustedWifiManager
+import com.wdtt.plus.trustedWifiAccessProblem
 import com.wdtt.plus.UPDATE_DIALOG_ACTION_POSTPONED
 import com.wdtt.plus.UPDATE_DIALOG_ACTION_UPDATE
 import com.wdtt.plus.WDTTColors
@@ -118,7 +119,6 @@ import com.wdtt.plus.downloadUpdateApk
 import com.wdtt.plus.fetchLatestReleaseInfo
 import com.wdtt.plus.installUpdateApk
 import com.wdtt.plus.isNewerVersion
-import com.wdtt.plus.label
 import com.wdtt.plus.resolveAppUpdateCandidate
 import com.wdtt.plus.selectUpdateApkAsset
 import com.wdtt.plus.deviceCheckActionIntent
@@ -314,6 +314,9 @@ fun InfoTab(
             latestRelease = latestRelease
         )
         val workers = runCatching { settingsStore.workersPerHash.first() }.getOrNull()
+        val diagnosticsSummary = withContext(Dispatchers.Default) {
+            buildSupportReportSummary(context.applicationContext, settingsStore)
+        }
         val report = withContext(Dispatchers.Default) {
             DeviceCompatibility.check(
                 context = context.applicationContext,
@@ -322,6 +325,7 @@ fun InfoTab(
             )
         }
         return report.copy(
+            summaryLines = diagnosticsSummary,
             items = listOf(versionItem) +
                 report.items.filterNot { it.title == DeviceCompatibility.APP_VERSION_ITEM_TITLE }
         )
@@ -356,7 +360,7 @@ fun InfoTab(
 
         ExpandableSectionCard(
             title = "Действия",
-            itemCount = "5 пунктов",
+            itemCount = "4 пункта",
             expanded = actionsExpanded,
             modifier = Modifier.onGloballyPositioned { actionsSectionY = it.positionInParent().y },
             onToggle = {
@@ -393,34 +397,11 @@ fun InfoTab(
             )
 
             WideActionTile(
-                title = "Собрать отчёт",
-                subtitle = "Android, ABI, память, сеть и компоненты",
-                onClick = {
-                    scope.launch {
-                        val report = withContext(Dispatchers.Default) {
-                            buildSupportReport(context.applicationContext, settingsStore)
-                        }
-                        val clipboard = context.getSystemService(ClipboardManager::class.java)
-                        clipboard?.setPrimaryClip(ClipData.newPlainText("WDTT Report", report))
-                        Toast.makeText(context, "Отчёт сформирован и скопирован", Toast.LENGTH_SHORT).show()
-                    }
-                },
-                icon = {
-                    Icon(
-                        imageVector = Icons.Default.ContentCopy,
-                        contentDescription = null,
-                        modifier = Modifier.size(20.dp),
-                        tint = MaterialTheme.colorScheme.onPrimaryContainer
-                    )
-                }
-            )
-
-            WideActionTile(
                 title = "Проверить устройство",
                 subtitle = if (isCheckingDevice) {
-                    "Проверяем версию, Android, ABI и системные условия..."
+                    "Проверяем версию, Android, ABI, сеть и системные условия..."
                 } else {
-                    "Версия, совместимость, ABI, native, WebView и настройки"
+                    "Проверка совместимости и полный отчёт для диагностики"
                 },
                 onClick = {
                     if (isCheckingDevice) return@WideActionTile
@@ -695,8 +676,8 @@ fun InfoTab(
         DeviceCompatibilityDialog(
             report = report,
             title = "Проверка устройства",
-            subtitle = "Расширенная проверка не запускает VPN, но показывает совместимость устройства, настройки Android и текущее состояние туннеля.",
-            note = "Здесь проверяется всё, что можно проверить без тестового подключения: VPN-разрешение, активен ли туннель сейчас, сеть, WebView, батарея, установка APK и базовая совместимость устройства.",
+            subtitle = "Расширенная проверка не запускает VPN, но показывает совместимость устройства, настройки Android и статус подключения.",
+            note = "Кнопка «Скопировать отчёт» добавит в буфер версию приложения, Android, ABI, память, сеть, WebView, native-клиент и текущие настройки без секретных значений.",
             onDismiss = { deviceCheckReport = null },
             onCopy = {
                 scope.launch {
@@ -708,7 +689,7 @@ fun InfoTab(
                     deviceCheckReport = freshReport
                     val clipboard = context.getSystemService(ClipboardManager::class.java)
                     clipboard?.setPrimaryClip(ClipData.newPlainText("WDTT Device Check", freshReport.toPlainText()))
-                    Toast.makeText(context, "Проверка устройства скопирована", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "Отчёт проверки скопирован", Toast.LENGTH_SHORT).show()
                 }
             },
             onAction = { action -> openDeviceCheckAction(context, action) }
@@ -1290,7 +1271,7 @@ private fun diagnosticText(block: () -> Any?): String =
 
 private fun formatMiB(bytes: Long): String = "${bytes.coerceAtLeast(0L) / (1024L * 1024L)} МБ"
 
-private suspend fun buildSupportReport(context: Context, settingsStore: SettingsStore): String {
+private suspend fun buildSupportReportSummary(context: Context, settingsStore: SettingsStore): List<String> {
     val androidVersion = Build.VERSION.RELEASE ?: "?"
     val sdkInt = Build.VERSION.SDK_INT
     val primaryAbi = Build.SUPPORTED_ABIS.firstOrNull().orEmpty().ifBlank { "unknown" }
@@ -1440,11 +1421,6 @@ private suspend fun buildSupportReport(context: Context, settingsStore: Settings
 
     val activeProfile = runCatching { settingsStore.activeProfile.first() + 1 }.getOrNull()
     val workers = runCatching { settingsStore.workersPerHash.first() }.getOrNull()
-    val deviceCompatibility = DeviceCompatibility.check(
-        context = context,
-        includeRuntimeChecks = true,
-        workersPerHash = workers
-    )
     val vkHashes = runCatching { settingsStore.vkHashes.first() }.getOrDefault("")
     val hashCount = vkHashes
         .split(Regex("[,\\s\\n]+"))
@@ -1459,10 +1435,21 @@ private suspend fun buildSupportReport(context: Context, settingsStore: Settings
     val themeMode = runCatching { settingsStore.themeMode.first() }.getOrNull()
     val dynamicColor = runCatching { settingsStore.isDynamicColor.first() }.getOrNull()
     val loggingEnabled = runCatching { settingsStore.loggingEnabled.first() }.getOrNull()
+    val trustedWifiEnabled = runCatching { settingsStore.trustedWifiEnabled.first() }.getOrNull()
+    val trustedWifiCount = runCatching { settingsStore.trustedWifiSsids.first().size }.getOrNull()
+    val trustedWifiAccess = if (trustedWifiEnabled == true) {
+        when (trustedWifiAccessProblem(context)) {
+            com.wdtt.plus.TrustedWifiAccessProblem.ForegroundPermission -> "нет доступа к имени Wi-Fi"
+            com.wdtt.plus.TrustedWifiAccessProblem.BackgroundPermission -> "нет фонового доступа"
+            com.wdtt.plus.TrustedWifiAccessProblem.LocationDisabled -> "определение местоположения выключено"
+            null -> "доступ выдан"
+        }
+    } else {
+        "не требуется"
+    }
     val tunnelIssue = TunnelManager.connectionIssue.value?.title.orEmpty().ifBlank { "нет" }
 
     return buildString {
-        appendLine("Отчёт создан: ${diagnosticText { dateFormat.format(Date()) }}")
         appendLine("Версия приложения: ${BuildConfig.VERSION_NAME}")
         appendLine("Дата релиза: ${BuildConfig.MOD_RELEASE_DATE}")
         appendLine("Версия пакета: code ${packageInfo?.longVersionCode ?: "?"}")
@@ -1500,13 +1487,10 @@ private suspend fun buildSupportReport(context: Context, settingsStore: Settings
         appendLine("Разрешение уведомлений: $notificationPermission")
         appendLine("Установка обновлений APK: $updateInstallPermission")
         appendLine("VPN-разрешение: $vpnPermission")
-        appendLine("Совместимость устройства: ${deviceCompatibility.overallStatus}")
-        deviceCompatibility.items.forEach { item ->
-            appendLine(" - [${item.severity.label()}] ${item.title}: ${item.status}")
-            if (item.recommendation.isNotBlank()) {
-                appendLine("   Рекомендация: ${item.recommendation}")
-            }
-        }
+        appendLine(
+            "Доверенные Wi-Fi: включено=${trustedWifiEnabled ?: "недоступно"}, " +
+                "сетей=${trustedWifiCount ?: "недоступно"}, ожидание=${TrustedWifiManager.state.value.waiting}, доступ=$trustedWifiAccess"
+        )
         appendLine("Локаль: ${diagnosticText { Locale.getDefault().toLanguageTag() }}")
         appendLine("Часовой пояс: ${diagnosticText { TimeZone.getDefault().id }}")
         appendLine("Туннель: запущен=${TunnelManager.running.value}, активных=${TunnelManager.activeWorkers.value}")
@@ -1521,5 +1505,5 @@ private suspend fun buildSupportReport(context: Context, settingsStore: Settings
         appendLine("Роль интерфейса: ${interfaceRole?.ifBlank { "не выбрана" } ?: "недоступно"}")
         appendLine("Тема: ${themeMode ?: "недоступно"}, Dynamic Colors=${dynamicColor ?: "недоступно"}")
         appendLine("Логирование: ${loggingEnabled ?: "недоступно"}")
-    }.trim()
+    }.trim().lines()
 }
