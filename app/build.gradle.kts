@@ -5,7 +5,7 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
-val appVersionName = "9"
+val appVersionName = "10"
 val releaseApkBaseName = "WDTT-Plus"
 
 val localProperties = Properties()
@@ -22,9 +22,9 @@ android {
         applicationId = "com.wdtt.plus"
         minSdk = 28
         targetSdk = 35
-        versionCode = 9
+        versionCode = 10
         versionName = appVersionName
-        buildConfigField("String", "MOD_RELEASE_DATE", "\"06.07.2026\"")
+        buildConfigField("String", "MOD_RELEASE_DATE", "\"07.07.2026\"")
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -287,6 +287,7 @@ dependencies {
     implementation("androidx.datastore:datastore-preferences:1.1.1")
     implementation("com.wireguard.android:tunnel:1.0.20230706")
     implementation("com.github.mwiede:jsch:0.2.16")
+    implementation("org.bouncycastle:bcprov-jdk18on:1.79")
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
     implementation("com.google.zxing:core:3.5.4")
     testImplementation("junit:junit:4.13.2")

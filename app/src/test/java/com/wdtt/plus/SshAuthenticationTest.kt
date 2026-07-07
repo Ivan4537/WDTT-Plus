@@ -51,6 +51,16 @@ class SshAuthenticationTest {
     }
 
     @Test
+    fun ed25519UsesBundledAndroidCompatibleImplementation() {
+        configureJschEdDsaCompatibility()
+
+        assertEquals("com.jcraft.jsch.bc.KeyPairGenEdDSA", JSch.getConfig("keypairgen.eddsa"))
+        assertEquals("com.jcraft.jsch.bc.KeyPairGenEdDSA", JSch.getConfig("keypairgen_fromprivate.eddsa"))
+        assertEquals("com.jcraft.jsch.bc.SignatureEd25519", JSch.getConfig("ssh-ed25519"))
+        assertEquals("com.jcraft.jsch.bc.SignatureEd448", JSch.getConfig("ssh-ed448"))
+    }
+
+    @Test
     fun privateKeyPresenceDoesNotDisablePasswordModeByItself() {
         val credentials = SshCredentials(
             password = "secret",

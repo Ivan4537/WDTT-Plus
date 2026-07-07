@@ -1503,6 +1503,7 @@ fun DeployTab(
             port = primarySshPort
         )
         serverDiagnosticsBusy = true
+        Toast.makeText(context, "Выполняется диагностика сервера", Toast.LENGTH_SHORT).show()
         serverDiagnosticsJob = scope.launch {
             val report = try {
                 collectServerDiagnostics(
@@ -9257,7 +9258,7 @@ private fun SshPrivateKeyDialog(
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     Text(
-                        "Вставьте приватный ключ OpenSSH/PEM или выберите файл. Соответствующий публичный ключ уже должен быть добавлен на сервер в authorized_keys. Приватный ключ и его пароль сохраняются только на этом устройстве в зашифрованном хранилище Android и не входят в передачу настроек администратора.",
+                        "Вставьте весь приватный SSH-ключ целиком или выберите файл. Нужен именно приватный ключ с первой и последней строкой BEGIN/END; публичная строка вида ssh-ed25519 или ssh-rsa сюда не подходит. Соответствующий публичный ключ уже должен быть добавлен на сервер в authorized_keys.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -9270,12 +9271,20 @@ private fun SshPrivateKeyDialog(
                             }
                         },
                         label = { Text("Приватный ключ") },
-                        placeholder = { Text("-----BEGIN OPENSSH PRIVATE KEY-----") },
+                        placeholder = {
+                            Text(
+                                "-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----"
+                            )
+                        },
                         minLines = 5,
                         maxLines = 9,
                         isError = keyIssue != null,
                         supportingText = {
-                            keyIssue?.let { Text(it) }
+                            if (keyIssue != null) {
+                                Text(keyIssue)
+                            } else {
+                                Text("Поддерживаются OpenSSH-ключи ed25519/rsa/ecdsa и PEM-ключи RSA/EC/PRIVATE/ENCRYPTED PRIVATE KEY.")
+                            }
                         },
                         modifier = Modifier.fillMaxWidth(),
                         shape = RoundedCornerShape(16.dp)
@@ -9326,7 +9335,12 @@ private fun SshPrivateKeyDialog(
                         InlineActionMessage(status)
                     }
                     Text(
-                        "При входе по ключу поле «Пароль SSH / sudo» можно оставить пустым для root или passwordless sudo. Если sudo требует пароль, оставьте его заполненным.",
+                        "При входе по ключу поле «Пароль sudo» можно оставить пустым для root или passwordless sudo. Если sudo требует пароль, оставьте его заполненным.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(
+                        "Приватный ключ и пароль ключа сохраняются только на этом устройстве в зашифрованном хранилище Android и не входят в передачу настроек администратора.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )

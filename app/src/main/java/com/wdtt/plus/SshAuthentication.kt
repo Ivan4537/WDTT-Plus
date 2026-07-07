@@ -7,6 +7,13 @@ import java.util.Properties
 
 const val MAX_SSH_PRIVATE_KEY_CHARS = 128 * 1024
 
+private const val JSCH_BC_EDDSA_KEYPAIRGEN = "com.jcraft.jsch.bc.KeyPairGenEdDSA"
+private const val JSCH_BC_ED25519_SIGNATURE = "com.jcraft.jsch.bc.SignatureEd25519"
+private const val JSCH_BC_ED448_SIGNATURE = "com.jcraft.jsch.bc.SignatureEd448"
+
+@Volatile
+private var jschEdDsaConfigured = false
+
 data class SshCredentials(
     val password: String = "",
     val privateKey: String = "",
@@ -43,6 +50,18 @@ fun sshCredentialsForMode(
 fun normalizeSshPrivateKey(value: String): String =
     value.removePrefix("\uFEFF").replace("\r\n", "\n").trim()
 
+internal fun configureJschEdDsaCompatibility() {
+    if (jschEdDsaConfigured) return
+    synchronized(JSch::class.java) {
+        if (jschEdDsaConfigured) return
+        JSch.setConfig("keypairgen.eddsa", JSCH_BC_EDDSA_KEYPAIRGEN)
+        JSch.setConfig("keypairgen_fromprivate.eddsa", JSCH_BC_EDDSA_KEYPAIRGEN)
+        JSch.setConfig("ssh-ed25519", JSCH_BC_ED25519_SIGNATURE)
+        JSch.setConfig("ssh-ed448", JSCH_BC_ED448_SIGNATURE)
+        jschEdDsaConfigured = true
+    }
+}
+
 fun sshPrivateKeyIssue(value: String): String? {
     val key = normalizeSshPrivateKey(value)
     if (key.isBlank()) return "Приватный ключ не указан."
@@ -66,6 +85,14 @@ fun sshPrivateKeyIssue(value: String): String? {
 }
 
 internal fun friendlySshConnectionError(message: String, credentials: SshCredentials): String = when {
+    message.contains("SignatureEd25519", ignoreCase = true) ||
+        message.contains("ssh-ed25519", ignoreCase = true) && (
+            message.contains("not available", ignoreCase = true) ||
+                message.contains("unsupported", ignoreCase = true) ||
+                message.contains("Java15", ignoreCase = true) ||
+                message.contains("class not found", ignoreCase = true)
+            ) ->
+        "Приложение не смогло использовать Ed25519 SSH-ключ. Обновите приложение или попробуйте RSA-ключ в формате OpenSSH/PEM."
     message.contains("invalid privatekey", ignoreCase = true) ->
         "Приватный SSH-ключ повреждён или имеет неподдерживаемый формат."
     message.contains("decrypt", ignoreCase = true) || message.contains("passphrase", ignoreCase = true) ->
@@ -88,6 +115,11 @@ internal fun friendlySshConnectionError(message: String, credentials: SshCredent
     else -> "Не удалось подключиться по SSH: ${message.ifBlank { "неизвестная ошибка" }}"
 }
 
+private fun Throwable.messageWithCauses(): String =
+    generateSequence(this) { it.cause }
+        .mapNotNull { it.message?.takeIf(String::isNotBlank) }
+        .joinToString(": ")
+
 fun createSshSession(
     host: String,
     user: String,
@@ -99,6 +131,7 @@ fun createSshSession(
     require(credentials.hasAuthentication) { "Укажите SSH-пароль или приватный SSH-ключ." }
 
     try {
+        configureJschEdDsaCompatibility()
         val jsch = JSch()
         val privateKey = normalizeSshPrivateKey(credentials.privateKey)
         if (privateKey.isNotBlank()) {
@@ -135,7 +168,7 @@ fun createSshSession(
     } catch (error: IllegalArgumentException) {
         throw error
     } catch (error: JSchException) {
-        val message = error.message.orEmpty()
+        val message = error.messageWithCauses()
         throw IllegalStateException(friendlySshConnectionError(message, credentials), error)
     }
 }
