@@ -153,7 +153,7 @@ class WireGuardHelper(context: Context) {
             }
 
             val nextTunnel = WgTunnel {
-                TunnelManager.onWireGuardStoppedExternally()
+                TunnelManager.onWireGuardInterfaceDropped()
             }
             setTunnelUpWithRetry(nextTunnel, finalConfig)
             sharedTunnel = nextTunnel

@@ -234,9 +234,16 @@ func isAuthError(err error) bool {
 		strings.Contains(errStr, "stale nonce")
 }
 
-func handleAuthError(streamID int) bool {
+func handleAuthError(streamID int, username, password string) bool {
 	cache := getStreamCache(streamID)
 	cacheID := getCacheID(streamID)
+	cache.mutex.Lock()
+	defer cache.mutex.Unlock()
+	if cache.creds.Username == "" || cache.creds.Password == "" ||
+		cache.creds.Username != username || cache.creds.Password != password {
+		log.Printf("[STREAM %d] [TURN] Креды уже заменены; поздняя ошибка авторизации проигнорирована (cache=%d)", streamID, cacheID)
+		return false
+	}
 
 	now := time.Now().Unix()
 
@@ -251,7 +258,10 @@ func handleAuthError(streamID int) bool {
 
 	if count >= maxCacheErrors {
 		log.Printf("[VK Auth] Multiple auth errors detected (%d), invalidating cache %d", count, cacheID)
-		cache.invalidate(streamID)
+		cache.creds = TurnCredentials{}
+		cache.errorCount.Store(0)
+		cache.lastErrorTime.Store(0)
+		log.Printf("[STREAM %d] [VK Auth] Credentials cache invalidated", streamID)
 		return true
 	}
 	return false

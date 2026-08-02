@@ -109,6 +109,7 @@ class TrustedWifiTest {
         assertTrue(
             shouldKeepTunnelServiceAlive(
                 tunnelRunning = false,
+                tunnelStarting = false,
                 tunnelPaused = false,
                 trustedWifiWaiting = false,
                 trustedWifiResumeInProgress = true
@@ -117,6 +118,20 @@ class TrustedWifiTest {
         assertFalse(
             shouldKeepTunnelServiceAlive(
                 tunnelRunning = false,
+                tunnelStarting = false,
+                tunnelPaused = false,
+                trustedWifiWaiting = false,
+                trustedWifiResumeInProgress = false
+            )
+        )
+    }
+
+    @Test
+    fun `service stays alive while tunnel process is starting`() {
+        assertTrue(
+            shouldKeepTunnelServiceAlive(
+                tunnelRunning = false,
+                tunnelStarting = true,
                 tunnelPaused = false,
                 trustedWifiWaiting = false,
                 trustedWifiResumeInProgress = false

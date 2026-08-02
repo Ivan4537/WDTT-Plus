@@ -59,15 +59,31 @@ internal val ConnectionIssue.isStandaloneUiIssue: Boolean
 
 enum class NetworkRecoveryAction {
     SoftRestart,
-    RecreateVpn,
     StopVpn
 }
 
-internal fun stableNetworkRecoveryAction(completedAttempts: Int): NetworkRecoveryAction = when {
-    completedAttempts <= 0 -> NetworkRecoveryAction.SoftRestart
-    completedAttempts == 1 -> NetworkRecoveryAction.RecreateVpn
-    else -> NetworkRecoveryAction.StopVpn
+internal fun stableNetworkRecoveryAction(@Suppress("UNUSED_PARAMETER") completedAttempts: Int): NetworkRecoveryAction =
+    NetworkRecoveryAction.SoftRestart
+
+internal fun hasFreshTransportHeartbeat(
+    running: Boolean,
+    activeWorkers: Int,
+    lastActiveAtMs: Long,
+    lastStatsAtMs: Long,
+    sinceMs: Long,
+    nowMs: Long,
+    freshnessMs: Long = 90_000L,
+): Boolean {
+    if (!running || activeWorkers <= 0) return false
+    val freshActive = lastActiveAtMs >= sinceMs && nowMs - lastActiveAtMs < freshnessMs
+    val freshStats = lastStatsAtMs >= sinceMs && nowMs - lastStatsAtMs < freshnessMs
+    return freshActive || freshStats
 }
+
+internal fun shouldObserveTunnelHealth(
+    deviceInteractive: Boolean,
+    wakeRecoveryGraceActive: Boolean,
+): Boolean = deviceInteractive && !wakeRecoveryGraceActive
 
 enum class TunnelStopReason(val displayText: String) {
     User("отключено пользователем"),
@@ -150,6 +166,287 @@ internal fun isExpiredAccessAuthFailure(line: String): Boolean =
 
 internal const val WRAP_HANDSHAKE_RETRY_MESSAGE =
     "[WRAP] Отдельные каналы не ответили, выполняется повтор"
+internal const val RT_MASQUE_CONFIG_FILE_NAME = "rt-masque-v1.json"
+
+internal fun shouldUseRtMasque(rtNetwork: Boolean, rtMasque: Boolean): Boolean =
+    rtNetwork && rtMasque
+
+internal fun shouldUseRtMasqueServerBootstrap(
+    rtNetwork: Boolean,
+    rtMasque: Boolean,
+    serverBootstrap: Boolean,
+): Boolean = rtNetwork && rtMasque && serverBootstrap
+
+internal data class MasqueLogPresentation(
+    val key: String,
+    val message: String,
+    val warning: Boolean = false,
+    val startsDtls: Boolean = false,
+)
+
+internal fun classifyMasqueLog(line: String): MasqueLogPresentation? {
+    val hasTag = line.contains("[MASQUE]", ignoreCase = true)
+    val mentionsSelectedPath = line.contains("внутри MASQUE", ignoreCase = true)
+    val mentionsUdpFallback = line.contains("после MASQUE", ignoreCase = true)
+    if (!hasTag && !mentionsSelectedPath && !mentionsUdpFallback) return null
+    val text = if (hasTag) line.substringAfter("[MASQUE]", line).trim() else line.trim()
+    val h2 = text.contains("HTTP/2", ignoreCase = true)
+    val h3 = text.contains("HTTP/3", ignoreCase = true)
+    val registrationProblem =
+        text.contains("конфигурация WARP повреждена", ignoreCase = true) ||
+            text.contains("публичный ключ WARP endpoint не совпал", ignoreCase = true) ||
+            text.contains("access denied", ignoreCase = true)
+    val httpStatus = Regex("HTTP\\s+(\\d{3})", RegexOption.IGNORE_CASE)
+        .find(text)
+        ?.groupValues
+        ?.getOrNull(1)
+        ?.toIntOrNull()
+    val apiCode = Regex("code=(\\d+)", RegexOption.IGNORE_CASE)
+        .find(text)
+        ?.groupValues
+        ?.getOrNull(1)
+    val enrollmentStage = when {
+        text.contains("этап 1/4", ignoreCase = true) ||
+            text.contains("регистрация WARP:", ignoreCase = true) ->
+            "создания устройства WARP (этап 1/4)"
+        text.contains("этап 2/4", ignoreCase = true) ||
+            text.contains("enrollment WARP", ignoreCase = true) ->
+            "включения MASQUE в Cloudflare (этап 2/4)"
+        text.contains("этап 3/4", ignoreCase = true) ||
+            text.contains("неполную конфигурацию", ignoreCase = true) ->
+            "проверки конфигурации MASQUE (этап 3/4)"
+        text.contains("этап 4/4", ignoreCase = true) ||
+            text.contains("сохранение регистрации", ignoreCase = true) ->
+            "сохранения регистрации на устройстве (этап 4/4)"
+        else -> "подготовки WARP"
+    }
+    val pathFailureReason = when {
+        text.contains("timeout", ignoreCase = true) ||
+            text.contains("deadline exceeded", ignoreCase = true) ||
+            text.contains("тайм-аут", ignoreCase = true) -> "таймаут"
+        text.contains("refused", ignoreCase = true) -> "соединение отклонено"
+        text.contains("unreachable", ignoreCase = true) ||
+            text.contains("no route", ignoreCase = true) -> "маршрут недоступен"
+        text.contains("lookup", ignoreCase = true) ||
+            text.contains("DNS", ignoreCase = true) -> "ошибка DNS внутри WARP"
+        text.contains("handshake", ignoreCase = true) -> "ошибка рукопожатия"
+        else -> "CONNECT-IP или TURN не ответил"
+    }
+    val enrollmentFailureReason = when {
+        httpStatus == 429 -> "Cloudflare ограничил частоту регистраций (HTTP 429)"
+        httpStatus == 403 -> "Cloudflare отклонил запрос (HTTP 403)"
+        httpStatus != null && httpStatus >= 500 -> "временная ошибка Cloudflare (HTTP $httpStatus)"
+        text.contains("тайм-аут TLS-рукопожатия", ignoreCase = true) ->
+            "TLS-рукопожатие с API Cloudflare не завершилось после успешного TCP/443"
+        text.contains("не прислал заголовки ответа", ignoreCase = true) ||
+            text.contains("не прислал ответ", ignoreCase = true) ->
+            "Cloudflare не ответил на уже отправленный HTTPS-запрос"
+        text.contains("тайм-аут подключения TCP/443", ignoreCase = true) ->
+            "не установилось TCP/443-соединение с API Cloudflare"
+        text.contains("тайм-аут системного DNS", ignoreCase = true) ->
+            "системный DNS Android не ответил для API Cloudflare"
+        text.contains("пустой ответ", ignoreCase = true) -> "Cloudflare вернул пустой ответ"
+        text.contains("не в формате JSON", ignoreCase = true) -> "Cloudflare вернул ответ не в формате JSON"
+        text.contains("структура JSON-ответа", ignoreCase = true) -> "формат ответа Cloudflare изменился"
+        text.contains("чтение ответа", ignoreCase = true) -> "ответ Cloudflare оборвался при чтении"
+        httpStatus != null -> "Cloudflare вернул HTTP $httpStatus"
+        text.contains("lookup", ignoreCase = true) ||
+            text.contains("DNS", ignoreCase = true) -> "не разрешился адрес API Cloudflare"
+        text.contains("timeout", ignoreCase = true) ||
+            text.contains("deadline exceeded", ignoreCase = true) ||
+            text.contains("тайм-аут", ignoreCase = true) -> "таймаут обращения к API Cloudflare"
+        text.contains("certificate", ignoreCase = true) ||
+            text.contains("x509", ignoreCase = true) -> "ошибка проверки TLS-сертификата API Cloudflare"
+        text.contains("connection refused", ignoreCase = true) -> "соединение с API Cloudflare отклонено"
+        text.contains("не вернула", ignoreCase = true) ||
+            text.contains("не вернул", ignoreCase = true) -> "Cloudflare вернул неполную конфигурацию"
+        else -> "запрос к API Cloudflare завершился ошибкой"
+    }
+    val rawEnrollmentFailure = text
+        .substringAfter("фоновая подготовка WARP пока не выполнена:", "")
+        .trim()
+        .replaceFirst(Regex("^этап\\s+\\d/4,[^:]{0,160}:\\s*", RegexOption.IGNORE_CASE), "")
+        .replace(Regex("(?i)Bearer\\s+\\S+"), "Bearer [скрыт]")
+        .replace(Regex("https?://\\S+", RegexOption.IGNORE_CASE), "[URL скрыт]")
+        .replace(Regex("[\\r\\n\\t]+"), " ")
+        .trim()
+        .take(260)
+    val enrollmentTechnicalDetail = buildList {
+        if (apiCode != null) add("код API $apiCode")
+        when {
+            text.contains("ошибка DNS для", ignoreCase = true) ->
+                add(text.substringAfter("ошибка DNS для", "").trim().take(180).let { "DNS: $it" })
+            text.contains("сетевая ошибка:", ignoreCase = true) ->
+                add(text.substringAfter("сетевая ошибка:", "").trim().take(180))
+            text.contains("не вернул ID или токен", ignoreCase = true) ->
+                add("в ответе отсутствует ID или токен")
+            text.contains("не вернул адрес MASQUE", ignoreCase = true) ->
+                add("в ответе отсутствует адрес MASQUE")
+            text.contains("неполная конфигурация", ignoreCase = true) ->
+                add("в ответе отсутствует обязательное поле")
+        }
+        if (rawEnrollmentFailure.isNotBlank()) add(rawEnrollmentFailure)
+    }.filter { it.isNotBlank() }.distinct().joinToString(", ")
+        .let { if (it.isBlank()) "" else "; подробность: $it" }
+
+    return when {
+        registrationProblem -> MasqueLogPresentation(
+            key = "masque_registration_invalid",
+            message = "[MASQUE] Регистрация WARP повреждена или отклонена. Остановите VPN и используйте «Сбросить регистрацию WARP» в справке MASQUE.",
+            warning = true,
+        )
+        text.contains("фоновая подготовка WARP пока не выполнена", ignoreCase = true) ->
+            MasqueLogPresentation(
+                key = "masque_enrollment_pending",
+                message = "[MASQUE] Ошибка на этапе $enrollmentStage: $enrollmentFailureReason$enrollmentTechnicalDetail. " +
+                    "Регистрация не сохранена; прямые пути продолжают работу. Для новой попытки остановите и снова запустите VPN.",
+                warning = true,
+            )
+        text.contains("повторяем через TLS 1.2/HTTP 1.1", ignoreCase = true) &&
+            text.contains("разделённым ClientHello", ignoreCase = true) ->
+            MasqueLogPresentation(
+                "masque_api_tls_fallback",
+                "[MASQUE] API Cloudflare: обычный TLS не ответил; пробуем TLS 1.2/HTTP 1.1 с разделённым ClientHello...",
+                warning = true,
+            )
+        text.contains("данные устройства ещё не отправлялись", ignoreCase = true) ->
+            MasqueLogPresentation(
+                "masque_api_retry",
+                "[MASQUE] API Cloudflare не завершил соединение до отправки данных. Выполняем одну безопасную повторную попытку через системную сеть Android...",
+                warning = true,
+            )
+        text.contains("прямые HTTPS-пути недоступны", ignoreCase = true) &&
+            text.contains("выход через сервер профиля", ignoreCase = true) ->
+            MasqueLogPresentation(
+                "masque_api_server_retry",
+                "[MASQUE] Прямой API Cloudflare не ответил; пробуем регистрацию через сервер профиля...",
+                warning = true,
+            )
+        text.contains("выход через сервер профиля доступен", ignoreCase = true) ->
+            MasqueLogPresentation(
+                "masque_api_server_connected",
+                "[MASQUE] Защищённый выход через сервер профиля установлен ✓",
+            )
+        text.contains("выход через сервер профиля сработал", ignoreCase = true) ->
+            MasqueLogPresentation(
+                "masque_api_server_ok",
+                "[MASQUE] API Cloudflare доступен через сервер профиля ✓",
+            )
+        text.contains("локальный выход для регистрации WARP отклонён", ignoreCase = true) ->
+            MasqueLogPresentation(
+                "masque_api_server_invalid",
+                "[MASQUE] Локальный выход регистрации отклонён как небезопасный; продолжаем прямые попытки",
+                warning = true,
+            )
+        text.contains("системный DNS Android разрешил адрес", ignoreCase = true) ->
+            MasqueLogPresentation(
+                "masque_api_dns",
+                "[MASQUE] API Cloudflare: системный DNS Android разрешил адрес ✓",
+            )
+        text.contains("TCP/443 через системную сеть Android установлен", ignoreCase = true) ->
+            MasqueLogPresentation(
+                "masque_api_tcp",
+                "[MASQUE] API Cloudflare: TCP/443 через системную сеть Android установлен ✓",
+            )
+        text.contains("TLS-рукопожатие завершено", ignoreCase = true) &&
+            text.contains("HTTP/1.1", ignoreCase = true) ->
+            MasqueLogPresentation(
+                "masque_api_tls_fallback_ok",
+                "[MASQUE] API Cloudflare: резерв TLS 1.2/HTTP 1.1 установлен ✓",
+            )
+        text.contains("TLS-рукопожатие завершено", ignoreCase = true) ->
+            MasqueLogPresentation(
+                "masque_api_tls",
+                "[MASQUE] API Cloudflare: защищённое TLS-соединение установлено ✓",
+            )
+        text.contains("HTTP-запрос отправлен", ignoreCase = true) &&
+            text.contains("ожидаем ответ", ignoreCase = true) ->
+            MasqueLogPresentation(
+                "masque_api_request",
+                "[MASQUE] API Cloudflare: HTTPS-запрос отправлен, ожидаем ответ...",
+            )
+        text.contains("получен первый байт HTTP-ответа", ignoreCase = true) ->
+            MasqueLogPresentation(
+                "masque_api_response",
+                "[MASQUE] API Cloudflare: получен HTTP-ответ ✓",
+            )
+        text.contains("регистрация начата:", ignoreCase = true) ||
+            text.contains("первый запуск: регистрируем", ignoreCase = true) ->
+            MasqueLogPresentation(
+                "masque_enrollment_start",
+                "[MASQUE] Этап 1/4: создаём отдельное устройство WARP в Cloudflare...",
+            )
+        text.contains("этап 1/4 завершён", ignoreCase = true) ||
+            text.contains("базовая регистрация WARP создана", ignoreCase = true) ->
+            MasqueLogPresentation(
+                "masque_account_created",
+                "[MASQUE] Этап 1/4 завершён: устройство WARP создано. Этап 2/4: включаем для него MASQUE...",
+            )
+        text.contains("этап 2/4 завершён", ignoreCase = true) ||
+            text.contains("Cloudflare принял ключ MASQUE", ignoreCase = true) ->
+            MasqueLogPresentation(
+                "masque_key_accepted",
+                "[MASQUE] Этап 2/4 завершён: Cloudflare принял ключ MASQUE. Этап 3/4: проверяем адреса и ключ сервера...",
+            )
+        text.contains("этап 3/4 завершён", ignoreCase = true) ->
+            MasqueLogPresentation(
+                "masque_config_valid",
+                "[MASQUE] Этап 3/4 завершён: конфигурация MASQUE корректна ✓",
+            )
+        text.contains("этап 4/4 — сохраняем", ignoreCase = true) ->
+            MasqueLogPresentation(
+                "masque_enrollment_saving",
+                "[MASQUE] Этап 4/4: сохраняем регистрацию только в приватном хранилище приложения...",
+            )
+        text.contains("этап 4/4 завершён", ignoreCase = true) ||
+            text.contains("enrollment WARP сохранён", ignoreCase = true) ->
+            MasqueLogPresentation(
+                "masque_enrollment_saved",
+                "[MASQUE] Этап 4/4 завершён: регистрация WARP сохранена в приватном хранилище ✓",
+            )
+        text.contains("конфигурация WARP подготовлена", ignoreCase = true) ->
+            MasqueLogPresentation("masque_config_ready", "[MASQUE] Сохранённая регистрация WARP готова ✓")
+        text.contains("Включён резерв", ignoreCase = true) ->
+            MasqueLogPresentation("masque_enabled", "[MASQUE] Резерв включён: HTTP/2 (TCP/443), затем HTTP/3 (QUIC/443)")
+        text.contains("Прямые TCP/TLS-пути", ignoreCase = true) ->
+            MasqueLogPresentation("masque_fallback_start", "[MASQUE] Прямые TCP/TLS-пути РТ не ответили — запускаем CONNECT-IP до попытки UDP")
+        text.contains("Последний резерв после MASQUE", ignoreCase = true) ->
+            MasqueLogPresentation(
+                "masque_udp_fallback",
+                "[MASQUE] HTTP/2 и HTTP/3 не дали рабочий TURN — пробуем прямой UDP последним резервом",
+                warning = true,
+            )
+        text.contains("Relay:", ignoreCase = true) && h2 ->
+            MasqueLogPresentation("masque_selected", "[MASQUE] Выбран HTTP/2 через TCP/443 ✓", startsDtls = true)
+        text.contains("Relay:", ignoreCase = true) && h3 ->
+            MasqueLogPresentation("masque_selected", "[MASQUE] Выбран HTTP/3 через QUIC/443 ✓", startsDtls = true)
+        text.contains("CONNECT-IP HTTP/2 установлен", ignoreCase = true) ->
+            MasqueLogPresentation("masque_h2_connected", "[MASQUE] CONNECT-IP HTTP/2 через TCP/443 установлен ✓")
+        text.contains("CONNECT-IP HTTP/3 установлен", ignoreCase = true) ->
+            MasqueLogPresentation("masque_h3_connected", "[MASQUE] CONNECT-IP HTTP/3 через QUIC/443 установлен ✓")
+        text.contains("устанавливаем CONNECT-IP", ignoreCase = true) && h2 ->
+            MasqueLogPresentation("masque_h2_connecting", "[MASQUE] Подключаем CONNECT-IP HTTP/2 через TCP/443...")
+        text.contains("устанавливаем CONNECT-IP", ignoreCase = true) && h3 ->
+            MasqueLogPresentation("masque_h3_connecting", "[MASQUE] Подключаем CONNECT-IP HTTP/3 через QUIC/443...")
+        text.contains("Пробуем TURN", ignoreCase = true) && h2 ->
+            MasqueLogPresentation("masque_h2_turn", "[MASQUE] Проверяем TURN внутри HTTP/2...")
+        text.contains("Пробуем TURN", ignoreCase = true) && h3 ->
+            MasqueLogPresentation("masque_h3_turn", "[MASQUE] Проверяем TURN внутри HTTP/3...")
+        (text.contains("не сработал", ignoreCase = true) || text.contains("потерян", ignoreCase = true)) && h2 ->
+            MasqueLogPresentation(
+                "masque_h2_failed",
+                "[MASQUE] Путь HTTP/2/TCP/443 не сработал ($pathFailureReason); проверяем другие TURN-адреса и HTTP/3",
+                warning = true,
+            )
+        (text.contains("не сработал", ignoreCase = true) || text.contains("потерян", ignoreCase = true)) && h3 ->
+            MasqueLogPresentation(
+                "masque_h3_failed",
+                "[MASQUE] Путь HTTP/3/QUIC/443 не сработал ($pathFailureReason); проверяем другие TURN-адреса и прямой UDP",
+                warning = true,
+            )
+        else -> MasqueLogPresentation("masque_status", "[MASQUE] $text")
+    }
+}
 
 const val AMNEZIA_STYLE_RECOVERY = true
 private const val RECOVERABLE_NETWORK_GRACE_MS = 90_000L
@@ -159,6 +456,7 @@ private const val STABLE_RECOVERY_GRACE_MS = 10 * 60_000L
 private const val STABLE_RECOVERY_RETRY_MS = 10 * 60_000L
 private const val STABLE_ZERO_WORKERS_GRACE_MS = 15 * 60_000L
 private const val STAGNANT_ACTIVE_TRAFFIC_MS = 20 * 60_000L
+private const val WAKE_RECOVERY_GRACE_MS = 90_000L
 
 object TunnelManager {
     // 100% защита от утечек: единый управляемый глобальный Scope
@@ -168,6 +466,7 @@ object TunnelManager {
     private var readerJob: Job? = null
     private var watchdogJob: Job? = null
     private var wgHelper: WireGuardHelper? = null
+    private var warpApiSshRelay: WarpApiSshRelay? = null
     
     private val startStopMutex = kotlinx.coroutines.sync.Mutex()
 
@@ -198,8 +497,10 @@ object TunnelManager {
     private var lastSoftRestartAtMs = 0L
     private var lastUnderlyingNetworkChangeAtMs = 0L
     private var networkTransitionGraceUntilMs = 0L
+    private var wakeRecoveryGraceUntilMs = 0L
     private var lastNetworkSettleRestartAtMs = 0L
     private var lastStableNetworkIssueLogAtMs = 0L
+    private val sessionTraffic = TunnelSessionTrafficAccumulator()
     private val captchaSolveRequestId = AtomicLong(0)
     private val activeCaptchaSolveRequests = ConcurrentHashMap.newKeySet<Long>()
 
@@ -381,6 +682,7 @@ object TunnelManager {
 
     fun pollNetworkRecoveryAction(now: Long = System.currentTimeMillis()): NetworkRecoveryAction? {
         if (!running.value) return null
+        if (isWakeRecoveryGraceActive(now)) return null
         if (AMNEZIA_STYLE_RECOVERY) {
             return pollStableNetworkRecoveryAction(now)
         }
@@ -495,13 +797,9 @@ object TunnelManager {
                 "Восстанавливаю транспорт",
                 "Сеть долго не подаёт признаков жизни. Выполняется тихая попытка без пересоздания VPN."
             )
-            NetworkRecoveryAction.RecreateVpn -> setConnectionIssue(
-                "Пересоздаю VPN",
-                "Тихое восстановление не помогло. Системный VPN-интерфейс будет пересоздан один раз."
-            )
             NetworkRecoveryAction.StopVpn -> setConnectionIssue(
                 "VPN остановлен, чтобы вернуть интернет",
-                "Пересоздание VPN не восстановило связь. WDTT Plus выключит VPN, чтобы телефон не остался без интернета."
+                "Повторные попытки не восстановили связь. WDTT Plus выключит VPN, чтобы телефон не остался без интернета."
             )
         }
         return action
@@ -660,6 +958,7 @@ object TunnelManager {
                     if (!preserveLogs) clearLogs()
                     config.value = null
                     stats.value = "Ожидание данных..."
+                    sessionTraffic.reset()
                     floodCount = 0
                     mismatchCount = 0
                     refusedCount = 0
@@ -671,6 +970,7 @@ object TunnelManager {
                     resetStatsLivenessState()
                     lastUnderlyingNetworkChangeAtMs = 0L
                     networkTransitionGraceUntilMs = 0L
+                    wakeRecoveryGraceUntilMs = 0L
                     lastNetworkSettleRestartAtMs = 0L
                     activeHashIndex = 0
                     currentParams = params
@@ -765,6 +1065,64 @@ object TunnelManager {
                 // Go boolean flags must use -flag=value. A separate "false" value
                 // stops flag.Parse and silently drops every argument after it.
                 cmd.add("-vkcalls-preflight=${params.vkCallsPreflight}")
+                cmd.add("-turn-stream-first=${params.rtNetwork}")
+                if (params.rtNetwork) {
+                    val turnSni = normalizeRtTurnSni(params.rtTurnSni)
+                    if (turnSni != null) {
+                        cmd.add("-turn-sni")
+                        cmd.add(turnSni)
+                    } else if (params.rtTurnSni.isNotBlank()) {
+                        updateWarningLog(
+                            "rt_sni_invalid",
+                            "[TURN] SNI режима «Сеть РТ» имеет неверный формат; запускаем TCP/TLS без подмены SNI",
+                            20,
+                        )
+                    }
+                }
+                val useRtMasque = shouldUseRtMasque(params.rtNetwork, params.rtMasque)
+                cmd.add("-rt-masque=$useRtMasque")
+                if (useRtMasque) {
+                    val masqueConfig = File(appContext.filesDir, RT_MASQUE_CONFIG_FILE_NAME)
+                    cmd.add("-rt-masque-config")
+                    cmd.add(masqueConfig.absolutePath)
+                    cmd.add("-rt-masque-accept-tos=true")
+                    if (
+                        !masqueConfig.exists() &&
+                        shouldUseRtMasqueServerBootstrap(
+                            rtNetwork = params.rtNetwork,
+                            rtMasque = params.rtMasque,
+                            serverBootstrap = params.rtMasqueServerBootstrap,
+                        )
+                    ) {
+                        closeWarpApiSshRelay()
+                        when (val relayResult = WarpApiSshRelay.start(appContext, params.profileIndex)) {
+                            is WarpApiSshRelayStartResult.Ready -> {
+                                warpApiSshRelay = relayResult.relay
+                                cmd.add("-warp-api-relay")
+                                cmd.add(relayResult.relay.loopbackAddress)
+                                updateLog(
+                                    "masque_server_bootstrap_ready",
+                                    "[MASQUE] Для первой регистрации подготовлен защищённый выход через сервер профиля ✓",
+                                    4,
+                                )
+                            }
+                            WarpApiSshRelayStartResult.MissingProfileAccess -> {
+                                updateWarningLog(
+                                    "masque_server_bootstrap_missing",
+                                    "[MASQUE] «Через сервер» недоступен: в «Деплой» нет адреса сервера или выбранного SSH-доступа (пароль/приватный ключ); пробуем прямую регистрацию",
+                                    20,
+                                )
+                            }
+                            is WarpApiSshRelayStartResult.Failed -> {
+                                updateWarningLog(
+                                    "masque_server_bootstrap_failed",
+                                    "[MASQUE] Выход через сервер не подготовлен: ${relayResult.message}; пробуем прямую регистрацию",
+                                    20,
+                                )
+                            }
+                        }
+                    }
+                }
 
                 val androidId = SettingsStore(appContext).getOrCreateTunnelDeviceId()
                 cmd.add("-device-id")
@@ -811,12 +1169,26 @@ object TunnelManager {
                 startWatchdog(appContext, params)
 
             } catch (e: Exception) {
+                closeWarpApiSshRelay()
                 val message = e.readableMessage()
                 updateLog("critical_start_error", "Критическая ошибка запуска: $message", 99, true)
                 setConnectionIssue("Не удалось запустить подключение", "Проверьте настройки туннеля и попробуйте подключиться снова. Причина: $message")
                 e.printStackTrace()
-                running.value = false
-                currentParams = null
+                if (isSwitching && currentParams != null) {
+                    // При автоматическом восстановлении не превращаем неудачную
+                    // попытку в окончательную остановку: служба оставляет параметры
+                    // сессии и сможет повторить восстановление позже.
+                    running.value = true
+                    processStartedAtMs = System.currentTimeMillis()
+                    updateWarningLog(
+                        "vpn_recovery_retry_pending",
+                        "[VPN] Автоматическое восстановление пока не завершилось; сохраняем сессию и повторим попытку позже.",
+                        50,
+                    )
+                } else {
+                    running.value = false
+                    currentParams = null
+                }
                 clearTransition()
             } finally {
                 if (!isSwitching) clearTransition()
@@ -1089,7 +1461,8 @@ object TunnelManager {
                     }
 
                     if (lineTrim.contains("[СТАТИСТИКА]")) {
-                        val msg = lineTrim.substringAfter("[СТАТИСТИКА]").trim()
+                        val rawStats = lineTrim.substringAfter("[СТАТИСТИКА]").trim()
+                        val msg = sessionTraffic.accumulate(rawStats)
                         stats.value = msg
                         lastStatsAtMs = now
 
@@ -1155,7 +1528,22 @@ object TunnelManager {
                     }
 
                     val workerRetry = classifyRecoverableWorkerRetry(lineTrim, activeWorkers.value)
+                    val masquePresentation = classifyMasqueLog(lineTrim)
                     when {
+                        masquePresentation != null -> {
+                            val presentation = masquePresentation
+                            if (presentation.warning) {
+                                updateWarningLog(presentation.key, presentation.message, 20)
+                            } else {
+                                updateLog(presentation.key, presentation.message, 2, false)
+                            }
+                            if (presentation.startsDtls) {
+                                updateLog("dtls_start", "[DTLS] Рукопожатие (Handshake)...", 1, false)
+                            }
+                            if (presentation.key == "masque_enrollment_saved") {
+                                closeWarpApiSshRelay()
+                            }
+                        }
                         workerRetry != null -> {
                             if (activeWorkers.value <= 0) {
                                 when (workerRetry.first) {
@@ -1352,10 +1740,23 @@ object TunnelManager {
                         lineTrim.contains("[TURN]") -> {
                             val text = lineTrim.substringAfter("[TURN]").trim()
                             when {
+                                text.contains("Креды уже заменены", true) ->
+                                    updateLog(
+                                        "turn_creds_current",
+                                        "[TURN] Используем уже обновлённые данные без повторного запроса к VK",
+                                        5,
+                                        false
+                                    )
                                 text.contains("Креды обновлены", true) ->
                                     updateLog("turn_creds_refreshed", "[TURN] Креды обновлены, продолжаем подключение", 2, false)
                                 text.contains("Креды уже обновлялись", true) ->
                                     updateLog("turn_creds_wait", "[TURN] Ждём перед повторным обновлением кредов", 2, false)
+                                text.contains("временно ограничил новые allocation", true) ->
+                                    updateWarningLog(
+                                        "turn_capacity_retry",
+                                        "[TURN] Узел временно ограничил новые каналы; повторяем без обновления данных VK",
+                                        20
+                                    )
                                 text.contains("неполный ответ", true) ->
                                     updateWarningLog("turn_allocate_retry", "[TURN] Неполный Allocate-ответ, обновляем данные и повторяем", 20)
                                 text.contains("Ошибка allocation/кредов", true) ->
@@ -1560,8 +1961,23 @@ object TunnelManager {
         watchdogJob = scope.launch {
             var zeroWorkersSince = 0L
             var processDeadSince = 0L
+            val powerManager = context.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
             delay(10_000)
             while (isActive && running.value) {
+                if (
+                    !shouldObserveTunnelHealth(
+                        deviceInteractive = powerManager?.isInteractive != false,
+                        wakeRecoveryGraceActive = isWakeRecoveryGraceActive(),
+                    )
+                ) {
+                    // Сон и первые секунды после пробуждения не входят в длительность
+                    // неисправности. Иначе старый таймер срабатывает сразу при включении
+                    // экрана и без необходимости перезапускает транспорт.
+                    zeroWorkersSince = 0L
+                    processDeadSince = 0L
+                    delay(10_000)
+                    continue
+                }
                 val proc = process
                 if (proc == null || !proc.isAlive) {
                     val now = System.currentTimeMillis()
@@ -1599,7 +2015,12 @@ object TunnelManager {
                         lastActiveAtMs == 0L &&
                         !isCaptchaInProgress()
                     ) {
-                        handleCriticalError("\uD83D\uDD12 Неверный пароль подключения или несовместимый WRAP. Воркеры остановлены.")
+                        val wrapStopMessage = if (currentParams?.rtNetwork == true) {
+                            "\uD83C\uDF10 Через сеть РТ не получен ответ WRAP. Обычно сеть не пропустила выбранный TURN/SNI; реже причина в пароле или совместимости WRAP. Воркеры остановлены."
+                        } else {
+                            "\uD83D\uDD12 Неверный пароль подключения или несовместимый WRAP. Воркеры остановлены."
+                        }
+                        handleCriticalError(wrapStopMessage)
                         return@launch
                     } else if (
                         System.currentTimeMillis() - zeroWorkersSince > (if (AMNEZIA_STYLE_RECOVERY) STABLE_ZERO_WORKERS_GRACE_MS else 3 * 60_000L) &&
@@ -1655,6 +2076,7 @@ object TunnelManager {
         updateLog("network_restart", reason, 50, false)
         activeWorkers.value = 0
         resetStatsLivenessState()
+        sessionTraffic.noteTransportRestart()
         val restartDelayMs = transportRecoveryPolicy(
             params.managedConfigFirstStart
         ).processRestartDelayMs
@@ -1715,6 +2137,7 @@ object TunnelManager {
             startStopMutex.lock()
             try {
                 if (currentParams !== params || !running.value) return@launch
+                sessionTraffic.noteTransportRestart()
                 killProcess()
                 delay(250L)
             } finally {
@@ -1761,6 +2184,30 @@ object TunnelManager {
     fun isNetworkTransitionGraceActive(now: Long = System.currentTimeMillis()): Boolean =
         now < networkTransitionGraceUntilMs
 
+    fun isWakeRecoveryGraceActive(now: Long = System.currentTimeMillis()): Boolean =
+        now < wakeRecoveryGraceUntilMs
+
+    fun noteDeviceSleepStarted() {
+        if (!running.value) return
+        // Ошибки, возникшие до или во время сна, нельзя переносить в решение о
+        // восстановлении после пробуждения: сеть и вывод статистики в этот период
+        // могут штатно приостанавливаться Android.
+        wakeRecoveryGraceUntilMs = 0L
+    }
+
+    fun noteDeviceWakeStarted(now: Long = System.currentTimeMillis()) {
+        if (!running.value) return
+        resetNetworkRecoveryState()
+        wakeRecoveryGraceUntilMs = now + WAKE_RECOVERY_GRACE_MS
+        networkTransitionGraceUntilMs = maxOf(networkTransitionGraceUntilMs, wakeRecoveryGraceUntilMs)
+        updateLog(
+            "wake_stabilization",
+            "[СОН] Устройство проснулось; даём текущему VPN восстановить активность без перезапуска.",
+            20,
+            false,
+        )
+    }
+
     fun connectionIssueTitleForNotification(now: Long = System.currentTimeMillis()): String? {
         val issue = connectionIssue.value ?: return null
         if (!running.value) return null
@@ -1788,10 +2235,14 @@ object TunnelManager {
     }
 
     fun hasFreshTunnelActivitySince(sinceMs: Long, now: Long = System.currentTimeMillis()): Boolean {
-        if (!running.value || activeWorkers.value <= 0) return false
-        val freshActive = lastActiveAtMs >= sinceMs && now - lastActiveAtMs < 90_000L
-        val freshStats = lastStatsAtMs >= sinceMs && now - lastStatsAtMs < 90_000L
-        return (freshActive || freshStats) && !isStatsTrafficStagnant(now)
+        return hasFreshTransportHeartbeat(
+            running = running.value,
+            activeWorkers = activeWorkers.value,
+            lastActiveAtMs = lastActiveAtMs,
+            lastStatsAtMs = lastStatsAtMs,
+            sinceMs = sinceMs,
+            nowMs = now,
+        )
     }
 
     fun noteWakeRescueStarted() {
@@ -1809,6 +2260,41 @@ object TunnelManager {
             "[СОН] VPN подал свежие признаки жизни после пробуждения.",
             50,
             false
+        )
+    }
+
+    fun noteWakeRescueDeferred() {
+        updateWarningLog(
+            "wake_rescue_deferred",
+            "[СОН] После пробуждения транспорт ещё не подал свежих признаков жизни. VPN-интерфейс оставлен активным; продолжаем наблюдение без аварийного отключения.",
+            50,
+        )
+    }
+
+    fun noteSleepVpnPaused() {
+        updateLog(
+            "sleep_vpn_paused",
+            "[СОН] VPN временно отключён для экономии батареи; интернет телефона идёт напрямую.",
+            20,
+            false,
+        )
+    }
+
+    fun noteSleepVpnPauseFailed() {
+        updateLog(
+            "sleep_vpn_pause_failed",
+            "[СОН] Режим экономии не применён: системный VPN-интерфейс не удалось безопасно остановить.",
+            50,
+            false,
+        )
+    }
+
+    fun noteSleepVpnResumed() {
+        updateLog(
+            "sleep_vpn_resumed",
+            "[СОН] Экран включён; возобновляем VPN с сохранёнными настройками.",
+            20,
+            false,
         )
     }
 
@@ -1837,15 +2323,16 @@ object TunnelManager {
     fun recreateVpnTunnel() {
         val params = currentParams ?: return
         val context = lastContext ?: return
-        updateWarningLog("network_full_restart", "[СЕТЬ] Мягкие попытки не помогли, пересоздаём VPN", 50)
+        updateWarningLog("network_full_restart", "[VPN] Android потерял системный VPN-интерфейс, создаём его заново", 50)
         scope.launch {
             withContext(Dispatchers.Main) {
                 wgHelper?.stopTunnel()
             }
+            sessionTraffic.noteTransportRestart()
             killProcess()
             activeWorkers.value = 0
             delay(2500)
-            if (currentParams != null) {
+            if (currentParams === params && running.value) {
                 start(context, params, isSwitching = true)
             }
         }
@@ -1867,6 +2354,7 @@ object TunnelManager {
 
     fun pause() {
         if (!running.value) return
+        sessionTraffic.noteTransportRestart()
         killProcess()
         activeWorkers.value = 0
         resetStatsLivenessState()
@@ -1904,9 +2392,18 @@ object TunnelManager {
                 try { proc.waitFor(1000, java.util.concurrent.TimeUnit.MILLISECONDS) } catch (_: Exception) {}
             }
         }
+        closeWarpApiSshRelay()
+    }
+
+    @Synchronized
+    private fun closeWarpApiSshRelay() {
+        val relay = warpApiSshRelay
+        warpApiSshRelay = null
+        relay?.close()
     }
 
     private fun stopOnlyProcess() {
+        sessionTraffic.noteTransportRestart()
         killProcess()
         running.value = false
     }
@@ -1918,29 +2415,13 @@ object TunnelManager {
         updateLog("stats", "[СТАТИСТИКА] $stoppedStats", 3, false)
     }
 
-    fun onWireGuardStoppedExternally() {
-        noteStopRequested()
-        scope.launch {
-            startStopMutex.lock()
-            try {
-                if (!running.value) return@launch
-                updateLog(
-                    "vpn_released",
-                    "[VPN] Android отключил WDTT Plus VPN или передал VPN другому приложению. Транспорт остановлен.",
-                    50,
-                    false
-                )
-                killProcess()
-                running.value = false
-                markLogSessionStopped(TunnelStopReason.VpnStoppedExternally)
-                resetStatsLivenessState()
-                currentParams = null
-                ManlCaptchaWebViewManager.cancelCaptcha()
-            } finally {
-                clearTransition()
-                startStopMutex.unlock()
-            }
-        }
+    fun onWireGuardInterfaceDropped() {
+        if (!running.value) return
+        updateWarningLog(
+            "vpn_interface_dropped",
+            "[VPN] Android сообщил о потере системного VPN-интерфейса. Проверяем состояние перед восстановлением.",
+            50,
+        )
     }
 
     fun stop(reason: TunnelStopReason = TunnelStopReason.User) {
@@ -1958,6 +2439,7 @@ object TunnelManager {
                 resetStatsLivenessState()
                 currentParams = null
                 resetNetworkRecoveryState()
+                wakeRecoveryGraceUntilMs = 0L
                 ManlCaptchaWebViewManager.cancelCaptcha()
             } finally {
                 if (reason == TunnelStopReason.User) {
@@ -1992,6 +2474,7 @@ object TunnelManager {
                 resetStatsLivenessState()
                 currentParams = null
                 resetNetworkRecoveryState()
+                wakeRecoveryGraceUntilMs = 0L
                 ManlCaptchaWebViewManager.cancelCaptcha()
             }
         } finally {
@@ -2173,6 +2656,10 @@ data class TunnelParams(
     val connectionPassword: String = "",
     val protocol: String = "udp",
     val vkCallsPreflight: Boolean = true,
+    val rtNetwork: Boolean = false,
+    val rtMasque: Boolean = false,
+    val rtMasqueServerBootstrap: Boolean = false,
+    val rtTurnSni: String = DEFAULT_RT_TURN_SNI,
     val captchaMode: String = "auto",
     val captchaSolveMethod: String = "auto",
     val fingerprint: String = "firefox",

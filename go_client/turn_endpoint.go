@@ -90,6 +90,19 @@ func legacyUDPEndpoint(raw string) (turnEndpoint, error) {
 	return endpoint, nil
 }
 
+// legacyTCPEndpoint preserves the behaviour of the original vk-turn-proxy
+// client: VK may advertise an address as UDP even though the same TURN
+// listener also accepts a TCP control connection.
+func legacyTCPEndpoint(raw string) (turnEndpoint, error) {
+	endpoint, err := parseTURNEndpoint(raw)
+	if err != nil {
+		return turnEndpoint{}, err
+	}
+	endpoint.Transport = turnTransportTCP
+	endpoint.LegacyUDP = false
+	return endpoint, nil
+}
+
 func splitTURNHostPort(address string, transport turnTransport) (string, string, error) {
 	host, port, err := net.SplitHostPort(address)
 	if err == nil {
@@ -135,6 +148,19 @@ func (e turnEndpoint) label() string {
 }
 
 func sessionTURNCandidates(rawURLs []string, sessionID int, tp *TurnParams) []turnEndpoint {
+	return sessionTURNCandidatesWithPreference(rawURLs, sessionID, tp, false)
+}
+
+// sessionTURNCandidatesWithPreference keeps the historical UDP-first order
+// unless the user explicitly enables the restricted-network mode. That mode
+// prefers stream transports so a mobile network that silently drops relayed
+// UDP is not retried forever.
+func sessionTURNCandidatesWithPreference(
+	rawURLs []string,
+	sessionID int,
+	tp *TurnParams,
+	preferStream bool,
+) []turnEndpoint {
 	if len(rawURLs) == 0 {
 		return nil
 	}
@@ -165,27 +191,62 @@ func sessionTURNCandidates(rawURLs []string, sessionID int, tp *TurnParams) []tu
 		result = append(result, endpoint)
 	}
 
-	if endpoint, err := legacyUDPEndpoint(rawURLs[selectedIndex]); err == nil {
-		add(endpoint)
-	}
-
-	for offset := 1; offset < len(rawURLs); offset++ {
-		idx := (selectedIndex + offset) % len(rawURLs)
-		if endpoint, err := legacyUDPEndpoint(rawURLs[idx]); err == nil {
+	addLegacyUDP := func() {
+		if endpoint, err := legacyUDPEndpoint(rawURLs[selectedIndex]); err == nil {
 			add(endpoint)
 		}
+
+		for offset := 1; offset < len(rawURLs); offset++ {
+			idx := (selectedIndex + offset) % len(rawURLs)
+			if endpoint, err := legacyUDPEndpoint(rawURLs[idx]); err == nil {
+				add(endpoint)
+			}
+		}
 	}
 
-	for offset := 0; offset < len(rawURLs); offset++ {
-		idx := (selectedIndex + offset) % len(rawURLs)
-		endpoint, err := parseTURNEndpoint(rawURLs[idx])
-		if err != nil {
-			continue
+	addStreamCandidates := func(tlsFirst bool) {
+		if !tlsFirst {
+			for offset := 0; offset < len(rawURLs); offset++ {
+				idx := (selectedIndex + offset) % len(rawURLs)
+				endpoint, err := parseTURNEndpoint(rawURLs[idx])
+				if err != nil || endpoint.Transport == turnTransportUDP {
+					continue
+				}
+				add(endpoint)
+			}
+			return
 		}
-		if endpoint.Transport == turnTransportUDP {
-			continue
+
+		// A restricted allow-list is most likely to accept the TLS endpoint:
+		// it uses the real TURN hostname supplied by VK as outer SNI.
+		for _, transport := range []turnTransport{turnTransportTLS, turnTransportTCP} {
+			for offset := 0; offset < len(rawURLs); offset++ {
+				idx := (selectedIndex + offset) % len(rawURLs)
+				endpoint, err := parseTURNEndpoint(rawURLs[idx])
+				if err != nil || endpoint.Transport != transport {
+					continue
+				}
+				add(endpoint)
+			}
 		}
-		add(endpoint)
+
+		// The upstream vk-turn-proxy uses TCP to the selected TURN address even
+		// when VK marks that URL as transport=udp. Keep this compatibility path
+		// behind stream preference so the normal UDP-first mode is untouched.
+		for offset := 0; offset < len(rawURLs); offset++ {
+			idx := (selectedIndex + offset) % len(rawURLs)
+			if endpoint, err := legacyTCPEndpoint(rawURLs[idx]); err == nil {
+				add(endpoint)
+			}
+		}
+	}
+
+	if preferStream {
+		addStreamCandidates(true)
+		addLegacyUDP()
+	} else {
+		addLegacyUDP()
+		addStreamCandidates(false)
 	}
 
 	return result

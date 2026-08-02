@@ -70,6 +70,7 @@ private const val PROFILE_RESET_TIMEOUT_MS = 10_000L
 @OptIn(ExperimentalLayoutApi::class, ExperimentalFoundationApi::class)
 @Composable
 fun FloatingToolbar(
+    settingsStore: SettingsStore,
     activeProfile: Int,
     profileNames: List<String>,
     onActiveProfileChange: (Int) -> Unit,
@@ -92,10 +93,10 @@ fun FloatingToolbar(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    val settingsStore = remember { SettingsStore(context) }
     val trustedWifiEnabled by settingsStore.trustedWifiEnabled.collectAsStateWithLifecycle(initialValue = false)
     val trustedWifiSsids by settingsStore.trustedWifiSsids.collectAsStateWithLifecycle(initialValue = emptyList())
     val trustedWifiRuntime by com.wdtt.plus.TrustedWifiManager.state.collectAsStateWithLifecycle()
+    val pauseVpnDuringSleep by settingsStore.pauseVpnDuringSleep.collectAsStateWithLifecycle(initialValue = false)
     val customVkCredentialsEnabled by settingsStore.customVkCredentialsEnabled.collectAsStateWithLifecycle(initialValue = false)
     val customVkCredentialsComplete by settingsStore.customVkCredentialsComplete.collectAsStateWithLifecycle(initialValue = false)
     val savedToolbarYFraction by settingsStore.floatingToolbarYFraction.collectAsStateWithLifecycle(
@@ -384,6 +385,38 @@ fun FloatingToolbar(
                         Switch(
                             checked = trustedWifiEnabled,
                             onCheckedChange = null,
+                            modifier = Modifier.scale(0.85f)
+                        )
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 4.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f).padding(end = 10.dp)) {
+                            Text(
+                                "Экономия батареи во сне",
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.SemiBold,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                            Text(
+                                if (pauseVpnDuringSleep) {
+                                    "VPN выключается · интернет напрямую"
+                                } else {
+                                    "VPN остаётся активным"
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                lineHeight = 15.sp
+                            )
+                        }
+                        Switch(
+                            checked = pauseVpnDuringSleep,
+                            onCheckedChange = { enabled ->
+                                scope.launch { settingsStore.savePauseVpnDuringSleep(enabled) }
+                            },
                             modifier = Modifier.scale(0.85f)
                         )
                     }

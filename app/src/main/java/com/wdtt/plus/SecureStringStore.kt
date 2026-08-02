@@ -12,11 +12,6 @@ import javax.crypto.spec.GCMParameterSpec
 
 class SecureStringStore(context: Context) {
     private val appContext = context.applicationContext
-    private val decryptedCache = object : LinkedHashMap<String, String>(32, 0.75f, true) {
-        override fun removeEldestEntry(
-            eldest: MutableMap.MutableEntry<String, String>?
-        ): Boolean = size > 64
-    }
 
     companion object {
         private const val KEY_ALIAS = "wdtt.settings.secrets"
@@ -24,6 +19,11 @@ class SecureStringStore(context: Context) {
         private const val TRANSFORMATION = "AES/GCM/NoPadding"
         private const val GCM_TAG_BITS = 128
         private const val VERSION_PREFIX = "v1:"
+        private val decryptedCache = object : LinkedHashMap<String, String>(64, 0.75f, true) {
+            override fun removeEldestEntry(
+                eldest: MutableMap.MutableEntry<String, String>?
+            ): Boolean = size > 128
+        }
     }
 
     private val keyStore: KeyStore by lazy {

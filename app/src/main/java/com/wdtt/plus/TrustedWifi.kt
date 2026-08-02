@@ -127,10 +127,11 @@ internal fun decideTrustedWifiTransition(
 
 internal fun shouldKeepTunnelServiceAlive(
     tunnelRunning: Boolean,
+    tunnelStarting: Boolean,
     tunnelPaused: Boolean,
     trustedWifiWaiting: Boolean,
     trustedWifiResumeInProgress: Boolean
-): Boolean = tunnelRunning || tunnelPaused || trustedWifiWaiting || trustedWifiResumeInProgress
+): Boolean = tunnelRunning || tunnelStarting || tunnelPaused || trustedWifiWaiting || trustedWifiResumeInProgress
 
 fun sanitizeTrustedWifiSsid(value: String): String {
     val clean = value

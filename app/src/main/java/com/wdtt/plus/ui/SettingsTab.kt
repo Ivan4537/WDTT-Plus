@@ -11,6 +11,7 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
@@ -27,6 +28,7 @@ import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Key
+import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.PowerSettingsNew
 import androidx.compose.material.icons.filled.Refresh
@@ -54,6 +56,7 @@ import androidx.compose.ui.text.LinkAnnotation
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextLinkStyles
 import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.withLink
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -80,6 +83,7 @@ import com.wdtt.plus.AccessStartDecision
 import com.wdtt.plus.CaptchaWebViewManager
 import com.wdtt.plus.ConnectionIssueKind
 import com.wdtt.plus.DEFAULT_VK_CLIENT_IDS
+import com.wdtt.plus.DEFAULT_RT_TURN_SNI
 import com.wdtt.plus.ManlCaptchaWebViewManager
 import com.wdtt.plus.MainActivity
 import com.wdtt.plus.MANAGED_CONFIG_FIRST_START_EXTRA
@@ -90,6 +94,7 @@ import com.wdtt.plus.RemoteDocumentGateway
 import com.wdtt.plus.RemoteLaunchTarget
 import com.wdtt.plus.RemoteUiAction
 import com.wdtt.plus.RemoteUiActionLauncher
+import com.wdtt.plus.RT_MASQUE_CONFIG_FILE_NAME
 import com.wdtt.plus.SettingsStore
 import com.wdtt.plus.TunnelManager
 import com.wdtt.plus.TunnelService
@@ -98,6 +103,7 @@ import com.wdtt.plus.TunnelStopResult
 import com.wdtt.plus.TunnelTransition
 import com.wdtt.plus.TUNNEL_PROFILE_INDEX_EXTRA
 import com.wdtt.plus.normalizeTunnelWorkerCount
+import com.wdtt.plus.normalizeRtTurnSni
 import com.wdtt.plus.shouldUseManagedConfigFirstStart
 import com.wdtt.plus.TrustedWifiManager
 import com.wdtt.plus.VkJoinLink
@@ -107,6 +113,8 @@ import com.wdtt.plus.WdttDeepLinkApplyPlan
 import com.wdtt.plus.isValidVkClientId
 import com.wdtt.plus.isStandaloneUiIssue
 import com.wdtt.plus.accessLifecycleDismissalSignature
+import com.wdtt.plus.accessLifecycleCanDismiss
+import com.wdtt.plus.boundContinuationAvailable
 import com.wdtt.plus.fallbackTitle
 import com.wdtt.plus.vpnProfileDisplayName
 import kotlinx.coroutines.Dispatchers
@@ -126,6 +134,7 @@ import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import kotlin.math.roundToInt
+import java.io.File
 
 private const val WORKERS_PER_GROUP = 9
 private const val REMOTE_ACTION_REFRESH_MS = 10 * 60 * 1000L
@@ -150,7 +159,13 @@ internal fun resolveConnectionInputMethod(
     hasManualConnection: Boolean,
     userInterface: Boolean,
 ): String = when (savedMethod) {
-    "link", "manual" -> savedMethod
+    "link" -> when {
+        hasStoredLink -> "link"
+        hasManualConnection -> "manual"
+        userInterface -> "link"
+        else -> "manual"
+    }
+    "manual" -> "manual"
     else -> when {
         hasStoredLink -> "link"
         hasManualConnection -> "manual"
@@ -199,6 +214,20 @@ internal fun shouldShowTunnelRemoteActionCard(
     )
 }
 
+internal fun shouldShowManagedHashStatusCard(
+    continuationAvailable: Boolean,
+    lifecycle: AccessLifecycleUiState,
+): Boolean =
+    !continuationAvailable &&
+        lifecycle.managed &&
+        lifecycle.allowConnect &&
+        lifecycle.severity == AccessLifecycleSeverity.NORMAL &&
+        (
+            lifecycle.title.isNotBlank() ||
+                lifecycle.message.isNotBlank() ||
+                lifecycle.detailValue.isNotBlank()
+            )
+
 internal fun isSelectedCompactConnectionReady(
     selectedMethod: String,
     savedMethod: String,
@@ -207,14 +236,8 @@ internal fun isSelectedCompactConnectionReady(
     linkValid: Boolean,
     manualValid: Boolean,
 ): Boolean = when (selectedMethod) {
-    "link" -> when {
-        storedLinkMode && linkPresent -> linkValid
-        savedMethod == "link" -> manualValid
-        else -> false
-    }
-    "manual" -> !storedLinkMode &&
-        (savedMethod == "manual" || savedMethod.isBlank()) &&
-        manualValid
+    "link" -> storedLinkMode && linkPresent && linkValid
+    "manual" -> !storedLinkMode && manualValid
     else -> false
 }
 
@@ -272,7 +295,7 @@ fun SettingsTabContent(
     onOpenProjectSupport: () -> Unit,
 ) {
     val profileSnapshotState by
-        settingsStore.activeTunnelProfileUiSnapshot.collectAsStateWithLifecycle()
+        settingsStore.activeTunnelProfileContentUiSnapshot.collectAsStateWithLifecycle()
     val profileSnapshot = profileSnapshotState ?: return
     val savedConnectionPassword = profileSnapshot.connectionPassword
     val savedPeer = profileSnapshot.peer
@@ -296,83 +319,35 @@ fun SettingsTabContent(
     val customVkClientId = profileSnapshot.customVkClientId
     val customVkClientSecret = profileSnapshot.customVkClientSecret
     val vkCallsPreflight = profileSnapshot.vkCallsPreflight
+    val rtNetwork = profileSnapshot.rtNetwork
+    val rtMasque = profileSnapshot.rtMasque
+    val rtMasqueServerBootstrap = profileSnapshot.rtMasqueServerBootstrap
+    val rtMasqueServerAccess = profileSnapshot.rtMasqueServerAccessStatus
+    val effectiveRtMasqueServerBootstrap =
+        rtMasqueServerBootstrap && rtMasqueServerAccess.available
+    val savedRtTurnSni = profileSnapshot.rtTurnSni
     val remoteActionKey = profileSnapshot.remoteActionKey
     val remoteActionUrl = profileSnapshot.remoteActionUrl
     val remoteManagedProfile = profileSnapshot.remoteManaged
     val interfaceRole = if (remoteManagedProfile) "user" else profileSnapshot.interfaceRole
     val cachedRemoteAction = profileSnapshot.cachedRemoteAction
     val remoteCardDismissed = profileSnapshot.remoteCardDismissed
-    val accessLifecycle = profileSnapshot.accessLifecycle
-    val accessLifecycleDismissedSignature =
-        profileSnapshot.accessLifecycleDismissedSignature
     val profileMaxWorkers = profileSnapshot.profileMaxWorkers
-    val refreshingProfiles by
-        AccessLifecycleCoordinator.refreshingProfiles.collectAsStateWithLifecycle()
-    val accessRefreshing = activeProfile in refreshingProfiles
-    var accessActionBusy by remember(activeProfile) { mutableStateOf(false) }
-    var accessManualRefreshBusy by remember(activeProfile) { mutableStateOf(false) }
-    var accessLifecycleDismissCountdown by remember(activeProfile) { mutableIntStateOf(0) }
-    val initialActionCatalog = remember { RemoteActionCatalogGateway.cached() }
-    var actionCatalog by remember { mutableStateOf(initialActionCatalog) }
-    var actionCatalogResolved by remember {
-        mutableStateOf(RemoteActionCatalogGateway.hasFreshCache())
+
+    LaunchedEffect(
+        activeProfile,
+        rtMasqueServerBootstrap,
+        rtMasqueServerAccess.available,
+    ) {
+        if (rtMasqueServerBootstrap && !rtMasqueServerAccess.available) {
+            settingsStore.saveRtMasqueServerBootstrap(false)
+        }
     }
-    var remoteCardDismissCountdown by remember(activeProfile) { mutableIntStateOf(0) }
-    val lifecycleOwner = LocalLifecycleOwner.current
 
     val compactTunnelInterface = usesCompactTunnelInterface(interfaceRole)
-    val remoteActionAudience =
-        compactTunnelInterface ||
-            interfaceRole == "admin" ||
-            BuildConfig.REMOTE_ACTION_PREVIEW
-    val remoteActionFetchAllowed = remoteActionAudience
-
-    LaunchedEffect(remoteActionFetchAllowed, lifecycleOwner) {
-        if (!remoteActionFetchAllowed) {
-            actionCatalog = com.wdtt.plus.RemoteActionCatalog.Empty
-            actionCatalogResolved = true
-            return@LaunchedEffect
-        }
-        if (RemoteActionCatalogGateway.hasFreshCache()) {
-            actionCatalog = RemoteActionCatalogGateway.cached()
-            actionCatalogResolved = true
-        } else {
-            actionCatalogResolved = false
-        }
-        lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
-            while (isActive) {
-                actionCatalog = RemoteActionCatalogGateway.fetch(force = true)
-                actionCatalogResolved = true
-                delay(REMOTE_ACTION_REFRESH_MS)
-            }
-        }
-    }
-
-    LaunchedEffect(activeProfile, remoteCardDismissCountdown > 0) {
-        if (remoteCardDismissCountdown <= 0) return@LaunchedEffect
-        while (remoteCardDismissCountdown > 0) {
-            delay(1_000)
-            remoteCardDismissCountdown--
-        }
-    }
-
-    LaunchedEffect(activeProfile, accessLifecycleDismissCountdown > 0) {
-        if (accessLifecycleDismissCountdown <= 0) return@LaunchedEffect
-        while (accessLifecycleDismissCountdown > 0) {
-            delay(1_000)
-            accessLifecycleDismissCountdown--
-        }
-    }
-
-    LaunchedEffect(activeProfile, accessLifecycle.managed) {
-        if (accessLifecycle.managed) {
-            AccessLifecycleCoordinator.refreshProfile(context, activeProfile, force = false)
-        } else {
-            TunnelManager.clearConnectionIssue(ConnectionIssueKind.ACCESS)
-        }
-    }
 
     val tunnelRunning by TunnelManager.running.collectAsStateWithLifecycle()
+    val warpResetBlockedMessage = "Для сброса отключите VPN"
     val tunnelTransition by TunnelManager.transition.collectAsStateWithLifecycle()
     val trustedWifiState by TrustedWifiManager.state.collectAsStateWithLifecycle()
     val trustedWifiWaiting = trustedWifiState.waiting
@@ -382,42 +357,81 @@ fun SettingsTabContent(
 
     val cooldownActive by TunnelManager.cooldownActive.collectAsStateWithLifecycle()
 
-    val loadedHashSlots = remember(profileSnapshot) { parseVkHashSlots(savedVkHashesState) }
-    var peerInput by remember(profileSnapshot) { mutableStateOf(savedPeer) }
-    var vkHash1 by remember(profileSnapshot) { mutableStateOf(loadedHashSlots.getOrElse(0) { "" }) }
-    var vkHash2 by remember(profileSnapshot) { mutableStateOf(loadedHashSlots.getOrElse(1) { "" }) }
-    var vkHash3 by remember(profileSnapshot) { mutableStateOf(loadedHashSlots.getOrElse(2) { "" }) }
-    var vkHash4 by remember(profileSnapshot) { mutableStateOf(loadedHashSlots.getOrElse(3) { "" }) }
-    val loadedWorkers = remember(profileSnapshot) {
+    val loadedHashSlots = remember(activeProfile, savedVkHashesState) {
+        parseVkHashSlots(savedVkHashesState)
+    }
+    var peerInput by remember(activeProfile, savedPeer) { mutableStateOf(savedPeer) }
+    var vkHash1 by remember(activeProfile, savedVkHashesState) {
+        mutableStateOf(loadedHashSlots.getOrElse(0) { "" })
+    }
+    var vkHash2 by remember(activeProfile, savedVkHashesState) {
+        mutableStateOf(loadedHashSlots.getOrElse(1) { "" })
+    }
+    var vkHash3 by remember(activeProfile, savedVkHashesState) {
+        mutableStateOf(loadedHashSlots.getOrElse(2) { "" })
+    }
+    var vkHash4 by remember(activeProfile, savedVkHashesState) {
+        mutableStateOf(loadedHashSlots.getOrElse(3) { "" })
+    }
+    val loadedWorkers = remember(
+        activeProfile,
+        savedWorkers,
+        savedVkHashesState,
+        profileMaxWorkers,
+    ) {
         val normalized = normalizeTunnelWorkerCount(savedWorkers, profileMaxWorkers)
         roundToGroup(
             normalized.toFloat(),
             maxWorkersForHashSlots(loadedHashSlots, profileMaxWorkers)
         )
     }
-    var workersInput by remember(profileSnapshot) { mutableFloatStateOf(loadedWorkers) }
+    var workersInput by remember(activeProfile, loadedWorkers) {
+        mutableFloatStateOf(loadedWorkers)
+    }
     var showHashesDialog by rememberSaveable { mutableStateOf(false) }
-    var autoCaptchaEnabled by remember(profileSnapshot) {
+    var profileRemoteAction by remember(activeProfile) {
+        mutableStateOf(RemoteActionCatalogGateway.cached().at("profile"))
+    }
+    LaunchedEffect(showHashesDialog, activeProfile) {
+        if (showHashesDialog) {
+            profileRemoteAction = RemoteActionCatalogGateway.fetch().at("profile")
+        }
+    }
+    var autoCaptchaEnabled by remember(activeProfile, savedCaptchaMode, savedCaptchaMethod) {
         mutableStateOf(savedCaptchaMode != "wv" || savedCaptchaMethod != "manual")
     }
-    var manualPortsEnabled by remember(profileSnapshot) { mutableStateOf(savedManualPortsEnabled) }
+    var manualPortsEnabled by remember(activeProfile, savedManualPortsEnabled) {
+        mutableStateOf(savedManualPortsEnabled)
+    }
     var showPowerHelp by rememberSaveable { mutableStateOf(false) }
     var showVkCallsHelp by rememberSaveable { mutableStateOf(false) }
     var showAutoCaptchaHelp by rememberSaveable { mutableStateOf(false) }
-    var serverDtlsPortInput by remember(profileSnapshot) { mutableStateOf(savedServerDtlsPort.toString()) }
-    var serverWgPortInput by remember(profileSnapshot) { mutableStateOf(savedServerWgPort.toString()) }
+    var showRtNetworkSettings by rememberSaveable { mutableStateOf(false) }
+    var showRtNetworkHelp by rememberSaveable { mutableStateOf(false) }
+    var showRtMasqueHelp by rememberSaveable { mutableStateOf(false) }
+    var showRtMasqueServerBootstrapHelp by rememberSaveable { mutableStateOf(false) }
+    var showRtMasqueConsent by rememberSaveable { mutableStateOf(false) }
+    var showRtMasqueResetConfirm by rememberSaveable { mutableStateOf(false) }
+    var serverDtlsPortInput by remember(activeProfile, savedServerDtlsPort) {
+        mutableStateOf(savedServerDtlsPort.toString())
+    }
+    var serverWgPortInput by remember(activeProfile, savedServerWgPort) {
+        mutableStateOf(savedServerWgPort.toString())
+    }
     var userConnectionEditor by remember(activeProfile) { mutableStateOf("") }
     var userLinkInput by remember(activeProfile) { mutableStateOf("") }
-    val storedLinkSelected = remember(profileSnapshot) {
+    val storedLinkSelected = remember(activeProfile, savedConnectionInputMethod, wdttLinkMode) {
         wdttLinkMode && WdttDeepLink.parse(wdttLink, allowMissingHashes = true) != null
     }
-    val importedLinkStoredAsManualFields = remember(profileSnapshot) {
-        savedConnectionInputMethod == "link" &&
-            !wdttLinkMode &&
-            savedPeer.isNotBlank() &&
-            savedConnectionPassword.isNotBlank()
-    }
-    var userConnectionMethod by remember(profileSnapshot) {
+    var userConnectionMethod by remember(
+        activeProfile,
+        savedConnectionInputMethod,
+        wdttLinkMode,
+        wdttLink,
+        savedPeer,
+        savedConnectionPassword,
+        interfaceRole,
+    ) {
         mutableStateOf(
             resolveConnectionInputMethod(
                 savedMethod = savedConnectionInputMethod,
@@ -446,8 +460,13 @@ fun SettingsTabContent(
     val dynamicMaxWorkers = remember(filledHashCount, profileMaxWorkers) {
         maxWorkersForHashCount(filledHashCount, profileMaxWorkers)
     }
-    var portInput by remember(profileSnapshot) { mutableStateOf(savedListenPort.toString()) }
-    var sniInput by remember(profileSnapshot) { mutableStateOf(savedSni) }
+    var portInput by remember(activeProfile, savedListenPort) {
+        mutableStateOf(savedListenPort.toString())
+    }
+    var sniInput by remember(activeProfile, savedSni) { mutableStateOf(savedSni) }
+    var rtTurnSniInput by remember(activeProfile, savedRtTurnSni) {
+        mutableStateOf(savedRtTurnSni)
+    }
 
     val currentWorkers = workersInput.coerceIn(WORKERS_PER_GROUP.toFloat(), dynamicMaxWorkers)
 
@@ -534,7 +553,8 @@ fun SettingsTabContent(
         linkValid = isLinkValid,
         manualValid = isManualValid,
     )
-    val isValid = selectedCompactMethodValid
+    val rtSniValid = !rtNetwork || normalizeRtTurnSni(rtTurnSniInput) != null
+    val isValid = selectedCompactMethodValid && rtSniValid
     val hasConnectionSource = hasTunnelConnectionSource(
         linkMode = wdttLinkMode,
         linkValid = linkConnectionPresent,
@@ -584,6 +604,10 @@ fun SettingsTabContent(
             putExtra("sni", sniInput)
             putExtra("connection_password", finalPassword)
             putExtra("vkcalls_preflight", vkCallsPreflight)
+            putExtra("rt_network", rtNetwork)
+            putExtra("rt_masque", rtMasque)
+            putExtra("rt_masque_server_bootstrap", effectiveRtMasqueServerBootstrap)
+            putExtra("rt_turn_sni", rtTurnSniInput)
             putExtra("captcha_mode", effectiveCaptchaMode)
             putExtra("captcha_solve_method", effectiveCaptchaSolveMethod)
             putExtra("fingerprint", activeFingerprint)
@@ -657,7 +681,7 @@ fun SettingsTabContent(
             } catch (error: Exception) {
                 TunnelManager.clearTransition()
                 TunnelManager.reportConnectionIssue(
-                    if (accessLifecycle.managed) {
+                    if (remoteManagedProfile) {
                         "Не удалось проверить доступ"
                     } else {
                         "Не удалось начать подключение"
@@ -760,6 +784,9 @@ fun SettingsTabContent(
         }
         if (WdttDeepLink.parse(cleanLink, allowMissingHashes = true) == null) return
         scope.launch {
+            val managedAccess = withContext(Dispatchers.IO) {
+                settingsStore.accessLifecycleForProfile(activeProfile).managed
+            }
             val result = settingsStore.applyWdttDeepLink(
                 plan = WdttDeepLinkApplyPlan(
                     link = cleanLink,
@@ -767,7 +794,7 @@ fun SettingsTabContent(
                     requiresConfirmation = hasConnectionSource,
                     storeAsLink = false
                 ),
-                resetRemoteContinuation = true,
+                resetRemoteContinuation = !managedAccess,
                 remoteManaged = false
             )
             if (result == null) {
@@ -803,7 +830,6 @@ fun SettingsTabContent(
             },
             onSave = ::saveUserWdttLink,
             allowMissingHashes = true,
-            importedLinkStoredAsManualFields = importedLinkStoredAsManualFields,
             remoteUpdateOnly = userConnectionEditor == "remote-update" || remoteManagedProfile,
             cachedAction = cachedRemoteAction,
             onCachedAction = {
@@ -918,9 +944,16 @@ fun SettingsTabContent(
     }
 
     if (showHashesDialog) {
+        val activeAccessSnapshot by
+            settingsStore.activeTunnelAccessUiSnapshot.collectAsStateWithLifecycle()
+        val accessLifecycle = activeAccessSnapshot
+            ?.takeIf { it.profileIndex == activeProfile }
+            ?.lifecycle
+            ?: AccessLifecycleUiState.Unmanaged
         val hashCheckCaptchaMode = if (autoCaptchaEnabled) "auto" else "wv"
         HashesDialog(
             settingsStore = settingsStore,
+            profileIndex = activeProfile,
             hash1 = vkHash1,
             hash2 = vkHash2,
             hash3 = vkHash3,
@@ -931,11 +964,17 @@ fun SettingsTabContent(
             customVkClientId = customVkClientId,
             customVkClientSecret = customVkClientSecret,
             remoteContinuation = RemoteContinuation(
-                available = remoteActionKey.isNotBlank() && remoteActionUrl.isNotBlank(),
+                available = boundContinuationAvailable(
+                    hasCredential = remoteActionKey.isNotBlank(),
+                    hasEndpoint = remoteActionUrl.isNotBlank(),
+                    remoteAvailability = accessLifecycle.continuationAvailable,
+                    expiresAtSeconds = accessLifecycle.continuationExpiresAtSeconds,
+                ),
                 key = remoteActionKey,
                 url = remoteActionUrl
             ),
-            remoteAction = actionCatalog.at("profile"),
+            remoteAccessLifecycle = accessLifecycle,
+            remoteAction = profileRemoteAction,
             vkCallsPreflight = vkCallsPreflight,
             captchaMode = hashCheckCaptchaMode,
             selectedWebViewManual = !autoCaptchaEnabled,
@@ -977,52 +1016,14 @@ fun SettingsTabContent(
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         Column {
-            val tunnelAction = actionCatalog.at("tunnel")
-            if (shouldShowTunnelRemoteActionCard(
-                    interfaceRole = interfaceRole,
-                    preview = BuildConfig.REMOTE_ACTION_PREVIEW,
-                    hasConnectionSource = hasConnectionSource,
-                    dismissed = remoteCardDismissed,
-                    dismissCountdown = remoteCardDismissCountdown,
-                    actionResolved = actionCatalogResolved,
-                    actionAvailable = tunnelAction != null,
-                )
-            ) {
-                Column {
-                    if (remoteCardDismissCountdown > 0) {
-                        DismissedNoticeCard(
-                            title = "Предложение скрыто",
-                            message = "Ссылку всегда можно найти в «Инфо» → «Поддержать проект».",
-                            countdown = remoteCardDismissCountdown,
-                            onProjectSupportClick = onOpenProjectSupport,
-                        )
-                    } else if (tunnelAction != null) {
-                        RemoteActionCard(
-                            action = tunnelAction,
-                            onLinkClick = onOpenProjectSupport,
-                            onClick = {
-                                scope.launch {
-                                    val opened = RemoteUiActionLauncher.open(context, tunnelAction)
-                                    if (!opened) {
-                                        Toast.makeText(
-                                            context,
-                                            "Не удалось открыть страницу. Проверьте браузер.",
-                                            Toast.LENGTH_LONG
-                                        ).show()
-                                    }
-                                }
-                            },
-                            onDismiss = {
-                                remoteCardDismissCountdown = 5
-                                scope.launch {
-                                    settingsStore.saveRemoteCardDismissed(activeProfile, true)
-                                }
-                            }
-                        )
-                    }
-                    Spacer(Modifier.height(12.dp))
-                }
-            }
+            TunnelRemoteActionSection(
+                settingsStore = settingsStore,
+                activeProfile = activeProfile,
+                interfaceRole = interfaceRole,
+                hasConnectionSource = hasConnectionSource,
+                dismissed = remoteCardDismissed,
+                onOpenProjectSupport = onOpenProjectSupport,
+            )
 
             Text(
                 "Настройки туннеля (${vpnProfileDisplayName(activeProfile, profileNames)})",
@@ -1031,139 +1032,12 @@ fun SettingsTabContent(
                 modifier = Modifier.padding(bottom = 12.dp)
             )
 
-            val accessDismissible =
-                accessLifecycle.allowConnect &&
-                    accessLifecycle.severity == AccessLifecycleSeverity.WARNING
-            val accessDismissSignature = accessLifecycleDismissalSignature(accessLifecycle)
-            val accessDismissed =
-                accessDismissible &&
-                    accessDismissSignature.isNotBlank() &&
-                    accessDismissSignature == accessLifecycleDismissedSignature
-            val routeUpdateAvailable = remoteManagedProfile
-            val accessCardDismissed =
-                accessDismissible &&
-                    accessDismissed &&
-                    accessLifecycleDismissCountdown <= 0 &&
-                    !routeUpdateAvailable
-            if (
-                accessLifecycle.managed &&
-                    !accessCardDismissed
-            ) {
-                if (accessLifecycleDismissCountdown > 0 && !routeUpdateAvailable) {
-                    DismissedNoticeCard(
-                        title = "Напоминание скрыто",
-                        message = "Действие для профиля остаётся доступно после следующей проверки.",
-                        countdown = accessLifecycleDismissCountdown,
-                    )
-                } else {
-                    AccessLifecycleCard(
-                        lifecycle = accessLifecycle,
-                        refreshing = accessRefreshing || accessManualRefreshBusy,
-                        actionBusy = accessActionBusy,
-                        onRouteUpdate = if (routeUpdateAvailable) {
-                            ::openRemoteUpdateEditor
-                        } else {
-                            null
-                        },
-                        onDismiss = if (accessDismissible) {
-                            {
-                                accessLifecycleDismissCountdown = 5
-                                scope.launch {
-                                    settingsStore.saveAccessLifecycleDismissedSignature(
-                                        activeProfile,
-                                        accessDismissSignature,
-                                    )
-                                }
-                            }
-                        } else {
-                            null
-                        },
-                        onRefresh = {
-                            if (accessManualRefreshBusy) return@AccessLifecycleCard
-                            accessManualRefreshBusy = true
-                            scope.launch {
-                                val startedAt = System.currentTimeMillis()
-                                try {
-                                    when (
-                                        val result = AccessLifecycleCoordinator.refreshProfile(
-                                            context,
-                                            activeProfile,
-                                            force = true,
-                                        )
-                                    ) {
-                                        is AccessLifecycleRefreshResult.Success -> Toast.makeText(
-                                            context,
-                                            "Данные обновлены",
-                                            Toast.LENGTH_SHORT,
-                                        ).show()
-                                        is AccessLifecycleRefreshResult.Cached -> Toast.makeText(
-                                            context,
-                                            "Данные уже актуальны",
-                                            Toast.LENGTH_SHORT,
-                                        ).show()
-                                        is AccessLifecycleRefreshResult.Throttled -> Toast.makeText(
-                                            context,
-                                            "Проверено недавно. Повторите через несколько секунд",
-                                            Toast.LENGTH_SHORT,
-                                        ).show()
-                                        is AccessLifecycleRefreshResult.Failed -> Toast.makeText(
-                                            context,
-                                            result.message,
-                                            Toast.LENGTH_LONG,
-                                        ).show()
-                                        AccessLifecycleRefreshResult.Unmanaged -> Toast.makeText(
-                                            context,
-                                            "Проверка недоступна",
-                                            Toast.LENGTH_SHORT,
-                                        ).show()
-                                    }
-                                } finally {
-                                    val visibleFor = System.currentTimeMillis() - startedAt
-                                    if (visibleFor < 450) delay(450 - visibleFor)
-                                    accessManualRefreshBusy = false
-                                }
-                            }
-                        },
-                        onAction = {
-                            if (accessActionBusy) return@AccessLifecycleCard
-                            accessActionBusy = true
-                            scope.launch {
-                                runCatching {
-                                    AccessLifecycleCoordinator.beginAction(
-                                        context,
-                                        activeProfile,
-                                    )
-                                }.onSuccess { target ->
-                                    runCatching {
-                                        launchRemoteTarget(context, target)
-                                    }.onFailure { error ->
-                                        if (error is CancellationException) throw error
-                                        Toast.makeText(
-                                            context,
-                                            error.message ?: "Не удалось открыть страницу.",
-                                            Toast.LENGTH_LONG,
-                                        ).show()
-                                    }
-                                }.onFailure { error ->
-                                    if (error is CancellationException) throw error
-                                    TunnelManager.noteAccessLifecycleEvent(
-                                        key = "action_unavailable_$activeProfile",
-                                        message = error.message ?: "Действие сейчас недоступно",
-                                        warning = true,
-                                    )
-                                    Toast.makeText(
-                                        context,
-                                        error.message ?: "Действие сейчас недоступно.",
-                                        Toast.LENGTH_LONG,
-                                    ).show()
-                                }
-                                accessActionBusy = false
-                            }
-                        }
-                    )
-                }
-                Spacer(Modifier.height(12.dp))
-            }
+            ManagedAccessLifecycleSection(
+                settingsStore = settingsStore,
+                activeProfile = activeProfile,
+                routeUpdateAvailable = remoteManagedProfile,
+                onRouteUpdate = ::openRemoteUpdateEditor,
+            )
 
             if (!remoteManagedProfile) {
                 CompactTunnelProfileCard(
@@ -1178,17 +1052,17 @@ fun SettingsTabContent(
                     onAddLinkClick = ::openUserLinkEditor,
                     onManualClick = ::openUserManualEditor,
                 )
-                Spacer(Modifier.height(12.dp))
+                Spacer(Modifier.height(8.dp))
             }
             AppSectionCard(
-                contentPadding = PaddingValues(16.dp),
+                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 10.dp),
                 verticalArrangement = Arrangement.spacedBy(0.dp)
             ) {
                 OutlinedButton(
                     onClick = ::openHashesSettings,
                     modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
                     shape = RoundedCornerShape(16.dp),
-                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp)
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
                 ) {
                     Icon(Icons.Default.Tag, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(6.dp))
@@ -1257,11 +1131,11 @@ fun SettingsTabContent(
                 }
             }
 
-            Spacer(Modifier.height(12.dp))
+            Spacer(Modifier.height(8.dp))
 
             // ═══ Мощность + Капча ═══
                 AppSectionCard(
-                    contentPadding = PaddingValues(16.dp),
+                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
                     verticalArrangement = Arrangement.spacedBy(0.dp)
                 ) {
                     // — Мощность —
@@ -1299,7 +1173,7 @@ fun SettingsTabContent(
                         )
                     }
 
-                    Spacer(Modifier.height(4.dp))
+                    Spacer(Modifier.height(2.dp))
 
                     val maxWorkers = dynamicMaxWorkers
                     val minWorkers = WORKERS_PER_GROUP.toFloat()
@@ -1332,13 +1206,13 @@ fun SettingsTabContent(
 
                     // — Разделитель —
                     HorizontalDivider(
-                        modifier = Modifier.padding(vertical = 4.dp),
+                        modifier = Modifier.padding(vertical = 2.dp),
                         color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
                     )
 
                     // — VKCalls preflight —
                     Row(
-                        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
@@ -1374,13 +1248,13 @@ fun SettingsTabContent(
                     }
 
                     HorizontalDivider(
-                        modifier = Modifier.padding(vertical = 4.dp),
+                        modifier = Modifier.padding(vertical = 2.dp),
                         color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
                     )
 
                     // — Режим капчи —
                     Row(
-                        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
@@ -1417,6 +1291,59 @@ fun SettingsTabContent(
                                 scope.launch {
                                     settingsStore.saveCaptchaPreference(enabled)
                                 }
+                            }
+                        )
+                    }
+
+                    HorizontalDivider(
+                        modifier = Modifier.padding(vertical = 2.dp),
+                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
+                    )
+
+                    // — Ограниченная мобильная сеть Ростелекома —
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(
+                            modifier = Modifier.weight(1f),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Text(
+                                "Сеть РТ",
+                                modifier = Modifier
+                                    .clickable { showRtNetworkSettings = true }
+                                    .padding(vertical = 10.dp),
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.Medium
+                            )
+                            IconButton(
+                                onClick = { showRtNetworkHelp = true },
+                                modifier = Modifier.size(28.dp),
+                            ) {
+                                Icon(
+                                    Icons.AutoMirrored.Filled.HelpOutline,
+                                    contentDescription = "Как работает Сеть РТ",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.size(18.dp),
+                                )
+                            }
+                        }
+                        Switch(
+                            checked = rtNetwork,
+                            enabled = !tunnelRunning,
+                            onCheckedChange = { enabled ->
+                                saveJob?.cancel()
+                                val nextSni = if (enabled) {
+                                    normalizeRtTurnSni(rtTurnSniInput) ?: DEFAULT_RT_TURN_SNI
+                                } else {
+                                    rtTurnSniInput.trim()
+                                }
+                                rtTurnSniInput = nextSni
+                                scope.launch { settingsStore.saveRtNetwork(enabled, nextSni) }
+                                if (enabled) showRtNetworkSettings = true
                             }
                         )
                     }
@@ -1570,6 +1497,40 @@ fun SettingsTabContent(
         }
     }
 
+    if (showRtNetworkSettings) {
+        RtNetworkSettingsDialog(
+            rtNetwork = rtNetwork,
+            turnSni = rtTurnSniInput,
+            turnSniValid = normalizeRtTurnSni(rtTurnSniInput) != null,
+            rtMasque = rtMasque,
+            rtMasqueServerBootstrap = effectiveRtMasqueServerBootstrap,
+            serverAccess = rtMasqueServerAccess,
+            tunnelRunning = tunnelRunning,
+            onTurnSniChange = { value ->
+                val nextSni = value.filterNot(Char::isWhitespace).take(253)
+                rtTurnSniInput = nextSni
+                saveJob?.cancel()
+                saveJob = scope.launch {
+                    delay(300)
+                    settingsStore.saveRtNetwork(enabled = true, turnSni = nextSni)
+                }
+            },
+            onRtMasqueChange = { enabled ->
+                if (enabled) {
+                    showRtMasqueConsent = true
+                } else {
+                    scope.launch { settingsStore.saveRtMasque(false) }
+                }
+            },
+            onServerBootstrapChange = { enabled ->
+                scope.launch { settingsStore.saveRtMasqueServerBootstrap(enabled) }
+            },
+            onShowRtHelp = { showRtNetworkHelp = true },
+            onShowMasqueHelp = { showRtMasqueHelp = true },
+            onShowServerHelp = { showRtMasqueServerBootstrapHelp = true },
+            onDismiss = { showRtNetworkSettings = false },
+        )
+    }
     if (showPowerHelp) {
         PowerHelpDialog(
             minWorkers = WORKERS_PER_GROUP,
@@ -1601,6 +1562,407 @@ fun SettingsTabContent(
             onDismiss = { showAutoCaptchaHelp = false }
         )
     }
+    if (showRtNetworkHelp) {
+        SettingsHelpDialog(
+            title = "Сеть РТ",
+            paragraphs = listOf(
+                "Режим предназначен для мобильной сети Ростелекома с белыми списками: разрешённые сайты открываются, но обычный WDTT Plus не подключается. В сети РТ без таких ограничений, у других операторов и по обычному Wi‑Fi он, как правило, не нужен.",
+                "При включении порядок меняется только для этого профиля: TURN/TLS с указанным SNI → TURN/TCP ко всем адресам, полученным от VK, с разделением первого STUN-запроса → MASQUE HTTP/2 и HTTP/3, если он включён → TURN/UDP как последний резерв. При выключенном режиме сохраняется обычный порядок с приоритетом UDP.",
+                "SNI по умолчанию — ya.ru; его можно заменить доступным доменом из белого списка. Это только имя во внешнем TLS-рукопожатии TURN/TLS и MASQUE: трафик не становится трафиком этого сайта, а TURN/TCP и TURN/UDP вообще не содержат SNI.",
+                "Для TURN/TLS приложение продолжает проверять публичную цепочку сертификата, но при подмене SNI не сопоставляет имя сертификата с доменом белого списка. MASQUE проверяет конечную точку по публичному ключу из регистрации WARP. Пароль подключения и шифрование WRAP не меняются.",
+                "Оператор может одновременно учитывать SNI, IP, порт и протокол, поэтому один SNI не гарантирует результат. TURN/TLS/TCP и MASQUE используют разные адреса и механизмы: рабочий вариант определяется только проверкой в конкретном регионе и тарифе.",
+                "TLS и TCP обычно дают большую задержку и хуже переносят потери, а MASQUE дополнительно расходует батарею и трафик. Если обычный режим работает, оставьте «Сеть РТ» выключенной.",
+                "После заблокированной UDP-попытки сеть иногда несколько минут плохо пропускает DNS или другой трафик. Перед повторной проверкой остановите VPN, дождитесь восстановления сайтов или переподключите мобильную сеть, затем запускайте режим заново."
+            ),
+            highlightedParagraphIndices = setOf(6),
+            onDismiss = { showRtNetworkHelp = false }
+        )
+    }
+    if (showRtMasqueHelp) {
+        SettingsHelpDialog(
+            title = "MASQUE в сети РТ",
+            paragraphs = listOf(
+                "Экспериментальный резерв только внутри «Сети РТ». После прямых TURN/TLS и TURN/TCP приложение пробует WARP CONNECT-IP с SNI из поля настроек; TURN/UDP остаётся последним аварийным путём.",
+                "Сначала проверяется HTTP/2 по TCP/443, затем HTTP/3 по QUIC/443. Успешный вариант совместно используется воркерами до остановки VPN; при новом запуске проверка выполняется заново, потому что доступность путей могла измениться.",
+                "Для первого запуска приложение регистрирует отдельное устройство Cloudflare WARP. Корректная регистрация хранится только в приватном каталоге WDTT Plus и повторно используется после перезапуска приложения и выключения рубильников — заново создавать её при каждом подключении не требуется.",
+                "Регистрация сначала выполняется через системную сеть и DNS Android с проверкой сертификата Cloudflare. Если прямой TLS не проходит до отправки данных и включён «Через сервер», последняя попытка регистрации идёт по SSH через сервер активного профиля. Обычный MASQUE-трафик через этот сервер не направляется.",
+                "Cloudflare обрабатывает внешний туннель и может видеть служебные метаданные и адреса назначения. Конечная точка MASQUE проверяется по публичному ключу сохранённой регистрации WARP, а шифрование WRAP между приложением и вашим WDTT-сервером сохраняется.",
+                "Режим может увеличить первый запуск, задержку, расход батареи и трафика и не гарантирует обход блокировки IP, TCP/443 или QUIC/443. Он активен только при одновременно включённых «Сеть РТ» и MASQUE; остальные режимы не меняются.",
+                "Сбрасывайте регистрацию WARP только при сообщении о повреждённых или отклонённых данных. Сброс удаляет локальные ключи, и следующему запуску снова понадобится регистрация; обычную сетевую блокировку это не исправляет."
+            ),
+            onDismiss = { showRtMasqueHelp = false },
+            secondaryActionLabel = "Сбросить регистрацию WARP",
+            secondaryActionEnabled = !tunnelRunning,
+            onSecondaryActionDisabled = {
+                Toast.makeText(context, warpResetBlockedMessage, Toast.LENGTH_LONG).show()
+            },
+            onSecondaryAction = {
+                if (tunnelRunning) {
+                    Toast.makeText(context, warpResetBlockedMessage, Toast.LENGTH_LONG).show()
+                } else {
+                    showRtMasqueHelp = false
+                    showRtMasqueResetConfirm = true
+                }
+            },
+        )
+    }
+    if (showRtMasqueServerBootstrapHelp) {
+        SettingsHelpDialog(
+            title = "Регистрация через сервер",
+            paragraphs = listOf(
+                "Помогает выполнить первоначальную регистрацию WARP, если Android не может напрямую установить TLS-соединение с API Cloudflare. Режим работает лишь вместе с «Сеть РТ» и MASQUE; обычный трафик WDTT, TURN и последующие соединения MASQUE через сервер не проходят.",
+                "Рубильник доступен, если в активном профиле раздела «Деплой» указан адрес сервера и выбран рабочий вход по SSH: пароль либо корректный приватный ключ. Если данных не хватает, рядом с выключенным рубильником указана точная причина.",
+                "Вероятнее всего, нужен иностранный сервер за пределами РФ — российский сервер может встретить те же ограничения доступа к Cloudflare.",
+                "SSH-сервер должен быть доступен из текущей сети и разрешать TCP-переадресацию.",
+                "На сервер ничего не устанавливается. WDTT Plus временно использует стандартную SSH-переадресацию только для HTTPS-запросов регистрации; сертификат Cloudflare проверяется сквозным TLS. Cloudflare видит IP сервера, а владелец сервера — факт соединения и объём, но не содержимое HTTPS.",
+                "Сначала приложение всё равно пробует прямые безопасные HTTPS-пути. К SSH оно переходит только при сбое до отправки регистрационных данных, поэтому запрос не дублируется небезопасным образом. Ошибка SSH записывается в журнал, а незавершённая регистрация не сохраняется.",
+                "После успешной регистрации SSH-выход закрывается, а данные WARP сохраняются в приватном хранилище. Пока сохранённая регистрация корректна, приложение не создаёт новую и рубильник фактически не используется — даже после перезапуска или временного выключения «Сети РТ» и MASQUE."
+            ),
+            highlightedParagraphIndices = setOf(2),
+            onDismiss = { showRtMasqueServerBootstrapHelp = false },
+        )
+    }
+    if (showRtMasqueConsent) {
+        val linkColor = MaterialTheme.colorScheme.primary
+        val cloudflareTerms = buildAnnotatedString {
+            append("Включая механизм, вы соглашаетесь с ")
+            withLink(
+                LinkAnnotation.Url(
+                    url = "https://www.cloudflare.com/application/terms/",
+                    styles = TextLinkStyles(
+                        style = SpanStyle(
+                            color = linkColor,
+                            fontWeight = FontWeight.SemiBold,
+                            textDecoration = TextDecoration.Underline,
+                        ),
+                    ),
+                ),
+            ) {
+                append("условиями Cloudflare")
+            }
+            append(" и разрешаете WDTT Plus зарегистрировать отдельное устройство WARP.")
+        }
+        AlertDialog(
+            onDismissRequest = { showRtMasqueConsent = false },
+            title = { Text("Включить MASQUE?") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text("Это внешний экспериментальный транспорт. Cloudflare будет обрабатывать туннель и сможет видеть метаданные подключений. При первом запуске VPN приложение в фоне зарегистрирует отдельное устройство WARP; для этого может потребоваться обычный интернет.")
+                    Text(cloudflareTerms)
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showRtMasqueConsent = false
+                        scope.launch { settingsStore.saveRtMasque(true) }
+                    },
+                ) { Text("Согласен, включить") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showRtMasqueConsent = false }) {
+                    Text("Отмена")
+                }
+            },
+        )
+    }
+    if (showRtMasqueResetConfirm) {
+        AlertDialog(
+            onDismissRequest = { showRtMasqueResetConfirm = false },
+            title = { Text("Сбросить регистрацию WARP?") },
+            text = {
+                Text(
+                    "Будут удалены только локальные ключи и токен WARP. При следующем запуске VPN с включённым MASQUE приложение зарегистрирует новое устройство. Используйте это при сообщении о повреждённой или отклонённой конфигурации; обычную блокировку HTTP/2 или HTTP/3 такой сброс не исправляет."
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        if (TunnelManager.running.value) {
+                            showRtMasqueResetConfirm = false
+                            Toast.makeText(context, warpResetBlockedMessage, Toast.LENGTH_LONG).show()
+                            return@TextButton
+                        }
+                        showRtMasqueResetConfirm = false
+                        scope.launch {
+                            val result = withContext(Dispatchers.IO) {
+                                val config = File(context.filesDir, RT_MASQUE_CONFIG_FILE_NAME)
+                                when {
+                                    !config.exists() -> "Регистрация WARP ещё не создана"
+                                    config.delete() -> "Локальная регистрация WARP сброшена"
+                                    else -> "Не удалось удалить регистрацию WARP"
+                                }
+                            }
+                            Toast.makeText(context, result, Toast.LENGTH_LONG).show()
+                        }
+                    },
+                ) { Text("Сбросить") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showRtMasqueResetConfirm = false }) {
+                    Text("Отмена")
+                }
+            },
+        )
+    }
+}
+
+@Composable
+private fun TunnelRemoteActionSection(
+    settingsStore: SettingsStore,
+    activeProfile: Int,
+    interfaceRole: String,
+    hasConnectionSource: Boolean,
+    dismissed: Boolean,
+    onOpenProjectSupport: () -> Unit,
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val fetchAllowed =
+        usesCompactTunnelInterface(interfaceRole) ||
+            interfaceRole == "admin" ||
+            BuildConfig.REMOTE_ACTION_PREVIEW
+    var actionCatalog by remember { mutableStateOf(RemoteActionCatalogGateway.cached()) }
+    var actionResolved by remember {
+        mutableStateOf(RemoteActionCatalogGateway.hasFreshCache())
+    }
+    var dismissCountdown by remember(activeProfile) { mutableIntStateOf(0) }
+
+    LaunchedEffect(fetchAllowed, lifecycleOwner) {
+        if (!fetchAllowed) {
+            actionCatalog = com.wdtt.plus.RemoteActionCatalog.Empty
+            actionResolved = true
+            return@LaunchedEffect
+        }
+        if (RemoteActionCatalogGateway.hasFreshCache()) {
+            actionCatalog = RemoteActionCatalogGateway.cached()
+            actionResolved = true
+        } else {
+            actionResolved = false
+        }
+        lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            while (isActive) {
+                actionCatalog = RemoteActionCatalogGateway.fetch(force = true)
+                actionResolved = true
+                delay(REMOTE_ACTION_REFRESH_MS)
+            }
+        }
+    }
+    LaunchedEffect(activeProfile, dismissCountdown > 0) {
+        if (dismissCountdown <= 0) return@LaunchedEffect
+        while (dismissCountdown > 0) {
+            delay(1_000)
+            dismissCountdown--
+        }
+    }
+
+    val action = actionCatalog.at("tunnel")
+    if (!shouldShowTunnelRemoteActionCard(
+            interfaceRole = interfaceRole,
+            preview = BuildConfig.REMOTE_ACTION_PREVIEW,
+            hasConnectionSource = hasConnectionSource,
+            dismissed = dismissed,
+            dismissCountdown = dismissCountdown,
+            actionResolved = actionResolved,
+            actionAvailable = action != null,
+        )
+    ) {
+        return
+    }
+    if (dismissCountdown > 0) {
+        DismissedNoticeCard(
+            title = "Предложение скрыто",
+            message = "Ссылку всегда можно найти в «Инфо» → «Поддержать проект».",
+            countdown = dismissCountdown,
+            onProjectSupportClick = onOpenProjectSupport,
+        )
+    } else if (action != null) {
+        RemoteActionCard(
+            action = action,
+            onLinkClick = onOpenProjectSupport,
+            onClick = {
+                scope.launch {
+                    val opened = RemoteUiActionLauncher.open(context, action)
+                    if (!opened) {
+                        Toast.makeText(
+                            context,
+                            "Не удалось открыть страницу. Проверьте браузер.",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    }
+                }
+            },
+            onDismiss = {
+                dismissCountdown = 5
+                scope.launch {
+                    settingsStore.saveRemoteCardDismissed(activeProfile, true)
+                }
+            },
+        )
+    }
+    Spacer(Modifier.height(12.dp))
+}
+
+@Composable
+private fun ManagedAccessLifecycleSection(
+    settingsStore: SettingsStore,
+    activeProfile: Int,
+    routeUpdateAvailable: Boolean,
+    onRouteUpdate: () -> Unit,
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val activeAccessSnapshot by
+        settingsStore.activeTunnelAccessUiSnapshot.collectAsStateWithLifecycle()
+    val lifecycle = activeAccessSnapshot
+        ?.takeIf { it.profileIndex == activeProfile }
+        ?.lifecycle
+        ?: AccessLifecycleUiState.Unmanaged
+    val dismissedSignature = activeAccessSnapshot
+        ?.takeIf { it.profileIndex == activeProfile }
+        ?.dismissedSignature
+        .orEmpty()
+    val refreshingProfiles by
+        AccessLifecycleCoordinator.refreshingProfiles.collectAsStateWithLifecycle()
+    val refreshing = activeProfile in refreshingProfiles
+    var actionBusy by remember(activeProfile) { mutableStateOf(false) }
+    var manualRefreshBusy by remember(activeProfile) { mutableStateOf(false) }
+    var dismissCountdown by remember(activeProfile) { mutableIntStateOf(0) }
+
+    LaunchedEffect(activeProfile, lifecycle.managed) {
+        if (lifecycle.managed) {
+            AccessLifecycleCoordinator.refreshProfile(context, activeProfile, force = false)
+        } else {
+            TunnelManager.clearConnectionIssue(ConnectionIssueKind.ACCESS)
+        }
+    }
+    LaunchedEffect(activeProfile, dismissCountdown > 0) {
+        if (dismissCountdown <= 0) return@LaunchedEffect
+        while (dismissCountdown > 0) {
+            delay(1_000)
+            dismissCountdown--
+        }
+    }
+
+    if (!lifecycle.managed) return
+    val canDismiss = accessLifecycleCanDismiss(lifecycle)
+    val signature = accessLifecycleDismissalSignature(lifecycle)
+    val dismissed = canDismiss && signature.isNotBlank() && signature == dismissedSignature
+    val keepVisibleForRouteUpdate = routeUpdateAvailable && lifecycle.dismissible != true
+    val cardDismissed =
+        dismissed && dismissCountdown <= 0 && !keepVisibleForRouteUpdate
+    if (cardDismissed) return
+
+    if (dismissCountdown > 0 && !keepVisibleForRouteUpdate) {
+        DismissedNoticeCard(
+            title = "Карточка скрыта",
+            message = lifecycle.dismissedMessage.ifBlank {
+                "Актуальная информация и доступные действия остаются у поставщика профиля."
+            },
+            countdown = dismissCountdown,
+        )
+    } else {
+        AccessLifecycleCard(
+            lifecycle = lifecycle,
+            refreshing = refreshing || manualRefreshBusy,
+            actionBusy = actionBusy,
+            onRouteUpdate = if (routeUpdateAvailable) onRouteUpdate else null,
+            onDismiss = if (canDismiss) {
+                {
+                    dismissCountdown = 5
+                    scope.launch {
+                        settingsStore.saveAccessLifecycleDismissedSignature(
+                            activeProfile,
+                            signature,
+                        )
+                    }
+                }
+            } else {
+                null
+            },
+            onRefresh = {
+                if (manualRefreshBusy) return@AccessLifecycleCard
+                manualRefreshBusy = true
+                scope.launch {
+                    val startedAt = System.currentTimeMillis()
+                    try {
+                        when (
+                            val result = AccessLifecycleCoordinator.refreshProfile(
+                                context,
+                                activeProfile,
+                                force = true,
+                            )
+                        ) {
+                            is AccessLifecycleRefreshResult.Success -> Toast.makeText(
+                                context,
+                                "Данные обновлены",
+                                Toast.LENGTH_SHORT,
+                            ).show()
+                            is AccessLifecycleRefreshResult.Cached -> Toast.makeText(
+                                context,
+                                "Данные уже актуальны",
+                                Toast.LENGTH_SHORT,
+                            ).show()
+                            is AccessLifecycleRefreshResult.Throttled -> Toast.makeText(
+                                context,
+                                "Проверено недавно. Повторите через несколько секунд",
+                                Toast.LENGTH_SHORT,
+                            ).show()
+                            is AccessLifecycleRefreshResult.Failed -> Toast.makeText(
+                                context,
+                                result.message,
+                                Toast.LENGTH_LONG,
+                            ).show()
+                            AccessLifecycleRefreshResult.Unmanaged -> Toast.makeText(
+                                context,
+                                "Проверка недоступна",
+                                Toast.LENGTH_SHORT,
+                            ).show()
+                        }
+                    } finally {
+                        val visibleFor = System.currentTimeMillis() - startedAt
+                        if (visibleFor < 450) delay(450 - visibleFor)
+                        manualRefreshBusy = false
+                    }
+                }
+            },
+            onAction = {
+                if (actionBusy) return@AccessLifecycleCard
+                actionBusy = true
+                scope.launch {
+                    runCatching {
+                        AccessLifecycleCoordinator.beginAction(context, activeProfile)
+                    }.onSuccess { target ->
+                        runCatching {
+                            launchRemoteTarget(context, target)
+                        }.onFailure { error ->
+                            if (error is CancellationException) throw error
+                            Toast.makeText(
+                                context,
+                                error.message ?: "Не удалось открыть страницу.",
+                                Toast.LENGTH_LONG,
+                            ).show()
+                        }
+                    }.onFailure { error ->
+                        if (error is CancellationException) throw error
+                        TunnelManager.noteAccessLifecycleEvent(
+                            key = "action_unavailable_$activeProfile",
+                            message = error.message ?: "Действие сейчас недоступно",
+                            warning = true,
+                        )
+                        Toast.makeText(
+                            context,
+                            error.message ?: "Действие сейчас недоступно.",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    }
+                    actionBusy = false
+                }
+            },
+        )
+    }
+    Spacer(Modifier.height(12.dp))
 }
 
 @Composable
@@ -1629,7 +1991,8 @@ private fun AccessLifecycleCard(
     val icon = when {
         lifecycle.checkedAtMillis <= 0 -> Icons.Default.Schedule
         !lifecycle.allowConnect -> Icons.Default.Lock
-        severity == AccessLifecycleSeverity.WARNING -> Icons.Default.WarningAmber
+        severity == AccessLifecycleSeverity.WARNING ||
+            severity == AccessLifecycleSeverity.ERROR -> Icons.Default.WarningAmber
         else -> Icons.Default.CheckCircle
     }
     val title = lifecycle.title.ifBlank {
@@ -1724,59 +2087,97 @@ private fun AccessLifecycleCard(
                 )
             }
             if (lifecycle.detailValue.isNotBlank() || lifecycle.actionAvailable) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                ) {
-                    if (lifecycle.detailValue.isNotBlank()) {
+                val actionLabel = lifecycle.actionLabel.ifBlank { "Продолжить" }
+                val textMeasurer = rememberTextMeasurer()
+                val density = LocalDensity.current
+                val detailLabelWidth = with(density) {
+                    textMeasurer.measure(
+                        text = lifecycle.detailLabel,
+                        style = MaterialTheme.typography.bodySmall,
+                        maxLines = 1,
+                        softWrap = false,
+                    ).size.width.toDp()
+                }
+                val detailValueWidth = with(density) {
+                    textMeasurer.measure(
+                        text = lifecycle.detailValue,
+                        style = MaterialTheme.typography.bodyMedium.copy(
+                            fontWeight = FontWeight.SemiBold,
+                        ),
+                        maxLines = 1,
+                        softWrap = false,
+                    ).size.width.toDp()
+                }
+                val actionLabelWidth = with(density) {
+                    textMeasurer.measure(
+                        text = actionLabel,
+                        style = MaterialTheme.typography.labelLarge.copy(
+                            fontWeight = FontWeight.SemiBold,
+                        ),
+                        maxLines = 1,
+                        softWrap = false,
+                    ).size.width.toDp()
+                }
+
+                BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+                    val hasDetail = lifecycle.detailValue.isNotBlank()
+                    val hasAction = lifecycle.actionAvailable
+                    val detailPreferredWidth = maxOf(
+                        120.dp,
+                        detailLabelWidth,
+                        detailValueWidth,
+                    )
+                    val actionPreferredWidth = maxOf(
+                        132.dp,
+                        actionLabelWidth + 46.dp,
+                    )
+                    val stackContent = hasAction && (
+                        !hasDetail ||
+                            detailPreferredWidth + 12.dp + actionPreferredWidth > maxWidth
+                        )
+
+                    if (stackContent) {
                         Column(
-                            modifier = Modifier.weight(1f),
-                            verticalArrangement = Arrangement.spacedBy(2.dp),
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalArrangement = Arrangement.spacedBy(10.dp),
                         ) {
-                            if (lifecycle.detailLabel.isNotBlank()) {
-                                Text(
-                                    text = lifecycle.detailLabel,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = accent.copy(alpha = 0.78f),
+                            if (hasDetail) {
+                                AccessLifecycleDetail(
+                                    lifecycle = lifecycle,
+                                    accent = accent,
+                                    modifier = Modifier.fillMaxWidth(),
                                 )
                             }
-                            Text(
-                                text = lifecycle.detailValue,
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = accent,
-                                fontWeight = FontWeight.SemiBold,
+                            AccessLifecycleActionButton(
+                                lifecycle = lifecycle,
+                                label = actionLabel,
+                                refreshing = refreshing,
+                                actionBusy = actionBusy,
+                                onAction = onAction,
+                                modifier = Modifier.fillMaxWidth(),
                             )
                         }
                     } else {
-                        Spacer(Modifier.weight(1f))
-                    }
-                    if (lifecycle.actionAvailable) {
-                        Button(
-                            onClick = onAction,
-                            enabled = !refreshing && !actionBusy,
-                            modifier = Modifier
-                                .widthIn(min = 132.dp)
-                                .heightIn(min = 46.dp),
-                            shape = RoundedCornerShape(14.dp),
-                            contentPadding = PaddingValues(
-                                horizontal = 8.dp,
-                                vertical = 6.dp,
-                            ),
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp),
                         ) {
-                            if (actionBusy) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(17.dp),
-                                    strokeWidth = 2.dp,
-                                    color = MaterialTheme.colorScheme.onPrimary,
+                            if (hasDetail) {
+                                AccessLifecycleDetail(
+                                    lifecycle = lifecycle,
+                                    accent = accent,
+                                    modifier = Modifier.weight(1f),
                                 )
-                            } else {
-                                if (lifecycle.actionIcon == "update") {
-                                    Icon(Icons.Default.Update, null, Modifier.size(17.dp))
-                                    Spacer(Modifier.width(5.dp))
-                                }
-                                FlexibleButtonText(
-                                    lifecycle.actionLabel.ifBlank { "Продолжить" }
+                            }
+                            if (hasAction) {
+                                AccessLifecycleActionButton(
+                                    lifecycle = lifecycle,
+                                    label = actionLabel,
+                                    refreshing = refreshing,
+                                    actionBusy = actionBusy,
+                                    onAction = onAction,
+                                    modifier = Modifier.width(actionPreferredWidth),
                                 )
                             }
                         }
@@ -1788,10 +2189,79 @@ private fun AccessLifecycleCard(
 }
 
 @Composable
+private fun AccessLifecycleDetail(
+    lifecycle: AccessLifecycleUiState,
+    accent: Color,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier = modifier,
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        if (lifecycle.detailLabel.isNotBlank()) {
+            Text(
+                text = lifecycle.detailLabel,
+                style = MaterialTheme.typography.bodySmall,
+                color = accent.copy(alpha = 0.78f),
+            )
+        }
+        Text(
+            text = lifecycle.detailValue,
+            style = MaterialTheme.typography.bodyMedium,
+            color = accent,
+            fontWeight = FontWeight.SemiBold,
+        )
+    }
+}
+
+@Composable
+private fun AccessLifecycleActionButton(
+    lifecycle: AccessLifecycleUiState,
+    label: String,
+    refreshing: Boolean,
+    actionBusy: Boolean,
+    onAction: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Button(
+        onClick = onAction,
+        enabled = !refreshing && !actionBusy,
+        modifier = modifier.heightIn(min = 46.dp),
+        shape = RoundedCornerShape(14.dp),
+        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
+    ) {
+        if (actionBusy) {
+            CircularProgressIndicator(
+                modifier = Modifier.size(17.dp),
+                strokeWidth = 2.dp,
+                color = MaterialTheme.colorScheme.onPrimary,
+            )
+        } else {
+            Icon(
+                imageVector = if (lifecycle.actionIcon == "update") {
+                    Icons.Default.Update
+                } else {
+                    Icons.Default.Link
+                },
+                contentDescription = null,
+                modifier = Modifier.size(17.dp),
+            )
+            Spacer(Modifier.width(5.dp))
+            FlexibleButtonText(label)
+        }
+    }
+}
+
+@Composable
 private fun SettingsHelpDialog(
     title: String,
     paragraphs: List<String>,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
+    highlightedParagraphIndices: Set<Int> = emptySet(),
+    secondaryActionLabel: String? = null,
+    onSecondaryAction: (() -> Unit)? = null,
+    secondaryActionEnabled: Boolean = true,
+    onSecondaryActionDisabled: (() -> Unit)? = null,
 ) {
     Dialog(onDismissRequest = onDismiss) {
         BoxWithConstraints(
@@ -1819,6 +2289,7 @@ private fun SettingsHelpDialog(
                     ) {
                         Text(
                             title,
+                            modifier = Modifier.weight(1f),
                             style = MaterialTheme.typography.titleLarge,
                             fontWeight = FontWeight.Bold,
                             color = MaterialTheme.colorScheme.primary
@@ -1827,12 +2298,52 @@ private fun SettingsHelpDialog(
                             Icon(Icons.Default.Close, contentDescription = "Закрыть")
                         }
                     }
-                    paragraphs.forEach { paragraph ->
-                        Text(
-                            paragraph,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
+                    paragraphs.forEachIndexed { index, paragraph ->
+                        if (index in highlightedParagraphIndices) {
+                            Surface(
+                                modifier = Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(14.dp),
+                                color = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.72f),
+                                contentColor = MaterialTheme.colorScheme.onTertiaryContainer,
+                                border = BorderStroke(
+                                    1.dp,
+                                    MaterialTheme.colorScheme.tertiary.copy(alpha = 0.32f),
+                                ),
+                            ) {
+                                Text(
+                                    paragraph,
+                                    modifier = Modifier.padding(12.dp),
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = FontWeight.SemiBold,
+                                )
+                            }
+                        } else {
+                            Text(
+                                paragraph,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                    if (secondaryActionLabel != null && onSecondaryAction != null) {
+                        Box(modifier = Modifier.fillMaxWidth()) {
+                            OutlinedButton(
+                                onClick = onSecondaryAction,
+                                enabled = secondaryActionEnabled,
+                                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                                shape = RoundedCornerShape(16.dp),
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
+                            ) {
+                                FlexibleButtonText(secondaryActionLabel)
+                            }
+                            if (!secondaryActionEnabled && onSecondaryActionDisabled != null) {
+                                Box(
+                                    modifier = Modifier
+                                        .matchParentSize()
+                                        .clickable(onClick = onSecondaryActionDisabled),
+                                )
+                            }
+                        }
                     }
                     Button(
                         onClick = onDismiss,
@@ -2026,7 +2537,7 @@ private fun CompactSteppedSlider(
 
     Canvas(
         modifier = modifier
-            .height(34.dp)
+            .height(30.dp)
             .pointerInput(enabled, valueRange, stepSize) {
                 if (!enabled) return@pointerInput
                 detectTapGestures { offset ->
@@ -2357,8 +2868,8 @@ private fun CompactTunnelProfileCard(
     onManualClick: () -> Unit,
 ) {
     AppSectionCard(
-        contentPadding = PaddingValues(16.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp)
+        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
         Text(
             "Способ подключения",
@@ -2389,7 +2900,7 @@ private fun CompactTunnelProfileCard(
                 onClick = onAddLinkClick,
                 modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
                 shape = RoundedCornerShape(16.dp),
-                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp)
+                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
             ) {
                 Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(18.dp))
                 Spacer(Modifier.width(6.dp))
@@ -2403,7 +2914,7 @@ private fun CompactTunnelProfileCard(
                 onClick = onManualClick,
                 modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
                 shape = RoundedCornerShape(16.dp),
-                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp)
+                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
             ) {
                 Icon(Icons.Default.Key, contentDescription = null, modifier = Modifier.size(18.dp))
                 Spacer(Modifier.width(6.dp))
@@ -2644,7 +3155,6 @@ private fun UserWdttLinkDialog(
     remoteUpdateOnly: Boolean,
     cachedAction: CachedRemoteAction = CachedRemoteAction.Unavailable,
     onCachedAction: () -> Unit = {},
-    importedLinkStoredAsManualFields: Boolean,
     title: String,
     subtitle: String,
     onDismiss: () -> Unit,
@@ -2773,13 +3283,6 @@ private fun UserWdttLinkDialog(
                         modifier = Modifier.fillMaxWidth(),
                         verticalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
-                        if (!remoteUpdateOnly && importedLinkStoredAsManualFields && linkText.isBlank()) {
-                            Text(
-                                "Ссылка принята. Данные сохранены в «Вручную»: там их можно изменить, либо здесь вставить новую ссылку.",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.primary
-                            )
-                        }
                         OutlinedTextField(
                             value = linkText,
                             onValueChange = onLinkTextChange,
@@ -2930,6 +3433,56 @@ private fun RemoteUpdateHelpDialog(
                         color = MaterialTheme.colorScheme.onSurface,
                     )
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ManagedHashStatusCard(lifecycle: AccessLifecycleUiState) {
+    val accent = MaterialTheme.colorScheme.primary
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.52f),
+        contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+        border = BorderStroke(1.dp, accent.copy(alpha = 0.36f)),
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(9.dp),
+            ) {
+                Icon(
+                    Icons.Default.CheckCircle,
+                    contentDescription = null,
+                    tint = accent,
+                    modifier = Modifier.size(21.dp),
+                )
+                Text(
+                    lifecycle.title.ifBlank { "Автоматическое получение VK-хешей" },
+                    modifier = Modifier.weight(1f),
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+            if (lifecycle.message.isNotBlank()) {
+                Text(
+                    lifecycle.message,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.86f),
+                )
+            }
+            if (lifecycle.detailLabel.isNotBlank() || lifecycle.detailValue.isNotBlank()) {
+                AccessLifecycleDetail(
+                    lifecycle = lifecycle,
+                    accent = accent,
+                    modifier = Modifier.fillMaxWidth(),
+                )
             }
         }
     }
@@ -3109,6 +3662,7 @@ private fun DismissedNoticeCard(
 @Composable
 fun HashesDialog(
     settingsStore: SettingsStore,
+    profileIndex: Int,
     hash1: String,
     hash2: String,
     hash3: String,
@@ -3119,6 +3673,7 @@ fun HashesDialog(
     customVkClientId: String,
     customVkClientSecret: String,
     remoteContinuation: RemoteContinuation,
+    remoteAccessLifecycle: AccessLifecycleUiState,
     remoteAction: RemoteUiAction?,
     vkCallsPreflight: Boolean,
     captchaMode: String,
@@ -3283,7 +3838,8 @@ fun HashesDialog(
                     ?: "Открываю продолжение..."
                 val target = RemoteContinuationLauncher.begin(
                     capability = remoteContinuation,
-                    device = settingsStore.getOrCreateConnectDeviceId()
+                    device = settingsStore.getOrCreateConnectDeviceId(),
+                    localDocument = settingsStore.remoteActionProfileDocument(profileIndex),
                 )
                 try {
                     launchRemoteTarget(context, target)
@@ -3720,6 +4276,13 @@ fun HashesDialog(
                             )
                         }
                     }
+                } else if (
+                    shouldShowManagedHashStatusCard(
+                        continuationAvailable = remoteContinuation.available,
+                        lifecycle = remoteAccessLifecycle,
+                    )
+                ) {
+                    ManagedHashStatusCard(remoteAccessLifecycle)
                 } else if (remoteAction != null) {
                     RemoteActionCard(
                         action = remoteAction,

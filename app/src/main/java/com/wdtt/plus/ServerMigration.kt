@@ -1,7 +1,7 @@
 package com.wdtt.plus
 
 /** Версии приложения, для которых выпускалась новая обязательная серверная часть. */
-internal val SERVER_MIGRATION_LEVELS = intArrayOf(2, 3, 5, 6, 7, 12)
+internal val SERVER_MIGRATION_LEVELS = intArrayOf(2, 3, 5, 6, 7, 12, 14)
 
 data class ServerMigrationState(
     val pendingLevel: Int,

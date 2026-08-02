@@ -8,8 +8,6 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.net.ConnectivityManager
-import android.net.NetworkCapabilities
 import android.net.Uri
 import android.net.VpnService
 import android.os.Build
@@ -23,7 +21,10 @@ import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -117,10 +118,13 @@ import com.wdtt.plus.RemoteActionForm
 import com.wdtt.plus.RemoteContinuationLauncher
 import com.wdtt.plus.RemoteUiAction
 import com.wdtt.plus.RemoteUiActionLauncher
+import com.wdtt.plus.RT_MASQUE_CONFIG_FILE_NAME
+import com.wdtt.plus.RtMasqueEnrollmentState
 import com.wdtt.plus.SettingsStore
 import com.wdtt.plus.TunnelManager
 import com.wdtt.plus.TrustedWifiManager
 import com.wdtt.plus.trustedWifiAccessProblem
+import com.wdtt.plus.inspectRtMasqueEnrollment
 import com.wdtt.plus.UPDATE_DIALOG_ACTION_POSTPONED
 import com.wdtt.plus.UPDATE_DIALOG_ACTION_UPDATE
 import com.wdtt.plus.WDTTColors
@@ -139,6 +143,7 @@ import com.wdtt.plus.selectUpdateApkAsset
 import com.wdtt.plus.deviceCheckActionIntent
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -260,6 +265,7 @@ fun InfoTab(
     var showHelpDialog by remember { mutableStateOf(false) }
     var showQuestionDialog by remember { mutableStateOf(false) }
     var showSupportDialog by remember { mutableStateOf(false) }
+    var highlightNoServerBlock by remember { mutableStateOf(false) }
     var pendingActionForm by remember { mutableStateOf<RemoteUiAction?>(null) }
     var actionCatalog by remember { mutableStateOf(RemoteActionCatalogGateway.cached()) }
     var questionAction by remember { mutableStateOf<RemoteUiAction?>(null) }
@@ -270,6 +276,7 @@ fun InfoTab(
     var projectExpanded by projectExpandedState
     LaunchedEffect(projectSupportDialogRequest) {
         if (projectSupportDialogRequest > 0) {
+            highlightNoServerBlock = true
             showSupportDialog = true
             onProjectSupportDialogRequestConsumed()
         }
@@ -353,6 +360,7 @@ fun InfoTab(
             latestRelease = latestRelease
         )
         val workers = runCatching { settingsStore.workersPerHash.first() }.getOrNull()
+        val tunnelProfile = runCatching { settingsStore.tunnelProfileSnapshot() }.getOrNull()
         val diagnosticsSummary = withContext(Dispatchers.Default) {
             buildSupportReportSummary(context.applicationContext, settingsStore)
         }
@@ -385,7 +393,12 @@ fun InfoTab(
         return report.copy(
             summaryLines = diagnosticsSummary + clientNetworkDiagnostics.summaryLines,
             items = listOf(versionItem) +
-                report.items.filterNot { it.title == DeviceCompatibility.APP_VERSION_ITEM_TITLE } +
+                report.items.filterNot {
+                    it.title == DeviceCompatibility.APP_VERSION_ITEM_TITLE ||
+                        it.title == "Сеть Android"
+                } + listOfNotNull(
+                    tunnelProfile?.let { DeviceCompatibility.rtNetworkModeItem(context, it) }
+                ) +
                 clientNetworkDiagnostics.items
         )
     }
@@ -415,6 +428,7 @@ fun InfoTab(
 			currentVersion = currentVersion,
             releaseDate = releaseDate,
 			onSupportClick = {
+                highlightNoServerBlock = false
                 showSupportDialog = true
             }
 		)
@@ -469,7 +483,7 @@ fun InfoTab(
             WideActionTile(
                 title = "Проверить устройство",
                 subtitle = if (isCheckingDevice) {
-                    "Проверяем версию, Android, ABI, сеть и системные условия..."
+                    "Проверяем Android, ABI, 16 КиБ, WireGuard, режим РТ и сеть..."
                 } else {
                     "Проверка совместимости и полный отчёт для диагностики"
                 },
@@ -790,10 +804,16 @@ fun InfoTab(
     }
 	if (showSupportDialog) {
 		AdditionalActionsDialog(
-			onDismiss = { showSupportDialog = false },
+			onDismiss = {
+                highlightNoServerBlock = false
+                showSupportDialog = false
+            },
             primaryAction = actionCatalog.at("about"),
             secondaryAction = actionCatalog.at("tunnel"),
+            highlightSecondaryAction = highlightNoServerBlock,
+            onSecondaryHighlightConsumed = { highlightNoServerBlock = false },
             onActionClick = { action ->
+                highlightNoServerBlock = false
                 if (action.form != null) {
                     showSupportDialog = false
                     pendingActionForm = action
@@ -811,10 +831,12 @@ fun InfoTab(
                 }
             },
             onProjectFallbackClick = {
+                highlightNoServerBlock = false
                 showSupportDialog = false
                 openUrlInBrowser(context, ProjectDonateFallbackUrl)
             },
 			onDonateOriginalClick = {
+                highlightNoServerBlock = false
                 showSupportDialog = false
                 openUrlInBrowser(context, OriginalDonateUrl)
             }
@@ -970,6 +992,8 @@ private fun AdditionalActionsDialog(
 	onDismiss: () -> Unit,
     primaryAction: RemoteUiAction?,
     secondaryAction: RemoteUiAction?,
+    highlightSecondaryAction: Boolean,
+    onSecondaryHighlightConsumed: () -> Unit,
     onActionClick: (RemoteUiAction) -> Unit,
     onProjectFallbackClick: () -> Unit,
 	onDonateOriginalClick: () -> Unit
@@ -1034,7 +1058,7 @@ private fun AdditionalActionsDialog(
                         ExternalSupportBlock(
                             title = primaryAction.title,
                             body = primaryAction.message,
-                            buttonText = primaryAction.label,
+                            buttonText = "Поддержать проект",
                             onClick = { onActionClick(primaryAction) },
                             emphasized = true,
                         )
@@ -1054,6 +1078,8 @@ private fun AdditionalActionsDialog(
                     secondaryAction?.let { action ->
                         RemoteInfoActionBlock(
                             action = action,
+                            highlightRequested = highlightSecondaryAction,
+                            onHighlightConsumed = onSecondaryHighlightConsumed,
                             onClick = { onActionClick(action) },
                         )
                     }
@@ -1088,6 +1114,19 @@ private fun RemoteActionFormDialog(
     var fallbackAvailable by remember(form.token) { mutableStateOf(false) }
     val numericValue = valueText.toLongOrNull()
     val valueValid = numericValue != null && numericValue in form.minimum..form.maximum
+    val supportAmount = valueText.trim()
+    val supportButtonLabel = if (supportAmount.isNotEmpty()) {
+        buildString {
+            append("Поддержать на ")
+            append(supportAmount)
+            if (form.inputSuffix.isNotBlank()) {
+                append(' ')
+                append(form.inputSuffix.trim())
+            }
+        }
+    } else {
+        "Поддержать"
+    }
 
     fun selectValue(value: String) {
         valueText = value
@@ -1268,7 +1307,7 @@ private fun RemoteActionFormDialog(
                         Text(form.busyLabel, fontWeight = FontWeight.Bold)
                     } else {
                         Text(
-                            form.submitLabel.replace("{value}", valueText),
+                            supportButtonLabel,
                             fontWeight = FontWeight.Bold,
                         )
                     }
@@ -1298,16 +1337,44 @@ private fun RemoteActionFormDialog(
 @Composable
 private fun RemoteInfoActionBlock(
     action: RemoteUiAction,
+	highlightRequested: Boolean = false,
+	onHighlightConsumed: () -> Unit = {},
 	onClick: () -> Unit,
 ) {
+	var borderPulseActive by remember(highlightRequested) {
+		mutableStateOf(false)
+	}
+	LaunchedEffect(highlightRequested) {
+		if (highlightRequested) {
+			repeat(2) {
+				borderPulseActive = true
+				delay(380)
+				borderPulseActive = false
+				delay(280)
+			}
+			onHighlightConsumed()
+		}
+	}
+	val borderColor by animateColorAsState(
+		targetValue = if (borderPulseActive) {
+			MaterialTheme.colorScheme.primary
+		} else {
+			MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f)
+		},
+		animationSpec = tween(durationMillis = 240),
+		label = "no_server_highlight_border",
+	)
+	val borderWidth by animateDpAsState(
+		targetValue = if (borderPulseActive) 2.5.dp else 1.dp,
+		animationSpec = tween(durationMillis = 240),
+		label = "no_server_highlight_border_width",
+	)
+
 	Surface(
 		shape = RoundedCornerShape(18.dp),
 		color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.48f),
 		contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
-		border = BorderStroke(
-			1.dp,
-			MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f)
-		)
+		border = BorderStroke(borderWidth, borderColor),
 	) {
 		Column(
 			modifier = Modifier.fillMaxWidth().padding(14.dp),
@@ -1930,41 +1997,14 @@ private suspend fun buildSupportReportSummary(context: Context, settingsStore: S
             "без ограничений батареи=${powerManager?.isIgnoringBatteryOptimizations(context.packageName)}"
     }
 
-    val connectivityManager = runCatching {
-        context.getSystemService(ConnectivityManager::class.java)
-    }.getOrNull()
-    val activeNetwork = runCatching { connectivityManager?.activeNetwork }.getOrNull()
-    val networkCapabilities = runCatching {
-        activeNetwork?.let { connectivityManager?.getNetworkCapabilities(it) }
-    }.getOrNull()
-    val networkTransports = buildList {
-        if (networkCapabilities?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true) add("Wi-Fi")
-        if (networkCapabilities?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true) add("мобильная")
-        if (networkCapabilities?.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) == true) add("Ethernet")
-        if (networkCapabilities?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true) add("VPN")
-    }.joinToString().ifBlank { "не определён" }
-    val networkSummary = if (networkCapabilities != null) {
-        "$networkTransports, internet=${networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)}, " +
-            "validated=${networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)}, " +
-            "metered=${connectivityManager?.isActiveNetworkMetered}"
-    } else {
-        "недоступно"
-    }
-    val privateDns = diagnosticText {
-        val properties = activeNetwork?.let { connectivityManager?.getLinkProperties(it) }
-        properties?.isPrivateDnsActive
-    }
-
     val webViewInfo = diagnosticText {
         WebView.getCurrentWebViewPackage()?.let { "${it.packageName} ${it.versionName}" }
     }
-    val nativeClientInfo = runCatching {
+    val nativeComponentsInfo = runCatching {
         val nativeClient = File(appInfo?.nativeLibraryDir.orEmpty(), "libclient.so")
-        if (nativeClient.isFile) {
-            "найден, ${formatMiB(nativeClient.length())}, executable=${nativeClient.canExecute()}"
-        } else {
-            "не найден"
-        }
+        val wireGuardBackend = File(appInfo?.nativeLibraryDir.orEmpty(), "libwg-go.so")
+        "libclient.so=${if (nativeClient.isFile) formatMiB(nativeClient.length()) else "не найден"}, " +
+            "libwg-go.so=${if (wireGuardBackend.isFile) formatMiB(wireGuardBackend.length()) else "не найден"}"
     }.getOrDefault("недоступно")
 
     val notificationPermission = diagnosticText {
@@ -1994,6 +2034,18 @@ private suspend fun buildSupportReportSummary(context: Context, settingsStore: S
         .coerceAtMost(4)
     val hasSecondaryHash = runCatching { settingsStore.secondaryVkHash.first().isNotBlank() }.getOrNull()
     val vkCallsEnabled = runCatching { settingsStore.vkCallsPreflight.first() }.getOrNull()
+    val rtNetworkEnabled = runCatching { settingsStore.rtNetwork.first() }.getOrNull()
+    val rtMasqueEnabled = runCatching { settingsStore.rtMasque.first() }.getOrNull()
+    val rtMasqueServerBootstrap =
+        runCatching { settingsStore.rtMasqueServerBootstrap.first() }.getOrNull()
+    val rtMasqueEnrollment = runCatching {
+        val config = File(context.filesDir, RT_MASQUE_CONFIG_FILE_NAME)
+        when (inspectRtMasqueEnrollment(config)) {
+            RtMasqueEnrollmentState.Missing -> "не создана"
+            RtMasqueEnrollmentState.Ready -> "сохранена и структурно корректна"
+            RtMasqueEnrollmentState.Invalid -> "повреждена"
+        }
+    }.getOrDefault("недоступно")
     val customVkCredentialsEnabled = runCatching { settingsStore.customVkCredentialsEnabled.first() }.getOrNull()
     val customVkCredentialsComplete = runCatching { settingsStore.customVkCredentialsComplete.first() }.getOrNull()
     val builtInVkClientCount = runCatching {
@@ -2052,10 +2104,8 @@ private suspend fun buildSupportReportSummary(context: Context, settingsStore: S
         appendLine("Low-RAM устройство: $lowRamDevice")
         appendLine("Хранилище приложения: $storageSummary")
         appendLine("Питание: $powerSummary")
-        appendLine("Сеть: $networkSummary")
-        appendLine("Private DNS: $privateDns")
         appendLine("WebView: $webViewInfo")
-        appendLine("Нативный клиент: $nativeClientInfo")
+        appendLine("Нативные компоненты: $nativeComponentsInfo")
         appendLine("Экран: $screenSummary")
         appendLine("Разрешение уведомлений: $notificationPermission")
         appendLine("Установка обновлений APK: $updateInstallPermission")
@@ -2072,6 +2122,12 @@ private suspend fun buildSupportReportSummary(context: Context, settingsStore: S
         appendLine("Потоки: ${workers ?: "недоступно"}")
         appendLine("VK-хеши: заполнено $hashCount, запасной=${hasSecondaryHash ?: "недоступно"}")
         appendLine("Быстрый VKCalls: ${vkCallsEnabled ?: "недоступно"}")
+        appendLine("Сеть РТ (TURN stream-first): ${rtNetworkEnabled ?: "недоступно"}")
+        appendLine(
+            "MASQUE в Сети РТ (HTTP/2 → HTTP/3): ${rtMasqueEnabled ?: "недоступно"}, " +
+                "регистрация WARP=$rtMasqueEnrollment, " +
+                "первая регистрация через сервер=${rtMasqueServerBootstrap ?: "недоступно"}"
+        )
         appendLine(
             "Резерв VK: собственные=${customVkCredentialsEnabled ?: "недоступно"}, " +
                 "заполнены=${customVkCredentialsComplete ?: "недоступно"}, встроенных=${builtInVkClientCount ?: "недоступно"}"

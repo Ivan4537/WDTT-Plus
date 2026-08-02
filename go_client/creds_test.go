@@ -79,3 +79,47 @@ func TestClassifyHashCheckErrorKeepsTerminalAndTransientStatusesSeparate(t *test
 		})
 	}
 }
+
+func TestAuthErrorsFromSupersededCredentialsDoNotInvalidateFreshCache(t *testing.T) {
+	const streamID = 9876540
+	cacheID := getCacheID(streamID)
+	credentialsStore.mu.Lock()
+	delete(credentialsStore.caches, cacheID)
+	credentialsStore.mu.Unlock()
+	t.Cleanup(func() {
+		credentialsStore.mu.Lock()
+		delete(credentialsStore.caches, cacheID)
+		credentialsStore.mu.Unlock()
+	})
+
+	cache := getStreamCache(streamID)
+	cache.mutex.Lock()
+	cache.creds = TurnCredentials{
+		Username:    "fresh-user",
+		Password:    "fresh-pass",
+		ServerAddrs: []string{"turn:fresh.example:3478"},
+		Link:        "fresh-link",
+	}
+	cache.mutex.Unlock()
+
+	for attempt := 0; attempt < maxCacheErrors+2; attempt++ {
+		if handleAuthError(streamID, "stale-user", "stale-pass") {
+			t.Fatal("superseded credentials invalidated the fresh cache")
+		}
+	}
+	if got := cache.errorCount.Load(); got != 0 {
+		t.Fatalf("superseded errors were counted: %d", got)
+	}
+
+	for attempt := 1; attempt <= maxCacheErrors; attempt++ {
+		invalidated := handleAuthError(streamID, "fresh-user", "fresh-pass")
+		if invalidated != (attempt == maxCacheErrors) {
+			t.Fatalf("attempt %d invalidated=%v", attempt, invalidated)
+		}
+	}
+	cache.mutex.RLock()
+	defer cache.mutex.RUnlock()
+	if cache.creds.Username != "" || cache.creds.Password != "" {
+		t.Fatal("current credential failures did not invalidate the cache")
+	}
+}

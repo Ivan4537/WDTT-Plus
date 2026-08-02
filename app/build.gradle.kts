@@ -46,7 +46,7 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
-val appVersionName = "13"
+val appVersionName = "14"
 val releaseApkBaseName = "WDTT-Plus"
 
 val localProperties = Properties()
@@ -90,9 +90,9 @@ android {
         applicationId = "com.wdtt.plus"
         minSdk = 28
         targetSdk = 35
-        versionCode = 13
+        versionCode = 14
         versionName = appVersionName
-        buildConfigField("String", "MOD_RELEASE_DATE", "\"30.07.2026\"")
+        buildConfigField("String", "MOD_RELEASE_DATE", "\"03.08.2026\"")
         buildConfigField("String", "WDTT_PLUS_DOMAIN", buildConfigString(wdttPlusDomain))
         manifestPlaceholders["wdttPlusDomain"] = wdttPlusDomain
         manifestPlaceholders["appLabel"] = "WDTT Plus"
@@ -249,11 +249,15 @@ tasks.register<Exec>("buildNativeClient") {
                 mkdir -p "${'$'}jni_dir/${'$'}abi"
                 if [ -n "${'$'}goarm" ]; then
                     env GOOS=android GOARCH="${'$'}goarch" GOARM="${'$'}goarm" CGO_ENABLED=1 CC="${'$'}ndk_bin/${'$'}cc" \
-                        go build -buildvcs=false -trimpath -ldflags="-s -w -checklinkname=0" -buildmode=pie \
+                        go build -buildvcs=false -trimpath \
+                        -ldflags="-s -w -checklinkname=0 -linkmode=external -extldflags=-Wl,-z,max-page-size=16384" \
+                        -buildmode=pie \
                         -o "${'$'}jni_dir/${'$'}abi/libclient.so" .
                 else
                     env GOOS=android GOARCH="${'$'}goarch" CGO_ENABLED=1 CC="${'$'}ndk_bin/${'$'}cc" \
-                        go build -buildvcs=false -trimpath -ldflags="-s -w -checklinkname=0" -buildmode=pie \
+                        go build -buildvcs=false -trimpath \
+                        -ldflags="-s -w -checklinkname=0 -linkmode=external -extldflags=-Wl,-z,max-page-size=16384" \
+                        -buildmode=pie \
                         -o "${'$'}jni_dir/${'$'}abi/libclient.so" .
                 fi
             }
@@ -267,6 +271,62 @@ tasks.register<Exec>("buildNativeClient") {
         goClientDir.asFile.absolutePath,
         jniLibsDir.asFile.absolutePath
     )
+}
+
+val verify16KbNativeLibraries = tasks.register<Exec>("verify16KbNativeLibraries") {
+    group = "verification"
+    description = "Verifies 16 KiB LOAD alignment for every 64-bit Android native library."
+    dependsOn("mergeReleaseNativeLibs")
+
+    val mergedNativeLibs = layout.buildDirectory.dir(
+        "intermediates/merged_native_libs/release/mergeReleaseNativeLibs/out/lib"
+    )
+    inputs.dir(mergedNativeLibs)
+
+    commandLine(
+        "bash",
+        "-lc",
+        """
+            set -euo pipefail
+            lib_root="${'$'}1"
+            sdk_dir="${'$'}2"
+            readelf_bin="$(command -v readelf || true)"
+            if [ -z "${'$'}readelf_bin" ] && [ -n "${'$'}sdk_dir" ]; then
+                readelf_bin="$(ls -d "${'$'}sdk_dir"/ndk/*/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf 2>/dev/null | sort -V | tail -n 1)"
+            fi
+            if [ -z "${'$'}readelf_bin" ] || [ ! -x "${'$'}readelf_bin" ]; then
+                echo "readelf is required to verify Android native page alignment." >&2
+                exit 1
+            fi
+            found=0
+            for abi in arm64-v8a x86_64; do
+                abi_dir="${'$'}lib_root/${'$'}abi"
+                [ -d "${'$'}abi_dir" ] || continue
+                while IFS= read -r -d '' library; do
+                    found=1
+                    while IFS= read -r alignment; do
+                        value=${'$'}((alignment))
+                        if [ "${'$'}value" -lt 16384 ]; then
+                            echo "Native library is not compatible with 16 KiB pages: ${'$'}library (LOAD align=${'$'}alignment)" >&2
+                            exit 1
+                        fi
+                    done < <("${'$'}readelf_bin" -lW "${'$'}library" | awk '${'$'}1 == "LOAD" { print ${'$'}NF }')
+                done < <(find "${'$'}abi_dir" -type f -name '*.so' -print0)
+            done
+            if [ "${'$'}found" -ne 1 ]; then
+                echo "No 64-bit Android native libraries found under ${'$'}lib_root." >&2
+                exit 1
+            fi
+            echo "All 64-bit Android native libraries use 16 KiB-compatible LOAD alignment."
+        """.trimIndent(),
+        "bash",
+        mergedNativeLibs.get().asFile.absolutePath,
+        androidSdkDir.orEmpty(),
+    )
+}
+
+tasks.matching { it.name == "packageRelease" }.configureEach {
+    dependsOn(verify16KbNativeLibraries)
 }
 
 tasks.matching {
@@ -389,7 +449,7 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
     implementation("androidx.datastore:datastore-preferences:1.1.1")
-    implementation("com.wireguard.android:tunnel:1.0.20230706")
+    implementation("com.wireguard.android:tunnel:1.0.20260102")
     implementation("com.github.mwiede:jsch:0.2.16")
     implementation("org.bouncycastle:bcprov-jdk18on:1.79")
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")

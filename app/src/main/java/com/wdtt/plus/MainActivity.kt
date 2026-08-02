@@ -124,6 +124,11 @@ internal fun shouldHandleIncomingIntent(
 
 private sealed interface WdttConnectFlow {
     data class Progress(val message: String) : WdttConnectFlow
+    data class SelectAttachmentProfile(
+        val link: RemoteDocumentLink,
+        val candidates: List<RemoteAttachmentCandidate>,
+        val selectedProfile: Int,
+    ) : WdttConnectFlow
     data class SelectProfile(
         val plan: WdttDeepLinkApplyPlan,
         val delivery: RemoteDocumentDelivery
@@ -264,7 +269,9 @@ class MainActivity : ComponentActivity() {
                         wdttDeepLinkMessage = message
                     },
                     onSelectWdttDeepLinkOverwriteProfile = { profile ->
-                        pendingWdttDeepLinkPlan = pendingWdttDeepLinkPlan?.copy(targetProfile = profile)
+                        pendingWdttDeepLinkPlan = pendingWdttDeepLinkPlan?.let { plan ->
+                            if (profile in plan.blockedProfiles) plan else plan.copy(targetProfile = profile)
+                        }
                     },
                     onConfirmWdttDeepLinkOverwrite = { plan ->
                         pendingWdttDeepLinkPlan = null
@@ -276,7 +283,31 @@ class MainActivity : ComponentActivity() {
                     },
                     onSelectWdttConnectProfile = { profile ->
                         (wdttConnectFlow as? WdttConnectFlow.SelectProfile)?.let { flow ->
-                            wdttConnectFlow = flow.copy(plan = flow.plan.copy(targetProfile = profile))
+                            if (profile !in flow.plan.blockedProfiles) {
+                                wdttConnectFlow = flow.copy(
+                                    plan = flow.plan.copy(targetProfile = profile)
+                                )
+                            }
+                        }
+                    },
+                    onSelectWdttAttachmentProfile = { profile ->
+                        (wdttConnectFlow as? WdttConnectFlow.SelectAttachmentProfile)?.let { flow ->
+                            if (flow.candidates.any { it.profileIndex == profile }) {
+                                wdttConnectFlow = flow.copy(selectedProfile = profile)
+                            }
+                        }
+                    },
+                    onConfirmWdttAttachmentProfile = {
+                        (wdttConnectFlow as? WdttConnectFlow.SelectAttachmentProfile)?.let { flow ->
+                            flow.candidates.firstOrNull {
+                                it.profileIndex == flow.selectedProfile
+                            }?.let { candidate ->
+                                receiveRemoteDocument(
+                                    flow.link,
+                                    candidate.document,
+                                    candidate.profileIndex,
+                                )
+                            }
                         }
                     },
                     onConfirmWdttConnectProfile = { plan ->
@@ -496,25 +527,119 @@ class MainActivity : ComponentActivity() {
         receiveRemoteDocument(link)
     }
 
-    private fun receiveRemoteDocument(link: RemoteDocumentLink) {
+    private fun receiveRemoteDocument(
+        link: RemoteDocumentLink,
+        localDocument: String? = null,
+        attachmentProfile: Int? = null,
+    ) {
         if (!remoteDocumentRequests.add(link.url)) return
         lifecycleScope.launch {
             try {
+                var requestedAttachmentProfile = attachmentProfile
                 wdttConnectFlow = WdttConnectFlow.Progress("Проверяем ссылку и получаем доступ...")
-                val delivery = RemoteDocumentGateway.receive(
-                    link = link,
-                    device = settingsStore.getOrCreateConnectDeviceId(),
-                    label = vkHashDeviceName(),
-                    client = BuildConfig.VERSION_NAME,
-                    system = Build.VERSION.RELEASE.orEmpty(),
-                    localBindings = settingsStore.remoteDocumentBindings(),
-                )
+                suspend fun request(
+                    document: String?,
+                    profileAttachment: Boolean = false,
+                ): RemoteDocumentDelivery =
+                    RemoteDocumentGateway.receive(
+                        link = link,
+                        device = settingsStore.getOrCreateConnectDeviceId(),
+                        label = vkHashDeviceName(),
+                        client = BuildConfig.VERSION_NAME,
+                        system = Build.VERSION.RELEASE.orEmpty(),
+                        localBindings = settingsStore.remoteDocumentBindings(),
+                        localDocument = document,
+                        profileAttachment = profileAttachment,
+                    )
+                val delivery = try {
+                    request(
+                        localDocument,
+                        profileAttachment = attachmentProfile != null,
+                    )
+                } catch (error: RemoteDocumentFailure) {
+                    if (!error.profileAttachmentRequired || localDocument != null) throw error
+                    val candidates = settingsStore.remoteAttachmentCandidates()
+                    val selection = resolveRemoteAttachmentCandidates(
+                        candidates = candidates,
+                    )
+                    when {
+                        candidates.isEmpty() -> {
+                            wdttConnectFlow = WdttConnectFlow.Failed(
+                                "Все локальные профили уже заняты действующими удалёнными " +
+                                    "разрешениями или готовыми профилями. Освободите обычный " +
+                                    "профиль и откройте ссылку снова."
+                            )
+                            return@launch
+                        }
+                        else -> {
+                            wdttConnectFlow = WdttConnectFlow.SelectAttachmentProfile(
+                                link = link,
+                                candidates = selection.choices,
+                                selectedProfile = selection.choices.first().profileIndex,
+                            )
+                            return@launch
+                        }
+                    }
+                }
+                if (delivery.kind == RemoteDocumentKind.ATTACHMENT) {
+                    val profile = requestedAttachmentProfile
+                        ?: settingsStore.profileForRemoteBinding(delivery.binding)
+                    if (
+                        profile == null ||
+                        !settingsStore.applyRemoteCapabilityAttachment(profile, delivery)
+                    ) {
+                        wdttConnectFlow = WdttConnectFlow.Failed(
+                            "Не удалось сохранить разрешение в выбранном профиле."
+                        )
+                        return@launch
+                    }
+                    val confirmedStatus = when (
+                        val confirmation = AccessLifecycleCoordinator.refreshProfile(
+                            this@MainActivity,
+                            profile,
+                            force = true,
+                        )
+                    ) {
+                        is AccessLifecycleRefreshResult.Success -> confirmation.status
+                        is AccessLifecycleRefreshResult.Cached -> confirmation.status
+                        else -> {
+                            wdttConnectFlow = WdttConnectFlow.Failed(
+                                "Разрешение сохранено в выбранном профиле, но сервер пока " +
+                                    "не подтвердил привязку. Проверьте интернет и обновите " +
+                                    "карточку профиля."
+                            )
+                            return@launch
+                        }
+                    }
+                    val confirmedContinuation =
+                        if (confirmedStatus?.continuationAvailable == false) {
+                            RemoteContinuation(
+                                available = false,
+                                message = delivery.continuation.message,
+                            )
+                        } else {
+                            delivery.continuation
+                        }
+                    wdttConnectFlow = WdttConnectFlow.SelectHashes(
+                        profile = profile,
+                        continuation = confirmedContinuation,
+                        access = delivery.access,
+                    )
+                    return@launch
+                }
                 wdttConnectFlow = WdttConnectFlow.Progress("Доступ получен. Подготавливаем VPN-профиль...")
                 var boundProfile: Int? = null
                 for (binding in listOf(delivery.binding, delivery.access.binding)) {
                     if (binding.isBlank()) continue
                     boundProfile = settingsStore.profileForRemoteBinding(binding)
                     if (boundProfile != null) break
+                }
+                if (
+                    boundProfile == null &&
+                    delivery.kind == RemoteDocumentKind.BASE &&
+                    requestedAttachmentProfile != null
+                ) {
+                    boundProfile = requestedAttachmentProfile
                 }
                 if (boundProfile == null && delivery.kind == RemoteDocumentKind.BASE) {
                     boundProfile = settingsStore.profileForConnectionDocument(delivery.document)
@@ -567,7 +692,10 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch {
             val store = SettingsStore(this@MainActivity)
             runCatching {
-                store.createWdttDeepLinkApplyPlan(link)
+                store.createWdttDeepLinkApplyPlan(
+                    link,
+                    allowOmittedConnection = delivery?.kind == RemoteDocumentKind.UPDATE,
+                )
             }.onSuccess { basePlan ->
                 val plan = basePlan?.let {
                     if (preferredProfile == null) it else it.copy(
@@ -684,24 +812,17 @@ class MainActivity : ComponentActivity() {
                 }
                 if (fromRemoteDocument) {
                     val profile = result?.targetProfile ?: plan.targetProfile
-                    if (delivery?.access?.available == true) {
+                    if (delivery?.access?.available == true || isBoundUpdate) {
                         lifecycleScope.launch {
                             AccessLifecycleCoordinator.refreshProfile(
                                 this@MainActivity,
                                 profile,
-                                force = delivery.access.initialStatus == null,
+                                force = isBoundUpdate || delivery?.access?.initialStatus == null,
                             )
                         }
                     }
-                    if (isBoundUpdate) {
-                        val profileLabel = vpnProfileDisplayName(profile, store.profileNames.first())
-                        wdttConnectFlow = WdttConnectFlow.Complete(
-                            if (result?.alreadyApplied == true) {
-                                "Обновление профиля $profileLabel уже применено."
-                            } else {
-                                "Профиль $profileLabel обновлён. Новые данные уже видны в настройках туннеля."
-                            }
-                        )
+                    if (shouldRestoreUiAfterBoundUpdate(isBoundUpdate)) {
+                        wdttConnectFlow = null
                     } else if (
                         existingRemoteProfile &&
                         store.tunnelProfileSnapshot(profile).vkHashes.isNotBlank()
@@ -737,7 +858,13 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startConnectAction(profile: Int, continuation: RemoteContinuation) {
-        connectActionJob?.cancel()
+        // The dialog can deliver two taps before Compose has rendered the
+        // ExternalAction state.  Do not cancel an already running preparation
+        // and start a second browser/login flow: VK treats those parallel
+        // attempts as repeated authentication requests and may answer with
+        // its flood-control error [9].  A fresh attempt is available through
+        // the explicit Back/Retry path after the current job finishes.
+        if (connectActionJob?.isActive == true) return
         val access = (wdttConnectFlow as? WdttConnectFlow.SelectHashes)
             ?.access
             ?: RemoteAccessCapability.Unavailable
@@ -792,7 +919,8 @@ class MainActivity : ComponentActivity() {
                 )
                 val target = RemoteContinuationLauncher.begin(
                     capability = continuation,
-                    device = settingsStore.getOrCreateConnectDeviceId()
+                    device = settingsStore.getOrCreateConnectDeviceId(),
+                    localDocument = settingsStore.remoteActionProfileDocument(profile),
                 )
                 launchRemoteContinuation(target)
                 wdttConnectFlow = WdttConnectFlow.Complete(
@@ -1251,6 +1379,8 @@ private fun MainScreen(
     onSelectWdttDeepLinkOverwriteProfile: (Int) -> Unit = {},
     onConfirmWdttDeepLinkOverwrite: (WdttDeepLinkApplyPlan) -> Unit = {},
     onCancelWdttDeepLinkOverwrite: () -> Unit = {},
+    onSelectWdttAttachmentProfile: (Int) -> Unit = {},
+    onConfirmWdttAttachmentProfile: () -> Unit = {},
     onSelectWdttConnectProfile: (Int) -> Unit = {},
     onConfirmWdttConnectProfile: (WdttDeepLinkApplyPlan) -> Unit = {},
     onContinueLimitedWdttSetup: (WdttDeepLinkApplyPlan, RemoteDocumentDelivery) -> Unit = { _, _ -> },
@@ -1283,7 +1413,8 @@ private fun MainScreen(
     val scope = rememberCoroutineScope()
     val updateCheckMutex = remember { Mutex() }
     val settingsReady by settingsStore.settingsReady.collectAsStateWithLifecycle(initialValue = false)
-    val startupSettings by settingsStore.activeTunnelProfileUiSnapshot.collectAsStateWithLifecycle()
+    val startupSettings by
+        settingsStore.activeTunnelProfileContentUiSnapshot.collectAsStateWithLifecycle()
     if (!settingsReady || startupSettings == null) {
         Box(modifier = Modifier.fillMaxSize()) {
             AppBackdrop(modifier = Modifier.matchParentSize())
@@ -1768,6 +1899,7 @@ private fun MainScreen(
 
         // Floating theme toolbar overlay
         FloatingToolbar(
+            settingsStore = settingsStore,
             activeProfile = activeProfile,
             profileNames = profileNames,
             onActiveProfileChange = { profile ->
@@ -1990,6 +2122,8 @@ private fun MainScreen(
         WdttConnectActivationDialog(
             flow = flow,
             profileNames = profileNames,
+            onSelectAttachmentProfile = onSelectWdttAttachmentProfile,
+            onConfirmAttachmentProfile = onConfirmWdttAttachmentProfile,
             onSelectProfile = onSelectWdttConnectProfile,
             onConfirmProfile = onConfirmWdttConnectProfile,
             onContinueLimitedSetup = onContinueLimitedWdttSetup,
@@ -2032,16 +2166,24 @@ private fun MainScreen(
                         repeat(3) { profile ->
                             FilterChip(
                                 selected = plan.targetProfile == profile,
+                                enabled = profile !in plan.blockedProfiles,
                                 onClick = { onSelectWdttDeepLinkOverwriteProfile(profile) },
                                 label = { Text(vpnProfileDisplayName(profile, profileNames)) }
                             )
                         }
                     }
-                    Text("Будет полностью заменено подключение в профиле $profileLabel.")
+                    if (plan.blockedProfiles.size == 3) {
+                        Text("Все профили защищены действующим удалённым доступом. Сначала освободите один из них.")
+                    } else {
+                        Text("Будет полностью заменено подключение в профиле $profileLabel.")
+                    }
                 }
             },
             confirmButton = {
-                TextButton(onClick = { onConfirmWdttDeepLinkOverwrite(plan) }) {
+                TextButton(
+                    enabled = plan.targetProfile !in plan.blockedProfiles,
+                    onClick = { onConfirmWdttDeepLinkOverwrite(plan) },
+                ) {
                     Text("Да")
                 }
             },
@@ -2058,6 +2200,8 @@ private fun MainScreen(
 private fun WdttConnectActivationDialog(
     flow: WdttConnectFlow,
     profileNames: List<String>,
+    onSelectAttachmentProfile: (Int) -> Unit,
+    onConfirmAttachmentProfile: () -> Unit,
     onSelectProfile: (Int) -> Unit,
     onConfirmProfile: (WdttDeepLinkApplyPlan) -> Unit,
     onContinueLimitedSetup: (WdttDeepLinkApplyPlan, RemoteDocumentDelivery) -> Unit,
@@ -2073,7 +2217,8 @@ private fun WdttConnectActivationDialog(
     var selectedHashMethod by rememberSaveable { mutableStateOf<String?>(null) }
     var helpMethod by rememberSaveable { mutableStateOf<String?>(null) }
     var unavailableAutoMessage by rememberSaveable { mutableStateOf<String?>(null) }
-    val canDismiss = flow is WdttConnectFlow.Complete ||
+    val canDismiss = flow is WdttConnectFlow.SelectAttachmentProfile ||
+        flow is WdttConnectFlow.Complete ||
         flow is WdttConnectFlow.Failed
     AlertDialog(
         onDismissRequest = {
@@ -2110,6 +2255,41 @@ private fun WdttConnectActivationDialog(
                             Text(state.message)
                         }
                     }
+                    is WdttConnectFlow.SelectAttachmentProfile -> {
+                        val selectedCandidate = state.candidates.first {
+                            it.profileIndex == state.selectedProfile
+                        }
+                        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Text(
+                                "Найдено несколько изменённых обычных профилей. " +
+                                    "Выберите, к какому из них привязать разрешение. " +
+                                    "Готовые профили здесь недоступны."
+                            )
+                            state.candidates.forEach { candidate ->
+                                FilterChip(
+                                    selected = state.selectedProfile == candidate.profileIndex,
+                                    onClick = {
+                                        onSelectAttachmentProfile(candidate.profileIndex)
+                                    },
+                                    label = {
+                                        Text("${candidate.displayName} · ${candidate.sourceLabel}")
+                                    },
+                                )
+                            }
+                            Text(
+                                if (selectedCandidate.sourceLabel.contains("Деплой")) {
+                                    "Если подключение в «Деплое» заполнено полностью, при запуске " +
+                                        "будут использованы только адрес, порты и главный пароль. " +
+                                        "SSH-логин, SSH-пароль и ключи не передаются."
+                                } else {
+                                    "Можно выбрать даже частично заполненный профиль и закончить " +
+                                        "его настройку позже. Подключение не заменяется."
+                                },
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                    }
                     is WdttConnectFlow.SelectProfile -> {
                         val incomingName = WdttDeepLink.parse(
                             state.plan.link,
@@ -2124,13 +2304,20 @@ private fun WdttConnectActivationDialog(
                                 repeat(3) { profile ->
                                     FilterChip(
                                         selected = state.plan.targetProfile == profile,
+                                        enabled = profile !in state.plan.blockedProfiles,
                                         onClick = { onSelectProfile(profile) },
                                         label = { Text(vpnProfileDisplayName(profile, profileNames)) }
                                     )
                                 }
                             }
                             Text(
-                                "Подключение в выбранном профиле будет полностью заменено.",
+                                if (state.plan.blockedProfiles.size == 3) {
+                                    "Все профили защищены действующим готовым доступом. " +
+                                        "Ни один из них нельзя перезаписать."
+                                } else {
+                                    "Подключение в выбранном профиле будет полностью заменено. " +
+                                        "Действующие готовые профили недоступны для выбора."
+                                },
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 style = MaterialTheme.typography.bodySmall,
                             )
@@ -2141,7 +2328,7 @@ private fun WdttConnectActivationDialog(
                             "Автоматическое получение VK-хешей сейчас недоступно."
                         }
                         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                            Text("Перед добавлением профиля обратите внимание:")
+                            Text("Перед продолжением обратите внимание:")
                             Text(reason)
                             Text(
                                 "Это ограничение относится только к автоматическому получению " +
@@ -2153,25 +2340,13 @@ private fun WdttConnectActivationDialog(
                     }
                     is WdttConnectFlow.SelectHashes -> {
                         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                            Text("Выберите способ заполнения VK-хешей для нового профиля.")
-                            if (state.access.exchange.actionAvailable) {
-                                HashMethodRow(
-                                    title = state.access.exchange.label.ifBlank {
-                                        "Вернуть хеши"
-                                    },
-                                    body = state.access.exchange.message.ifBlank {
-                                        "Восстановить сохранённые хеши этого профиля"
-                                    },
-                                    onHelp = { helpMethod = "restore" },
-                                    onClick = {
-                                        onRestoreSavedHashes(state.profile, state.access)
-                                    }
-                                )
-                            }
+                            Text("Выберите способ заполнения VK-хешей для профиля.")
                             HashMethodRow(
                                 title = "Получить автоматически",
                                 body = if (state.continuation.available) {
-                                    "Войти в VK при необходимости и создать ссылки"
+                                    state.continuation.message.ifBlank {
+                                        "Войти в VK при необходимости и создать ссылки"
+                                    }
                                 } else {
                                     "Недоступно — нажмите, чтобы узнать, что делать"
                                 },
@@ -2192,6 +2367,20 @@ private fun WdttConnectActivationDialog(
                                 onHelp = { helpMethod = "manual" },
                                 onClick = { selectedHashMethod = "manual" }
                             )
+                            if (state.access.exchange.actionAvailable) {
+                                HashMethodRow(
+                                    title = state.access.exchange.label.ifBlank {
+                                        "Вернуть хеши"
+                                    },
+                                    body = state.access.exchange.message.ifBlank {
+                                        "Восстановить сохранённые хеши этого профиля"
+                                    },
+                                    onHelp = { helpMethod = "restore" },
+                                    onClick = {
+                                        onRestoreSavedHashes(state.profile, state.access)
+                                    }
+                                )
+                            }
                             if (selectedHashMethod == "manual") {
                                 OutlinedTextField(
                                     value = manualHashes,
@@ -2211,8 +2400,16 @@ private fun WdttConnectActivationDialog(
         },
         confirmButton = {
             when (flow) {
+                is WdttConnectFlow.SelectAttachmentProfile -> {
+                    TextButton(onClick = onConfirmAttachmentProfile) {
+                        Text("Продолжить")
+                    }
+                }
                 is WdttConnectFlow.SelectProfile -> {
-                    TextButton(onClick = { onConfirmProfile(flow.plan) }) {
+                    TextButton(
+                        enabled = flow.plan.targetProfile !in flow.plan.blockedProfiles,
+                        onClick = { onConfirmProfile(flow.plan) },
+                    ) {
                         Text("Сохранить")
                     }
                 }
@@ -2256,6 +2453,11 @@ private fun WdttConnectActivationDialog(
         },
         dismissButton = {
             when (flow) {
+                is WdttConnectFlow.SelectAttachmentProfile -> {
+                    TextButton(onClick = onDismiss) {
+                        Text("Отмена")
+                    }
+                }
                 is WdttConnectFlow.SelectProfile -> {
                     TextButton(onClick = onDismiss) {
                         Text("Позже")
@@ -2310,7 +2512,7 @@ private fun WdttConnectActivationDialog(
                         }
                         "restore" -> {
                             "WDTT Plus безопасно вернёт хеши, ранее сохранённые именно для " +
-                                "этого готового профиля. Хеши других ваших профилей не используются."
+                                "этого профиля. Значения других профилей не используются."
                         }
                         else -> {
                             "Создайте или скопируйте до четырёх ссылок-приглашений VK Звонков, " +

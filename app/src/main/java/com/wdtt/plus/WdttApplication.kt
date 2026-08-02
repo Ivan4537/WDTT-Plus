@@ -9,7 +9,11 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+
+internal fun shouldClearPhantomVpn(activeTunnelProfile: Int?): Boolean =
+    activeTunnelProfile == null
 
 class WdttApplication : Application() {
     @Volatile
@@ -21,12 +25,19 @@ class WdttApplication : Application() {
     override fun onCreate() {
         super.onCreate()
         DeployManager.init(this)
-        
-        // Очищаем фантомный VPN при холодном старте приложения (например, после перезагрузки телефона).
-        // Если телефон перезагрузился, система Android пытается сама восстановить VpnService, 
-        // что приводит к фантомному ключу без интернета. Этот код мгновенно сбрасывает статус в DOWN.
+
+        val settingsStore = SettingsStore(this)
+
+        // Очищаем только действительно бесхозный фантомный VPN. Если сохранён активный
+        // профиль, Android одновременно восстанавливает TunnelService: безусловный DOWN
+        // здесь мог опередить или оборвать штатное восстановление и затем вызвать новый UP.
         CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
             runCatching {
+                val activeTunnelProfile = settingsStore.activeTunnelProfile.first()
+                if (!shouldClearPhantomVpn(activeTunnelProfile)) {
+                    Log.d("WdttApp", "Ожидается восстановление активного VPN; очистка фантома пропущена")
+                    return@runCatching
+                }
                 val backend = getBackend(this@WdttApplication)
                 val tunnel = WireGuardHelper.WgTunnel()
                 backend.setState(tunnel, Tunnel.State.DOWN, null)
@@ -35,8 +46,6 @@ class WdttApplication : Application() {
                 Log.w("WdttApp", "Не удалось очистить фантомный VPN: ${it.message}")
             }
         }
-
-        val settingsStore = SettingsStore(this)
         CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
             RemoteActionCatalogGateway.fetch(force = true)
         }

@@ -115,6 +115,22 @@ case "$( uname )" in                #(
   NONSTOP* )        nonstop=true ;;
 esac
 
+# Gradle starts another daemon when the compatible daemon is busy. On Linux,
+# serialize wrapper invocations for this checkout so an accidental repeated
+# command waits instead of running a second memory-heavy Android build. The
+# lock descriptor stays in flock's parent process and is not inherited by the
+# long-lived Gradle or Kotlin daemons.
+if [ "${WDTT_GRADLE_LOCK_HELD:-0}" != 1 ] &&
+   ! "$cygwin" && ! "$msys" && ! "$darwin" && ! "$nonstop" &&
+   command -v flock >/dev/null 2>&1
+then
+    gradle_lock_dir=$APP_HOME/.gradle
+    mkdir -p "$gradle_lock_dir" || die "Could not create Gradle lock directory: $gradle_lock_dir"
+    WDTT_GRADLE_LOCK_HELD=1
+    export WDTT_GRADLE_LOCK_HELD
+    exec flock --exclusive --close "$gradle_lock_dir/wdtt-build.lock" "$0" "$@"
+fi
+
 CLASSPATH=$APP_HOME/gradle/wrapper/gradle-wrapper.jar
 
 

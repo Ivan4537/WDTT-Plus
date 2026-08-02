@@ -29,17 +29,25 @@ data class RemoteLaunchTarget(
 }
 
 object RemoteContinuationLauncher {
-    suspend fun begin(capability: RemoteContinuation, device: String): RemoteLaunchTarget {
+    suspend fun begin(
+        capability: RemoteContinuation,
+        device: String,
+        localDocument: String? = null,
+    ): RemoteLaunchTarget {
         require(capability.available && opaqueValue(capability.key)) {
             "Автоматическое заполнение недоступно для этого профиля."
         }
         require(safeServiceUrl(capability.url)) { "Автоматическое заполнение сейчас недоступно." }
         require(validDevice(device)) { "Не удалось определить текущее устройство." }
         return withContext(Dispatchers.IO) {
-            val payload = JSONObject()
+            val request = JSONObject()
                 .put("key", capability.key.trim())
                 .put("device", device.trim())
                 .put("return_transport", "auth_tab")
+            attachmentDocumentForRequest(localDocument)?.let { document ->
+                request.put("profile", document)
+            }
+            val payload = request
                 .toString()
                 .toByteArray(Charsets.UTF_8)
             var connection: HttpURLConnection? = null
@@ -164,6 +172,11 @@ object RemoteContinuationLauncher {
 
     internal fun browserLaunchUrls(target: RemoteLaunchTarget): List<String> =
         (
+            // The primary URL is for the preferred native VK handler. When
+            // that handler is unavailable, the backend-provided mobile login
+            // URL is the proven browser entry: it preserves the opaque `to`
+            // state through an unauthenticated VK login and immediately
+            // continues to the Mini App for an existing browser session.
             if (target.handlerPackages().isNotEmpty() && target.fallbackUrl.isNotBlank()) {
                 listOf(target.fallbackUrl, target.primaryUrl)
             } else {

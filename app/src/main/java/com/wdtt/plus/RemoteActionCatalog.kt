@@ -3,6 +3,8 @@ package com.wdtt.plus
 import android.content.Context
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.net.HttpURLConnection
@@ -81,6 +83,7 @@ object RemoteActionCatalogGateway {
     private const val CACHE_TTL_MS = 10 * 60 * 1000L
     private const val MAX_RESPONSE_CHARS = 32 * 1024
     private val placements = setOf("tunnel", "profile", "about")
+    private val fetchMutex = Mutex()
 
     @Volatile
     private var cachedAt = 0L
@@ -91,21 +94,24 @@ object RemoteActionCatalogGateway {
     fun hasFreshCache(): Boolean =
         System.currentTimeMillis() - cachedAt in 0 until CACHE_TTL_MS
 
-    fun cached(): RemoteActionCatalog =
-        if (hasFreshCache()) cachedCatalog else RemoteActionCatalog.Empty
+    fun cached(): RemoteActionCatalog = cachedCatalog
 
     suspend fun fetch(force: Boolean = false): RemoteActionCatalog {
         val now = System.currentTimeMillis()
         if (!force && now - cachedAt in 0 until CACHE_TTL_MS) return cachedCatalog
         return withContext(Dispatchers.IO) {
-            val current = System.currentTimeMillis()
-            if (!force && current - cachedAt in 0 until CACHE_TTL_MS) {
-                return@withContext cachedCatalog
+            fetchMutex.withLock {
+                val current = System.currentTimeMillis()
+                if (!force && current - cachedAt in 0 until CACHE_TTL_MS) {
+                    return@withLock cachedCatalog
+                }
+                runCatching { request() }
+                    .onSuccess { received ->
+                        cachedCatalog = received
+                        cachedAt = current
+                    }
+                cachedCatalog
             }
-            val received = runCatching { request() }.getOrDefault(RemoteActionCatalog.Empty)
-            cachedCatalog = received
-            cachedAt = current
-            received
         }
     }
 

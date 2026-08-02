@@ -3,12 +3,14 @@ package com.wdtt.plus
 import android.content.Context
 import android.os.Build
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import java.util.TimeZone
 
 sealed interface AccessLifecycleRefreshResult {
@@ -32,6 +34,14 @@ object AccessLifecycleCoordinator {
     private val pendingExternalRefresh = mutableSetOf<Int>()
 
     suspend fun refreshProfile(
+        context: Context,
+        profileIndex: Int,
+        force: Boolean = false,
+    ): AccessLifecycleRefreshResult = withContext(Dispatchers.IO) {
+        refreshProfileOnWorker(context, profileIndex, force)
+    }
+
+    private suspend fun refreshProfileOnWorker(
         context: Context,
         profileIndex: Int,
         force: Boolean = false,
@@ -60,7 +70,9 @@ object AccessLifecycleCoordinator {
             val current = store.accessLifecycleForProfile(profile)
             val currentNow = System.currentTimeMillis()
             if (!current.capability.available) return@withLock AccessLifecycleRefreshResult.Unmanaged
-            syncPendingProfileValues(store, profile, current.capability)
+            if (current.status?.continuationAvailable != false) {
+                syncPendingProfileValues(store, profile, current.capability)
+            }
             if (
                 !force &&
                 current.status != null &&
@@ -103,6 +115,20 @@ object AccessLifecycleCoordinator {
                     )
                 ) {
                     return@withLock AccessLifecycleRefreshResult.Unmanaged
+                }
+                if (received.continuationAvailable != false) {
+                    try {
+                        syncPendingProfileValues(store, profile, effectiveCapability)
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (error: Exception) {
+                        TunnelManager.noteAccessLifecycleEvent(
+                            key = "profile_${profile}_values_sync_failed",
+                            message = error.message
+                                ?: "Не удалось обновить сохранённые данные профиля",
+                            warning = true,
+                        )
+                    }
                 }
                 val profileUpdated = applyProfileUpdateIfNeeded(
                     appContext = appContext,
@@ -478,22 +504,17 @@ object AccessLifecycleCoordinator {
         require(binding.isNotBlank() && delivery.binding == binding) {
             "Обновление относится к другому профилю."
         }
-        val applied = store.applyWdttDeepLink(
+        val applied = store.applyRemoteDocumentDelivery(
             plan = WdttDeepLinkApplyPlan(
                 link = delivery.document,
                 targetProfile = profile,
                 requiresConfirmation = false,
                 storeAsLink = false,
             ),
-            resetRemoteContinuation = false,
-            profileMaxWorkers = delivery.profileMaxWorkers,
-            remoteManaged = null,
-            preserveVkHashes = true,
+            delivery = delivery,
+            isBoundUpdate = true,
         )
         require(applied != null) { "Не удалось применить обновление профиля." }
-        if (delivery.access.available) {
-            store.saveRemoteAccessCapability(delivery.access, profile)
-        }
         store.saveAppliedAccessProfileRevision(profile, update.revision)
         requestTunnelProfileRuntimeUpdate(profile)
         TunnelManager.noteAccessLifecycleEvent(

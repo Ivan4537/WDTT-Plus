@@ -98,6 +98,10 @@ data class AccessLifecycleStatus(
     val detailLabel: String = "",
     val detailValue: String = "",
     val actionIcon: String = "",
+    val continuationAvailable: Boolean? = null,
+    val continuationExpiresAtSeconds: Long? = null,
+    val dismissible: Boolean? = null,
+    val dismissedMessage: String = "",
     val severity: AccessLifecycleSeverity = AccessLifecycleSeverity.NORMAL,
     val checkedAtMillis: Long = System.currentTimeMillis(),
     val profileRevision: Long = 0,
@@ -125,6 +129,10 @@ data class AccessLifecycleUiState(
     val detailLabel: String = "",
     val detailValue: String = "",
     val actionIcon: String = "",
+    val continuationAvailable: Boolean? = null,
+    val continuationExpiresAtSeconds: Long? = null,
+    val dismissible: Boolean? = null,
+    val dismissedMessage: String = "",
     val severity: AccessLifecycleSeverity,
     val checkedAtMillis: Long,
 ) {
@@ -140,6 +148,10 @@ data class AccessLifecycleUiState(
             detailLabel = "",
             detailValue = "",
             actionIcon = "",
+            continuationAvailable = null,
+            continuationExpiresAtSeconds = null,
+            dismissible = null,
+            dismissedMessage = "",
             severity = AccessLifecycleSeverity.NORMAL,
             checkedAtMillis = 0,
         )
@@ -157,8 +169,28 @@ internal fun accessLifecycleDismissalSignature(
         lifecycle.message,
         lifecycle.detailLabel,
         lifecycle.detailValue,
+        lifecycle.continuationAvailable,
+        lifecycle.continuationExpiresAtSeconds,
+        lifecycle.dismissible,
+        lifecycle.dismissedMessage,
     ).joinToString("|")
 }
+
+internal fun accessLifecycleCanDismiss(lifecycle: AccessLifecycleUiState): Boolean =
+    lifecycle.dismissible ?: (
+        lifecycle.allowConnect && lifecycle.severity == AccessLifecycleSeverity.WARNING
+        )
+
+internal fun boundContinuationAvailable(
+    hasCredential: Boolean,
+    hasEndpoint: Boolean,
+    remoteAvailability: Boolean?,
+    expiresAtSeconds: Long? = null,
+    nowSeconds: Long = System.currentTimeMillis() / 1_000L,
+): Boolean = hasCredential &&
+    hasEndpoint &&
+    remoteAvailability != false &&
+    (expiresAtSeconds == null || expiresAtSeconds == 0L || expiresAtSeconds > nowSeconds)
 
 internal fun StoredAccessLifecycle.toUiState(): AccessLifecycleUiState {
     val current = status
@@ -173,6 +205,10 @@ internal fun StoredAccessLifecycle.toUiState(): AccessLifecycleUiState {
         detailLabel = current?.detailLabel.orEmpty(),
         detailValue = current?.detailValue.orEmpty(),
         actionIcon = current?.actionIcon.orEmpty(),
+        continuationAvailable = current?.continuationAvailable,
+        continuationExpiresAtSeconds = current?.continuationExpiresAtSeconds,
+        dismissible = current?.dismissible,
+        dismissedMessage = current?.dismissedMessage.orEmpty(),
         severity = current?.severity ?: AccessLifecycleSeverity.NORMAL,
         checkedAtMillis = current?.checkedAtMillis ?: 0,
     )

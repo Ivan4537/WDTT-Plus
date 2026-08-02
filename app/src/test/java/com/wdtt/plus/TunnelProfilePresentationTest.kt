@@ -21,7 +21,7 @@ class TunnelProfilePresentationTest {
         assertEquals("link", resolveConnectionInputMethod("", false, false, true))
         assertEquals("manual", resolveConnectionInputMethod("", false, false, false))
         assertEquals("manual", resolveConnectionInputMethod("", false, true, true))
-        assertEquals("link", resolveConnectionInputMethod("link", false, true, false))
+        assertEquals("manual", resolveConnectionInputMethod("link", false, true, false))
     }
 
     @Test
@@ -81,7 +81,7 @@ class TunnelProfilePresentationTest {
                 manualValid = true,
             )
         )
-        assertTrue(
+        assertFalse(
             isSelectedCompactConnectionReady(
                 selectedMethod = "link",
                 savedMethod = "link",
@@ -91,7 +91,7 @@ class TunnelProfilePresentationTest {
                 manualValid = true,
             )
         )
-        assertFalse(
+        assertTrue(
             isSelectedCompactConnectionReady(
                 selectedMethod = "manual",
                 savedMethod = "link",

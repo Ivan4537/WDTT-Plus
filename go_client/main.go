@@ -235,6 +235,9 @@ func enqueueCaptchaResult(result CaptchaResult) {
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 	os.Args = normalizeBooleanFlagArgs(os.Args, "-vkcalls-preflight")
+	os.Args = normalizeBooleanFlagArgs(os.Args, "-turn-stream-first")
+	os.Args = normalizeBooleanFlagArgs(os.Args, "-rt-masque")
+	os.Args = normalizeBooleanFlagArgs(os.Args, "-rt-masque-accept-tos")
 
 	setupGlobalResolver()
 
@@ -322,6 +325,36 @@ func main() {
 	connPassword := flag.String("password", "", "пароль подключения")
 	captchaMode := flag.String("captcha-mode", "auto", "режим обхода капчи (auto/wv/rjs)")
 	vkCallsPreflight := flag.Bool("vkcalls-preflight", true, "пробовать VKCalls до captcha-цепочки")
+	turnStreamFirst := flag.Bool(
+		"turn-stream-first",
+		false,
+		"сначала пробовать TURN/TLS и TURN/TCP, сохраняя UDP как резерв",
+	)
+	turnSNI := flag.String(
+		"turn-sni",
+		"",
+		"SNI белого списка для TURN/TLS (используется только внешним TLS-соединением)",
+	)
+	rtMasque := flag.Bool(
+		"rt-masque",
+		false,
+		"после прямых путей Сети РТ пробовать WARP CONNECT-IP по HTTP/2 и HTTP/3",
+	)
+	rtMasqueConfig := flag.String(
+		"rt-masque-config",
+		"",
+		"путь к приватной конфигурации enrollment WARP MASQUE",
+	)
+	rtMasqueAcceptTOS := flag.Bool(
+		"rt-masque-accept-tos",
+		false,
+		"пользователь подтвердил условия Cloudflare для первой регистрации WARP",
+	)
+	warpAPIRelay := flag.String(
+		"warp-api-relay",
+		"",
+		"локальный loopback-выход только для регистрации WARP API",
+	)
 	fingerprint := flag.String("fingerprint", "firefox", "браузерный фингерпринт (firefox, chrome, safari, ios, android)")
 	clientIdsFlag := flag.String("client-ids", "", "ID клиентов VK через запятую")
 
@@ -332,6 +365,22 @@ func main() {
 	}
 	activeCaptchaMode := setCaptchaMode(*captchaMode)
 	setVKCallsPreflight(*vkCallsPreflight, *deviceID)
+	var normalizedTurnSNI string
+	if *turnStreamFirst {
+		var turnSNIErr error
+		normalizedTurnSNI, turnSNIErr = normalizeTURNFrontSNI(*turnSNI)
+		if turnSNIErr != nil {
+			log.Fatalf("[КЛИЕНТ] Некорректный TURN SNI: %v", turnSNIErr)
+		}
+		if normalizedTurnSNI != "" {
+			log.Printf("[TURN] Режим «Сеть РТ»: TURN/TLS, затем TCP ко всем адресам VK с разделением первого STUN-запроса; UDP остаётся резервом; внешний TLS SNI=%s", normalizedTurnSNI)
+		} else {
+			log.Printf("[TURN] Режим «Сеть РТ»: TURN/TLS, затем TCP ко всем адресам VK с разделением первого STUN-запроса; UDP остаётся резервом")
+		}
+	}
+	if *rtMasque && !*turnStreamFirst {
+		log.Printf("[MASQUE] Проигнорирован: механизм доступен только вместе с режимом «Сеть РТ»")
+	}
 
 	if *vkHash == "" {
 		log.Fatal("[КЛИЕНТ] Нужен -vk")
@@ -404,11 +453,29 @@ func main() {
 	useConfigFirstStart := *configFirstStart && *numW == workersPerGroup
 	useHashFallback := *hashFallback && *numW == workersPerGroup
 
+	var masqueManager *warpMasqueManager
+	if *turnStreamFirst && *rtMasque {
+		if err := configureWarpAPIRelay(*warpAPIRelay); err != nil {
+			log.Printf("[MASQUE] Локальный выход для регистрации WARP отклонён: %v; продолжаем прямые попытки", err)
+		}
+		masqueManager, err = newWarpMasqueManager(ctx, *rtMasqueConfig, normalizedTurnSNI, *rtMasqueAcceptTOS)
+		if err != nil {
+			log.Printf("[MASQUE] Не удалось включить новый механизм: %v; прямые пути «Сети РТ» остаются доступны", err)
+			masqueManager = nil
+		} else {
+			defer masqueManager.Close()
+			log.Printf("[MASQUE] Включён резерв после прямых путей: HTTP/2 (TCP/443), затем HTTP/3 (QUIC/443)")
+			go masqueManager.prewarmConfig()
+		}
+	}
+
 	tp := &TurnParams{
-		Host:    *host,
-		Port:    *port,
-		Hashes:  hashes,
-		WrapKey: wrapKey,
+		Host:        *host,
+		Port:        *port,
+		Hashes:      hashes,
+		TLSFrontSNI: normalizedTurnSNI,
+		Masque:      masqueManager,
+		WrapKey:     wrapKey,
 	}
 
 	// Слушаем локально с ожиданием (если старый процесс еще не убит Parent Watcher'ом)
@@ -555,7 +622,7 @@ func main() {
 			defer wg.Done()
 			WorkerGroup(ctx, cancel, groupID, startHashIndex, tp, peer, disp, localPort,
 				isFirstGroup, configChan, workerIds, *numW, useConfigFirstStart, useHashFallback, &pauseFlag,
-				*deviceID, *connPassword, *deviceInfo, transportSession, stats, waitR, sigR)
+				*deviceID, *connPassword, *deviceInfo, transportSession, stats, *turnStreamFirst, waitR, sigR)
 		}(gID, isFirst, cc, ids, g, myWaitReady, mySignalReady)
 	}
 

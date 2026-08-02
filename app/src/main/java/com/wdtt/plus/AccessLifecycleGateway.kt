@@ -246,6 +246,17 @@ object AccessLifecycleGateway {
         val actionIcon = action?.optString("icon").orEmpty().trim().take(32)
             .takeIf { it == "update" }
             .orEmpty()
+        val continuationAvailable = root.optJSONObject("continuation")
+            ?.takeIf { it.has("available") }
+            ?.optBoolean("available", false)
+        val continuationExpiresAtSeconds = root.optJSONObject("continuation")
+            ?.takeIf { it.has("expires") }
+            ?.optLong("expires", 0L)
+            ?.coerceAtLeast(0L)
+        val dismissible = root
+            .takeIf { it.has("dismissible") }
+            ?.optBoolean("dismissible", false)
+        val dismissedMessage = root.optString("dismissed_message").trim().take(400)
         val title = root.optString("title").trim().take(120)
         val message = root.optString("message").trim().take(400)
         val detail = root.optJSONObject("detail")
@@ -281,6 +292,10 @@ object AccessLifecycleGateway {
             detailLabel = detailLabel,
             detailValue = detailValue,
             actionIcon = actionIcon,
+            continuationAvailable = continuationAvailable,
+            continuationExpiresAtSeconds = continuationExpiresAtSeconds,
+            dismissible = dismissible,
+            dismissedMessage = dismissedMessage,
             severity = severity,
             profileRevision = revision,
             profileUpdate = update,

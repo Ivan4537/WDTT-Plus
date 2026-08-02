@@ -67,6 +67,22 @@ class ServerMigrationTest {
     }
 
     @Test
+    fun updateFrom13To14RequiresServerMigration() {
+        val result = resolveServerMigrationInitialization(
+            currentVersionCode = 14,
+            isUpdatedInstall = true,
+            storedLastSeenAppVersionCode = 13,
+            storedPendingLevel = 12,
+            storedAcknowledgedLevel = 12,
+            legacyAcknowledgedLevel = 5
+        )
+
+        assertEquals(14, result.pendingLevel)
+        assertEquals(12, result.acknowledgedLevel)
+        assertEquals(14, latestServerMigrationLevel(14))
+    }
+
+    @Test
     fun stateSeparatesReadNoticeFromCompletedDeployment() {
         val state = ServerMigrationState(
             pendingLevel = 7,

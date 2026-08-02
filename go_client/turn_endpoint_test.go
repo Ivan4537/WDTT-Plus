@@ -32,24 +32,78 @@ func TestSessionTURNCandidatesKeepLegacyUDPFirst(t *testing.T) {
 		"turn:turn.example:3478?transport=tcp",
 	}
 	got := sessionTURNCandidates(raw, 0, nil)
+	want := []struct {
+		host      string
+		port      string
+		transport turnTransport
+		legacyUDP bool
+	}{
+		{"turn.example", "443", turnTransportUDP, true},
+		{"1.2.3.4", "3478", turnTransportUDP, true},
+		{"turn.example", "3478", turnTransportUDP, true},
+		{"turn.example", "443", turnTransportTLS, false},
+		{"turn.example", "3478", turnTransportTCP, false},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("normal-mode candidates=%#v, want %d entries", got, len(want))
+	}
+	for index, expected := range want {
+		actual := got[index]
+		if actual.Host != expected.host || actual.Port != expected.port ||
+			actual.Transport != expected.transport || actual.LegacyUDP != expected.legacyUDP {
+			t.Fatalf("normal-mode candidate[%d]=%#v, want %#v", index, actual, expected)
+		}
+	}
+}
+
+func TestSessionTURNCandidatesPreferStreamForRtMode(t *testing.T) {
+	raw := []string{
+		"turn:turn.example:443?transport=tcp",
+		"turn:1.2.3.4:3478?transport=udp",
+		"turns:turn.example:443?transport=tcp",
+	}
+	got := sessionTURNCandidatesWithPreference(raw, 0, nil, true)
 	if len(got) < 3 {
 		t.Fatalf("not enough candidates: %#v", got)
 	}
-	if got[0].Transport != turnTransportUDP || !got[0].LegacyUDP || got[0].Host != "turn.example" || got[0].Port != "443" {
-		t.Fatalf("first candidate must preserve old UDP behavior, got %#v", got[0])
+	if got[0].Transport != turnTransportTLS || got[0].LegacyUDP {
+		t.Fatalf("first candidate must be the real TLS transport, got %#v", got[0])
 	}
-	foundTLS := false
-	foundTCP := false
-	for _, endpoint := range got[1:] {
-		if endpoint.Transport == turnTransportTLS {
-			foundTLS = true
-		}
-		if endpoint.Transport == turnTransportTCP {
-			foundTCP = true
-		}
+	if got[1].Transport != turnTransportTCP || got[1].LegacyUDP {
+		t.Fatalf("second candidate must be the real TCP transport, got %#v", got[1])
 	}
-	if !foundTLS || !foundTCP {
-		t.Fatalf("expected TCP/TLS fallbacks, got %#v", got)
+	if got[len(got)-1].Transport != turnTransportUDP || !got[len(got)-1].LegacyUDP {
+		t.Fatalf("legacy UDP candidates must remain as a final fallback, got %#v", got)
+	}
+}
+
+func TestSessionTURNCandidatesPreferStreamSynthesizesTCPFromUDPURL(t *testing.T) {
+	got := sessionTURNCandidatesWithPreference(
+		[]string{"turn:1.2.3.4:3478?transport=udp"},
+		0,
+		nil,
+		true,
+	)
+	if len(got) != 2 {
+		t.Fatalf("expected synthetic TCP plus UDP fallback, got %#v", got)
+	}
+	if got[0].Transport != turnTransportTCP || got[0].Host != "1.2.3.4" || got[0].Port != "3478" {
+		t.Fatalf("first candidate must be synthetic TCP to the VK TURN address, got %#v", got[0])
+	}
+	if got[1].Transport != turnTransportUDP || !got[1].LegacyUDP {
+		t.Fatalf("last candidate must preserve UDP fallback, got %#v", got[1])
+	}
+}
+
+func TestSessionTURNCandidatesNormalModeDoesNotSynthesizeTCP(t *testing.T) {
+	got := sessionTURNCandidatesWithPreference(
+		[]string{"turn:1.2.3.4:3478?transport=udp"},
+		0,
+		nil,
+		false,
+	)
+	if len(got) != 1 || got[0].Transport != turnTransportUDP || !got[0].LegacyUDP {
+		t.Fatalf("normal mode must keep the historical UDP-only candidate, got %#v", got)
 	}
 }
 

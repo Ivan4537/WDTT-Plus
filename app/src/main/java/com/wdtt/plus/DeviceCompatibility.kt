@@ -16,6 +16,7 @@ import android.provider.Settings
 import android.system.Os
 import android.system.OsConstants
 import android.webkit.WebView
+import org.json.JSONObject
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -97,6 +98,70 @@ data class DeviceCompatibilityReport(
     }
 }
 
+internal enum class RtMasqueEnrollmentState {
+    Missing,
+    Ready,
+    Invalid,
+}
+
+internal fun inspectRtMasqueEnrollment(file: File): RtMasqueEnrollmentState {
+    if (!file.isFile) return RtMasqueEnrollmentState.Missing
+    if (file.length() !in 1L..128L * 1024L) return RtMasqueEnrollmentState.Invalid
+    return runCatching {
+        val json = JSONObject(file.readText(Charsets.UTF_8))
+        val requiredFields = listOf(
+            "private_key",
+            "endpoint_v4",
+            "endpoint_pub_key",
+            "ipv4",
+        )
+        if (
+            json.optInt("version", -1) != 1 ||
+            requiredFields.any { json.optString(it).isBlank() }
+        ) {
+            RtMasqueEnrollmentState.Invalid
+        } else {
+            RtMasqueEnrollmentState.Ready
+        }
+    }.getOrDefault(RtMasqueEnrollmentState.Invalid)
+}
+
+internal fun pageSizeCompatibilityItem(
+    pageSize: Long?,
+    processIs64Bit: Boolean,
+): DeviceCheckItem = when {
+    pageSize == null || pageSize <= 0L -> DeviceCheckItem(
+        title = "Страница памяти",
+        status = "не удалось определить",
+        details = "Android не вернул размер страницы памяти.",
+        recommendation = "Если VPN не стартует на новом устройстве, скопируйте отчёт через «Проверить устройство».",
+        severity = DeviceCheckSeverity.Info,
+        firstLaunchRelevant = false,
+    )
+    pageSize == 16L * 1024L && processIs64Bit -> DeviceCheckItem(
+        title = "Страница памяти",
+        status = "16 КиБ · поддерживается",
+        details = "Устройство использует страницы памяти 16 КиБ. Все 64-битные нативные библиотеки release-сборки WDTT Plus проверяются на совместимое LOAD-выравнивание.",
+        severity = DeviceCheckSeverity.Ok,
+        firstLaunchRelevant = true,
+    )
+    pageSize > 4096L -> DeviceCheckItem(
+        title = "Страница памяти",
+        status = "$pageSize байт · требуется проверка",
+        details = "Android использует нестандартный для этой ABI размер страницы памяти, который нельзя подтвердить как штатный 16-КиБ режим текущей 64-битной сборки.",
+        recommendation = "Если туннель не стартует, установите подходящий APK и отправьте отчёт из «Проверить устройство».",
+        severity = DeviceCheckSeverity.Warning,
+        firstLaunchRelevant = true,
+    )
+    else -> DeviceCheckItem(
+        title = "Страница памяти",
+        status = "$pageSize байт",
+        details = "Размер страницы памяти поддерживается текущей нативной сборкой.",
+        severity = DeviceCheckSeverity.Ok,
+        firstLaunchRelevant = true,
+    )
+}
+
 object DeviceCompatibility {
     const val APP_VERSION_ITEM_TITLE = "Версия WDTT Plus"
     private const val MIN_RECOMMENDED_SDK = 29
@@ -112,7 +177,7 @@ object DeviceCompatibility {
         val items = buildList {
             add(androidVersionItem())
             add(abiItem())
-            add(nativeClientItem(appContext))
+            add(nativeComponentsItem(appContext))
             nativeRuntimeSafetyItem()?.let(::add)
             add(pageSizeItem())
             add(memoryClassItem(appContext, workersPerHash))
@@ -231,30 +296,27 @@ object DeviceCompatibility {
         )
     }
 
-    private fun nativeClientItem(context: Context): DeviceCheckItem {
+    private fun nativeComponentsItem(context: Context): DeviceCheckItem {
         val nativeLibraryDir = context.applicationInfo.nativeLibraryDir.orEmpty()
         val nativeClient = File(nativeLibraryDir, "libclient.so")
+        val wireGuardBackend = File(nativeLibraryDir, "libwg-go.so")
+        val missing = buildList {
+            if (!nativeClient.isFile || nativeClient.length() <= 0L) add("libclient.so")
+            if (!wireGuardBackend.isFile || wireGuardBackend.length() <= 0L) add("libwg-go.so")
+        }
         return when {
-            !nativeClient.isFile -> DeviceCheckItem(
-                title = "Нативный клиент",
-                status = "libclient.so не найден",
-                details = "Android-часть запустилась, но нативный Go-клиент, который поднимает TURN/DTLS транспорт, в установленном APK не найден.",
+            missing.isNotEmpty() -> DeviceCheckItem(
+                title = "Нативные компоненты",
+                status = "не найдены: ${missing.joinToString()}",
+                details = "В установленном APK отсутствует или повреждён нативный клиент TURN/DTLS либо WireGuard backend системного VPN.",
                 recommendation = "Переустановите APK нужной ABI или universal APK из официального релиза WDTT Plus.",
                 severity = DeviceCheckSeverity.Error,
                 firstLaunchRelevant = true
             )
-            nativeClient.length() <= 0L -> DeviceCheckItem(
-                title = "Нативный клиент",
-                status = "libclient.so пустой",
-                details = "Файл нативного клиента найден, но его размер равен нулю.",
-                recommendation = "Переустановите APK; текущая установка выглядит повреждённой.",
-                severity = DeviceCheckSeverity.Error,
-                firstLaunchRelevant = true
-            )
             else -> DeviceCheckItem(
-                title = "Нативный клиент",
-                status = "найден",
-                details = "libclient.so найден в установленном APK, размер: ${formatMiB(nativeClient.length())}.",
+                title = "Нативные компоненты",
+                status = "клиент и WireGuard найдены",
+                details = "libclient.so: ${formatMiB(nativeClient.length())}; libwg-go.so: ${formatMiB(wireGuardBackend.length())}.",
                 severity = DeviceCheckSeverity.Ok,
                 firstLaunchRelevant = true
             )
@@ -263,29 +325,56 @@ object DeviceCompatibility {
 
     private fun pageSizeItem(): DeviceCheckItem {
         val pageSize = runCatching { Os.sysconf(OsConstants._SC_PAGESIZE) }.getOrNull()
+        return pageSizeCompatibilityItem(pageSize, android.os.Process.is64Bit())
+    }
+
+    fun rtNetworkModeItem(context: Context, profile: TunnelProfileSnapshot): DeviceCheckItem {
+        val enrollment = inspectRtMasqueEnrollment(
+            File(context.filesDir, RT_MASQUE_CONFIG_FILE_NAME)
+        )
         return when {
-            pageSize == null || pageSize <= 0L -> DeviceCheckItem(
-                title = "Страница памяти",
-                status = "не удалось определить",
-                details = "Android не вернул размер страницы памяти.",
-                recommendation = "Если VPN не стартует на новом устройстве, скопируйте отчёт через «Проверить устройство».",
+            !profile.rtNetwork -> DeviceCheckItem(
+                title = "Режим Сеть РТ",
+                status = "выключен",
+                details = "Используется обычный порядок транспортов; настройки РТ этого профиля не влияют на подключение.",
                 severity = DeviceCheckSeverity.Info,
-                firstLaunchRelevant = false
             )
-            pageSize > 4096L -> DeviceCheckItem(
-                title = "Страница памяти",
-                status = "$pageSize байт",
-                details = "Устройство использует страницу памяти больше 4 KB. Для новых Android-устройств с 16 KB page size нужна отдельная проверка нативной библиотеки.",
-                recommendation = "Запуск не блокируется. Если туннель не стартует, отправьте отчёт из «Проверить устройство» — это важный сценарий для будущей совместимости.",
+            !profile.rtMasque -> DeviceCheckItem(
+                title = "Режим Сеть РТ",
+                status = "TURN/TLS и TCP включены · MASQUE выключен",
+                details = "Для активного профиля включён только основной механизм Сети РТ. Регистрация WARP не требуется.",
+                severity = DeviceCheckSeverity.Ok,
+            )
+            profile.rtMasqueServerBootstrap && !profile.rtMasqueServerAccessReady -> DeviceCheckItem(
+                title = "Режим Сеть РТ",
+                status = "«Через сервер» настроен не полностью",
+                details = "MASQUE включён, но в активном профиле нет полного SSH-доступа из раздела «Деплой».",
+                recommendation = "Заполните адрес и пароль либо приватный SSH-ключ в «Деплой» или выключите «Через сервер».",
                 severity = DeviceCheckSeverity.Warning,
-                firstLaunchRelevant = true
+            )
+            enrollment == RtMasqueEnrollmentState.Invalid -> DeviceCheckItem(
+                title = "Режим Сеть РТ",
+                status = "регистрация WARP повреждена",
+                details = "Локальный файл регистрации MASQUE не содержит корректной структуры версии 1. Секретные поля в отчёт не включены.",
+                recommendation = "Остановите VPN и выполните «Сбросить регистрацию WARP» в инструкции MASQUE.",
+                severity = DeviceCheckSeverity.Warning,
+            )
+            enrollment == RtMasqueEnrollmentState.Missing -> DeviceCheckItem(
+                title = "Режим Сеть РТ",
+                status = "MASQUE включён · регистрация ещё не создана",
+                details = "При следующем запуске VPN приложение попробует зарегистрировать отдельное устройство WARP. Прямые TURN-пути продолжат работать во время подготовки.",
+                recommendation = if (profile.rtMasqueServerBootstrap) {
+                    "Если прямой TLS Cloudflare недоступен, приложение сможет использовать SSH-выход активного профиля."
+                } else {
+                    "Если регистрация не выполняется, проверьте журнал MASQUE; при необходимости настройте «Через сервер»."
+                },
+                severity = DeviceCheckSeverity.Info,
             )
             else -> DeviceCheckItem(
-                title = "Страница памяти",
-                status = "$pageSize байт",
-                details = "Обычный размер страницы памяти для текущей нативной сборки.",
+                title = "Режим Сеть РТ",
+                status = "MASQUE готов",
+                details = "Структура сохранённой регистрации WARP корректна; при запуске её дополнительно проверит нативный клиент.",
                 severity = DeviceCheckSeverity.Ok,
-                firstLaunchRelevant = true
             )
         }
     }

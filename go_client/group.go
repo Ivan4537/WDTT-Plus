@@ -12,13 +12,61 @@ import (
 )
 
 const (
-	workersPerGroup       = 9
-	defaultCycleSecs      = 36000
-	defaultWorkerRetryMin = 5 * time.Second
-	defaultWorkerRetryMax = 15 * time.Second
-	wrapHandshakeRetryMin = 1 * time.Second
-	wrapHandshakeRetryMax = 3 * time.Second
+	workersPerGroup              = 9
+	defaultCycleSecs             = 36000
+	defaultWorkerRetryMin        = 5 * time.Second
+	defaultWorkerRetryMax        = 15 * time.Second
+	wrapHandshakeRetryMin        = 1 * time.Second
+	wrapHandshakeRetryMax        = 3 * time.Second
+	refreshedCredsRetryMin       = 500 * time.Millisecond
+	refreshedCredsRetrySlot      = 250 * time.Millisecond
+	refreshedCredsRetryJitterMax = 250 * time.Millisecond
 )
+
+type credentialRefreshResult uint8
+
+const (
+	credentialRefreshNone credentialRefreshResult = iota
+	credentialRefreshApplied
+	credentialRefreshSuperseded
+)
+
+type groupCredentialsState struct {
+	mu       sync.RWMutex
+	value    Credentials
+	revision uint64
+}
+
+func newGroupCredentialsState(value Credentials) *groupCredentialsState {
+	value.TurnURLs = cloneStringSlice(value.TurnURLs)
+	return &groupCredentialsState{value: value, revision: 1}
+}
+
+func (state *groupCredentialsState) snapshot() (Credentials, uint64) {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	value := state.value
+	value.TurnURLs = cloneStringSlice(value.TurnURLs)
+	return value, state.revision
+}
+
+func (state *groupCredentialsState) isCurrent(revision uint64) bool {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	return state.revision == revision
+}
+
+func (state *groupCredentialsState) replaceIfCurrent(revision uint64, value Credentials) bool {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.revision != revision {
+		return false
+	}
+	value.TurnURLs = cloneStringSlice(value.TurnURLs)
+	state.value = value
+	state.revision++
+	return true
+}
 
 func workerRetryDelayBounds(err error) (time.Duration, time.Duration) {
 	if err != nil && strings.Contains(strings.ToUpper(err.Error()), "WRAP_AUTH_TIMEOUT") {
@@ -31,6 +79,18 @@ func workerRetryDelay(err error) time.Duration {
 	minDelay, maxDelay := workerRetryDelayBounds(err)
 	steps := int((maxDelay-minDelay)/time.Second) + 1
 	return minDelay + time.Duration(rand.Intn(steps))*time.Second
+}
+
+func workerRetryDelayAfterCredentialRefresh(err error, result credentialRefreshResult, workerIndex int) time.Duration {
+	if result != credentialRefreshApplied && result != credentialRefreshSuperseded {
+		return workerRetryDelay(err)
+	}
+	if workerIndex < 0 {
+		workerIndex = 0
+	}
+	slot := workerIndex % workersPerGroup
+	jitter := time.Duration(rand.Int63n(int64(refreshedCredsRetryJitterMax) + 1))
+	return refreshedCredsRetryMin + time.Duration(slot)*refreshedCredsRetrySlot + jitter
 }
 
 type workerPolicyRetryGate struct {
@@ -140,6 +200,7 @@ func WorkerGroup(
 	pauseFlag *int32,
 	deviceID, password, deviceInfo, transportSession string,
 	stats *Stats,
+	turnStreamFirst bool,
 	waitReady <-chan struct{},
 	signalReady chan<- struct{},
 ) {
@@ -240,26 +301,35 @@ func WorkerGroup(
 			user, pass, turnURLs, err = GetCreds(ctx, hash, credStreamID)
 		}
 	}
-	creds := &Credentials{User: user, Pass: pass, TurnURLs: turnURLs, CacheStreamID: credStreamID}
+	credsState := newGroupCredentialsState(Credentials{
+		User:          user,
+		Pass:          pass,
+		TurnURLs:      turnURLs,
+		CacheStreamID: credStreamID,
+	})
 
-	log.Printf("[ГРУППА #%d] Креды OK, TURN: %v, %d воркеров", groupID, creds.TurnURLs, len(workerIDs))
+	initialCreds, _ := credsState.snapshot()
+	log.Printf("[ГРУППА #%d] Креды OK, TURN: %v, %d воркеров", groupID, initialCreds.TurnURLs, len(workerIDs))
 
 	var configRequestInFlight int32
 	var wg sync.WaitGroup
-	var credsMu sync.RWMutex
 	var refreshMu sync.Mutex
 	var lastCredRefresh atomic.Int64
 	var policyRetryGate workerPolicyRetryGate
 
-	refreshCreds := func(reason string) bool {
+	refreshCreds := func(reason string, failedRevision uint64) credentialRefreshResult {
 		refreshMu.Lock()
 		defer refreshMu.Unlock()
+		if !credsState.isCurrent(failedRevision) {
+			log.Printf("[TURN] Креды уже заменены после этой попытки, используем актуальные (%s)", reason)
+			return credentialRefreshSuperseded
+		}
 
 		now := time.Now().Unix()
 		last := lastCredRefresh.Load()
 		if last > 0 && now-last < 15 {
 			log.Printf("[TURN] Креды уже обновлялись %d сек назад, ждём следующий retry (%s)", now-last, reason)
-			return true
+			return credentialRefreshNone
 		}
 
 		rotateForTurnFailure := hashFallback &&
@@ -295,17 +365,24 @@ func WorkerGroup(
 		}
 		if refreshErr != nil {
 			log.Printf("[TURN] Не удалось обновить креды после %s: %v", reason, refreshErr)
-			return false
+			return credentialRefreshNone
 		}
 		selectedHash = nextHashIndex
 		hash = hashCandidates[selectedHash]
 
-		credsMu.Lock()
-		creds = &Credentials{User: u, Pass: p, TurnURLs: urls, CacheStreamID: credStreamID}
-		credsMu.Unlock()
+		replaced := credsState.replaceIfCurrent(failedRevision, Credentials{
+			User:          u,
+			Pass:          p,
+			TurnURLs:      urls,
+			CacheStreamID: credStreamID,
+		})
+		if !replaced {
+			log.Printf("[TURN] Креды уже заменены во время обновления, используем актуальные (%s)", reason)
+			return credentialRefreshSuperseded
+		}
 		lastCredRefresh.Store(time.Now().Unix())
 		log.Printf("[TURN] Креды обновлены после %s, TURN urls=%d", reason, len(urls))
-		return true
+		return credentialRefreshApplied
 	}
 
 	// Сигнализируем следующей группе, что мы успешно запустились (креды получены + 2 сек форы)
@@ -358,15 +435,13 @@ func WorkerGroup(
 					}
 				}
 
-				credsMu.RLock()
-				credsSnapshot := *creds
-				credsSnapshot.TurnURLs = cloneStringSlice(creds.TurnURLs)
-				credsMu.RUnlock()
+				credsSnapshot, credsRevision := credsState.snapshot()
 
 				configDelivered, sessErr := RunSession(ctx, tp, peer, d, localPort,
 					getConf, cc, requireConfig, onConfigDelivered, wid, &credsSnapshot,
 					deviceID, password, deviceInfo,
-					transportSession, stats)
+					transportSession, stats, turnStreamFirst)
+				refreshResult := credentialRefreshNone
 
 				if getConf {
 					if configDelivered {
@@ -406,14 +481,8 @@ func WorkerGroup(
 
 					turnAllocAttrMissing := strings.Contains(errStrLower, "turn allocate") &&
 						strings.Contains(errStrLower, "attribute not found")
-					turnCredRefreshNeeded := turnAllocAttrMissing ||
-						strings.Contains(errStrLower, "turn allocate auth") ||
-						strings.Contains(errStrLower, "invalid credential") ||
-						strings.Contains(errStrLower, "stale nonce") ||
-						strings.Contains(errStrLower, "allocation mismatch") ||
-						strings.Contains(errStrLower, "error 508") ||
-						strings.Contains(errStrLower, "turn квота") ||
-						strings.Contains(errStrLower, "quota")
+					turnCredRefreshNeeded := turnAllocAttrMissing || isCredentialTURNError(sessErr)
+					turnCapacityLimited := isTURNCapacityError(sessErr)
 
 					if strings.Contains(errStrLower, "rate limit") ||
 						strings.Contains(errStrLower, "flood control") ||
@@ -431,10 +500,12 @@ func WorkerGroup(
 					attempt++
 					if turnAllocAttrMissing {
 						log.Printf("[ВОРКЕР #%d] [TURN] Allocate вернул неполный ответ, обновляем TURN-креды и повторяем (попытка %d): %s", wid, attempt, errStr)
-						refreshCreds("TURN Allocate attribute-not-found")
+						refreshResult = refreshCreds("TURN Allocate attribute-not-found", credsRevision)
 					} else if turnCredRefreshNeeded {
 						log.Printf("[ВОРКЕР #%d] [TURN] Ошибка allocation/кредов, обновляем TURN-креды и повторяем (попытка %d): %s", wid, attempt, errStr)
-						refreshCreds("TURN allocation error")
+						refreshResult = refreshCreds("TURN allocation error", credsRevision)
+					} else if turnCapacityLimited {
+						log.Printf("[ВОРКЕР #%d] [TURN] Узел временно ограничил новые allocation; сохраняем креды и повторяем другие TURN-пути (попытка %d): %s", wid, attempt, errStr)
 					} else {
 						log.Printf("[ВОРКЕР #%d] Ошибка (попытка %d): %s", wid, attempt, errStr)
 					}
@@ -453,7 +524,7 @@ func WorkerGroup(
 					return
 				}
 
-				retryDelay := workerRetryDelay(sessErr)
+				retryDelay := workerRetryDelayAfterCredentialRefresh(sessErr, refreshResult, workerIndex)
 				select {
 				case <-time.After(retryDelay):
 				case <-ctx.Done():
@@ -554,10 +625,12 @@ func normalizeVKJoinHash(input string) string {
 
 // TurnParams — конфигурация TURN
 type TurnParams struct {
-	Host    string
-	Port    string
-	Hashes  []string
-	WrapKey []byte // Password-derived WRAP key (32 bytes), nil = disabled
+	Host        string
+	Port        string
+	Hashes      []string
+	TLSFrontSNI string
+	Masque      *warpMasqueManager
+	WrapKey     []byte // Password-derived WRAP key (32 bytes), nil = disabled
 }
 
 // Credentials — учетные данные TURN

@@ -31,6 +31,54 @@ data class SshCredentials(
         get() = allowPasswordAuthentication && password.isNotBlank()
 }
 
+data class SshProfileAccessStatus(
+    val available: Boolean,
+    val unavailableReason: String = "",
+)
+
+internal fun sshProfileAccessStatus(
+    host: String,
+    authMode: String,
+    password: String,
+    privateKey: String,
+): SshProfileAccessStatus {
+    if (host.isBlank()) {
+        return SshProfileAccessStatus(
+            available = false,
+            unavailableReason = "укажите адрес сервера в разделе «Деплой»",
+        )
+    }
+    if (authMode == "key") {
+        if (privateKey.isBlank()) {
+            return SshProfileAccessStatus(
+                available = false,
+                unavailableReason = "добавьте приватный SSH-ключ в разделе «Деплой»",
+            )
+        }
+        sshPrivateKeyIssue(privateKey)?.let {
+            return SshProfileAccessStatus(
+                available = false,
+                unavailableReason = "исправьте приватный SSH-ключ в разделе «Деплой»: ${it.removeSuffix(".")}",
+            )
+        }
+        return SshProfileAccessStatus(available = true)
+    }
+    if (password.isBlank()) {
+        return SshProfileAccessStatus(
+            available = false,
+            unavailableReason = "укажите SSH-пароль в разделе «Деплой»",
+        )
+    }
+    return SshProfileAccessStatus(available = true)
+}
+
+internal data class SshProfileConnection(
+    val host: String,
+    val user: String,
+    val credentials: SshCredentials,
+    val port: Int,
+)
+
 fun sshCredentialsForMode(
     mode: String,
     password: String,

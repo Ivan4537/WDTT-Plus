@@ -3,7 +3,10 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"strings"
@@ -64,12 +67,136 @@ type connectedUDPConn struct{ *net.UDPConn }
 
 func (c *connectedUDPConn) WriteTo(p []byte, _ net.Addr) (int, error) { return c.Write(p) }
 
+// splitFirstWriteConn fragments the first STUN request so its magic cookie
+// crosses TCP segment boundaries. Some shallow DPI rules classify plain TURN
+// by looking only at the first segment. This wrapper is enabled exclusively by
+// the explicit «Сеть РТ» mode; ordinary operators keep the original writes.
+type splitFirstWriteConn struct {
+	net.Conn
+	splitAt int
+	delay   time.Duration
+	done    atomic.Bool
+}
+
+func writeFull(conn net.Conn, payload []byte) (int, error) {
+	total := 0
+	for len(payload) > 0 {
+		n, err := conn.Write(payload)
+		total += n
+		payload = payload[n:]
+		if err != nil {
+			return total, err
+		}
+		if n == 0 {
+			return total, io.ErrShortWrite
+		}
+	}
+	return total, nil
+}
+
+func (conn *splitFirstWriteConn) Write(payload []byte) (int, error) {
+	if !conn.done.CompareAndSwap(false, true) || len(payload) <= conn.splitAt {
+		return conn.Conn.Write(payload)
+	}
+	first, err := writeFull(conn.Conn, payload[:conn.splitAt])
+	if err != nil {
+		return first, err
+	}
+	if conn.delay > 0 {
+		time.Sleep(conn.delay)
+	}
+	second, err := writeFull(conn.Conn, payload[conn.splitAt:])
+	return first + second, err
+}
+
+func normalizeTURNFrontSNI(value string) (string, error) {
+	host := strings.ToLower(strings.TrimSpace(value))
+	if host == "" {
+		return "", nil
+	}
+	if len(host) > 253 || net.ParseIP(host) != nil || strings.HasPrefix(host, ".") ||
+		strings.HasSuffix(host, ".") || strings.Contains(host, "..") {
+		return "", fmt.Errorf("ожидалось доменное имя длиной до 253 символов")
+	}
+	labels := strings.Split(host, ".")
+	if len(labels) < 2 {
+		return "", fmt.Errorf("ожидалось доменное имя как ya.ru")
+	}
+	for _, label := range labels {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return "", fmt.Errorf("некорректная метка домена")
+		}
+		for _, ch := range label {
+			if (ch < 'a' || ch > 'z') && (ch < '0' || ch > '9') && ch != '-' {
+				return "", fmt.Errorf("разрешены только латинские буквы, цифры, дефис и точки")
+			}
+		}
+	}
+	return host, nil
+}
+
+func verifyTURNCertificateChainWithoutHostname(state tls.ConnectionState) error {
+	if len(state.PeerCertificates) == 0 {
+		return fmt.Errorf("TURN TLS не прислал сертификат")
+	}
+	intermediates := x509.NewCertPool()
+	for _, cert := range state.PeerCertificates[1:] {
+		intermediates.AddCert(cert)
+	}
+	_, err := state.PeerCertificates[0].Verify(x509.VerifyOptions{
+		Intermediates: intermediates,
+		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	})
+	if err != nil {
+		return fmt.Errorf("проверка цепочки сертификата TURN TLS: %w", err)
+	}
+	return nil
+}
+
+func turnTLSConfig(endpoint turnEndpoint, frontSNI string) *tls.Config {
+	config := &tls.Config{MinVersion: tls.VersionTLS12}
+	serverName := endpoint.Host
+	if frontSNI != "" {
+		serverName = frontSNI
+	}
+	if net.ParseIP(serverName) == nil {
+		config.ServerName = serverName
+	}
+
+	// При подмене SNI имя сертификата ожидаемо относится к TURN-узлу, а не к
+	// домену белого списка. Отключаем только сопоставление имени: публичная CA-
+	// цепочка всё равно проверяется в VerifyConnection.
+	if frontSNI != "" && !strings.EqualFold(frontSNI, endpoint.Host) {
+		config.InsecureSkipVerify = true // проверка перенесена в VerifyConnection
+		config.VerifyConnection = verifyTURNCertificateChainWithoutHostname
+	}
+	return config
+}
+
+func turnPathSNI(endpoint turnEndpoint, frontSNI string, rtMode bool) string {
+	if endpoint.Transport != turnTransportTLS {
+		if endpoint.Transport == turnTransportTCP && rtMode {
+			return "SNI не применяется, первый STUN-запрос разделён для DPI"
+		}
+		return "SNI не применяется"
+	}
+	if frontSNI != "" {
+		return "SNI=" + frontSNI
+	}
+	if net.ParseIP(endpoint.Host) == nil {
+		return "SNI=" + endpoint.Host
+	}
+	return "без SNI"
+}
+
 func openTURNAllocation(
 	ctx context.Context,
 	endpoint turnEndpoint,
 	peer *net.UDPAddr,
 	creds *Credentials,
 	sessionID int,
+	frontSNI string,
+	splitTCPFirstWrite bool,
 ) (*turn.Client, net.PacketConn, error) {
 	turnAddr := endpoint.address()
 
@@ -91,21 +218,21 @@ func openTURNAllocation(
 		dialCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
 		defer cancel()
 		dialer := &net.Dialer{Timeout: 6 * time.Second, KeepAlive: 30 * time.Second}
-		conn, err := dialer.DialContext(dialCtx, "tcp", turnAddr)
+		rawConn, err := dialer.DialContext(dialCtx, "tcp", turnAddr)
 		if err != nil {
 			return nil, nil, fmt.Errorf("TURN TCP подключение %s: %w", turnAddr, err)
+		}
+		var conn net.Conn = rawConn
+		if splitTCPFirstWrite {
+			conn = &splitFirstWriteConn{Conn: rawConn, splitAt: 6, delay: 20 * time.Millisecond}
 		}
 		turnConn = turn.NewSTUNConn(conn)
 	case turnTransportTLS:
 		dialCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
 		defer cancel()
-		tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
-		if net.ParseIP(endpoint.Host) == nil {
-			tlsConfig.ServerName = endpoint.Host
-		}
 		dialer := &tls.Dialer{
 			NetDialer: &net.Dialer{Timeout: 8 * time.Second, KeepAlive: 30 * time.Second},
-			Config:    tlsConfig,
+			Config:    turnTLSConfig(endpoint, frontSNI),
 		}
 		conn, err := dialer.DialContext(dialCtx, "tcp", turnAddr)
 		if err != nil {
@@ -115,6 +242,17 @@ func openTURNAllocation(
 	default:
 		return nil, nil, fmt.Errorf("неподдерживаемый TURN transport: %s", endpoint.Transport)
 	}
+
+	return allocateTURNOnConn(endpoint, peer, creds, turnConn)
+}
+
+func allocateTURNOnConn(
+	endpoint turnEndpoint,
+	peer *net.UDPAddr,
+	creds *Credentials,
+	turnConn net.PacketConn,
+) (*turn.Client, net.PacketConn, error) {
+	turnAddr := endpoint.address()
 
 	// RequestedAddressFamily
 	var addrFamily turn.RequestedAddressFamily
@@ -146,7 +284,7 @@ func openTURNAllocation(
 	relay, err := tc.Allocate()
 	if err != nil {
 		if isAuthError(err) {
-			handleAuthError(creds.CacheStreamID)
+			handleAuthError(creds.CacheStreamID, creds.User, creds.Pass)
 		}
 		errStr := err.Error()
 		if strings.Contains(errStr, "Quota") || strings.Contains(errStr, "486") {
@@ -160,19 +298,76 @@ func openTURNAllocation(
 	return tc, relay, nil
 }
 
+func openTURNAllocationOverMasque(
+	ctx context.Context,
+	endpoint turnEndpoint,
+	peer *net.UDPAddr,
+	creds *Credentials,
+	manager *warpMasqueManager,
+	protocol warpMasqueProtocol,
+) (*turn.Client, net.PacketConn, error) {
+	if endpoint.Transport == turnTransportUDP {
+		return nil, nil, errors.New("TURN/UDP нельзя передать через TCP-поток CONNECT-IP")
+	}
+
+	rawConn, err := manager.dialProtocol(ctx, endpoint.address(), protocol)
+	if err != nil {
+		return nil, nil, fmt.Errorf("MASQUE %s к %s: %w", protocol, endpoint.address(), err)
+	}
+	var conn net.Conn = rawConn
+	if endpoint.Transport == turnTransportTLS {
+		tlsConn := tls.Client(rawConn, turnTLSConfig(endpoint, ""))
+		handshakeCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+		err = tlsConn.HandshakeContext(handshakeCtx)
+		cancel()
+		if err != nil {
+			_ = rawConn.Close()
+			return nil, nil, fmt.Errorf("TURN TLS внутри MASQUE %s к %s: %w", protocol, endpoint.address(), err)
+		}
+		conn = tlsConn
+	}
+
+	return allocateTURNOnConn(endpoint, peer, creds, turn.NewSTUNConn(conn))
+}
+
 func isCredentialTURNError(err error) bool {
 	if err == nil {
 		return false
 	}
 	text := strings.ToLower(err.Error())
-	return strings.Contains(text, "turn квота") ||
-		strings.Contains(text, "turn allocate auth") ||
+	return strings.Contains(text, "turn allocate auth") ||
+		strings.Contains(text, "unauthorized") ||
+		strings.Contains(text, "authentication") ||
+		strings.Contains(text, "error 401") ||
 		strings.Contains(text, "invalid credential") ||
 		strings.Contains(text, "stale nonce") ||
 		strings.Contains(text, "allocation mismatch") ||
-		strings.Contains(text, "attribute not found") ||
+		strings.Contains(text, "attribute not found")
+}
+
+func isTURNCapacityError(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "turn квота") ||
 		strings.Contains(text, "error 508") ||
 		strings.Contains(text, "quota")
+}
+
+func turnCandidateStages(candidates []turnEndpoint, useMasque bool) (direct, masque, finalUDP []turnEndpoint) {
+	if !useMasque {
+		return candidates, nil, nil
+	}
+	for _, candidate := range candidates {
+		if candidate.Transport == turnTransportUDP {
+			finalUDP = append(finalUDP, candidate)
+			continue
+		}
+		direct = append(direct, candidate)
+		masque = append(masque, candidate)
+	}
+	return direct, masque, finalUDP
 }
 
 func RunSession(
@@ -189,30 +384,42 @@ func RunSession(
 	creds *Credentials,
 	deviceID, password, deviceInfo, transportSession string,
 	stats *Stats,
+	preferTURNStream bool,
 ) (bool, error) {
 	configDelivered := false
 
 	if len(creds.TurnURLs) == 0 {
 		return false, fmt.Errorf("нет TURN URL в учетных данных")
 	}
-	candidates := sessionTURNCandidates(creds.TurnURLs, sessionID, tp)
+	candidates := sessionTURNCandidatesWithPreference(
+		creds.TurnURLs,
+		sessionID,
+		tp,
+		preferTURNStream,
+	)
 	if len(candidates) == 0 {
 		return false, fmt.Errorf("нет пригодных TURN URL в учетных данных")
 	}
+	directCandidates, masqueCandidates, finalUDPCandidates := turnCandidateStages(candidates, tp.Masque != nil)
 
 	var tc *turn.Client
 	var relay net.PacketConn
 	var selectedEndpoint turnEndpoint
+	var selectedMasqueProtocol warpMasqueProtocol
 	var lastTURNErr error
 	var err error
-	for idx, candidate := range candidates {
-		if idx == 0 {
+	for idx, candidate := range directCandidates {
+		if !preferTURNStream && idx == 0 {
 			log.Printf("[СЕССИЯ #%d] TURN %s (%s)", sessionID, candidate.label(), candidate.address())
-		} else {
+		} else if !preferTURNStream {
 			log.Printf("[СЕССИЯ #%d] [TURN] Резервный путь %s (%s) после ошибки: %v", sessionID, candidate.label(), candidate.address(), lastTURNErr)
+		} else if idx == 0 {
+			log.Printf("[СЕССИЯ #%d] [TURN] Путь %s (%s), %s", sessionID, candidate.label(), candidate.address(), turnPathSNI(candidate, tp.TLSFrontSNI, preferTURNStream))
+		} else {
+			log.Printf("[СЕССИЯ #%d] [TURN] Резервный путь %s (%s), %s, после ошибки: %v", sessionID, candidate.label(), candidate.address(), turnPathSNI(candidate, tp.TLSFrontSNI, preferTURNStream), lastTURNErr)
 		}
 
-		tc, relay, err = openTURNAllocation(ctx, candidate, peer, creds, sessionID)
+		tc, relay, err = openTURNAllocation(ctx, candidate, peer, creds, sessionID, tp.TLSFrontSNI, preferTURNStream)
 		if err == nil {
 			selectedEndpoint = candidate
 			break
@@ -220,6 +427,41 @@ func RunSession(
 		lastTURNErr = err
 		if isCredentialTURNError(err) {
 			return false, err
+		}
+	}
+	if relay == nil && tp.Masque != nil {
+		log.Printf("[СЕССИЯ #%d] [MASQUE] Прямые TCP/TLS-пути «Сети РТ» не сработали; до UDP пробуем WARP CONNECT-IP: %v", sessionID, lastTURNErr)
+	masqueProtocols:
+		for _, protocol := range tp.Masque.protocolOrder() {
+			for _, candidate := range masqueCandidates {
+				log.Printf("[СЕССИЯ #%d] [MASQUE] Пробуем TURN %s (%s) внутри CONNECT-IP %s", sessionID, candidate.label(), candidate.address(), protocol)
+				tc, relay, err = openTURNAllocationOverMasque(ctx, candidate, peer, creds, tp.Masque, protocol)
+				if err == nil {
+					selectedEndpoint = candidate
+					selectedMasqueProtocol = protocol
+					tp.Masque.markPreferred(protocol)
+					break masqueProtocols
+				}
+				lastTURNErr = err
+				log.Printf("[СЕССИЯ #%d] [MASQUE] %s через %s не сработал: %v", sessionID, candidate.label(), protocol, err)
+				if isCredentialTURNError(err) {
+					return false, err
+				}
+			}
+		}
+	}
+	if relay == nil && tp.Masque != nil {
+		for _, candidate := range finalUDPCandidates {
+			log.Printf("[СЕССИЯ #%d] [TURN] Последний резерв после MASQUE: %s (%s), после ошибки: %v", sessionID, candidate.label(), candidate.address(), lastTURNErr)
+			tc, relay, err = openTURNAllocation(ctx, candidate, peer, creds, sessionID, tp.TLSFrontSNI, preferTURNStream)
+			if err == nil {
+				selectedEndpoint = candidate
+				break
+			}
+			lastTURNErr = err
+			if isCredentialTURNError(err) {
+				return false, err
+			}
 		}
 	}
 	if lastTURNErr != nil && relay == nil {
@@ -231,7 +473,11 @@ func RunSession(
 	// Reset error count on successful allocation
 	getStreamCache(creds.CacheStreamID).errorCount.Store(0)
 
-	log.Printf("[СЕССИЯ #%d] Relay: %s через TURN %s", sessionID, relay.LocalAddr(), selectedEndpoint.label())
+	if selectedMasqueProtocol != "" {
+		log.Printf("[СЕССИЯ #%d] Relay: %s через TURN %s внутри MASQUE %s ✓", sessionID, relay.LocalAddr(), selectedEndpoint.label(), selectedMasqueProtocol)
+	} else {
+		log.Printf("[СЕССИЯ #%d] Relay: %s через TURN %s", sessionID, relay.LocalAddr(), selectedEndpoint.label())
+	}
 
 	// Pipe для DTLS ↔ TURN relay
 	pipeA, pipeB := connutil.AsyncPacketPipe()

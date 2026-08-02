@@ -51,6 +51,46 @@ class SshAuthenticationTest {
     }
 
     @Test
+    fun serverBootstrapAcceptsPasswordOrValidPrivateKeyFromDeploy() {
+        assertTrue(
+            sshProfileAccessStatus(
+                host = "server.example",
+                authMode = "password",
+                password = "secret",
+                privateKey = "",
+            ).available
+        )
+        assertTrue(
+            sshProfileAccessStatus(
+                host = "server.example",
+                authMode = "key",
+                password = "",
+                privateKey = openSshKey,
+            ).available
+        )
+    }
+
+    @Test
+    fun serverBootstrapExplainsMissingOrInvalidDeployAccess() {
+        val missingHost = sshProfileAccessStatus("", "password", "secret", "")
+        assertFalse(missingHost.available)
+        assertTrue(missingHost.unavailableReason.contains("адрес сервера"))
+
+        val missingPassword = sshProfileAccessStatus("server.example", "password", "", "")
+        assertFalse(missingPassword.available)
+        assertTrue(missingPassword.unavailableReason.contains("SSH-пароль"))
+
+        val invalidKey = sshProfileAccessStatus(
+            host = "server.example",
+            authMode = "key",
+            password = "",
+            privateKey = "ssh-ed25519 AAAA public-only",
+        )
+        assertFalse(invalidKey.available)
+        assertTrue(invalidKey.unavailableReason.contains("приватный SSH-ключ"))
+    }
+
+    @Test
     fun ed25519UsesBundledAndroidCompatibleImplementation() {
         configureJschEdDsaCompatibility()
 

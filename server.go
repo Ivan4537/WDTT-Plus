@@ -43,7 +43,7 @@ import (
 )
 
 const (
-	wdttServerVersion     = "13"
+	wdttServerVersion     = "14"
 	wgIfaceName           = "wdtt0"
 	wgServerAddr          = "10.66.66.1"
 	wgServerCIDR          = wgServerAddr + "/24"

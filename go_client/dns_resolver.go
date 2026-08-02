@@ -11,6 +11,12 @@ import (
 
 const dnsProbeHost = "login.vk.ru"
 
+// Keep Android's resolver before setupGlobalResolver optionally replaces the
+// process-wide resolver with a direct DNS route optimized for VK. Some public
+// resolvers return different Cloudflare WARP API edges, so MASQUE enrollment
+// must be able to consult the device resolver independently.
+var deviceSystemResolver = net.DefaultResolver
+
 type dnsRoute struct {
 	Label   string
 	Network string
@@ -27,7 +33,7 @@ type directDNSProbe func(context.Context, dnsRoute, time.Duration) error
 type systemDNSProbe func(context.Context, *net.Resolver, time.Duration) error
 
 func setupGlobalResolver() {
-	systemResolver := net.DefaultResolver
+	systemResolver := deviceSystemResolver
 	route, probes := chooseDNSRoute(context.Background(), systemResolver)
 	if route.System {
 		logDNSSystemRoute(probes)

@@ -21,6 +21,7 @@ data class RemoteDocumentFailureAction(
 class RemoteDocumentFailure(
     message: String,
     val action: RemoteDocumentFailureAction? = null,
+    val profileAttachmentRequired: Boolean = false,
 ) : IllegalStateException(message)
 
 data class RemoteContinuation(
@@ -33,7 +34,8 @@ data class RemoteContinuation(
 
 enum class RemoteDocumentKind {
     BASE,
-    UPDATE
+    UPDATE,
+    ATTACHMENT,
 }
 
 data class RemoteDocumentDelivery(
@@ -49,7 +51,11 @@ data class RemoteDocumentDelivery(
 internal fun RemoteDocumentDelivery.shouldPreserveLocalVkHashes(
     existingProfileRedelivery: Boolean = false,
 ): Boolean {
-    val deliveredHashes = WdttDeepLink.parse(document, allowMissingHashes = true)
+    val deliveredHashes = WdttDeepLink.parse(
+        document,
+        allowMissingHashes = true,
+        allowOmittedConnection = kind == RemoteDocumentKind.UPDATE,
+    )
         ?.hashes
         .orEmpty()
     return deliveredHashes.isBlank() &&
@@ -64,7 +70,24 @@ internal fun RemoteDocumentDelivery.requiresInitialContinuationWarning(
 ): Boolean =
     kind == RemoteDocumentKind.BASE &&
         !continuation.available &&
-        !existingProfileHasVkHashes
+    !existingProfileHasVkHashes
+
+internal fun attachmentDocumentForRequest(localDocument: String?): String? =
+    localDocument
+        ?.trim()
+        ?.takeIf { document ->
+            document.length <= 4 * 1024 &&
+                document.startsWith("wdtt://connect?", ignoreCase = true) &&
+                WdttDeepLink.parse(document, allowMissingHashes = true)
+                    ?.let { it.hashes.isBlank() } == true
+        }
+
+internal fun eligibleRemoteAttachmentDocument(
+    localDocument: String?,
+    alreadyManaged: Boolean,
+): String? = if (alreadyManaged) null else attachmentDocumentForRequest(localDocument)
+
+internal fun profileAttachmentRequired(value: String?): Boolean = value?.trim() == "1"
 
 object RemoteDocumentGateway {
     private const val MAX_RESPONSE_CHARS = 32 * 1024
@@ -95,6 +118,8 @@ object RemoteDocumentGateway {
         client: String,
         system: String,
         localBindings: Collection<String>? = null,
+        localDocument: String? = null,
+        profileAttachment: Boolean = false,
     ): RemoteDocumentDelivery {
         require(extractLink(link.url) != null) { "Ссылка повреждена или неполна." }
         require(validDevice(device)) { "Не удалось определить текущее устройство." }
@@ -112,6 +137,11 @@ object RemoteDocumentGateway {
                     .distinct()
                     .take(6)
                 request.put("bindings", JSONArray(bindings))
+            }
+            attachmentDocumentForRequest(localDocument)
+                ?.let { request.put("profile", it) }
+            if (profileAttachment) {
+                request.put("attach", true)
             }
             val payload = request
                 .toString()
@@ -135,6 +165,9 @@ object RemoteDocumentGateway {
                             "Ссылка недоступна. Получите новую ссылку подключения."
                         },
                         failure.second,
+                        profileAttachmentRequired = profileAttachmentRequired(
+                            connection.getHeaderField("X-WDTT-Profile-Required")
+                        ),
                     )
                 }
                 parse(body)
@@ -161,11 +194,20 @@ object RemoteDocumentGateway {
         val kind = when (root.optString("type").trim()) {
             "base" -> RemoteDocumentKind.BASE
             "update" -> RemoteDocumentKind.UPDATE
+            "attachment" -> RemoteDocumentKind.ATTACHMENT
             else -> throw IllegalStateException("WDTT Plus вернул неподдерживаемый тип данных.")
         }
         val document = root.optString("document").trim()
-        val documentParts = WdttDeepLink.parse(document, allowMissingHashes = true)
-        if (documentParts == null) {
+        val documentParts = document
+            .takeIf(String::isNotBlank)
+            ?.let {
+                WdttDeepLink.parse(
+                    it,
+                    allowMissingHashes = true,
+                    allowOmittedConnection = kind == RemoteDocumentKind.UPDATE,
+                )
+            }
+        if (kind != RemoteDocumentKind.ATTACHMENT && documentParts == null) {
             throw IllegalStateException("WDTT Plus вернул неполные данные подключения.")
         }
         val binding = root.optString("binding").trim().takeIf(::opaqueValue).orEmpty()
@@ -203,7 +245,7 @@ object RemoteDocumentGateway {
         }
         when (kind) {
             RemoteDocumentKind.BASE -> {
-                if (documentParts.hashes.isNotBlank()) {
+                if (documentParts?.hashes?.isNotBlank() == true) {
                     throw IllegalStateException(
                         "Ссылка подключения содержит лишние данные. Получите новую ссылку."
                     )
@@ -216,6 +258,19 @@ object RemoteDocumentGateway {
                 ) {
                     throw IllegalStateException(
                         "Обновление профиля неполное или относится к другому действию."
+                    )
+                }
+            }
+            RemoteDocumentKind.ATTACHMENT -> {
+                if (
+                    document.isNotBlank() ||
+                    binding.isBlank() ||
+                    !available ||
+                    !accessAvailable ||
+                    accessBinding != binding
+                ) {
+                    throw IllegalStateException(
+                        "WDTT Plus вернул неполное разрешение для выбранного профиля."
                     )
                 }
             }

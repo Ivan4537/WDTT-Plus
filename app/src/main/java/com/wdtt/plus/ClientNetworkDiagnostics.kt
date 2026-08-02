@@ -9,6 +9,7 @@ import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.CancellationSignal
 import android.os.SystemClock
+import android.telephony.SubscriptionManager
 import android.telephony.TelephonyManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
@@ -111,6 +112,12 @@ private val vkHttpsTargets = listOf(
 )
 
 suspend fun collectClientNetworkDiagnostics(context: Context): ClientNetworkDiagnosticsReport =
+    collectClientNetworkDiagnostics(context, retryOnNetworkChange = true)
+
+private suspend fun collectClientNetworkDiagnostics(
+    context: Context,
+    retryOnNetworkChange: Boolean
+): ClientNetworkDiagnosticsReport =
     withContext(Dispatchers.IO) {
         val connectivityManager = context.getSystemService(ConnectivityManager::class.java)
         val diagnosticNetwork = connectivityManager?.let { selectDiagnosticNetwork(context, it) }
@@ -136,6 +143,28 @@ suspend fun collectClientNetworkDiagnostics(context: Context): ClientNetworkDiag
             val clientDns = async { probeClientDns(diagnosticNetwork.network) }
             val vkHttps = async { probeVkHttps(diagnosticNetwork.network) }
             Triple(systemDns.await(), clientDns.await(), vkHttps.await())
+        }
+
+        val networkAfterProbes = selectDiagnosticNetwork(context, connectivityManager)
+        if (networkAfterProbes?.network != diagnosticNetwork.network) {
+            if (retryOnNetworkChange && networkAfterProbes != null) {
+                val retried = collectClientNetworkDiagnostics(
+                    context,
+                    retryOnNetworkChange = false
+                )
+                return@withContext retried.copy(
+                    summaryLines = listOf(
+                        "Сеть изменилась во время диагностики; проверки автоматически повторены на новой сети"
+                    ) + retried.summaryLines,
+                    items = listOf(networkChangeItem(retried = true)) + retried.items
+                )
+            }
+            return@withContext ClientNetworkDiagnosticsReport(
+                summaryLines = listOf(
+                    "Сеть изменилась во время диагностики; результаты устаревшей сети отброшены"
+                ),
+                items = listOf(networkChangeItem(retried = false))
+            )
         }
 
         val primaryDnsResults = dnsResults.filter { it.label in primaryVkDiagnosticHosts }
@@ -287,17 +316,44 @@ private fun selectDiagnosticNetwork(context: Context, connectivityManager: Conne
 private fun mobileOperatorSummary(context: Context, capabilities: NetworkCapabilities): String {
     if (!capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) return "не применяется"
     return runCatching {
-        val telephonyManager = context.getSystemService(TelephonyManager::class.java)
-        val network = telephonyManager?.networkOperatorName.orEmpty().trim()
-        val sim = telephonyManager?.simOperatorName.orEmpty().trim()
-        val names = listOf(network, sim).filter(String::isNotBlank).distinct()
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
+            return@runCatching "не определён для выбранной сети на этой версии Android"
+        }
+        val dataSubscriptionId = SubscriptionManager.getDefaultDataSubscriptionId()
+        if (dataSubscriptionId < 0) {
+            return@runCatching "не определён для выбранной data-SIM"
+        }
+        val baseManager = context.getSystemService(TelephonyManager::class.java)
+        val manager = baseManager?.createForSubscriptionId(dataSubscriptionId)
+            ?: return@runCatching "телефонная служба недоступна"
+        val names = listOf(manager.networkOperatorName, manager.simOperatorName)
+            .map(String::trim)
+            .filter(String::isNotBlank)
+            .distinct()
         buildString {
             append(names.joinToString(" / ").ifBlank { "не определён" })
             append(", roaming=")
-            append(telephonyManager?.isNetworkRoaming ?: false)
+            append(manager.isNetworkRoaming)
+            append(", основная data-SIM")
         }
     }.getOrDefault("недоступен")
 }
+
+private fun networkChangeItem(retried: Boolean): DeviceCheckItem = DeviceCheckItem(
+    title = "Смена сети во время диагностики",
+    status = if (retried) "проверки повторены" else "результаты отброшены",
+    details = if (retried) {
+        "Android сменил физическую сеть или мобильную data-SIM во время проверки. " +
+            "Результаты старой сети не использованы; пункты ниже относятся к новой сети."
+    } else {
+        "Android сменил физическую сеть или мобильную data-SIM, поэтому ошибки старого " +
+            "сетевого дескриптора (например ENONET/ENETUNREACH) не считаются отказом DNS или устройства."
+    },
+    recommendation = if (retried) "" else
+        "Дождитесь устойчивого подключения к нужной сети и повторите проверку устройства.",
+    severity = if (retried) DeviceCheckSeverity.Info else DeviceCheckSeverity.Warning,
+    action = if (retried) null else DeviceCheckAction.NetworkSettings
+)
 
 private fun buildNetworkPathItem(network: DiagnosticNetwork): DeviceCheckItem {
     val capabilities = network.capabilities
@@ -542,6 +598,8 @@ private fun buildRecentNetworkEventsItem(): DeviceCheckItem? {
                 entry.key.startsWith("vk_credentials_") ||
                 entry.key.startsWith("vk_legacy_") ||
                 entry.key.startsWith("turn_") ||
+                entry.key.startsWith("rt_") ||
+                entry.key.startsWith("masque_") ||
                 entry.key.startsWith("worker_turn_")
         }
         .take(12)

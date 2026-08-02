@@ -5,6 +5,33 @@ import android.content.Intent
 
 internal const val TUNNEL_PROFILE_INDEX_EXTRA = "profile_index"
 internal const val MANAGED_CONFIG_FIRST_START_EXTRA = "managed_config_first_start"
+internal const val DEFAULT_RT_TURN_SNI = "ya.ru"
+
+internal fun normalizeRtTurnSni(value: String): String? {
+    val host = value.trim().lowercase()
+    if (
+        host.isBlank() ||
+        host.length > 253 ||
+        host.startsWith(".") ||
+        host.endsWith(".") ||
+        host.contains("..")
+    ) {
+        return null
+    }
+    val labels = host.split('.')
+    if (labels.size < 2 || labels.all { it.toIntOrNull() != null }) return null
+    return host.takeIf {
+        labels.all { label ->
+            label.isNotBlank() &&
+                label.length <= 63 &&
+                !label.startsWith("-") &&
+                !label.endsWith("-") &&
+                label.all { char ->
+                    char in 'a'..'z' || char in '0'..'9' || char == '-'
+                }
+        }
+    }
+}
 
 internal data class TransportRecoveryPolicy(
     val networkSettleDelayMs: Long,
@@ -15,18 +42,12 @@ internal data class TransportRecoveryPolicy(
 
 internal fun transportRecoveryPolicy(
     managedConfigFirstStart: Boolean,
-): TransportRecoveryPolicy = if (managedConfigFirstStart) {
-    TransportRecoveryPolicy(
-        networkSettleDelayMs = 3_000L,
-        reconnectMinIntervalMs = 8_000L,
-        processRestartDelayMs = 250L,
-        forceRestart = true,
-    )
-} else {
-    TransportRecoveryPolicy(
+): TransportRecoveryPolicy {
+    val processRestartDelayMs = if (managedConfigFirstStart) 250L else 2_500L
+    return TransportRecoveryPolicy(
         networkSettleDelayMs = 15_000L,
         reconnectMinIntervalMs = 2 * 60_000L,
-        processRestartDelayMs = 2_500L,
+        processRestartDelayMs = processRestartDelayMs,
         forceRestart = false,
     )
 }
@@ -96,6 +117,11 @@ internal fun buildTunnelParams(saved: TunnelProfileSnapshot): TunnelParams? {
             connectionPassword = linkParts.password,
             protocol = saved.protocol,
             vkCallsPreflight = saved.vkCallsPreflight,
+            rtNetwork = saved.rtNetwork,
+            rtMasque = saved.rtMasque,
+            rtMasqueServerBootstrap =
+                saved.rtMasqueServerBootstrap && saved.rtMasqueServerAccessReady,
+            rtTurnSni = saved.rtTurnSni,
             captchaMode = sanitizeTunnelCaptchaMode(saved.captchaMode),
             captchaSolveMethod = saved.captchaSolveMethod,
             fingerprint = saved.fingerprint,
@@ -127,6 +153,11 @@ internal fun buildTunnelParams(saved: TunnelProfileSnapshot): TunnelParams? {
             connectionPassword = password,
             protocol = saved.protocol,
             vkCallsPreflight = saved.vkCallsPreflight,
+            rtNetwork = saved.rtNetwork,
+            rtMasque = saved.rtMasque,
+            rtMasqueServerBootstrap =
+                saved.rtMasqueServerBootstrap && saved.rtMasqueServerAccessReady,
+            rtTurnSni = saved.rtTurnSni,
             captchaMode = sanitizeTunnelCaptchaMode(saved.captchaMode),
             captchaSolveMethod = saved.captchaSolveMethod,
             fingerprint = saved.fingerprint,
@@ -154,6 +185,10 @@ suspend fun buildTunnelStartIntentFromSettings(context: Context): Intent? {
         putExtra("connection_password", params.connectionPassword)
         putExtra("protocol", params.protocol)
         putExtra("vkcalls_preflight", params.vkCallsPreflight)
+        putExtra("rt_network", params.rtNetwork)
+        putExtra("rt_masque", params.rtMasque)
+        putExtra("rt_masque_server_bootstrap", params.rtMasqueServerBootstrap)
+        putExtra("rt_turn_sni", params.rtTurnSni)
         putExtra("captcha_mode", params.captchaMode)
         putExtra("captcha_solve_method", params.captchaSolveMethod)
         putExtra("fingerprint", params.fingerprint)
