@@ -2431,8 +2431,9 @@ class SettingsStore(context: Context) {
                 this[getProfileKey(PROFILE_NAME, profile)] = importedProfileName
             }
             this[getProfileKey(WDTT_LINK_MODE, profile)] = plan.storeAsLink
-            this[getProfileKey(CONNECTION_INPUT_METHOD, profile)] =
-                if (plan.storeAsLink) "link" else "manual"
+            // A parsed wdtt:// import is still a link-originated connection even when its
+            // sensitive fields are materialized separately instead of keeping the raw link.
+            this[getProfileKey(CONNECTION_INPUT_METHOD, profile)] = "link"
             if (plan.storeAsLink) {
                 this[getProfileKey(WDTT_LINK, profile)] = plan.link
                 clearManualTunnelFields(profile)
@@ -3278,9 +3279,7 @@ class SettingsStore(context: Context) {
                 }
 
                 val methodKey = getProfileKey(CONNECTION_INPUT_METHOD, profile)
-                if (!linkMode && hasManualConnection && prefs[methodKey] == "link") {
-                    prefs[methodKey] = "manual"
-                } else if (prefs[methodKey] != "link" && prefs[methodKey] != "manual") {
+                if (prefs[methodKey] != "link" && prefs[methodKey] != "manual") {
                     when {
                         linkMode && hasStoredLink -> prefs[methodKey] = "link"
                         hasManualConnection -> prefs[methodKey] = "manual"

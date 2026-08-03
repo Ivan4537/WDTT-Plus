@@ -159,12 +159,7 @@ internal fun resolveConnectionInputMethod(
     hasManualConnection: Boolean,
     userInterface: Boolean,
 ): String = when (savedMethod) {
-    "link" -> when {
-        hasStoredLink -> "link"
-        hasManualConnection -> "manual"
-        userInterface -> "link"
-        else -> "manual"
-    }
+    "link" -> "link"
     "manual" -> "manual"
     else -> when {
         hasStoredLink -> "link"
@@ -236,8 +231,14 @@ internal fun isSelectedCompactConnectionReady(
     linkValid: Boolean,
     manualValid: Boolean,
 ): Boolean = when (selectedMethod) {
-    "link" -> storedLinkMode && linkPresent && linkValid
-    "manual" -> !storedLinkMode && manualValid
+    "link" -> when {
+        storedLinkMode && linkPresent -> linkValid
+        savedMethod == "link" -> manualValid
+        else -> false
+    }
+    "manual" -> !storedLinkMode &&
+        (savedMethod == "manual" || savedMethod.isBlank()) &&
+        manualValid
     else -> false
 }
 
@@ -800,6 +801,7 @@ fun SettingsTabContent(
             if (result == null) {
                 Toast.makeText(context, "Ссылка WDTT не распознана.", Toast.LENGTH_LONG).show()
             } else {
+                userConnectionMethod = "link"
                 userLinkInput = ""
                 userConnectionEditor = ""
                 Toast.makeText(context, "Подключение сохранено", Toast.LENGTH_SHORT).show()
