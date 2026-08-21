@@ -82,13 +82,16 @@ internal fun displayedTunnelProfile(
 internal fun shouldUseManagedConfigFirstStart(
     remoteManaged: Boolean,
     profileMaxWorkers: Int,
-): Boolean = remoteManaged && profileMaxWorkers == TUNNEL_WORKERS_PER_GROUP
+): Boolean = remoteManaged &&
+    profileMaxWorkers in TUNNEL_WORKERS_PER_GROUP..APP_MAX_WORKERS &&
+    profileMaxWorkers % TUNNEL_WORKERS_PER_GROUP == 0
 
 suspend fun buildTunnelParamsFromSettings(
     context: Context,
     profileIndex: Int? = null,
 ): TunnelParams? {
     val store = SettingsStore(context.applicationContext)
+    store.reconcileRemoteProfileWorkerLimit(profileIndex)
     val saved = store.tunnelProfileSnapshot(profileIndex)
     return buildTunnelParams(saved)
 }

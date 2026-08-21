@@ -317,19 +317,19 @@ func TestGeneralServerRuntimeDefaultsAreUnrestricted(t *testing.T) {
 	}
 }
 
-func TestFiftyClientNineWorkerAcceptanceProfile(t *testing.T) {
+func TestFiftyClientEighteenWorkerAcceptanceProfile(t *testing.T) {
 	previous := accessRuntimes
 	accessRuntimes = newAccessRuntimeRegistry()
 	t.Cleanup(func() { accessRuntimes = previous })
-	configureAccessRuntime(12, 50)
+	configureAccessRuntime(24, 50)
 
-	releases := make([]func(), 0, 50*9)
+	releases := make([]func(), 0, 50*18)
 	for client := 0; client < 50; client++ {
 		identity := accessIdentity{
 			id:       "pass:client-" + strconv.Itoa(client),
 			password: "secret-" + strconv.Itoa(client),
 		}
-		for worker := 0; worker < 9; worker++ {
+		for worker := 0; worker < 18; worker++ {
 			_, release, ok := acquireAccessWorker(identity)
 			if !ok {
 				t.Fatalf("client %d worker %d was rejected", client, worker)
@@ -337,8 +337,28 @@ func TestFiftyClientNineWorkerAcceptanceProfile(t *testing.T) {
 			releases = append(releases, release)
 		}
 	}
-	if len(releases) != 450 {
-		t.Fatalf("expected 450 workers, got %d", len(releases))
+	if len(releases) != 900 {
+		t.Fatalf("expected 900 workers, got %d", len(releases))
+	}
+	for _, release := range releases {
+		release()
+	}
+}
+
+func TestLegacyNineWorkerClientRemainsAcceptedByExpandedServerLimit(t *testing.T) {
+	previous := accessRuntimes
+	accessRuntimes = newAccessRuntimeRegistry()
+	t.Cleanup(func() { accessRuntimes = previous })
+	configureAccessRuntime(24, 50)
+	identity := accessIdentity{id: "pass:legacy-client", password: "secret"}
+
+	releases := make([]func(), 0, 9)
+	for worker := 0; worker < 9; worker++ {
+		_, release, ok := acquireAccessWorker(identity)
+		if !ok {
+			t.Fatalf("legacy worker %d was rejected", worker)
+		}
+		releases = append(releases, release)
 	}
 	for _, release := range releases {
 		release()

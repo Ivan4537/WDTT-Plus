@@ -32,12 +32,62 @@ import org.json.JSONObject
 import android.os.Build
 import java.util.UUID
 
+internal const val DEFAULT_SLEEP_PAUSE_DELAY_MINUTES = 5
+internal const val MIN_SLEEP_PAUSE_DELAY_MINUTES = 0
+internal const val MAX_SLEEP_PAUSE_DELAY_MINUTES = 24 * 60
+
+internal fun normalizeSleepPauseDelayMinutes(minutes: Int): Int =
+    minutes.coerceIn(MIN_SLEEP_PAUSE_DELAY_MINUTES, MAX_SLEEP_PAUSE_DELAY_MINUTES)
+
+enum class SleepBatteryMode(val storedValue: String) {
+    DELAYED_PAUSE("delayed_pause"),
+    TIMED_PAUSE("timed_pause");
+
+    companion object {
+        fun fromStoredValue(value: String?): SleepBatteryMode =
+            entries.firstOrNull { it.storedValue == value } ?: DELAYED_PAUSE
+    }
+}
+
+internal enum class SleepBatteryRuntimePhase(val storedValue: String) {
+    IDLE("idle"),
+    WAITING_TO_PAUSE("waiting_to_pause"),
+    PAUSED_UNTIL_SCREEN_ON("paused_until_screen_on"),
+    WAITING_TO_RESUME("waiting_to_resume"),
+    RESUMED_UNTIL_SCREEN_ON("resumed_until_screen_on");
+
+    companion object {
+        fun fromStoredValue(value: String?): SleepBatteryRuntimePhase =
+            entries.firstOrNull { it.storedValue == value } ?: IDLE
+    }
+}
+
+internal data class SleepBatteryRuntimeState(
+    val phase: SleepBatteryRuntimePhase = SleepBatteryRuntimePhase.IDLE,
+    val deadlineMs: Long = 0L,
+)
+
 data class VkHashInsertResult(
     val slot: Int,
     val hash: String,
     val previousHash: String,
     val profile: Int = 0,
     val hashes: List<String> = emptyList(),
+)
+
+internal data class VpnRoutingImportResult(
+    val blacklistAppCount: Int,
+    val whitelistAppCount: Int,
+    val blacklistAddressCount: Int,
+    val whitelistAddressCount: Int,
+    val isWhitelist: Boolean,
+)
+
+internal data class VpnRoutingSettingsSnapshot(
+    val profileIndex: Int,
+    val isWhitelist: Boolean,
+    val appPackages: String,
+    val addressRules: List<VpnAddressRule>,
 )
 
 data class WdttLinkParts(
@@ -161,6 +211,8 @@ data class TunnelProfileSnapshot(
     val listenPort: Int,
     val sni: String,
     val protocol: String,
+    val vpnDnsSelectionId: String = VPN_DNS_PROFILE_ID,
+    val vpnDnsCustomServers: List<String> = emptyList(),
     val vkCallsPreflight: Boolean,
     val rtNetwork: Boolean = false,
     val rtMasque: Boolean = false,
@@ -261,6 +313,8 @@ data class ActiveTunnelProfileUiSnapshot(
     val serverWgPort: Int,
     val listenPort: Int,
     val sni: String,
+    val vpnDnsSelectionId: String,
+    val vpnDnsCustomServers: List<String>,
     val captchaMode: String,
     val captchaSolveMethod: String,
     val fingerprint: String,
@@ -522,6 +576,18 @@ class SettingsStore(context: Context) {
         private val TRUSTED_WIFI_WAITING = booleanPreferencesKey("trusted_wifi_waiting")
         private val TRUSTED_WIFI_WAITING_SSID = stringPreferencesKey("trusted_wifi_waiting_ssid")
         private val PAUSE_VPN_DURING_SLEEP = booleanPreferencesKey("pause_vpn_during_sleep")
+        private val PAUSE_VPN_DURING_SLEEP_DELAY_MINUTES =
+            intPreferencesKey("pause_vpn_during_sleep_delay_minutes")
+        private val PAUSE_VPN_DURING_SLEEP_MODE =
+            stringPreferencesKey("pause_vpn_during_sleep_mode")
+        private val RESUME_VPN_DURING_SLEEP_DELAY_MINUTES =
+            intPreferencesKey("resume_vpn_during_sleep_delay_minutes")
+        private val SLEEP_BATTERY_SETTINGS_CONFIGURED =
+            booleanPreferencesKey("sleep_battery_settings_configured")
+        private val SLEEP_BATTERY_RUNTIME_PHASE =
+            stringPreferencesKey("sleep_battery_runtime_phase")
+        private val ACTIVE_TIMED_SLEEP_RESUME_DEADLINE_MS =
+            longPreferencesKey("active_timed_sleep_resume_deadline_ms")
         private val WDTT_LINK = stringPreferencesKey("wdtt_link")
         private val WDTT_LINK_MODE = booleanPreferencesKey("wdtt_link_mode")
         private val CONNECTION_INPUT_METHOD = stringPreferencesKey("connection_input_method")
@@ -599,6 +665,7 @@ class SettingsStore(context: Context) {
         private val ACCESS_ACTION_LAUNCHED_AT =
             longPreferencesKey("access_action_launched_at")
         private val PROFILE_MAX_WORKERS = intPreferencesKey("profile_max_workers")
+        private val PROFILE_WORKER_LIMIT_SEEN = intPreferencesKey("profile_worker_limit_seen")
         private val VK_HASH_NEXT_SLOT = intPreferencesKey("vk_hash_next_slot")
         private val WORKERS_PER_HASH = intPreferencesKey("workers_per_hash")
         private val PROTOCOL = stringPreferencesKey("protocol")
@@ -609,6 +676,8 @@ class SettingsStore(context: Context) {
         private val SNI = stringPreferencesKey("sni")
         private val NO_DTLS = booleanPreferencesKey("no_dtls")
         private val NO_DNS = booleanPreferencesKey("no_dns")
+        private val VPN_DNS_SELECTION = stringPreferencesKey("vpn_dns_selection")
+        private val VPN_DNS_CUSTOM = stringPreferencesKey("vpn_dns_custom")
 
         private val USER_AGENT = stringPreferencesKey("user_agent")
 
@@ -662,6 +731,8 @@ class SettingsStore(context: Context) {
         private val IS_WHITELIST = booleanPreferencesKey("is_whitelist")
         private val BLACKLIST_APPS = stringPreferencesKey("blacklist_apps")
         private val WHITELIST_APPS = stringPreferencesKey("whitelist_apps")
+        private val BLACKLIST_ADDRESSES = stringPreferencesKey("blacklist_addresses")
+        private val WHITELIST_ADDRESSES = stringPreferencesKey("whitelist_addresses")
 
         // ═══ Theme Mode ═══
         private val THEME_MODE = stringPreferencesKey("theme_mode") // "system", "light", "dark"
@@ -749,6 +820,8 @@ class SettingsStore(context: Context) {
             ACCESS_LIFECYCLE_DISMISSED_SIGNATURE,
             PROTOCOL,
             SNI,
+            VPN_DNS_SELECTION,
+            VPN_DNS_CUSTOM,
             USER_AGENT,
             DEPLOY_IP,
             DEPLOY_LOGIN,
@@ -770,6 +843,8 @@ class SettingsStore(context: Context) {
             EXCLUDED_APPS,
             BLACKLIST_APPS,
             WHITELIST_APPS,
+            BLACKLIST_ADDRESSES,
+            WHITELIST_ADDRESSES,
             CONNECTION_PASSWORD,
             CONNECTION_PASSWORD_ENCRYPTED,
             DEPLOY_MAIN_PASSWORD,
@@ -795,6 +870,7 @@ class SettingsStore(context: Context) {
         private val PROFILE_INT_KEYS = listOf(
             WORKERS_PER_HASH,
             PROFILE_MAX_WORKERS,
+            PROFILE_WORKER_LIMIT_SEEN,
             VK_HASH_NEXT_SLOT,
             LISTEN_PORT,
             SERVER_DTLS_PORT,
@@ -895,6 +971,12 @@ class SettingsStore(context: Context) {
                     serverWgPort = it[getProfileKey(SERVER_WG_PORT, profile)] ?: 56001,
                     listenPort = it[getProfileKey(LISTEN_PORT, profile)] ?: 9000,
                     sni = it[getProfileKey(SNI, profile)].orEmpty(),
+                    vpnDnsSelectionId = normalizeVpnDnsSelectionId(
+                        it[getProfileKey(VPN_DNS_SELECTION, profile)]
+                    ),
+                    vpnDnsCustomServers = decodeStoredCustomVpnDnsServers(
+                        it[getProfileKey(VPN_DNS_CUSTOM, profile)].orEmpty()
+                    ),
                     captchaMode = it[getProfileKey(CAPTCHA_MODE, profile)] ?: "auto",
                     captchaSolveMethod = it[getProfileKey(CAPTCHA_SOLVE_METHOD, profile)] ?: "auto",
                     fingerprint = it[getProfileKey(SELECTED_FINGERPRINT, profile)] ?: "firefox",
@@ -1038,6 +1120,41 @@ class SettingsStore(context: Context) {
     val pauseVpnDuringSleep: Flow<Boolean> = preferencesFlow.map {
         it[PAUSE_VPN_DURING_SLEEP] ?: false
     }
+    val pauseVpnDuringSleepDelayMinutes: Flow<Int> = preferencesFlow.map {
+        normalizeSleepPauseDelayMinutes(
+            it[PAUSE_VPN_DURING_SLEEP_DELAY_MINUTES] ?: DEFAULT_SLEEP_PAUSE_DELAY_MINUTES
+        )
+    }
+    val sleepBatteryMode: Flow<SleepBatteryMode> = preferencesFlow.map {
+        SleepBatteryMode.fromStoredValue(it[PAUSE_VPN_DURING_SLEEP_MODE])
+    }
+    val resumeVpnDuringSleepDelayMinutes: Flow<Int> = preferencesFlow.map {
+        normalizeSleepPauseDelayMinutes(
+            it[RESUME_VPN_DURING_SLEEP_DELAY_MINUTES] ?: DEFAULT_SLEEP_PAUSE_DELAY_MINUTES
+        )
+    }
+    val sleepBatterySettingsConfigured: Flow<Boolean> = preferencesFlow.map {
+        it[SLEEP_BATTERY_SETTINGS_CONFIGURED]
+            ?: (
+                it[PAUSE_VPN_DURING_SLEEP_DELAY_MINUTES] != null ||
+                    it[PAUSE_VPN_DURING_SLEEP_MODE] != null ||
+                    it[RESUME_VPN_DURING_SLEEP_DELAY_MINUTES] != null
+                )
+    }
+    internal val sleepBatteryRuntimeState: Flow<SleepBatteryRuntimeState> = preferencesFlow.map { prefs ->
+        val deadlineMs = (prefs[ACTIVE_TIMED_SLEEP_RESUME_DEADLINE_MS] ?: 0L).coerceAtLeast(0L)
+        val storedPhase = prefs[SLEEP_BATTERY_RUNTIME_PHASE]
+        SleepBatteryRuntimeState(
+            phase = if (storedPhase == null && deadlineMs > 0L) {
+                // Совместимость с локальными сборками, где сохранялся только
+                // дедлайн второго режима.
+                SleepBatteryRuntimePhase.WAITING_TO_RESUME
+            } else {
+                SleepBatteryRuntimePhase.fromStoredValue(storedPhase)
+            },
+            deadlineMs = deadlineMs,
+        )
+    }
     val wdttLink: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(WDTT_LINK, profile)] ?: ""
@@ -1174,15 +1291,87 @@ class SettingsStore(context: Context) {
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(DEPLOY_DNS2, profile)] ?: "1.0.0.1"
     }
-    val vpnAppPackages: Flow<String> = preferencesFlow.map { prefs ->
-        val profile = prefs[ACTIVE_PROFILE] ?: 0
-        val baseKey = if (prefs[getProfileKey(IS_WHITELIST, profile)] == true) {
+
+    private fun vpnDnsSettingsSnapshot(
+        prefs: Preferences,
+        profileIndex: Int,
+    ): VpnDnsSettingsSnapshot {
+        val profile = profileIndex.coerceIn(0, VPN_PROFILE_COUNT - 1)
+        return VpnDnsSettingsSnapshot(
+            profileIndex = profile,
+            selectionId = normalizeVpnDnsSelectionId(
+                prefs[getProfileKey(VPN_DNS_SELECTION, profile)]
+            ),
+            customServers = decodeStoredCustomVpnDnsServers(
+                prefs[getProfileKey(VPN_DNS_CUSTOM, profile)].orEmpty()
+            ),
+        )
+    }
+
+    internal val vpnDnsSettings: Flow<VpnDnsSettingsSnapshot> = preferencesFlow.map { prefs ->
+        vpnDnsSettingsSnapshot(
+            prefs = prefs,
+            profileIndex = prefs[ACTIVE_PROFILE] ?: 0,
+        )
+    }.distinctUntilChanged().flowOn(Dispatchers.IO)
+
+    internal suspend fun vpnDnsSettingsForProfile(
+        profileIndex: Int,
+    ): VpnDnsSettingsSnapshot = vpnDnsSettingsSnapshot(
+        prefs = preferencesFlow.first(),
+        profileIndex = profileIndex,
+    )
+
+    private fun vpnRoutingSettingsSnapshot(
+        prefs: Preferences,
+        profileIndex: Int,
+    ): VpnRoutingSettingsSnapshot {
+        val profile = profileIndex.coerceIn(0, VPN_PROFILE_COUNT - 1)
+        val whitelist = prefs[getProfileKey(IS_WHITELIST, profile)] == true
+        val appKey = if (whitelist) {
             WHITELIST_APPS
         } else {
             BLACKLIST_APPS
         }
-        prefs[getProfileKey(baseKey, profile)] ?: ""
+        val addressKey = if (whitelist) {
+            WHITELIST_ADDRESSES
+        } else {
+            BLACKLIST_ADDRESSES
+        }
+        return VpnRoutingSettingsSnapshot(
+            profileIndex = profile,
+            isWhitelist = whitelist,
+            appPackages = sanitizeVpnRoutingPackages(
+                decodeStoredVpnPackages(prefs[getProfileKey(appKey, profile)].orEmpty()),
+                appContext.packageName,
+            ).joinToString(","),
+            addressRules = decodeVpnAddressRules(
+                prefs[getProfileKey(addressKey, profile)].orEmpty()
+            ),
+        )
     }
+
+    internal val vpnRoutingSettings: Flow<VpnRoutingSettingsSnapshot> = preferencesFlow.map { prefs ->
+        vpnRoutingSettingsSnapshot(
+            prefs = prefs,
+            profileIndex = prefs[ACTIVE_PROFILE] ?: 0,
+        )
+    }.distinctUntilChanged().flowOn(Dispatchers.IO)
+
+    internal suspend fun vpnRoutingSettingsForProfile(
+        profileIndex: Int,
+    ): VpnRoutingSettingsSnapshot = vpnRoutingSettingsSnapshot(
+        prefs = preferencesFlow.first(),
+        profileIndex = profileIndex,
+    )
+
+    val vpnAppPackages: Flow<String> = vpnRoutingSettings
+        .map { snapshot -> snapshot.appPackages }
+        .distinctUntilChanged()
+
+    internal val vpnAddressRules: Flow<List<VpnAddressRule>> = vpnRoutingSettings
+        .map { snapshot -> snapshot.addressRules }
+        .distinctUntilChanged()
     
     val detailedLogs: Flow<Boolean> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
@@ -1252,10 +1441,9 @@ class SettingsStore(context: Context) {
     }
 
     // ═══ VPN Exclusions Mode ═══
-    val isWhitelist: Flow<Boolean> = preferencesFlow.map { prefs ->
-        val profile = prefs[ACTIVE_PROFILE] ?: 0
-        prefs[getProfileKey(IS_WHITELIST, profile)] ?: false
-    }
+    val isWhitelist: Flow<Boolean> = vpnRoutingSettings
+        .map { snapshot -> snapshot.isWhitelist }
+        .distinctUntilChanged()
 
     // ═══ Theme Mode ═══
     val themeMode: Flow<String> = preferencesFlow.map { it[THEME_MODE] ?: "system" }
@@ -1655,8 +1843,11 @@ class SettingsStore(context: Context) {
 
     suspend fun saveTrustedWifiEnabled(enabled: Boolean) {
         dataStore.edit { prefs ->
-            prefs[TRUSTED_WIFI_ENABLED] = enabled
-            if (!enabled) {
+            val hasConfiguredNetworks =
+                parseTrustedWifiSsids(prefs[TRUSTED_WIFI_SSIDS].orEmpty()).isNotEmpty()
+            val effectiveEnabled = enabled && hasConfiguredNetworks
+            prefs[TRUSTED_WIFI_ENABLED] = effectiveEnabled
+            if (!effectiveEnabled) {
                 prefs.remove(TRUSTED_WIFI_WAITING)
                 prefs.remove(TRUSTED_WIFI_WAITING_SSID)
             }
@@ -1683,8 +1874,14 @@ class SettingsStore(context: Context) {
         dataStore.edit { prefs ->
             val values = parseTrustedWifiSsids(prefs[TRUSTED_WIFI_SSIDS].orEmpty())
                 .filterNot { it == clean }
-            if (values.isEmpty()) prefs.remove(TRUSTED_WIFI_SSIDS)
-            else prefs[TRUSTED_WIFI_SSIDS] = JSONArray(values).toString()
+            if (values.isEmpty()) {
+                prefs.remove(TRUSTED_WIFI_SSIDS)
+                prefs[TRUSTED_WIFI_ENABLED] = false
+                prefs.remove(TRUSTED_WIFI_WAITING)
+                prefs.remove(TRUSTED_WIFI_WAITING_SSID)
+            } else {
+                prefs[TRUSTED_WIFI_SSIDS] = JSONArray(values).toString()
+            }
         }
     }
 
@@ -1703,6 +1900,41 @@ class SettingsStore(context: Context) {
     suspend fun savePauseVpnDuringSleep(enabled: Boolean) {
         dataStore.edit { prefs ->
             prefs[PAUSE_VPN_DURING_SLEEP] = enabled
+        }
+    }
+
+    suspend fun saveSleepBatteryMode(
+        enabled: Boolean,
+        mode: SleepBatteryMode,
+        pauseDelayMinutes: Int,
+        resumeDelayMinutes: Int,
+    ) {
+        dataStore.edit { prefs ->
+            prefs[PAUSE_VPN_DURING_SLEEP] = enabled
+            prefs[PAUSE_VPN_DURING_SLEEP_DELAY_MINUTES] =
+                normalizeSleepPauseDelayMinutes(pauseDelayMinutes)
+            prefs[PAUSE_VPN_DURING_SLEEP_MODE] = mode.storedValue
+            prefs[RESUME_VPN_DURING_SLEEP_DELAY_MINUTES] =
+                normalizeSleepPauseDelayMinutes(resumeDelayMinutes)
+            prefs[SLEEP_BATTERY_SETTINGS_CONFIGURED] = true
+        }
+    }
+
+    internal suspend fun saveSleepBatteryRuntimeState(
+        phase: SleepBatteryRuntimePhase,
+        deadlineMs: Long = 0L,
+    ) {
+        dataStore.edit { prefs ->
+            if (phase == SleepBatteryRuntimePhase.IDLE) {
+                prefs.remove(SLEEP_BATTERY_RUNTIME_PHASE)
+            } else {
+                prefs[SLEEP_BATTERY_RUNTIME_PHASE] = phase.storedValue
+            }
+            if (deadlineMs > 0L) {
+                prefs[ACTIVE_TIMED_SLEEP_RESUME_DEADLINE_MS] = deadlineMs
+            } else {
+                prefs.remove(ACTIVE_TIMED_SLEEP_RESUME_DEADLINE_MS)
+            }
         }
     }
 
@@ -1776,6 +2008,12 @@ class SettingsStore(context: Context) {
                 listenPort = prefs[getProfileKey(LISTEN_PORT, profile)] ?: 9000,
                 sni = prefs[getProfileKey(SNI, profile)].orEmpty(),
                 protocol = prefs[getProfileKey(PROTOCOL, profile)] ?: "udp",
+                vpnDnsSelectionId = normalizeVpnDnsSelectionId(
+                    prefs[getProfileKey(VPN_DNS_SELECTION, profile)]
+                ),
+                vpnDnsCustomServers = decodeStoredCustomVpnDnsServers(
+                    prefs[getProfileKey(VPN_DNS_CUSTOM, profile)].orEmpty()
+                ),
                 vkCallsPreflight = prefs[getProfileKey(VKCALLS_PREFLIGHT, profile)] ?: true,
                 rtNetwork = prefs[getProfileKey(RT_NETWORK, profile)] ?: false,
                 rtMasque = prefs[getProfileKey(RT_MASQUE, profile)] ?: false,
@@ -1979,6 +2217,18 @@ class SettingsStore(context: Context) {
                 put("sni", prefs[getProfileKey(SNI, profile)].orEmpty())
                 put("noDtls", prefs[getProfileKey(NO_DTLS, profile)] ?: false)
                 put("noDns", prefs[getProfileKey(NO_DNS, profile)] ?: false)
+                put(
+                    "vpnDnsSelection",
+                    normalizeVpnDnsSelectionId(
+                        prefs[getProfileKey(VPN_DNS_SELECTION, profile)]
+                    )
+                )
+                put(
+                    "vpnDnsCustom",
+                    decodeStoredCustomVpnDnsServers(
+                        prefs[getProfileKey(VPN_DNS_CUSTOM, profile)].orEmpty()
+                    ).joinToString(",")
+                )
                 put("userAgent", prefs[getProfileKey(USER_AGENT, profile)].orEmpty())
                 put("connectionPassword", readSecret(prefs, CONNECTION_PASSWORD_ENCRYPTED, CONNECTION_PASSWORD, profile))
                 put("deployIp", prefs[getProfileKey(DEPLOY_IP, profile)].orEmpty())
@@ -2007,6 +2257,8 @@ class SettingsStore(context: Context) {
                 put("isWhitelist", prefs[getProfileKey(IS_WHITELIST, profile)] ?: false)
                 put("blacklistApps", prefs[getProfileKey(BLACKLIST_APPS, profile)].orEmpty())
                 put("whitelistApps", prefs[getProfileKey(WHITELIST_APPS, profile)].orEmpty())
+                put("blacklistAddresses", prefs[getProfileKey(BLACKLIST_ADDRESSES, profile)].orEmpty())
+                put("whitelistAddresses", prefs[getProfileKey(WHITELIST_ADDRESSES, profile)].orEmpty())
                 put("detailedLogs", prefs[getProfileKey(DETAILED_LOGS, profile)] ?: false)
                 put("selectedFingerprint", prefs[getProfileKey(SELECTED_FINGERPRINT, profile)] ?: "firefox")
                 put("activeClientIds", prefs[getProfileKey(ACTIVE_CLIENT_IDS, profile)] ?: "6287487,8202606")
@@ -2056,6 +2308,7 @@ class SettingsStore(context: Context) {
                 prefs.remove(getProfileKey(REMOTE_ACTION_URL, profile))
                 prefs.remove(getProfileKey(REMOTE_DOCUMENT_BINDING, profile))
                 prefs.remove(getProfileKey(REMOTE_MANAGED_PROFILE, profile))
+                prefs.remove(getProfileKey(PROFILE_WORKER_LIMIT_SEEN, profile))
                 prefs.clearAccessLifecycle(profile)
                 val importedLink = item.optString("wdttLink")
                 val importedLinkMode = item.optBoolean("wdttLinkMode")
@@ -2101,6 +2354,27 @@ class SettingsStore(context: Context) {
                 prefs[getProfileKey(SNI, profile)] = item.optString("sni")
                 prefs[getProfileKey(NO_DTLS, profile)] = item.optBoolean("noDtls")
                 prefs[getProfileKey(NO_DNS, profile)] = item.optBoolean("noDns")
+                val importedVpnDnsSelection = normalizeVpnDnsSelectionId(
+                    item.optString("vpnDnsSelection", VPN_DNS_PROFILE_ID)
+                )
+                val importedVpnDnsCustom = decodeStoredCustomVpnDnsServers(
+                    item.optString("vpnDnsCustom")
+                )
+                prefs[getProfileKey(VPN_DNS_SELECTION, profile)] =
+                    if (
+                        importedVpnDnsSelection == VPN_DNS_CUSTOM_ID &&
+                        importedVpnDnsCustom.isEmpty()
+                    ) {
+                        VPN_DNS_PROFILE_ID
+                    } else {
+                        importedVpnDnsSelection
+                    }
+                if (importedVpnDnsCustom.isEmpty()) {
+                    prefs.remove(getProfileKey(VPN_DNS_CUSTOM, profile))
+                } else {
+                    prefs[getProfileKey(VPN_DNS_CUSTOM, profile)] =
+                        importedVpnDnsCustom.joinToString(",")
+                }
                 prefs[getProfileKey(USER_AGENT, profile)] = item.optString("userAgent")
                 prefs.putSecret(
                     CONNECTION_PASSWORD_ENCRYPTED,
@@ -2137,8 +2411,18 @@ class SettingsStore(context: Context) {
                 prefs[getProfileKey(CAPTCHA_SOLVE_METHOD, profile)] = item.optString("captchaSolveMethod", "auto")
                 prefs[getProfileKey(CAPTCHA_WBV_SOLVE_METHOD, profile)] = item.optString("captchaWbvSolveMethod", "auto")
                 prefs[getProfileKey(IS_WHITELIST, profile)] = item.optBoolean("isWhitelist")
-                prefs[getProfileKey(BLACKLIST_APPS, profile)] = item.optString("blacklistApps")
-                prefs[getProfileKey(WHITELIST_APPS, profile)] = item.optString("whitelistApps")
+                prefs[getProfileKey(BLACKLIST_APPS, profile)] = sanitizeVpnRoutingPackages(
+                    decodeStoredVpnPackages(item.optString("blacklistApps")),
+                    appContext.packageName,
+                ).joinToString(",")
+                prefs[getProfileKey(WHITELIST_APPS, profile)] = sanitizeVpnRoutingPackages(
+                    decodeStoredVpnPackages(item.optString("whitelistApps")),
+                    appContext.packageName,
+                ).joinToString(",")
+                prefs[getProfileKey(BLACKLIST_ADDRESSES, profile)] =
+                    importedVpnAddressRules(item, "blacklistAddresses")
+                prefs[getProfileKey(WHITELIST_ADDRESSES, profile)] =
+                    importedVpnAddressRules(item, "whitelistAddresses")
                 prefs[getProfileKey(DETAILED_LOGS, profile)] = item.optBoolean("detailedLogs")
                 prefs[getProfileKey(SELECTED_FINGERPRINT, profile)] = item.optString("selectedFingerprint", "firefox")
                 prefs[getProfileKey(ACTIVE_CLIENT_IDS, profile)] = item.optString("activeClientIds", "6287487,8202606")
@@ -2200,6 +2484,32 @@ class SettingsStore(context: Context) {
             overwritten = plan.requiresConfirmation,
             storedAsLink = plan.storeAsLink
         )
+    }
+
+    suspend fun reconcileRemoteProfileWorkerLimit(profileIndex: Int? = null) {
+        dataStore.edit { prefs ->
+            val profile = (profileIndex ?: prefs[ACTIVE_PROFILE] ?: 0)
+                .coerceIn(0, VPN_PROFILE_COUNT - 1)
+            val seenKey = getProfileKey(PROFILE_WORKER_LIMIT_SEEN, profile)
+            val remoteManaged = prefs[getProfileKey(REMOTE_MANAGED_PROFILE, profile)] == true
+            val currentLimit = prefs[getProfileKey(PROFILE_MAX_WORKERS, profile)] ?: 0
+            if (
+                !remoteManaged ||
+                currentLimit !in TUNNEL_WORKERS_PER_GROUP..APP_MAX_WORKERS ||
+                currentLimit % TUNNEL_WORKERS_PER_GROUP != 0
+            ) {
+                prefs.remove(seenKey)
+                return@edit
+            }
+            val workersKey = getProfileKey(WORKERS_PER_HASH, profile)
+            prefs[workersKey] = reconcileTunnelWorkerCountForProfileLimit(
+                selectedWorkers = prefs[workersKey] ?: 18,
+                previousProfileMaxWorkers = prefs[seenKey],
+                currentProfileMaxWorkers = currentLimit,
+                remoteManaged = true,
+            )
+            prefs[seenKey] = currentLimit
+        }
     }
 
     /**
@@ -2408,24 +2718,45 @@ class SettingsStore(context: Context) {
             remove(getProfileKey(REMOTE_ACTION_URL, profile))
             remove(getProfileKey(REMOTE_DOCUMENT_BINDING, profile))
             remove(getProfileKey(REMOTE_MANAGED_PROFILE, profile))
+            remove(getProfileKey(PROFILE_WORKER_LIMIT_SEEN, profile))
             clearAccessLifecycle(profile)
         }
         remoteManaged?.let { managed ->
             val key = getProfileKey(REMOTE_MANAGED_PROFILE, profile)
             if (managed) this[key] = true else remove(key)
         }
-        if (!preserveConnectionSettings) {
-            val requestedLimit = profileMaxWorkers
-                ?.takeIf { it >= TUNNEL_WORKERS_PER_GROUP }
-                ?: parts.maxWorkers
-            val normalizedLimit = (requestedLimit / TUNNEL_WORKERS_PER_GROUP) *
-                TUNNEL_WORKERS_PER_GROUP
-            if (normalizedLimit >= TUNNEL_WORKERS_PER_GROUP) {
-                this[getProfileKey(PROFILE_MAX_WORKERS, profile)] =
-                    normalizedLimit.coerceAtMost(APP_MAX_WORKERS)
+        val maxWorkersKey = getProfileKey(PROFILE_MAX_WORKERS, profile)
+        val seenLimitKey = getProfileKey(PROFILE_WORKER_LIMIT_SEEN, profile)
+        val selectedWorkersKey = getProfileKey(WORKERS_PER_HASH, profile)
+        val previousLimit = this[seenLimitKey] ?: this[maxWorkersKey]
+        val requestedLimit = profileMaxWorkers
+            ?.takeIf { it >= TUNNEL_WORKERS_PER_GROUP }
+            ?: parts.maxWorkers
+        val normalizedLimit = ((requestedLimit / TUNNEL_WORKERS_PER_GROUP) *
+            TUNNEL_WORKERS_PER_GROUP).coerceAtMost(APP_MAX_WORKERS)
+        if (normalizedLimit >= TUNNEL_WORKERS_PER_GROUP) {
+            this[maxWorkersKey] = normalizedLimit
+            val managed = this[getProfileKey(REMOTE_MANAGED_PROFILE, profile)] == true
+            if (managed) {
+                this[selectedWorkersKey] = if (remoteManaged == true) {
+                    normalizedLimit
+                } else {
+                    reconcileTunnelWorkerCountForProfileLimit(
+                        selectedWorkers = this[selectedWorkersKey] ?: 18,
+                        previousProfileMaxWorkers = previousLimit,
+                        currentProfileMaxWorkers = normalizedLimit,
+                        remoteManaged = true,
+                    )
+                }
+                this[seenLimitKey] = normalizedLimit
             } else {
-                remove(getProfileKey(PROFILE_MAX_WORKERS, profile))
+                remove(seenLimitKey)
             }
+        } else {
+            remove(maxWorkersKey)
+            remove(seenLimitKey)
+        }
+        if (!preserveConnectionSettings) {
             val importedProfileName = vpnProfileRestorableName(parts.profileName)
             if (importedProfileName.isNotBlank()) {
                 this[getProfileKey(PROFILE_NAME, profile)] = importedProfileName
@@ -2518,6 +2849,69 @@ class SettingsStore(context: Context) {
             prefs[getProfileKey(LISTEN_PORT, profile)] = listenPort
             prefs[getProfileKey(SNI, profile)] = sni
             prefs[getProfileKey(NO_DNS, profile)] = noDns
+        }
+    }
+
+    suspend fun applyImportedServerConnection(
+        profileIndex: Int,
+        host: String,
+        connectionPassword: String,
+        dtlsPort: Int,
+        wgPort: Int,
+        ownerProfile: ServerAdminProfileInfo
+    ) {
+        val profile = profileIndex.coerceIn(0, VPN_PROFILE_COUNT - 1)
+        require(host.isNotBlank()) { "Адрес импортированного сервера пустой." }
+        require(connectionPassword.isNotBlank()) { "Главный пароль импортированного сервера пустой." }
+        require(dtlsPort in 1..65535 && wgPort in 1..65535 && ownerProfile.listenPort in 1..65535) {
+            "В импортированном профиле указаны некорректные порты."
+        }
+        val importedVpnDnsSelection = normalizeVpnDnsSelectionId(ownerProfile.vpnDnsSelectionId)
+        val importedVpnDnsCustom = ownerProfile.vpnDnsCustomServers
+            .joinToString(",")
+            .let(::decodeStoredCustomVpnDnsServers)
+        val effectiveVpnDnsSelection = if (
+            importedVpnDnsSelection == VPN_DNS_CUSTOM_ID && importedVpnDnsCustom.isEmpty()
+        ) {
+            VPN_DNS_PROFILE_ID
+        } else {
+            importedVpnDnsSelection
+        }
+        dataStore.edit { prefs ->
+            prefs[getProfileKey(WDTT_LINK_MODE, profile)] = false
+            prefs.remove(getProfileKey(WDTT_LINK, profile))
+            prefs[getProfileKey(CONNECTION_INPUT_METHOD, profile)] = "manual"
+            prefs[getProfileKey(PEER, profile)] = host.trim()
+            prefs.putSecret(
+                CONNECTION_PASSWORD_ENCRYPTED,
+                CONNECTION_PASSWORD,
+                connectionPassword,
+                profile
+            )
+            prefs[getProfileKey(VK_HASHES, profile)] = ownerProfile.vkHashes.trim()
+            prefs[getProfileKey(SECONDARY_VK_HASH, profile)] = ownerProfile.secondaryVkHash.trim()
+            prefs[getProfileKey(WORKERS_PER_HASH, profile)] = ownerProfile.workersPerHash.coerceIn(1, 128)
+            prefs[getProfileKey(PROTOCOL, profile)] =
+                ownerProfile.protocol.trim().lowercase().takeIf { it == "udp" || it == "tcp" } ?: "udp"
+            prefs[getProfileKey(LISTEN_PORT, profile)] = ownerProfile.listenPort
+            prefs[getProfileKey(SERVER_DTLS_PORT, profile)] = dtlsPort
+            prefs[getProfileKey(SERVER_WG_PORT, profile)] = wgPort
+            prefs[getProfileKey(MANUAL_PORTS_ENABLED, profile)] =
+                dtlsPort != 56000 || wgPort != 56001 || ownerProfile.listenPort != 9000
+            prefs[getProfileKey(SNI, profile)] = ownerProfile.sni.trim()
+            prefs[getProfileKey(NO_DNS, profile)] = ownerProfile.noDns
+            if (ownerProfile.vpnDnsStored) {
+                prefs[getProfileKey(VPN_DNS_SELECTION, profile)] = effectiveVpnDnsSelection
+                if (importedVpnDnsCustom.isEmpty()) {
+                    prefs.remove(getProfileKey(VPN_DNS_CUSTOM, profile))
+                } else {
+                    prefs[getProfileKey(VPN_DNS_CUSTOM, profile)] =
+                        importedVpnDnsCustom.joinToString(",")
+                }
+            }
+            vpnProfileRestorableName(ownerProfile.profileName)
+                .takeIf { it.isNotBlank() }
+                ?.let { prefs[getProfileKey(PROFILE_NAME, profile)] = it }
         }
     }
 
@@ -2967,38 +3361,185 @@ class SettingsStore(context: Context) {
         }
     }
 
-    suspend fun toggleVpnAppSelected(packageName: String, whitelist: Boolean) {
+    suspend fun toggleVpnAppSelected(
+        packageName: String,
+        whitelist: Boolean,
+        profileIndex: Int? = null,
+    ) {
+        val normalizedPackage = packageName.trim()
+        require(
+            normalizedPackage.isNotEmpty() &&
+                ',' !in normalizedPackage &&
+                !isAlwaysBypassedVpnPackage(normalizedPackage, appContext.packageName)
+        ) { "Это приложение нельзя добавить в список маршрутизации." }
         dataStore.edit { prefs ->
-            val profile = prefs[ACTIVE_PROFILE] ?: 0
+            val profile = profileIndex?.coerceIn(0, VPN_PROFILE_COUNT - 1)
+                ?: (prefs[ACTIVE_PROFILE] ?: 0).coerceIn(0, VPN_PROFILE_COUNT - 1)
             val key = getProfileKey(if (whitelist) WHITELIST_APPS else BLACKLIST_APPS, profile)
-            val packages = prefs[key]
-                .orEmpty()
-                .split(",")
-                .map { it.trim() }
-                .filter { it.isNotEmpty() }
-                .toMutableSet()
-            if (!packages.add(packageName)) packages.remove(packageName)
+            val packages = sanitizeVpnRoutingPackages(
+                decodeStoredVpnPackages(prefs[key].orEmpty()),
+                appContext.packageName,
+            ).toMutableSet()
+            if (!packages.add(normalizedPackage)) packages.remove(normalizedPackage)
             prefs[key] = packages.sorted().joinToString(",")
         }
     }
 
-    suspend fun addBlacklistPackages(newPackages: Set<String>): Int {
+    suspend fun addBlacklistPackages(
+        newPackages: Set<String>,
+        profileIndex: Int? = null,
+    ): Int {
         var addedCount = 0
         dataStore.edit { prefs ->
-            val profile = prefs[ACTIVE_PROFILE] ?: 0
+            val profile = profileIndex?.coerceIn(0, VPN_PROFILE_COUNT - 1)
+                ?: (prefs[ACTIVE_PROFILE] ?: 0).coerceIn(0, VPN_PROFILE_COUNT - 1)
             val key = getProfileKey(BLACKLIST_APPS, profile)
-            val packages = prefs[key]
-                .orEmpty()
-                .split(",")
-                .map { it.trim() }
-                .filter { it.isNotEmpty() }
-                .toMutableSet()
+            val packages = sanitizeVpnRoutingPackages(
+                decodeStoredVpnPackages(prefs[key].orEmpty()),
+                appContext.packageName,
+            ).toMutableSet()
             val before = packages.size
-            packages.addAll(newPackages)
+            packages.addAll(sanitizeVpnRoutingPackages(newPackages, appContext.packageName))
             addedCount = packages.size - before
             prefs[key] = packages.sorted().joinToString(",")
         }
         return addedCount
+    }
+
+    internal suspend fun addVpnAddressRules(
+        rawValue: String,
+        whitelist: Boolean,
+        profileIndex: Int? = null,
+    ): List<VpnAddressRule> {
+        val normalized = normalizeVpnAddressRules(rawValue)
+        dataStore.edit { prefs ->
+            val profile = profileIndex?.coerceIn(0, VPN_PROFILE_COUNT - 1)
+                ?: (prefs[ACTIVE_PROFILE] ?: 0).coerceIn(0, VPN_PROFILE_COUNT - 1)
+            val key = getProfileKey(
+                if (whitelist) WHITELIST_ADDRESSES else BLACKLIST_ADDRESSES,
+                profile,
+            )
+            val rules = decodeVpnAddressRules(prefs[key].orEmpty()).toMutableList()
+            val newRules = normalized.filterNot(rules::contains)
+            if (newRules.isNotEmpty()) {
+                require(rules.size + newRules.size <= MAX_VPN_ADDRESS_RULES) {
+                    "В одном списке может быть не больше $MAX_VPN_ADDRESS_RULES адресов."
+                }
+                rules += newRules
+                prefs[key] = encodeVpnAddressRules(rules)
+            }
+        }
+        return normalized
+    }
+
+    internal suspend fun removeVpnAddressRule(
+        rule: VpnAddressRule,
+        whitelist: Boolean,
+        profileIndex: Int? = null,
+    ) {
+        dataStore.edit { prefs ->
+            val profile = profileIndex?.coerceIn(0, VPN_PROFILE_COUNT - 1)
+                ?: (prefs[ACTIVE_PROFILE] ?: 0).coerceIn(0, VPN_PROFILE_COUNT - 1)
+            val key = getProfileKey(
+                if (whitelist) WHITELIST_ADDRESSES else BLACKLIST_ADDRESSES,
+                profile,
+            )
+            val rules = decodeVpnAddressRules(prefs[key].orEmpty()).filterNot { it == rule }
+            prefs[key] = encodeVpnAddressRules(rules)
+        }
+    }
+
+    suspend fun exportVpnRoutingSettings(profileIndex: Int? = null): String = preferencesFlow.map { prefs ->
+        val profile = profileIndex?.coerceIn(0, VPN_PROFILE_COUNT - 1)
+            ?: (prefs[ACTIVE_PROFILE] ?: 0).coerceIn(0, VPN_PROFILE_COUNT - 1)
+        encodeVpnRoutingDocument(
+            VpnRoutingDocument(
+                isWhitelist = prefs[getProfileKey(IS_WHITELIST, profile)] ?: false,
+                blacklistApps = sanitizeVpnRoutingPackages(
+                    decodeStoredVpnPackages(prefs[getProfileKey(BLACKLIST_APPS, profile)].orEmpty()),
+                    appContext.packageName,
+                ),
+                whitelistApps = sanitizeVpnRoutingPackages(
+                    decodeStoredVpnPackages(prefs[getProfileKey(WHITELIST_APPS, profile)].orEmpty()),
+                    appContext.packageName,
+                ),
+                blacklistAddresses = decodeVpnAddressRules(
+                    prefs[getProfileKey(BLACKLIST_ADDRESSES, profile)].orEmpty()
+                ),
+                whitelistAddresses = decodeVpnAddressRules(
+                    prefs[getProfileKey(WHITELIST_ADDRESSES, profile)].orEmpty()
+                ),
+            )
+        )
+    }.first()
+
+    internal suspend fun importVpnRoutingSettings(
+        settingsJson: String,
+        profileIndex: Int? = null,
+    ): VpnRoutingImportResult {
+        val imported = decodeVpnRoutingDocument(settingsJson)
+        val document = imported.copy(
+            blacklistApps = sanitizeVpnRoutingPackages(
+                imported.blacklistApps,
+                appContext.packageName,
+            ),
+            whitelistApps = sanitizeVpnRoutingPackages(
+                imported.whitelistApps,
+                appContext.packageName,
+            ),
+        )
+
+        dataStore.edit { prefs ->
+            val profile = profileIndex?.coerceIn(0, VPN_PROFILE_COUNT - 1)
+                ?: (prefs[ACTIVE_PROFILE] ?: 0).coerceIn(0, VPN_PROFILE_COUNT - 1)
+            prefs[getProfileKey(IS_WHITELIST, profile)] = document.isWhitelist
+            prefs[getProfileKey(BLACKLIST_APPS, profile)] = document.blacklistApps.joinToString(",")
+            prefs[getProfileKey(WHITELIST_APPS, profile)] = document.whitelistApps.joinToString(",")
+            prefs[getProfileKey(BLACKLIST_ADDRESSES, profile)] =
+                encodeVpnAddressRules(document.blacklistAddresses)
+            prefs[getProfileKey(WHITELIST_ADDRESSES, profile)] =
+                encodeVpnAddressRules(document.whitelistAddresses)
+        }
+        return VpnRoutingImportResult(
+            blacklistAppCount = document.blacklistApps.size,
+            whitelistAppCount = document.whitelistApps.size,
+            blacklistAddressCount = document.blacklistAddresses.size,
+            whitelistAddressCount = document.whitelistAddresses.size,
+            isWhitelist = document.isWhitelist,
+        )
+    }
+
+    internal suspend fun saveVpnDnsSettings(
+        selectionId: String,
+        customServersRaw: String = "",
+        profileIndex: Int? = null,
+    ): VpnDnsSettingsSnapshot {
+        val selection = normalizeVpnDnsSelectionId(selectionId)
+        require(selection == selectionId.trim().lowercase()) {
+            "Неизвестный вариант DNS."
+        }
+        val customServers = if (selection == VPN_DNS_CUSTOM_ID) {
+            normalizeCustomVpnDnsServers(customServersRaw)
+        } else {
+            decodeStoredCustomVpnDnsServers(customServersRaw)
+        }
+        var savedProfile = 0
+        dataStore.edit { prefs ->
+            savedProfile = profileIndex?.coerceIn(0, VPN_PROFILE_COUNT - 1)
+                ?: (prefs[ACTIVE_PROFILE] ?: 0).coerceIn(0, VPN_PROFILE_COUNT - 1)
+            prefs[getProfileKey(VPN_DNS_SELECTION, savedProfile)] = selection
+            if (customServers.isEmpty()) {
+                prefs.remove(getProfileKey(VPN_DNS_CUSTOM, savedProfile))
+            } else {
+                prefs[getProfileKey(VPN_DNS_CUSTOM, savedProfile)] =
+                    customServers.joinToString(",")
+            }
+        }
+        return VpnDnsSettingsSnapshot(
+            profileIndex = savedProfile,
+            selectionId = selection,
+            customServers = customServers,
+        )
     }
     
     suspend fun saveDetailedLogs(enabled: Boolean) {
@@ -3192,9 +3733,10 @@ class SettingsStore(context: Context) {
     }
 
     // ═══ Сохранение режима списка (ЧС/БС) ═══
-    suspend fun saveIsWhitelist(enabled: Boolean) {
+    suspend fun saveIsWhitelist(enabled: Boolean, profileIndex: Int? = null) {
         dataStore.edit { prefs ->
-            val profile = prefs[ACTIVE_PROFILE] ?: 0
+            val profile = profileIndex?.coerceIn(0, VPN_PROFILE_COUNT - 1)
+                ?: (prefs[ACTIVE_PROFILE] ?: 0).coerceIn(0, VPN_PROFILE_COUNT - 1)
             prefs[getProfileKey(IS_WHITELIST, profile)] = enabled
         }
     }
@@ -3242,18 +3784,31 @@ class SettingsStore(context: Context) {
             for (profile in 0 until VPN_PROFILE_COUNT) {
                 val legacyKey = getProfileKey(EXCLUDED_APPS, profile)
                 val legacyPackages = prefs[legacyKey].orEmpty()
-                if (legacyPackages.isBlank()) continue
+                if (legacyPackages.isNotBlank()) {
+                    val targetBaseKey = if (prefs[getProfileKey(IS_WHITELIST, profile)] == true) {
+                        WHITELIST_APPS
+                    } else {
+                        BLACKLIST_APPS
+                    }
+                    val targetKey = getProfileKey(targetBaseKey, profile)
+                    if (prefs[targetKey] == null) {
+                        prefs[targetKey] = sanitizeVpnRoutingPackages(
+                            decodeStoredVpnPackages(legacyPackages),
+                            appContext.packageName,
+                        ).joinToString(",")
+                    }
+                }
 
-                val targetBaseKey = if (prefs[getProfileKey(IS_WHITELIST, profile)] == true) {
-                    WHITELIST_APPS
-                } else {
-                    BLACKLIST_APPS
+                listOf(BLACKLIST_APPS, WHITELIST_APPS).forEach { baseKey ->
+                    val key = getProfileKey(baseKey, profile)
+                    val stored = prefs[key] ?: return@forEach
+                    val sanitized = sanitizeVpnRoutingPackages(
+                        decodeStoredVpnPackages(stored),
+                        appContext.packageName,
+                    ).joinToString(",")
+                    if (stored != sanitized) prefs[key] = sanitized
                 }
-                val targetKey = getProfileKey(targetBaseKey, profile)
-                if (prefs[targetKey] == null) {
-                    prefs[targetKey] = legacyPackages
-                }
-                prefs.remove(legacyKey)
+                if (prefs[legacyKey] != null) prefs.remove(legacyKey)
             }
         }
     }
@@ -3777,6 +4332,11 @@ class SettingsStore(context: Context) {
 }
 
 fun vpnProfileDefaultName(profile: Int): String = "VPN ${profile.coerceIn(0, 2) + 1}"
+
+private fun importedVpnAddressRules(item: JSONObject, key: String): String {
+    if (!item.has(key)) return encodeVpnAddressRules(emptyList())
+    return encodeVpnAddressRules(decodeVpnAddressRulesStrict(item.optString(key)))
+}
 
 private fun parseTrustedWifiSsids(raw: String): List<String> {
     if (raw.isBlank()) return emptyList()

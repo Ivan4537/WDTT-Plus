@@ -157,14 +157,14 @@ class TrustedWifiTest {
 
     @Test
     fun `lost trusted wifi is not reused as validated resume network`() {
-        val networks = TrustedWifiValidatedNetworkTracker<String>()
-        networks.update(network = "home", validated = true, wifi = true)
+        val networks = TrustedWifiResumeNetworkTracker<String>()
+        networks.update(network = "home", internetCapable = true, validated = true, wifi = true)
         assertTrue(networks.hasUsableNetwork())
 
         networks.forgetWifi()
         assertFalse(networks.hasUsableNetwork())
 
-        networks.update(network = "cellular", validated = true, wifi = false)
+        networks.update(network = "cellular", internetCapable = true, validated = true, wifi = false)
         assertTrue(networks.hasUsableNetwork())
 
         networks.lost("cellular")
@@ -173,9 +173,9 @@ class TrustedWifiTest {
 
     @Test
     fun `trusted wifi loss preserves an already validated cellular network`() {
-        val networks = TrustedWifiValidatedNetworkTracker<String>()
-        networks.update(network = "home", validated = true, wifi = true)
-        networks.update(network = "cellular", validated = true, wifi = false)
+        val networks = TrustedWifiResumeNetworkTracker<String>()
+        networks.update(network = "home", internetCapable = true, validated = true, wifi = true)
+        networks.update(network = "cellular", internetCapable = true, validated = true, wifi = false)
 
         networks.forgetWifi()
 
@@ -183,20 +183,62 @@ class TrustedWifiTest {
     }
 
     @Test
-    fun `internet capability without validation is not enough to resume`() {
-        val networks = TrustedWifiValidatedNetworkTracker<String>()
-        networks.update(network = "cellular", validated = false, wifi = false)
+    fun `limited cellular network can resume after trusted wifi`() {
+        val networks = TrustedWifiResumeNetworkTracker<String>()
+        networks.update(network = "cellular", internetCapable = true, validated = false, wifi = false)
+        assertTrue(networks.hasUsableNetwork())
+
+        networks.update(network = "cellular", internetCapable = false, validated = false, wifi = false)
+        assertFalse(networks.hasUsableNetwork())
+    }
+
+    @Test
+    fun `unvalidated wifi cannot resume through a captive portal`() {
+        val networks = TrustedWifiResumeNetworkTracker<String>()
+        networks.update(network = "hotel", internetCapable = true, validated = false, wifi = true)
         assertFalse(networks.hasUsableNetwork())
 
-        networks.update(network = "cellular", validated = true, wifi = false)
+        networks.update(network = "hotel", internetCapable = true, validated = true, wifi = true)
         assertTrue(networks.hasUsableNetwork())
     }
 
     @Test
+    fun `trusted wifi resume fallback accepts validated networks and limited cellular only`() {
+        assertTrue(
+            isUsableTrustedWifiResumeNetwork(
+                internetCapable = true,
+                validated = true,
+                wifi = true,
+            )
+        )
+        assertFalse(
+            isUsableTrustedWifiResumeNetwork(
+                internetCapable = true,
+                validated = false,
+                wifi = true,
+            )
+        )
+        assertTrue(
+            isUsableTrustedWifiResumeNetwork(
+                internetCapable = true,
+                validated = false,
+                wifi = false,
+            )
+        )
+        assertFalse(
+            isUsableTrustedWifiResumeNetwork(
+                internetCapable = false,
+                validated = true,
+                wifi = false,
+            )
+        )
+    }
+
+    @Test
     fun `losing trusted wifi does not discard a newly validated untrusted wifi`() {
-        val networks = TrustedWifiValidatedNetworkTracker<String>()
-        networks.update(network = "home", validated = true, wifi = true)
-        networks.update(network = "office", validated = true, wifi = true)
+        val networks = TrustedWifiResumeNetworkTracker<String>()
+        networks.update(network = "home", internetCapable = true, validated = true, wifi = true)
+        networks.update(network = "office", internetCapable = true, validated = true, wifi = true)
 
         networks.lost("home")
 

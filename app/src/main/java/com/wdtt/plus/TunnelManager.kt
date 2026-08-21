@@ -15,6 +15,8 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 import java.util.concurrent.ConcurrentHashMap
@@ -39,6 +41,48 @@ data class LogEntry(
 ) {
     val isError: Boolean get() = severity == LogSeverity.Error
 }
+
+internal fun addPhoneTimeToSleepLog(
+    message: String,
+    nowMs: Long = System.currentTimeMillis(),
+    timeZone: TimeZone = TimeZone.getDefault(),
+): String {
+    val prefix = "[СОН] "
+    if (!message.startsWith(prefix)) return message
+    val body = message.removePrefix(prefix)
+    if (body.isBlank()) return message
+
+    val formatter = SimpleDateFormat("HH:mm:ss", Locale.ROOT).apply {
+        this.timeZone = timeZone
+    }
+    val phoneTime = formatter.format(Date(nowMs))
+    val boundary = body.indexOfAny(charArrayOf(';', '.', ':', '!', '?'))
+    return if (boundary > 0) {
+        "$prefix${body.substring(0, boundary)} в $phoneTime${body.substring(boundary)}"
+    } else {
+        "$prefix$body в $phoneTime"
+    }
+}
+
+internal fun shouldUseVkCallsPreflight(
+    enabledByUser: Boolean,
+    cooldownUntilMs: Long,
+    nowMs: Long = System.currentTimeMillis(),
+): Boolean = enabledByUser && nowMs >= cooldownUntilMs
+
+internal fun vkCallsPreflightCooldownForLog(line: String): Long = when {
+    line.contains("[VKCalls] VK временно ограничил анонимный вход", true) -> 60_000L
+    line.contains("[VKCalls] VKCalls запросил CAPTCHA", true) -> 120_000L
+    line.contains("[VKCalls] preflight не сработал", true) &&
+        line.contains("временно не повторяем", true) -> 45_000L
+    else -> 0L
+}
+
+internal fun boundedVkCallsPreflightCooldownUntil(
+    untilMs: Long,
+    nowMs: Long = System.currentTimeMillis(),
+    maxDurationMs: Long = 2 * 60_000L,
+): Long = if (untilMs > nowMs && untilMs - nowMs <= maxDurationMs) untilMs else 0L
 
 @Stable
 enum class ConnectionIssueKind {
@@ -65,25 +109,106 @@ enum class NetworkRecoveryAction {
 internal fun stableNetworkRecoveryAction(@Suppress("UNUSED_PARAMETER") completedAttempts: Int): NetworkRecoveryAction =
     NetworkRecoveryAction.SoftRestart
 
+internal fun shouldBlockVpnStart(vpnSlotYieldRequested: Boolean): Boolean =
+    vpnSlotYieldRequested
+
+internal fun confirmedFailureRecoveryAction(
+    hardFailure: Boolean,
+    completedAttempts: Int,
+): NetworkRecoveryAction = if (hardFailure) {
+    if (completedAttempts == 0) {
+        NetworkRecoveryAction.SoftRestart
+    } else {
+        NetworkRecoveryAction.StopVpn
+    }
+} else {
+    stableNetworkRecoveryAction(completedAttempts)
+}
+
+internal fun hasConfirmedNetworkFailureAtOrAfter(
+    running: Boolean,
+    hardNetworkErrorAtMs: Long,
+    sinceMs: Long,
+): Boolean = running && hardNetworkErrorAtMs > 0L && hardNetworkErrorAtMs >= sinceMs
+
+internal fun shouldResetNetworkRecoveryFromStats(
+    downstreamChanged: Boolean,
+    hardNetworkFailure: Boolean,
+    trafficChanged: Boolean,
+    statsTrafficStagnant: Boolean,
+): Boolean {
+    if (downstreamChanged) return true
+    return !hardNetworkFailure &&
+        (trafficChanged || !statsTrafficStagnant)
+}
+
 internal fun hasFreshTransportHeartbeat(
     running: Boolean,
     activeWorkers: Int,
-    lastActiveAtMs: Long,
-    lastStatsAtMs: Long,
+    lastInboundTrafficAtMs: Long,
     sinceMs: Long,
     nowMs: Long,
     freshnessMs: Long = 90_000L,
 ): Boolean {
     if (!running || activeWorkers <= 0) return false
-    val freshActive = lastActiveAtMs >= sinceMs && nowMs - lastActiveAtMs < freshnessMs
-    val freshStats = lastStatsAtMs >= sinceMs && nowMs - lastStatsAtMs < freshnessMs
-    return freshActive || freshStats
+    return lastInboundTrafficAtMs >= sinceMs && nowMs - lastInboundTrafficAtMs < freshnessMs
 }
+
+internal fun hasFreshTransportPath(
+    running: Boolean,
+    activeWorkers: Int,
+    lastInboundTrafficAtMs: Long,
+    lastKeepaliveResponseAtMs: Long,
+    sinceMs: Long,
+    nowMs: Long,
+    freshnessMs: Long = 90_000L,
+): Boolean {
+    if (!running || activeWorkers <= 0) return false
+    val lastResponseAtMs = maxOf(lastInboundTrafficAtMs, lastKeepaliveResponseAtMs)
+    return lastResponseAtMs >= sinceMs && nowMs - lastResponseAtMs < freshnessMs
+}
+
+internal fun stableRecoveryGraceMs(hardFailure: Boolean): Long =
+    if (hardFailure) 30_000L else 10 * 60_000L
+
+internal fun stableRecoveryRetryMs(hardFailure: Boolean): Long =
+    if (hardFailure) 2 * 60_000L else 10 * 60_000L
+
+internal fun isConfirmedUserTrafficFailure(userTrafficStalled: Boolean): Boolean =
+    userTrafficStalled
+
+internal fun shouldDeferConnectionIssueNotification(
+    confirmedUserTrafficFailure: Boolean,
+    recoverableNetworkErrorAtMs: Long,
+    recoveryAttempts: Int,
+    nowMs: Long,
+    firstGraceMs: Long,
+): Boolean = !confirmedUserTrafficFailure &&
+    recoverableNetworkErrorAtMs > 0L &&
+    recoveryAttempts == 0 &&
+    nowMs - recoverableNetworkErrorAtMs < firstGraceMs
+
+internal fun isTransportHealthRecovery(message: String): Boolean =
+    message.contains("снова получает ответы", ignoreCase = true)
+
+internal fun shouldReconnectTunnelAfterWake(
+    activeWorkers: Int,
+    confirmedNetworkFailure: Boolean,
+): Boolean = activeWorkers <= 0 || confirmedNetworkFailure
 
 internal fun shouldObserveTunnelHealth(
     deviceInteractive: Boolean,
     wakeRecoveryGraceActive: Boolean,
 ): Boolean = deviceInteractive && !wakeRecoveryGraceActive
+
+internal fun shouldReloadWireGuardRouting(
+    tunnelRunning: Boolean,
+    activeTunnelProfile: Int?,
+    changedProfile: Int,
+): Boolean =
+    tunnelRunning &&
+        changedProfile in 0..2 &&
+        activeTunnelProfile == changedProfile
 
 enum class TunnelStopReason(val displayText: String) {
     User("отключено пользователем"),
@@ -459,12 +584,17 @@ private const val STAGNANT_ACTIVE_TRAFFIC_MS = 20 * 60_000L
 private const val WAKE_RECOVERY_GRACE_MS = 90_000L
 
 object TunnelManager {
+    private const val VK_CALLS_RUNTIME_PREFERENCES = "tunnel_runtime"
+    private const val VK_CALLS_PREFLIGHT_COOLDOWN_UNTIL = "vkcalls_preflight_cooldown_until"
+    private const val VK_CALLS_PREFLIGHT_MAX_COOLDOWN_MS = 2 * 60_000L
     // 100% защита от утечек: единый управляемый глобальный Scope
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private var process: Process? = null
+    private val processInputLock = Any()
     private var readerJob: Job? = null
     private var watchdogJob: Job? = null
+    private var wireGuardReloadJob: Job? = null
     private var wgHelper: WireGuardHelper? = null
     private var warpApiSshRelay: WarpApiSshRelay? = null
     
@@ -479,10 +609,18 @@ object TunnelManager {
     var processStartedAtMs = 0L
     private var lastActiveAtMs = 0L
     private var lastStatsAtMs = 0L
-    private var lastStatsTrafficSignature = ""
-    private var lastStatsTrafficChangedAtMs = 0L
+    private var lastStatsDownTrafficSignature = ""
+    private var lastStatsUpTrafficSignature = ""
+    private var lastDownstreamTrafficChangedAtMs = 0L
+    private var lastUpstreamTrafficChangedAtMs = 0L
+    private var lastKeepaliveResponseAtMs = 0L
     private var lastStagnantTrafficIssueAtMs = 0L
     private var activeHashIndex = 0 // 0: primary, 1: secondary
+    // Нативный процесс создаётся заново при выключении/включении туннеля. Эта
+    // пауза остаётся в Android-процессе, чтобы быстрые нажатия не обходили
+    // защиту VKCalls от flood control.
+    @Volatile
+    private var vkCallsPreflightCooldownUntilMs = 0L
     private var currentParams: TunnelParams? = null
     private var lastContext: Context? = null
     private var forceRegenerateUA = false // принудительная перегенерация UA при ошибках
@@ -491,6 +629,7 @@ object TunnelManager {
     private var recoverableNetworkErrorAtMs = 0L
     private var hardNetworkErrorAtMs = 0L
     private var hardNetworkErrorCount = 0
+    private var confirmedUserTrafficFailureAtMs = 0L
     private var lastRecoveryAtMs = 0L
     private var recoveryAttempts = 0
     private var softRestartCount = 0
@@ -501,6 +640,7 @@ object TunnelManager {
     private var lastNetworkSettleRestartAtMs = 0L
     private var lastStableNetworkIssueLogAtMs = 0L
     private val sessionTraffic = TunnelSessionTrafficAccumulator()
+    private var sessionTrafficStore: TunnelSessionTrafficStore? = null
     private val captchaSolveRequestId = AtomicLong(0)
     private val activeCaptchaSolveRequests = ConcurrentHashMap.newKeySet<Long>()
 
@@ -516,17 +656,65 @@ object TunnelManager {
     val stats = MutableStateFlow("Ожидание данных...")
     val activeWorkers = MutableStateFlow(0)
     val connectionIssue = MutableStateFlow<ConnectionIssue?>(null)
+    val vpnSlotYieldRequested = MutableStateFlow(false)
     
     val cooldownActive = MutableStateFlow(false)
     private var cooldownJob: Job? = null
-    private val statsTrafficRegex = Regex("[↓↑]\\s*([0-9]+(?:[.,][0-9]+)?)\\s*МБ")
+    private val statsDownTrafficRegex = Regex("↓\\s*([0-9]+(?:[.,][0-9]+)?)\\s*МБ")
+    private val statsUpTrafficRegex = Regex("↑\\s*([0-9]+(?:[.,][0-9]+)?)\\s*МБ")
 
     fun clearUnreadErrors() {
         unreadErrorCount.value = 0
     }
 
+    private fun restoreVkCallsPreflightCooldown(context: Context, now: Long = System.currentTimeMillis()): Long {
+        val storedUntil = context
+            .getSharedPreferences(VK_CALLS_RUNTIME_PREFERENCES, Context.MODE_PRIVATE)
+            .getLong(VK_CALLS_PREFLIGHT_COOLDOWN_UNTIL, 0L)
+        val validUntil = boundedVkCallsPreflightCooldownUntil(
+            untilMs = storedUntil,
+            nowMs = now,
+            maxDurationMs = VK_CALLS_PREFLIGHT_MAX_COOLDOWN_MS,
+        )
+        if (validUntil == 0L && storedUntil != 0L) {
+            context.getSharedPreferences(VK_CALLS_RUNTIME_PREFERENCES, Context.MODE_PRIVATE)
+                .edit()
+                .remove(VK_CALLS_PREFLIGHT_COOLDOWN_UNTIL)
+                .apply()
+        }
+        return validUntil
+    }
+
+    private fun extendVkCallsPreflightCooldown(context: Context, durationMs: Long, now: Long) {
+        if (durationMs <= 0L) return
+        val currentUntil = maxOf(
+            vkCallsPreflightCooldownUntilMs,
+            restoreVkCallsPreflightCooldown(context, now),
+        )
+        val proposedUntil = now + durationMs.coerceAtMost(VK_CALLS_PREFLIGHT_MAX_COOLDOWN_MS)
+        val nextUntil = maxOf(currentUntil, proposedUntil)
+        vkCallsPreflightCooldownUntilMs = nextUntil
+        context.getSharedPreferences(VK_CALLS_RUNTIME_PREFERENCES, Context.MODE_PRIVATE)
+            .edit()
+            .putLong(VK_CALLS_PREFLIGHT_COOLDOWN_UNTIL, nextUntil)
+            .apply()
+    }
+
+    private fun persistSessionTraffic() {
+        sessionTrafficStore?.save(sessionTraffic.snapshot())
+    }
+
+    private fun noteSessionTransportRestart() {
+        sessionTraffic.noteTransportRestart()
+        persistSessionTraffic()
+    }
+
     fun noteStartRequested() {
         transition.value = TunnelTransition.STARTING
+    }
+
+    fun allowVpnSlotAcquisition() {
+        vpnSlotYieldRequested.value = false
     }
 
     fun noteStopRequested() {
@@ -604,6 +792,7 @@ object TunnelManager {
         recoverableNetworkErrorAtMs = 0L
         hardNetworkErrorAtMs = 0L
         hardNetworkErrorCount = 0
+        confirmedUserTrafficFailureAtMs = 0L
         lastRecoveryAtMs = 0L
         recoveryAttempts = 0
         softRestartCount = 0
@@ -614,28 +803,33 @@ object TunnelManager {
     private fun resetStatsLivenessState() {
         lastActiveAtMs = 0L
         lastStatsAtMs = 0L
-        lastStatsTrafficSignature = ""
-        lastStatsTrafficChangedAtMs = 0L
+        lastStatsDownTrafficSignature = ""
+        lastStatsUpTrafficSignature = ""
+        lastDownstreamTrafficChangedAtMs = 0L
+        lastUpstreamTrafficChangedAtMs = 0L
+        lastKeepaliveResponseAtMs = 0L
         lastStagnantTrafficIssueAtMs = 0L
     }
 
-    private fun statsTrafficSignature(message: String): String =
-        statsTrafficRegex.findAll(message)
-            .joinToString("|") { match ->
-                match.value.replace(Regex("\\s+"), "").replace(',', '.')
-            }
+    private fun trafficSignature(regex: Regex, message: String): String =
+        regex.find(message)?.groupValues?.getOrNull(1)?.replace(',', '.').orEmpty()
 
     private fun isStatsTrafficStagnant(now: Long = System.currentTimeMillis()): Boolean {
         val startupGrace = processStartedAtMs == 0L || now - processStartedAtMs < 90_000L
         return activeWorkers.value > 0 &&
-            lastStatsTrafficSignature.isNotBlank() &&
-            lastStatsTrafficChangedAtMs > 0L &&
-            now - lastStatsTrafficChangedAtMs > STAGNANT_ACTIVE_TRAFFIC_MS &&
+            lastUpstreamTrafficChangedAtMs > lastDownstreamTrafficChangedAtMs &&
+            lastDownstreamTrafficChangedAtMs > 0L &&
+            now - lastDownstreamTrafficChangedAtMs > STAGNANT_ACTIVE_TRAFFIC_MS &&
             !startupGrace &&
             !isCaptchaInProgress()
     }
 
-    private fun noteRecoverableNetworkIssue(title: String, action: String, hardFailure: Boolean = false) {
+    private fun noteRecoverableNetworkIssue(
+        title: String,
+        action: String,
+        hardFailure: Boolean = false,
+        confirmedUserTrafficFailure: Boolean = false,
+    ) {
         val now = System.currentTimeMillis()
         if (!hardFailure && now < networkTransitionGraceUntilMs && recoverableNetworkErrorAtMs == 0L) {
             updateLog(
@@ -656,11 +850,23 @@ object TunnelManager {
                 }
                 hardNetworkErrorCount++
             }
+            if (confirmedUserTrafficFailure) {
+                if (confirmedUserTrafficFailureAtMs == 0L) {
+                    confirmedUserTrafficFailureAtMs = now
+                }
+                networkTransitionGraceUntilMs = 0L
+                setConnectionIssue(title, action)
+            }
             if (now - lastStableNetworkIssueLogAtMs > 60_000L) {
                 lastStableNetworkIssueLogAtMs = now
+                val observation = if (confirmedUserTrafficFailure) {
+                    "Подтверждаем сбой перед мягким восстановлением транспорта."
+                } else {
+                    "Наблюдаем без немедленного перезапуска; восстановление будет только после долгой тишины или смены сети."
+                }
                 updateLog(
                     "network_stable_observe",
-                    "[СЕТЬ] $title. Наблюдаем без немедленного перезапуска; восстановление будет только после долгой тишины или смены сети.",
+                    "[СЕТЬ] $title. $observation",
                     50,
                     false
                 )
@@ -781,16 +987,17 @@ object TunnelManager {
         }
         if (recoverableNetworkErrorAtMs == 0L) return null
 
+        val hardFailure = confirmedUserTrafficFailureAtMs > 0L
         val hasFreshActiveWorkers = activeWorkers.value > 0 &&
             lastActiveAtMs > recoverableNetworkErrorAtMs &&
             now - lastActiveAtMs < 2 * 60_000L
-        if (hasFreshActiveWorkers && !isStatsTrafficStagnant(now)) return null
+        if (!hardFailure && hasFreshActiveWorkers && !isStatsTrafficStagnant(now)) return null
 
-        if (now - recoverableNetworkErrorAtMs < STABLE_RECOVERY_GRACE_MS) return null
-        if (now - lastRecoveryAtMs < STABLE_RECOVERY_RETRY_MS) return null
+        if (now - recoverableNetworkErrorAtMs < stableRecoveryGraceMs(hardFailure)) return null
+        if (now - lastRecoveryAtMs < stableRecoveryRetryMs(hardFailure)) return null
 
         lastRecoveryAtMs = now
-        val action = stableNetworkRecoveryAction(recoveryAttempts)
+        val action = confirmedFailureRecoveryAction(hardFailure, recoveryAttempts)
         recoveryAttempts++
         when (action) {
             NetworkRecoveryAction.SoftRestart -> setConnectionIssue(
@@ -885,8 +1092,45 @@ object TunnelManager {
         }
     }
 
+    fun noteSleepBatteryEvent(key: String, message: String, warning: Boolean = false) {
+        val logKey = "sleep_battery_$key"
+        val text = "[СОН] $message"
+        if (warning) {
+            updateWarningLog(logKey, text, 20)
+        } else {
+            updateLog(logKey, text, 20, false)
+        }
+    }
+
+    fun noteAddressRoutingWarning(key: String, message: String) {
+        updateWarningLog(
+            key = "address_routing_$key",
+            message = "[МАРШРУТИЗАЦИЯ] $message",
+            priority = 10,
+        )
+    }
+
+    fun noteVpnDnsEvent(key: String, message: String, warning: Boolean = false) {
+        val logKey = "vpn_dns_$key"
+        val text = "[DNS VPN] $message"
+        if (warning) {
+            updateWarningLog(logKey, text, 10)
+        } else {
+            updateLog(logKey, text, 10, false)
+        }
+    }
+
+    fun noteVpnInterfaceReloadWarning(message: String) {
+        updateWarningLog(
+            key = "vpn_interface_reload_failed",
+            message = "[VPN] $message",
+            priority = 10,
+        )
+    }
+
     private fun updateLog(key: String, message: String, priority: Int, isError: Boolean = false) {
         if (!isLoggingEnabled) return
+        val displayedMessage = addPhoneTimeToSleepLog(message)
         val severity = if (isError) LogSeverity.Error else LogSeverity.Info
         if (severity == LogSeverity.Error) {
             val list = logs.value
@@ -901,10 +1145,10 @@ object TunnelManager {
             if (index != -1) {
                 // Обновляем текст и счётчик НА МЕСТЕ
                 val entry = current[index]
-                current[index] = entry.copy(count = entry.count + 1, message = message, priority = priority, severity = severity)
+                current[index] = entry.copy(count = entry.count + 1, message = displayedMessage, priority = priority, severity = severity)
             } else {
                 // Новая запись
-                current.add(LogEntry(key, message, 1, priority, severity))
+                current.add(LogEntry(key, displayedMessage, 1, priority, severity))
             }
 
             // Сортировка: по приоритету (наименьший сверху), затем ошибки
@@ -918,6 +1162,7 @@ object TunnelManager {
 
     private fun updateWarningLog(key: String, message: String, priority: Int) {
         if (!isLoggingEnabled) return
+        val displayedMessage = addPhoneTimeToSleepLog(message)
         logs.update { currentList ->
             val current = currentList.toMutableList()
             val index = current.indexOfFirst { it.key == key }
@@ -925,12 +1170,12 @@ object TunnelManager {
                 val entry = current[index]
                 current[index] = entry.copy(
                     count = entry.count + 1,
-                    message = message,
+                    message = displayedMessage,
                     priority = priority,
                     severity = LogSeverity.Warning
                 )
             } else {
-                current.add(LogEntry(key, message, 1, priority, LogSeverity.Warning))
+                current.add(LogEntry(key, displayedMessage, 1, priority, LogSeverity.Warning))
             }
             val sorted = current.sortedWith(compareBy({ it.priority }, { it.severity.ordinal }, { it.key }))
             if (sorted.size > 100) sorted.takeLast(100) else sorted
@@ -941,8 +1186,10 @@ object TunnelManager {
         context: Context,
         params: TunnelParams,
         isSwitching: Boolean = false,
-        preserveLogs: Boolean = false
+        preserveLogs: Boolean = false,
+        restoreSessionTraffic: Boolean = false,
     ) {
+        if (shouldBlockVpnStart(vpnSlotYieldRequested.value)) return
         if (!isSwitching) noteStartRequested()
         scope.launch {
             startStopMutex.lock()
@@ -953,12 +1200,29 @@ object TunnelManager {
                 }
         
                 val appContext = context.applicationContext // Защита от Memory Leak
+                val trafficStore = sessionTrafficStore ?: TunnelSessionTrafficStore(appContext).also {
+                    sessionTrafficStore = it
+                }
                 
                 if (!isSwitching) {
                     if (!preserveLogs) clearLogs()
                     config.value = null
                     stats.value = "Ожидание данных..."
-                    sessionTraffic.reset()
+                    if (restoreSessionTraffic) {
+                        val restoredTraffic = trafficStore.load()
+                        sessionTraffic.restore(restoredTraffic)
+                        if (restoredTraffic != null) {
+                            updateLog(
+                                "service_session_restored",
+                                "[СЛУЖБА] Android восстановил VPN-службу; счётчик текущей сессии продолжен.",
+                                20,
+                                false,
+                            )
+                        }
+                    } else {
+                        sessionTraffic.reset()
+                        trafficStore.clear()
+                    }
                     floodCount = 0
                     mismatchCount = 0
                     refusedCount = 0
@@ -1064,7 +1328,25 @@ object TunnelManager {
 
                 // Go boolean flags must use -flag=value. A separate "false" value
                 // stops flag.Parse and silently drops every argument after it.
-                cmd.add("-vkcalls-preflight=${params.vkCallsPreflight}")
+                vkCallsPreflightCooldownUntilMs = maxOf(
+                    vkCallsPreflightCooldownUntilMs,
+                    restoreVkCallsPreflightCooldown(appContext),
+                )
+                val useVkCallsPreflight = shouldUseVkCallsPreflight(
+                    enabledByUser = params.vkCallsPreflight,
+                    cooldownUntilMs = vkCallsPreflightCooldownUntilMs,
+                )
+                cmd.add("-vkcalls-preflight=$useVkCallsPreflight")
+                if (params.vkCallsPreflight && !useVkCallsPreflight) {
+                    val remainingSeconds = ((vkCallsPreflightCooldownUntilMs -
+                        System.currentTimeMillis()).coerceAtLeast(0L) + 999L) / 1_000L
+                    updateLog(
+                        "vkcalls_restart_cooldown",
+                        "[VKCalls] До следующей проверки ждём ещё ${remainingSeconds} с; используем legacy-резерв",
+                        20,
+                        false,
+                    )
+                }
                 cmd.add("-turn-stream-first=${params.rtNetwork}")
                 if (params.rtNetwork) {
                     val turnSni = normalizeRtTurnSni(params.rtTurnSni)
@@ -1135,11 +1417,12 @@ object TunnelManager {
 
                 if (
                     params.managedConfigFirstStart &&
-                    params.profileMaxWorkers == TUNNEL_WORKERS_PER_GROUP &&
-                    totalWorkers == TUNNEL_WORKERS_PER_GROUP
+                    params.profileMaxWorkers >= TUNNEL_WORKERS_PER_GROUP
                 ) {
                     cmd.add("-config-first-start=true")
-                    cmd.add("-hash-fallback=true")
+                    if (totalWorkers == TUNNEL_WORKERS_PER_GROUP) {
+                        cmd.add("-hash-fallback=true")
+                    }
                 }
 
                 cmd.add("-captcha-mode")
@@ -1219,6 +1502,13 @@ object TunnelManager {
 
                     val msgPrefixReplaced = line.replace(Regex("^\\d{4}/\\d{2}/\\d{2}\\s\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?\\s"), "")
                     val lineTrim = msgPrefixReplaced.trim()
+
+                    val vkCallsCooldownMs = vkCallsPreflightCooldownForLog(lineTrim)
+                    if (vkCallsCooldownMs > 0L) {
+                        lastContext?.let { context ->
+                            extendVkCallsPreflightCooldown(context, vkCallsCooldownMs, now)
+                        }
+                    }
 
                     if (lineTrim.contains("[МОЩНОСТЬ] Лимит временно занят", true)) {
                         updateLog(
@@ -1463,6 +1753,7 @@ object TunnelManager {
                     if (lineTrim.contains("[СТАТИСТИКА]")) {
                         val rawStats = lineTrim.substringAfter("[СТАТИСТИКА]").trim()
                         val msg = sessionTraffic.accumulate(rawStats)
+                        persistSessionTraffic()
                         stats.value = msg
                         lastStatsAtMs = now
 
@@ -1471,16 +1762,27 @@ object TunnelManager {
                             val active = match.groupValues[1].toIntOrNull() ?: 0
                             activeWorkers.value = active
 
-                            val trafficSignature = statsTrafficSignature(msg)
-                            val trafficKnown = trafficSignature.isNotBlank()
-                            val trafficChanged = trafficKnown && trafficSignature != lastStatsTrafficSignature
-                            if (trafficChanged) {
-                                lastStatsTrafficSignature = trafficSignature
-                                lastStatsTrafficChangedAtMs = now
+                            val downSignature = trafficSignature(statsDownTrafficRegex, msg)
+                            val upSignature = trafficSignature(statsUpTrafficRegex, msg)
+                            val trafficKnown = downSignature.isNotBlank() && upSignature.isNotBlank()
+                            val downstreamChanged = trafficKnown && downSignature != lastStatsDownTrafficSignature
+                            val upstreamChanged = trafficKnown && upSignature != lastStatsUpTrafficSignature
+                            val trafficChanged = downstreamChanged || upstreamChanged
+                            if (trafficKnown && lastDownstreamTrafficChangedAtMs == 0L) {
+                                lastStatsDownTrafficSignature = downSignature
+                                lastStatsUpTrafficSignature = upSignature
+                                lastDownstreamTrafficChangedAtMs = now
+                                lastUpstreamTrafficChangedAtMs = now
+                            } else if (trafficChanged) {
+                                if (downstreamChanged) {
+                                    lastStatsDownTrafficSignature = downSignature
+                                    lastDownstreamTrafficChangedAtMs = now
+                                }
+                                if (upstreamChanged) {
+                                    lastStatsUpTrafficSignature = upSignature
+                                    lastUpstreamTrafficChangedAtMs = now
+                                }
                                 lastStagnantTrafficIssueAtMs = 0L
-                            } else if (trafficKnown && lastStatsTrafficChangedAtMs == 0L) {
-                                lastStatsTrafficSignature = trafficSignature
-                                lastStatsTrafficChangedAtMs = now
                             }
 
                             if (active > 0) {
@@ -1509,14 +1811,15 @@ object TunnelManager {
                                         "Трафик туннеля остановился",
                                         "Активные воркеры есть, но счётчики трафика долго не меняются. WDTT Plus попробует восстановить транспорт автоматически."
                                     )
-                                } else if (trafficChanged || (hardNetworkErrorAtMs == 0L && !isStatsTrafficStagnant(now))) {
-                                    recoverableNetworkErrorAtMs = 0L
-                                    hardNetworkErrorAtMs = 0L
-                                    hardNetworkErrorCount = 0
-                                    lastRecoveryAtMs = 0L
-                                    recoveryAttempts = 0
-                                    softRestartCount = 0
-                                    lastSoftRestartAtMs = 0L
+                                } else if (
+                                    shouldResetNetworkRecoveryFromStats(
+                                        downstreamChanged = downstreamChanged,
+                                        hardNetworkFailure = confirmedUserTrafficFailureAtMs > 0L,
+                                        trafficChanged = trafficChanged,
+                                        statsTrafficStagnant = isStatsTrafficStagnant(now),
+                                    )
+                                ) {
+                                    resetNetworkRecoveryState()
                                     networkTransitionGraceUntilMs = 0L
                                     clearConnectionIssue()
                                 }
@@ -1538,7 +1841,7 @@ object TunnelManager {
                                 updateLog(presentation.key, presentation.message, 2, false)
                             }
                             if (presentation.startsDtls) {
-                                updateLog("dtls_start", "[DTLS] Рукопожатие (Handshake)...", 1, false)
+                                updateLog("dtls_start", "[DTLS] Рукопожатие DTLS...", 1, false)
                             }
                             if (presentation.key == "masque_enrollment_saved") {
                                 closeWarpApiSshRelay()
@@ -1598,7 +1901,7 @@ object TunnelManager {
                                 lineTrim.contains("preflight не сработал", true) ||
                                     lineTrim.contains("временно ограничил", true) ||
                                     lineTrim.contains("временно пропущен", true) ->
-                                    updateLog("vkcalls_fallback", "[VKCalls] Основной провайдер временно недоступен — пробуем legacy-резерв", 20, false)
+                                    updateLog("vkcalls_fallback", "[VKCalls] Основной провайдер временно недоступен — пробуем совместимый резерв", 20, false)
                                 lineTrim.contains("пробуем совместимый резерв", true) ->
                                     updateLog("vkcalls_api_fallback", "[VKCalls] Основной API-домен не ответил — пробуем совместимый резерв", 20, false)
                                 lineTrim.endsWith("[VKCalls] preflight", true) ->
@@ -1621,21 +1924,21 @@ object TunnelManager {
                                     )
                                 }
                                 lineTrim.contains("legacy-custom", true) && lineTrim.contains("успешно", true) ->
-                                    updateLog("vk_provider_custom", "[ВК] Собственный legacy Client ID сработал ✓", 5, false)
+                                    updateLog("vk_provider_custom", "[ВК] Собственный совместимый ID клиента сработал ✓", 5, false)
                                 lineTrim.contains("legacy-custom", true) && lineTrim.contains("пробуем", true) ->
-                                    updateLog("vk_provider_custom", "[ВК] Пробуем собственный legacy Client ID...", 5, false)
+                                    updateLog("vk_provider_custom", "[ВК] Пробуем собственный совместимый ID клиента...", 5, false)
                                 lineTrim.contains("legacy-custom", true) && lineTrim.contains("CAPTCHA_WAIT_REQUIRED", true) ->
-                                    updateLog("vk_provider_custom_wait", "[КАПЧА] Собственный legacy-провайдер ждёт следующую безопасную попытку", 20, false)
+                                    updateLog("vk_provider_custom_wait", "[КАПЧА] Собственный совместимый провайдер ждёт следующую безопасную попытку", 20, false)
                                 lineTrim.contains("legacy-custom", true) && lineTrim.contains("не сработал", true) ->
-                                    updateLog("vk_provider_custom_fallback", "[ВК] Собственный legacy Client ID не сработал — пробуем встроенный резерв", 20, false)
+                                    updateLog("vk_provider_custom_fallback", "[ВК] Собственный совместимый ID клиента не сработал — пробуем встроенный резерв", 20, false)
                                 lineTrim.contains("legacy-built-in", true) && lineTrim.contains("успешно", true) ->
-                                    updateLog("vk_provider_builtin", "[ВК] Встроенный legacy Client ID сработал ✓", 5, false)
+                                    updateLog("vk_provider_builtin", "[ВК] Встроенный совместимый ID клиента сработал ✓", 5, false)
                                 lineTrim.contains("legacy-built-in", true) && lineTrim.contains("пробуем", true) ->
-                                    updateLog("vk_provider_builtin", "[ВК] Пробуем встроенный legacy Client ID...", 5, false)
+                                    updateLog("vk_provider_builtin", "[ВК] Пробуем встроенный совместимый ID клиента...", 5, false)
                                 lineTrim.contains("legacy-built-in", true) && lineTrim.contains("CAPTCHA_WAIT_REQUIRED", true) ->
-                                    updateLog("vk_provider_builtin_wait", "[КАПЧА] Встроенный legacy-провайдер ждёт следующую безопасную попытку", 20, false)
+                                    updateLog("vk_provider_builtin_wait", "[КАПЧА] Встроенный совместимый провайдер ждёт следующую безопасную попытку", 20, false)
                                 lineTrim.contains("legacy-built-in", true) && lineTrim.contains("не сработал", true) ->
-                                    updateLog("vk_provider_builtin_fallback", "[ВК] Этот встроенный Client ID не сработал — пробуем следующий", 20, false)
+                                    updateLog("vk_provider_builtin_fallback", "[ВК] Этот встроенный ID клиента не сработал — пробуем следующий", 20, false)
                                 lineTrim.contains("modern-vkcalls", true) && lineTrim.contains("успешно", true) ->
                                     updateLog("vk_provider_modern", "[ВК] Используется современный VKCalls ✓", 2, false)
                                 else -> updateLog("vk_provider_status", lineTrim, 20, false)
@@ -1649,27 +1952,53 @@ object TunnelManager {
                                     updateLog("vk_credentials_throttle", "[ВК] Безопасная пауза между запросами к VK", 20, false)
                                 lineTrim.contains("Credentials cache invalidated", true) ->
                                     updateLog("vk_credentials_refresh", "[ВК] TURN-данные устарели — получаем свежие", 5, false)
+                                lineTrim.contains("Multiple auth errors", true) ->
+                                    updateWarningLog(
+                                        "vk_credentials_refresh_after_auth",
+                                        "[ВК] TURN-данные несколько раз отклонены — получаем свежие",
+                                        20
+                                    )
                                 lineTrim.contains("getCallPreview failed", true) ->
-                                    updateLog("vk_preview_optional", "[ВК] Предпросмотр legacy-звонка недоступен, продолжаем получение TURN-данных", 20, false)
+                                    updateLog("vk_preview_optional", "[ВК] Предпросмотр звонка недоступен, продолжаем получение TURN-данных", 20, false)
                                 lineTrim.contains("Rate limit detected", true) ->
-                                    updateLog("vk_legacy_rate_limit", "[ВК] Этот legacy Client ID временно ограничен — пробуем следующий", 20, false)
+                                    updateLog("vk_legacy_rate_limit", "[ВК] Этот совместимый ID клиента временно ограничен — пробуем следующий", 20, false)
                                 lineTrim.contains("Все legacy-провайдеры", true) ->
-                                    updateLog("vk_legacy_retry", "[ВК] Legacy-провайдеры временно не ответили — выполняется безопасный повтор", 20, false)
+                                    updateLog("vk_legacy_retry", "[ВК] Совместимые провайдеры временно не ответили — выполняется безопасный повтор", 20, false)
                                 else -> {
                                     if (isError) updateWarningLog("vk_auth_status", lineTrim, 20)
                                 }
                             }
                         }
+                        lineTrim.contains("Auth error", true) && lineTrim.contains("[STREAM", true) -> {
+                            updateWarningLog(
+                                "turn_stream_auth_retry",
+                                "[TURN] Сервер отклонил старые TURN-данные — обновляем данные и повторяем подключение",
+                                20
+                            )
+                        }
                         lineTrim.contains("[КАПЧА] AUTO:") -> {
                             var text = lineTrim.substringAfter("[КАПЧА] AUTO:").trim()
                             text = text.replace(Regex("\\s*\\([^)]+\\)\\s*"), " ").trim()
 
-                            val isIntermediateFallback = text.contains("текущая captcha-сессия завершена", true)
+                            val isIntermediateFallback = text.contains("не завершил проверку", true)
                             val isErr = !isIntermediateFallback && (
                                 text.contains("ошибка", true) ||
                                     text.contains("timeout", true) ||
                                     text.contains("не решил", true)
                                 )
+                            // У WebView есть собственное финальное сообщение
+                            // «Капча решена». Не дублируем его строкой из Go.
+                            // У встроенной Go-проверки такого Android-события нет.
+                            if (text.contains("Auto WebView решил капчу", true) ||
+                                text.contains("Manual WebView решил капчу", true)
+                            ) {
+                                return@forEachLine
+                            }
+                            val displayText = text
+                                .replace("стадия", "этап", ignoreCase = true)
+                                .replace("Auto WebView", "Авто-WebView", ignoreCase = true)
+                                .replace("Manual WebView", "ручной WebView", ignoreCase = true)
+                                .replace("Go v2", "встроенная проверка", ignoreCase = true)
                             val stableKey = when {
                                 text.contains("старт") -> "captcha_auto_1"
                                 isIntermediateFallback -> "captcha_auto_next_challenge"
@@ -1680,8 +2009,8 @@ object TunnelManager {
                                 text.contains("решил") || text.contains("решила") -> "captcha_auto_done"
                                 else -> "captcha_auto_${text.take(18).hashCode()}"
                             }
-                            if (isErr) updateWarningLog(stableKey, "[КАПЧА AUTO] $text", 5)
-                            else updateLog(stableKey, "[КАПЧА AUTO] $text", 5, false)
+                            if (isErr) updateWarningLog(stableKey, "[КАПЧА AUTO] $displayText", 5)
+                            else updateLog(stableKey, "[КАПЧА AUTO] $displayText", 5, false)
                         }
 
                         lineTrim.contains("[КАПЧА] RJS:") -> {
@@ -1703,6 +2032,9 @@ object TunnelManager {
                         lineTrim.contains("[КАПЧА] WBV:") -> {
                             var text = lineTrim.substringAfter("[КАПЧА] WBV:").trim()
                             text = text.replace(Regex("\\s*\\([^)]+\\)\\s*"), " ").trim()
+                            // Такой текст посылали старые native-клиенты после
+                            // уже показанного результата WebView.
+                            if (text.contains("solve succeeded", true)) return@forEachLine
                             
                             val isErr = text.contains("Ошибка")
                             val stableKey = when {
@@ -1725,10 +2057,12 @@ object TunnelManager {
                             updateLog("captcha_start", "[КАПЧА] Решение капчи...", 5, false)
                         lineTrim.contains("Smart Captcha решена") ->
                             updateLog("captcha_done", "[КАПЧА] Капча решена ✓", 5, false)
-                        lineTrim.contains("капча не решена") || lineTrim.contains("ошибка решения капчи") ->
+                        lineTrim.contains("капча не решена") ||
+                            lineTrim.contains("не решил капчу") ||
+                            lineTrim.contains("ошибка решения капчи") ->
                             updateWarningLog("captcha_failed", "[КАПЧА] Текущий способ не решил капчу, пробуем следующий", 5)
                         lineTrim.contains("Timed out waiting for", true) && lineTrim.contains("ms", true) ->
-                            updateLog("captcha_auto_timeout", "[КАПЧА] Auto WebView не успел, используется следующий способ", 5, false)
+                            updateLog("captcha_auto_timeout", "[КАПЧА] Авто-WebView не успел, используется следующий способ", 5, false)
                         lineTrim.contains("CAPTCHA_WAIT_REQUIRED", true) && activeWorkers.value > 0 ->
                             updateLog("captcha_group_retry", "[КАПЧА] Дополнительная группа повторит получение credentials позже", 20, false)
                         lineTrim.contains("Креды пока не получены", true) ->
@@ -1769,29 +2103,47 @@ object TunnelManager {
                         }
                         lineTrim.contains("[HEALTH]") -> {
                             val text = lineTrim.substringAfter("[HEALTH]").trim()
-                            val seconds = trailingSeconds(text)
-                            val userTrafficStalled = text.contains("пользовательский трафик", true)
-                            noteRecoverableNetworkIssue(
-                                if (userTrafficStalled) "Нет ответа на пользовательский трафик" else "Транспорт потерял ответ сервера",
-                                if (userTrafficStalled) {
-                                    "Трафик уже ушёл в VPN, но сервер не ответил. WDTT Plus восстановит транспорт или выключит VPN, чтобы вернуть обычный интернет."
-                                } else {
-                                    "Keepalive от сервера не пришёл. WDTT Plus перезапустит транспорт, если связь не восстановится сама."
-                                },
-                                hardFailure = userTrafficStalled && (seconds == null || seconds >= 60)
-                            )
-                            updateWarningLog(
-                                if (userTrafficStalled) "transport_health_user_traffic" else "transport_health_keepalive",
-                                if (userTrafficStalled) {
-                                    "[СВЯЗЬ] Трафик ушёл в VPN, ответа сервера нет${seconds?.let { " $it сек" } ?: ""}. Восстанавливаем транспорт"
-                                } else {
-                                    "[СВЯЗЬ] Сервер не отвечает на keepalive${seconds?.let { " $it сек" } ?: ""}. Переподключаем канал"
-                                },
-                                50
-                            )
+                            if (text.contains("сервер ответил на keepalive", true)) {
+                                lastKeepaliveResponseAtMs = now
+                            } else if (isTransportHealthRecovery(text)) {
+                                resetNetworkRecoveryState()
+                                clearConnectionIssue(ConnectionIssueKind.GENERAL)
+                                updateLog(
+                                    "transport_health_recovered",
+                                    "[СВЯЗЬ] Ответы на пользовательский трафик снова поступают ✓",
+                                    20,
+                                    false,
+                                )
+                            } else {
+                                val seconds = trailingSeconds(text)
+                                val userTrafficStalled = text.contains("пользовательский трафик", true)
+                                noteRecoverableNetworkIssue(
+                                    if (userTrafficStalled) "Нет ответа на пользовательский трафик" else "Транспорт потерял ответ сервера",
+                                    if (userTrafficStalled) {
+                                        "Трафик уже ушёл в VPN, но сервер не ответил. WDTT Plus восстановит транспорт или выключит VPN, чтобы вернуть обычный интернет."
+                                    } else {
+                                        "Keepalive от сервера не пришёл. WDTT Plus перезапустит транспорт, если связь не восстановится сама."
+                                    },
+                                    // Нативный клиент уже выдержал собственный таймаут
+                                    // неотвеченного пользовательского трафика. Keepalive
+                                    // сюда не попадает, поэтому второй минутный порог
+                                    // только откладывал восстановление реального зависания.
+                                    hardFailure = isConfirmedUserTrafficFailure(userTrafficStalled),
+                                    confirmedUserTrafficFailure = userTrafficStalled,
+                                )
+                                updateWarningLog(
+                                    if (userTrafficStalled) "transport_health_user_traffic" else "transport_health_keepalive",
+                                    if (userTrafficStalled) {
+                                        "[СВЯЗЬ] Трафик ушёл в VPN, ответа сервера нет${seconds?.let { " $it сек" } ?: ""}. Восстанавливаем транспорт"
+                                    } else {
+                                        "[СВЯЗЬ] Сервер не отвечает на keepalive${seconds?.let { " $it сек" } ?: ""}. Переподключаем канал"
+                                    },
+                                    50
+                                )
+                            }
                         }
                         lineTrim.contains("Relay:") ->
-                            updateLog("dtls_start", "[DTLS] Рукопожатие (Handshake)...", 1, false)
+                            updateLog("dtls_start", "[DTLS] Рукопожатие DTLS...", 1, false)
                         lineTrim.contains("DTLS ОК") ->
                             updateLog("dtls_ok", "[DTLS] Соединение установлено ✓", 1, false)
                         lineTrim.contains("Активна ✓") ->
@@ -2076,7 +2428,7 @@ object TunnelManager {
         updateLog("network_restart", reason, 50, false)
         activeWorkers.value = 0
         resetStatsLivenessState()
-        sessionTraffic.noteTransportRestart()
+        noteSessionTransportRestart()
         val restartDelayMs = transportRecoveryPolicy(
             params.managedConfigFirstStart
         ).processRestartDelayMs
@@ -2137,7 +2489,7 @@ object TunnelManager {
             startStopMutex.lock()
             try {
                 if (currentParams !== params || !running.value) return@launch
-                sessionTraffic.noteTransportRestart()
+                noteSessionTransportRestart()
                 killProcess()
                 delay(250L)
             } finally {
@@ -2193,16 +2545,18 @@ object TunnelManager {
         // восстановлении после пробуждения: сеть и вывод статистики в этот период
         // могут штатно приостанавливаться Android.
         wakeRecoveryGraceUntilMs = 0L
+        sendTransportLifecycleCommand("DEVICE_SLEEP")
     }
 
     fun noteDeviceWakeStarted(now: Long = System.currentTimeMillis()) {
         if (!running.value) return
         resetNetworkRecoveryState()
+        sendTransportLifecycleCommand("DEVICE_WAKE")
         wakeRecoveryGraceUntilMs = now + WAKE_RECOVERY_GRACE_MS
         networkTransitionGraceUntilMs = maxOf(networkTransitionGraceUntilMs, wakeRecoveryGraceUntilMs)
         updateLog(
             "wake_stabilization",
-            "[СОН] Устройство проснулось; даём текущему VPN восстановить активность без перезапуска.",
+            "[СОН] Экран включён; даём текущему VPN восстановить активность без перезапуска.",
             20,
             false,
         )
@@ -2212,9 +2566,13 @@ object TunnelManager {
         val issue = connectionIssue.value ?: return null
         if (!running.value) return null
         val firstGraceMs = if (hardNetworkErrorAtMs > 0L) HARD_NETWORK_GRACE_MS else RECOVERABLE_NETWORK_GRACE_MS
-        val waitingBeforeFirstRecovery = recoverableNetworkErrorAtMs > 0L &&
-            recoveryAttempts == 0 &&
-            now - recoverableNetworkErrorAtMs < firstGraceMs
+        val waitingBeforeFirstRecovery = shouldDeferConnectionIssueNotification(
+            confirmedUserTrafficFailure = confirmedUserTrafficFailureAtMs > 0L,
+            recoverableNetworkErrorAtMs = recoverableNetworkErrorAtMs,
+            recoveryAttempts = recoveryAttempts,
+            nowMs = now,
+            firstGraceMs = firstGraceMs,
+        )
         return if (waitingBeforeFirstRecovery) null else issue.title
     }
 
@@ -2238,20 +2596,39 @@ object TunnelManager {
         return hasFreshTransportHeartbeat(
             running = running.value,
             activeWorkers = activeWorkers.value,
-            lastActiveAtMs = lastActiveAtMs,
-            lastStatsAtMs = lastStatsAtMs,
+            lastInboundTrafficAtMs = lastDownstreamTrafficChangedAtMs,
             sinceMs = sinceMs,
             nowMs = now,
         )
     }
 
-    fun noteWakeRescueStarted() {
-        updateLog(
-            "wake_rescue_start",
-            "[СОН] Экран включён. Проверяем, ожил ли VPN после сна.",
-            50,
-            false
+    fun hasFreshTransportPathSince(sinceMs: Long, now: Long = System.currentTimeMillis()): Boolean {
+        return hasFreshTransportPath(
+            running = running.value,
+            activeWorkers = activeWorkers.value,
+            lastInboundTrafficAtMs = lastDownstreamTrafficChangedAtMs,
+            lastKeepaliveResponseAtMs = lastKeepaliveResponseAtMs,
+            sinceMs = sinceMs,
+            nowMs = now,
         )
+    }
+
+    fun hasConfirmedNetworkFailureSince(sinceMs: Long): Boolean =
+        hasConfirmedNetworkFailureAtOrAfter(
+            running = running.value,
+            hardNetworkErrorAtMs = confirmedUserTrafficFailureAtMs,
+            sinceMs = sinceMs,
+        )
+
+    private fun sendTransportLifecycleCommand(command: String) {
+        val observedProcess = process ?: return
+        synchronized(processInputLock) {
+            if (process !== observedProcess || !observedProcess.isAlive) return
+            runCatching {
+                observedProcess.outputStream.write("$command\n".toByteArray(Charsets.UTF_8))
+                observedProcess.outputStream.flush()
+            }
+        }
     }
 
     fun noteWakeRescueHealthy() {
@@ -2281,11 +2658,10 @@ object TunnelManager {
     }
 
     fun noteSleepVpnPauseFailed() {
-        updateLog(
+        updateWarningLog(
             "sleep_vpn_pause_failed",
             "[СОН] Режим экономии не применён: системный VPN-интерфейс не удалось безопасно остановить.",
             50,
-            false,
         )
     }
 
@@ -2298,11 +2674,54 @@ object TunnelManager {
         )
     }
 
+    fun noteSleepVpnTimerResumed() {
+        updateLog(
+            "sleep_vpn_timer_resumed",
+            "[СОН] Таймер завершён; возобновляем VPN с сохранёнными настройками.",
+            20,
+            false,
+        )
+    }
+
+    fun noteSleepVpnUserResumed() {
+        updateLog(
+            "sleep_vpn_user_resumed",
+            "[СОН] VPN включается досрочно по действию пользователя.",
+            20,
+            false,
+        )
+    }
+
+    fun noteSleepVpnFailsafeResumed() {
+        updateWarningLog(
+            "sleep_vpn_failsafe_resumed",
+            "[СОН] Таймер включения недоступен; VPN восстанавливается сразу, чтобы не оставлять соединение выключенным.",
+            50,
+        )
+    }
+
     fun noteWakeRescueReconnect() {
         updateWarningLog(
             "wake_rescue_reconnect",
-            "[СОН] VPN не ожил после пробуждения. Делаем мягкое переподключение транспорта.",
+            "[СОН] Транспорт не ожил после пробуждения. Мягко переподключаем его без пересоздания системного VPN.",
             50
+        )
+    }
+
+    fun noteSleepTimerTransportHealthy() {
+        updateLog(
+            "sleep_timer_transport_healthy",
+            "[СОН] После таймера сервер отвечает; транспорт готов принимать трафик.",
+            20,
+            false,
+        )
+    }
+
+    fun noteSleepTimerTransportReconnect() {
+        updateWarningLog(
+            "sleep_timer_transport_reconnect",
+            "[СОН] После таймера сервер не ответил. Мягко переподключаем транспорт до включения экрана.",
+            50,
         )
     }
 
@@ -2320,15 +2739,21 @@ object TunnelManager {
         )
     }
 
-    fun recreateVpnTunnel() {
+    fun recreateVpnTunnel(
+        reason: String = "[VPN] Android потерял системный VPN-интерфейс, создаём его заново",
+    ) {
+        if (vpnSlotYieldRequested.value) return
         val params = currentParams ?: return
         val context = lastContext ?: return
-        updateWarningLog("network_full_restart", "[VPN] Android потерял системный VPN-интерфейс, создаём его заново", 50)
+        resetNetworkRecoveryState()
+        resetStatsLivenessState()
+        networkTransitionGraceUntilMs = System.currentTimeMillis() + WAKE_RECOVERY_GRACE_MS
+        updateWarningLog("network_full_restart", reason, 50)
         scope.launch {
             withContext(Dispatchers.Main) {
                 wgHelper?.stopTunnel()
             }
-            sessionTraffic.noteTransportRestart()
+            noteSessionTransportRestart()
             killProcess()
             activeWorkers.value = 0
             delay(2500)
@@ -2354,7 +2779,7 @@ object TunnelManager {
 
     fun pause() {
         if (!running.value) return
-        sessionTraffic.noteTransportRestart()
+        noteSessionTransportRestart()
         killProcess()
         activeWorkers.value = 0
         resetStatsLivenessState()
@@ -2403,7 +2828,7 @@ object TunnelManager {
     }
 
     private fun stopOnlyProcess() {
-        sessionTraffic.noteTransportRestart()
+        noteSessionTransportRestart()
         killProcess()
         running.value = false
     }
@@ -2415,13 +2840,25 @@ object TunnelManager {
         updateLog("stats", "[СТАТИСТИКА] $stoppedStats", 3, false)
     }
 
-    fun onWireGuardInterfaceDropped() {
+    fun onWireGuardInterfaceDropped(vpnSlotTransferred: Boolean) {
         if (!running.value) return
-        updateWarningLog(
-            "vpn_interface_dropped",
-            "[VPN] Android сообщил о потере системного VPN-интерфейса. Проверяем состояние перед восстановлением.",
-            50,
-        )
+        if (vpnSlotTransferred) {
+            if (vpnSlotYieldRequested.value) return
+            vpnSlotYieldRequested.value = true
+            updateWarningLog(
+                "vpn_interface_dropped",
+                "[VPN] Android передал VPN-слот другому приложению. " +
+                    "WDTT Plus уступает слот и не будет включать VPN повторно.",
+                50,
+            )
+        } else if (!vpnSlotYieldRequested.value) {
+            updateWarningLog(
+                "vpn_interface_dropped",
+                "[VPN] Android сообщил о потере системного VPN-интерфейса. " +
+                    "Проверяем состояние перед восстановлением.",
+                50,
+            )
+        }
     }
 
     fun stop(reason: TunnelStopReason = TunnelStopReason.User) {
@@ -2487,8 +2924,21 @@ object TunnelManager {
     }
 
     fun reloadWireGuard() {
-        if (running.value) {
-            scope.launch {
+        wireGuardReloadJob?.cancel()
+        wireGuardReloadJob = scope.launch {
+            if (running.value && !vpnSlotYieldRequested.value) wgHelper?.reloadTunnel()
+        }
+    }
+
+    fun scheduleWireGuardReload(profileIndex: Int, delayMs: Long = 250L) {
+        if (!shouldReloadWireGuardRouting(running.value, activeTunnelProfile.value, profileIndex)) return
+        wireGuardReloadJob?.cancel()
+        wireGuardReloadJob = scope.launch {
+            delay(delayMs.coerceAtLeast(0L))
+            if (
+                !vpnSlotYieldRequested.value &&
+                shouldReloadWireGuardRouting(running.value, activeTunnelProfile.value, profileIndex)
+            ) {
                 wgHelper?.reloadTunnel()
             }
         }
@@ -2512,14 +2962,14 @@ object TunnelManager {
             val token = when (mode) {
                 "auto" -> solveSingleAutoWebViewCaptcha(redirectUri, sessionToken)
                 "manual" -> {
-                    updateLog("captcha_wv_step_1", "[КАПЧА WBV] Создание ручного WebView...", 5, false)
+                updateLog("captcha_wv_step_1", "[КАПЧА WBV] Открываем ручной WebView...", 5, false)
                     ManlCaptchaWebViewManager.solveCaptchaAsync(ctx, redirectUri, sessionToken)
                 }
                 else -> {
                     if (currentCaptchaSolveMethod == "auto") {
                         solveAutoWebViewCaptcha(ctx, redirectUri, sessionToken)
                     } else {
-                        updateLog("captcha_wv_step_1", "[КАПЧА WBV] Создание ручного WebView...", 5, false)
+                        updateLog("captcha_wv_step_1", "[КАПЧА WBV] Открываем ручной WebView...", 5, false)
                         ManlCaptchaWebViewManager.solveCaptchaAsync(ctx, redirectUri, sessionToken)
                     }
                 }
@@ -2535,14 +2985,14 @@ object TunnelManager {
                     errorMsg == CaptchaWebViewManager.ERROR_AUTO_NO_RESULT
                 )
             if (autoFallback) {
-                updateLog("captcha_wv_fallback", "[КАПЧА WBV] Авто WebView не подходит для этой капчи, идём дальше", 5, false)
+                updateLog("captcha_wv_fallback", "[КАПЧА WBV] Авто-WebView не подходит для этой капчи, идём дальше", 5, false)
             } else {
                 updateWarningLog("captcha_wv_err", "[КАПЧА WBV] $errorMsg", 5)
             }
             writeCaptchaResult(expectedProcess, requestId, "error:$errorMsg")
         } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
             if (mode == "auto") {
-                updateLog("captcha_wv_timeout", "[КАПЧА WBV] Авто WebView не успел, идём дальше", 5, false)
+                updateLog("captcha_wv_timeout", "[КАПЧА WBV] Авто-WebView не успел, идём дальше", 5, false)
             } else {
                 updateWarningLog("captcha_wv_err", "[КАПЧА WBV] WebView не ответил вовремя", 5)
             }
@@ -2566,7 +3016,7 @@ object TunnelManager {
         redirectUri: String,
         sessionToken: String
     ): String {
-        updateLog("captcha_wv_step_1", "[КАПЧА WBV] Авто WebView попытка 18с...", 5, false)
+        updateLog("captcha_wv_step_1", "[КАПЧА WBV] Попытка через авто-WebView, до 18 с...", 5, false)
         return CaptchaWebViewManager.solveCaptchaAsync(redirectUri, sessionToken) { step ->
             updateLog("captcha_wv_auto_step", "[КАПЧА WBV] $step", 5, false)
         }
@@ -2578,7 +3028,7 @@ object TunnelManager {
         sessionToken: String
     ): String {
         for (attempt in 1..2) {
-            updateLog("captcha_wv_step_1", "[КАПЧА WBV] Авто WebView попытка $attempt/2, 18с...", 5, false)
+            updateLog("captcha_wv_step_1", "[КАПЧА WBV] Попытка через авто-WebView $attempt/2, до 18 с...", 5, false)
             try {
                 return CaptchaWebViewManager.solveCaptchaAsync(redirectUri, sessionToken) { step ->
                     updateLog("captcha_wv_auto_step", "[КАПЧА WBV] $step", 5, false)
@@ -2586,11 +3036,11 @@ object TunnelManager {
             } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
                 updateWarningLog(
                     "captcha_wv_timeout",
-                    "[КАПЧА WBV] Авто WebView не ответил вовремя ($attempt/2), продолжаем",
+                    "[КАПЧА WBV] Авто-WebView не ответил вовремя ($attempt/2), продолжаем",
                     5
                 )
                 if (attempt == 2) {
-                    updateLog("captcha_wv_fallback", "[КАПЧА WBV] 2 таймаута авто, открыт ручной WebView", 5, false)
+                    updateLog("captcha_wv_fallback", "[КАПЧА WBV] Две авто-попытки не ответили, открыт ручной WebView", 5, false)
                     return ManlCaptchaWebViewManager.solveCaptchaAsync(ctx, redirectUri, sessionToken)
                 }
             } catch (e: IllegalStateException) {

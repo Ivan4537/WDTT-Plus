@@ -1,9 +1,12 @@
 package com.wdtt.plus.ui
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
+import java.nio.file.Files
+import java.util.Base64
 
 class OutboundWireGuardTest {
     private val safeConfig = """
@@ -70,6 +73,138 @@ class OutboundWireGuardTest {
     }
 
     @Test
+    fun localProxyFirewallHelper_preservesRuntimeActionAndRepairsIssue16() {
+        val helper = localProxyFirewallScript(10808)
+        val installScript = buildLocalProxyInstallScript(
+            port = 10808,
+            login = "proxy-user",
+            proxyPassword = "safe-test-password",
+        )
+
+        assertTrue("action=\"${'$'}{1:-}\"" in helper)
+        assertFalse("action=\"\"" in helper)
+        assertTrue("systemctl reset-failed wdtt-3proxy" in installScript)
+        assertFalse("local-proxy-firewall <<EOF" in installScript)
+        val encodedHelper = Regex(
+            "printf '%s' '([A-Za-z0-9+/=]+)' \\| base64 -d >/usr/local/lib/wdtt/local-proxy-firewall"
+        ).find(installScript)?.groupValues?.get(1).orEmpty()
+        assertTrue("helper должен встраиваться без shell-подстановок", encodedHelper.isNotBlank())
+        assertEquals(
+            helper,
+            String(Base64.getDecoder().decode(encodedHelper), Charsets.UTF_8),
+        )
+        assertShellSyntax(helper, shell = "sh")
+        assertShellSyntax(installScript)
+
+        val tempDir = Files.createTempDirectory("wdtt-proxy-firewall-").toFile()
+        try {
+            val calls = File(tempDir, "iptables-calls")
+            val existingRule = File(tempDir, "iptables-existing").apply { writeText("present") }
+            val fakeIptables = File(tempDir, "iptables").apply {
+                writeText(
+                    """
+                    #!/bin/sh
+                    if [ "${'$'}{1:-}" = "-S" ]; then
+                      if [ -f "${'$'}IPTABLES_EXISTING" ]; then
+                        echo '-A INPUT -p tcp --dport 9999 -m comment --comment WDTT_LOCAL_PROXY -j ACCEPT'
+                      fi
+                      exit 0
+                    fi
+                    printf '%s\n' "${'$'}*" >>"${'$'}IPTABLES_CALLS"
+                    if [ "${'$'}{1:-}" = "-D" ]; then
+                      rm -f "${'$'}IPTABLES_EXISTING"
+                    fi
+                    """.trimIndent() + "\n"
+                )
+                setExecutable(true)
+            }
+            assertTrue(fakeIptables.canExecute())
+            val helperFile = File(tempDir, "local-proxy-firewall").apply {
+                writeText(helper)
+                setExecutable(true)
+            }
+            fun run(action: String): Int = ProcessBuilder("sh", helperFile.absolutePath, action)
+                .apply {
+                    environment()["PATH"] = tempDir.absolutePath + File.pathSeparator +
+                        System.getenv("PATH").orEmpty()
+                    environment()["IPTABLES_CALLS"] = calls.absolutePath
+                    environment()["IPTABLES_EXISTING"] = existingRule.absolutePath
+                }
+                .redirectErrorStream(true)
+                .start()
+                .let { process ->
+                    process.inputStream.bufferedReader().readText()
+                    process.waitFor()
+                }
+
+            assertEquals(0, run("up"))
+            val appliedRules = calls.readLines()
+            assertTrue(appliedRules.any { it.startsWith("-D INPUT") && "--dport 9999" in it })
+            assertTrue(appliedRules.any { "--dport 10808" in it })
+            assertTrue(appliedRules.any { "--dport 10809" in it })
+            assertTrue(appliedRules.any { "--dport 10810" in it })
+            assertEquals(0, run("down"))
+            assertEquals(2, run("invalid"))
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun externalProxyRoutesHelper_preservesRuntimeArguments() {
+        val helper = externalProxyRoutesScript()
+
+        assertTrue("action=\"${'$'}{1:-}\"" in helper)
+        assertTrue("PROXY_IP=\"${'$'}{2:-}\"" in helper)
+        assertFalse("action=\"\"" in helper)
+        assertShellSyntax(helper, shell = "sh")
+
+        val tempDir = Files.createTempDirectory("wdtt-proxy-routes-").toFile()
+        try {
+            val calls = File(tempDir, "iptables-calls")
+            File(tempDir, "iptables").apply {
+                writeText(
+                    """
+                    #!/bin/sh
+                    printf '%s\n' "${'$'}*" >>"${'$'}IPTABLES_CALLS"
+                    case " ${'$'}* " in
+                      *" -D "*) exit 1 ;;
+                    esac
+                    exit 0
+                    """.trimIndent() + "\n"
+                )
+                setExecutable(true)
+            }
+            val helperFile = File(tempDir, "redsocks-routes").apply {
+                writeText(helper)
+                setExecutable(true)
+            }
+            fun run(vararg arguments: String): Int = ProcessBuilder(
+                listOf("sh", helperFile.absolutePath) + arguments
+            )
+                .apply {
+                    environment()["PATH"] = tempDir.absolutePath + File.pathSeparator +
+                        System.getenv("PATH").orEmpty()
+                    environment()["IPTABLES_CALLS"] = calls.absolutePath
+                }
+                .redirectErrorStream(true)
+                .start()
+                .let { process ->
+                    process.inputStream.bufferedReader().readText()
+                    process.waitFor()
+                }
+
+            assertEquals(0, run("up", "203.0.113.9"))
+            assertTrue(calls.readLines().any { "-d 203.0.113.9 -j RETURN" in it })
+            assertEquals(0, run("down", "203.0.113.9"))
+            assertEquals(2, run("up"))
+            assertEquals(2, run("invalid", "203.0.113.9"))
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
     fun directExitScript_forceCleansPartiallyStartedWireGuard() {
         val script = disableOutboundExitScript()
 
@@ -113,7 +248,13 @@ class OutboundWireGuardTest {
     @Test
     fun protocolErrorMarker_isNotCopiedRawToUserLog() {
         assertFalse(shouldWriteRemoteErrorToUserLog("WDTT_ERROR=local_proxy_check_failed"))
+        assertFalse(shouldWriteRemoteErrorToUserLog("WDTT_TUN_FAIL_CLOSED_ACTIVE=0"))
+        assertFalse(shouldWriteRemoteErrorToUserLog("CHECK_FAILED=0"))
         assertTrue(shouldWriteRemoteErrorToUserLog("FAIL: служба не запустилась"))
+        assertEquals(
+            "Ошибка на сервере: служба не запустилась",
+            remoteErrorMessageForUserLog("FAIL: служба не запустилась"),
+        )
     }
 
     @Test
@@ -149,6 +290,16 @@ class OutboundWireGuardTest {
         assertTrue("WG_DEFAULT_ROUTE_ACTIVE" in script)
         assertTrue("WG_NAT_ACTIVE" in script)
         assertTrue("WireGuard-выход запущен не полностью" in script)
+        assertTrue("внешний TCP-прокси запущен не полностью" in script)
+        assertTrue("конфликт маршрутов внешнего выхода" in script)
+        assertTrue("остались компоненты WireGuard-выхода" in script)
+        assertTrue("остались компоненты TUN-выхода" in script)
+        assertTrue("неизвестный режим выхода" in script)
+        assertTrue("Прокси на этом VPS (3proxy)" in script)
+        assertTrue("автозапуск включён, служба не работает" in script)
+        assertTrue("Учётные данные диагностикой не читаются" in script)
+        assertTrue("EXTERNAL_PROXY_REDIRECT_ACTIVE" in script)
+        assertTrue("LOCAL_PROXY_LISTEN_ACTIVE" in script)
         assertTrue("FIREWALL_SEVERITY=\"ERROR\"" in script)
         assertTrue("NAT прямого выхода отсутствует" in script)
         assertTrue("WDTT_EXPECTED_DTLS_PORT" in script)

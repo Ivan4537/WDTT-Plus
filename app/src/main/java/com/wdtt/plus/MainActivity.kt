@@ -508,7 +508,8 @@ class MainActivity : ComponentActivity() {
             }
             link != null -> handleIncomingWdttLink(link)
             WdttTransferCodec.isAdminTransfer(value) -> pendingAdminTransfer = value.trim()
-            WdttTransferCodec.documentFormat(value) == "wdtt-server-backup" -> {
+            WdttTransferCodec.isEncryptedServerBackup(value) ||
+                WdttTransferCodec.documentFormat(value) == "wdtt-server-backup" -> {
                 wdttDeepLinkMessage = "Распознана резервная копия сервера. Она применяется к выбранному серверу во вкладке «Деплой» → «Перенос сервера» → «Импорт»."
             }
             WdttTransferCodec.documentFormat(value) == "wdtt-plus-admin-settings" -> {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"net/url"
 	"reflect"
 	"testing"
@@ -153,6 +154,21 @@ func TestVKCallsFloodPause(t *testing.T) {
 		t.Fatalf("expired pause remaining = %v, want 0", got)
 	}
 	vkCallsFloodUntil.Store(0)
+}
+
+func TestVKCallsPreflightPauseForError(t *testing.T) {
+	if got := vkCallsPreflightPauseForError(fmt.Errorf("%w: rate limited", errVKCallsFlood)); got != vkCallsFloodPause {
+		t.Fatalf("flood pause = %v, want %v", got, vkCallsFloodPause)
+	}
+	if got := vkCallsPreflightPauseForError(&VkCaptchaError{ErrorCode: 14}); got != vkCallsCaptchaPause {
+		t.Fatalf("captcha pause = %v, want %v", got, vkCallsCaptchaPause)
+	}
+	if got := vkCallsPreflightPauseForError(errors.New("temporary network failure")); got != vkCallsTransientFailurePause {
+		t.Fatalf("transient pause = %v, want %v", got, vkCallsTransientFailurePause)
+	}
+	if got := vkCallsPreflightPauseForError(errors.New("INVALID_JOIN_LINK")); got != 0 {
+		t.Fatalf("terminal pause = %v, want 0", got)
+	}
 }
 
 func TestExtractVKCallsValues(t *testing.T) {

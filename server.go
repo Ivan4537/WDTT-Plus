@@ -116,6 +116,8 @@ type AdminProfileEntry struct {
 	ListenPort      int      `json:"listen_port,omitempty"`
 	SNI             string   `json:"sni,omitempty"`
 	NoDNS           bool     `json:"no_dns,omitempty"`
+	VpnDNSSelection string   `json:"vpn_dns_selection,omitempty"`
+	VpnDNSCustom    string   `json:"vpn_dns_custom,omitempty"`
 	Ports           string   `json:"ports,omitempty"`      // "dtls,wg,tun"
 	DeviceIDs       []string `json:"device_ids,omitempty"` // устройства, подключавшиеся по main_password
 	UpdatedAt       int64    `json:"updated_at,omitempty"`

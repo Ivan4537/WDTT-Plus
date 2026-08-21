@@ -21,7 +21,151 @@ const (
 	refreshedCredsRetryMin       = 500 * time.Millisecond
 	refreshedCredsRetrySlot      = 250 * time.Millisecond
 	refreshedCredsRetryJitterMax = 250 * time.Millisecond
+	// VK-реквизиты запрашиваются последовательно. Меньший интервал старта
+	// воркеров не должен превращать их в burst запросов к VK.
+	credentialRequestCooldown = 100 * time.Millisecond
 )
+
+// workerStartInterval выбирает темп только для начального набора сессии.
+// Несколько независимых VK-хешей распределяют нагрузку между группами, поэтому
+// их можно запускать быстрее. Для единственного хеша и TCP/TLS режима «Сеть
+// РТ» оставляем более щадящий темп: это снижает вероятность flood/CAPTCHA и
+// всплеска тяжёлых TLS-подключений.
+func workerStartInterval(hashCount int, turnStreamFirst bool) time.Duration {
+	if turnStreamFirst {
+		return 125 * time.Millisecond
+	}
+	switch {
+	case hashCount >= 3:
+		return 100 * time.Millisecond
+	case hashCount == 2:
+		return 125 * time.Millisecond
+	default:
+		return 150 * time.Millisecond
+	}
+}
+
+// workerDistributionByHash возвращает, сколько воркеров получит каждый
+// уникальный хеш. Одна группа всегда содержит workersPerGroup воркеров.
+func workerDistributionByHash(workerCount, hashCount int) []int {
+	if hashCount < 1 {
+		return nil
+	}
+	distribution := make([]int, hashCount)
+	groupCount := workerCount / workersPerGroup
+	for group := 0; group < groupCount; group++ {
+		distribution[group%hashCount] += workersPerGroup
+	}
+	return distribution
+}
+
+// startPacer распределяет первичные подключения всех групп по общей шкале
+// времени. Это позволяет готовить группы параллельно, не создавая всплеск из
+// десятков одновременных DTLS/TURN-handshake.
+type startPacer struct {
+	mu       sync.Mutex
+	next     time.Time
+	interval time.Duration
+}
+
+func newStartPacer(interval time.Duration) *startPacer {
+	if interval < 0 {
+		interval = 0
+	}
+	return &startPacer{interval: interval}
+}
+
+func (p *startPacer) reserve(now time.Time) time.Time {
+	if p == nil {
+		return now
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	scheduled := now
+	if p.next.After(scheduled) {
+		scheduled = p.next
+	}
+	p.next = scheduled.Add(p.interval)
+	return scheduled
+}
+
+func (p *startPacer) wait(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	scheduled := p.reserve(time.Now())
+	delay := time.Until(scheduled)
+	if delay <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return ctx.Err()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+type credentialFetchResult struct {
+	user     string
+	pass     string
+	turnURLs []string
+	err      error
+}
+
+// credentialRequestGate оставляет только один активный запрос реквизитов.
+// Короткая пауза между запросами защищает VK-путь от стартового flood control,
+// при этом группы больше не ждут полного запуска предыдущих девяти воркеров.
+type credentialRequestGate struct {
+	token    chan struct{}
+	cooldown time.Duration
+}
+
+func newCredentialRequestGate(cooldown time.Duration) *credentialRequestGate {
+	if cooldown < 0 {
+		cooldown = 0
+	}
+	gate := &credentialRequestGate{
+		token:    make(chan struct{}, 1),
+		cooldown: cooldown,
+	}
+	gate.token <- struct{}{}
+	return gate
+}
+
+func (g *credentialRequestGate) fetch(
+	ctx context.Context,
+	request func() (string, string, []string, error),
+) credentialFetchResult {
+	if g == nil {
+		user, pass, turnURLs, err := request()
+		return credentialFetchResult{user: user, pass: pass, turnURLs: turnURLs, err: err}
+	}
+	select {
+	case <-g.token:
+	case <-ctx.Done():
+		return credentialFetchResult{err: ctx.Err()}
+	}
+	defer func() { g.token <- struct{}{} }()
+
+	user, pass, turnURLs, err := request()
+	if g.cooldown > 0 && ctx.Err() == nil {
+		timer := time.NewTimer(g.cooldown)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		}
+	}
+	return credentialFetchResult{user: user, pass: pass, turnURLs: turnURLs, err: err}
+}
 
 type credentialRefreshResult uint8
 
@@ -159,8 +303,8 @@ func newConfigFirstStartGate(enabled bool) *configFirstStartGate {
 	return gate
 }
 
-func (g *configFirstStartGate) wait(ctx context.Context, workerIndex int) error {
-	if g == nil || !g.enabled || workerIndex == 0 {
+func (g *configFirstStartGate) wait(ctx context.Context, configWorker bool) error {
+	if g == nil || !g.enabled || configWorker {
 		return nil
 	}
 	select {
@@ -195,59 +339,34 @@ func WorkerGroup(
 	configCh chan<- string,
 	workerIDs []int,
 	requestedWorkers int,
-	configFirstStart bool,
 	hashFallback bool,
 	pauseFlag *int32,
 	deviceID, password, deviceInfo, transportSession string,
 	stats *Stats,
 	turnStreamFirst bool,
-	waitReady <-chan struct{},
-	signalReady chan<- struct{},
+	configStartGate *configFirstStartGate,
+	workerStarts *startPacer,
+	credentialRequests *credentialRequestGate,
+	waitForPrimaryCredentials <-chan struct{},
+	signalPrimaryCredentials chan<- struct{},
 ) {
-	// Каскадный запуск: ждем свою очередь
-	if waitReady != nil {
-		log.Printf("[ГРУППА #%d] Ожидание сигнала от предыдущей группы...", groupID)
-		select {
-		case <-waitReady:
-		case <-ctx.Done():
-			return
-		}
-	}
-
 	var configSent int32
 	if !getConfig {
 		configSent = 1
 	}
-	configStartGate := newConfigFirstStartGate(
-		configFirstStart && getConfig && requestedWorkers == workersPerGroup,
-	)
-
-	var signalReadyOnce sync.Once
-	signalNext := func(delay time.Duration, reason string) {
-		if signalReady == nil {
-			return
-		}
-		go func() {
-			if delay > 0 {
-				select {
-				case <-time.After(delay):
-				case <-ctx.Done():
-					return
-				}
-			}
-			signalReadyOnce.Do(func() {
-				close(signalReady)
-				log.Printf("[ГРУППА #%d] Передача запуска следующей группе: %s", groupID, reason)
-			})
-		}()
-	}
-
 	// Doze-mode пауза
 	for atomic.LoadInt32(pauseFlag) != 0 {
 		if ctx.Err() != nil {
 			return
 		}
 		time.Sleep(1 * time.Second)
+	}
+	if waitForPrimaryCredentials != nil {
+		select {
+		case <-waitForPrimaryCredentials:
+		case <-ctx.Done():
+			return
+		}
 	}
 
 	hashCandidates := []string{tp.Hashes[hashIndex%len(tp.Hashes)]}
@@ -265,7 +384,13 @@ func WorkerGroup(
 	log.Printf("[ГРУППА #%d] Запрос реквизитов подключения", groupID)
 
 	credStreamID := groupID * 100
-	user, pass, turnURLs, err := GetCreds(ctx, hash, credStreamID)
+	fetchCredentials := func(candidateHash string) credentialFetchResult {
+		return credentialRequests.fetch(ctx, func() (string, string, []string, error) {
+			return GetCreds(ctx, candidateHash, credStreamID)
+		})
+	}
+	credentials := fetchCredentials(hash)
+	user, pass, turnURLs, err := credentials.user, credentials.pass, credentials.turnURLs, credentials.err
 	for err != nil &&
 		selectedHash+1 < len(hashCandidates) &&
 		isHashFallbackCredentialError(err) {
@@ -277,7 +402,11 @@ func WorkerGroup(
 			selectedHash+1,
 			len(hashCandidates),
 		)
-		user, pass, turnURLs, err = GetCreds(ctx, hash, credStreamID)
+		credentials = fetchCredentials(hash)
+		user, pass, turnURLs, err = credentials.user, credentials.pass, credentials.turnURLs, credentials.err
+	}
+	if signalPrimaryCredentials != nil {
+		close(signalPrimaryCredentials)
 	}
 	if err != nil && getConfig {
 		log.Printf("[ГРУППА #%d] Стартовые креды не получены: %v; завершаем запуск для чистого повтора", groupID, err)
@@ -285,7 +414,6 @@ func WorkerGroup(
 		return
 	}
 	if err != nil {
-		signalNext(0, "текущая группа ждёт повтор credentials")
 		for attempt := 2; err != nil; attempt++ {
 			if isTerminalGroupCredentialError(err) {
 				log.Printf("[ГРУППА #%d] Креды недоступны без восстановления: %v", groupID, err)
@@ -298,7 +426,8 @@ func WorkerGroup(
 			case <-ctx.Done():
 				return
 			}
-			user, pass, turnURLs, err = GetCreds(ctx, hash, credStreamID)
+			credentials = fetchCredentials(hash)
+			user, pass, turnURLs, err = credentials.user, credentials.pass, credentials.turnURLs, credentials.err
 		}
 	}
 	credsState := newGroupCredentialsState(Credentials{
@@ -354,7 +483,8 @@ func WorkerGroup(
 				)
 			}
 			getStreamCache(credStreamID).invalidate(credStreamID)
-			u, p, urls, refreshErr = GetCreds(ctx, candidateHash, credStreamID)
+			credentials := fetchCredentials(candidateHash)
+			u, p, urls, refreshErr = credentials.user, credentials.pass, credentials.turnURLs, credentials.err
 			if refreshErr == nil {
 				nextHashIndex = candidateIndex
 				break
@@ -385,28 +515,18 @@ func WorkerGroup(
 		return credentialRefreshApplied
 	}
 
-	// Сигнализируем следующей группе, что мы успешно запустились (креды получены + 2 сек форы)
-	signalNext(2*time.Second, "credentials получены")
-
 	for i, wid := range workerIDs {
 		wg.Add(1)
 
-		// Stagger: 500мс между воркерами
-		workerDelay := time.Duration(i) * 500 * time.Millisecond
-
-		go func(workerIndex, wid int, delay time.Duration) {
+		go func(workerIndex, wid int) {
 			defer wg.Done()
 
-			if err := configStartGate.wait(ctx, workerIndex); err != nil {
+			if err := configStartGate.wait(ctx, getConfig && workerIndex == 0); err != nil {
 				return
 			}
 
-			if delay > 0 {
-				select {
-				case <-time.After(delay):
-				case <-ctx.Done():
-					return
-				}
+			if err := workerStarts.wait(ctx); err != nil {
+				return
 			}
 
 			shouldGetConfig := getConfig
@@ -531,7 +651,7 @@ func WorkerGroup(
 					return
 				}
 			}
-		}(i, wid, workerDelay)
+		}(i, wid)
 	}
 
 	wg.Wait()

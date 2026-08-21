@@ -67,6 +67,14 @@ class OutboundProfileComparisonTest {
     }
 
     @Test
+    fun configuredTunInterfaceChange_isReported() {
+        val server = snapshot(mode = "tun_interface", tunInterface = "xray0")
+        val local = forms(tunInterface = "singtun0")
+
+        assertTrue(outboundProfilesDiffer(server, local))
+    }
+
+    @Test
     fun orphanedWarpInterface_isAttributedOnlyToWarpAndCanBeDisabledThere() {
         val server = snapshot(
             mode = "direct",
@@ -169,7 +177,8 @@ class OutboundProfileComparisonTest {
         wireGuardExitPassword: String = "",
         wireGuardExitPort: String = "51820",
         wireGuardExitDns: String = "1.1.1.1,8.8.8.8",
-        importedWireGuardConfig: String = ""
+        importedWireGuardConfig: String = "",
+        tunInterface: String = ""
     ) = OutboundProfileForms(
         localProxyPort = localProxyPort,
         localProxyLogin = localProxyLogin,
@@ -185,7 +194,8 @@ class OutboundProfileComparisonTest {
         wireGuardExitPassword = wireGuardExitPassword,
         wireGuardExitPort = wireGuardExitPort,
         wireGuardExitDns = wireGuardExitDns,
-        importedWireGuardConfig = importedWireGuardConfig
+        importedWireGuardConfig = importedWireGuardConfig,
+        tunInterface = tunInterface
     )
 
     private fun snapshot(
@@ -212,7 +222,8 @@ class OutboundProfileComparisonTest {
         warpPresent: Boolean = false,
         externalProxyServiceActive: Boolean = false,
         externalProxyRouteActive: Boolean = false,
-        wireGuardOwnerMode: String = ""
+        wireGuardOwnerMode: String = "",
+        tunInterface: String = ""
     ) = OutboundServerSnapshot(
         mode = mode,
         detail = "",
@@ -244,6 +255,8 @@ class OutboundProfileComparisonTest {
         checkedAtMillis = 0L,
         externalProxyServiceActive = externalProxyServiceActive,
         externalProxyRouteActive = externalProxyRouteActive,
-        wireGuardOwnerMode = wireGuardOwnerMode
+        wireGuardOwnerMode = wireGuardOwnerMode,
+        tunInterface = tunInterface,
+        tunPresent = tunInterface.isNotBlank()
     )
 }

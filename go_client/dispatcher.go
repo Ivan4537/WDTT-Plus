@@ -2,12 +2,23 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"log"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+const (
+	wireGuardTransportDataType = 4
+	wireGuardEmptyDataSize     = 32
+)
+
+func isWireGuardUserDataPacket(packet []byte) bool {
+	return len(packet) > wireGuardEmptyDataSize &&
+		binary.LittleEndian.Uint32(packet[:4]) == wireGuardTransportDataType
+}
 
 var pktPool = sync.Pool{
 	New: func() interface{} {
@@ -68,6 +79,12 @@ type Dispatcher struct {
 	cancel     context.CancelFunc
 	wg         sync.WaitGroup
 	stats      *Stats
+	// firstUnansweredUserTxAt is global for the dispatcher because a reply may
+	// return through a different worker than the one that sent the request.
+	// Keeping the first (rather than latest) unanswered send also prevents a
+	// continuous stream of retries from postponing stall detection forever.
+	firstUnansweredUserTxAt atomic.Int64
+	stalledUserTraffic      atomic.Bool
 }
 
 func NewDispatcher(ctx context.Context, localConn net.PacketConn, stats *Stats) *Dispatcher {
@@ -117,6 +134,33 @@ func (d *Dispatcher) Unregister(slot *WorkerSlot) {
 	}
 	d.workers.Store(&newWorkers)
 	log.Printf("[ДИСП] Воркер #%d отключён (осталось: %d)", slot.ID, len(newWorkers))
+}
+
+func (d *Dispatcher) noteUserTrafficSent(now time.Time) {
+	d.firstUnansweredUserTxAt.CompareAndSwap(0, now.UnixNano())
+}
+
+func (d *Dispatcher) noteUserTrafficResponse() bool {
+	d.firstUnansweredUserTxAt.Store(0)
+	return d.stalledUserTraffic.Swap(false)
+}
+
+func (d *Dispatcher) resetUserTrafficHealth() {
+	d.firstUnansweredUserTxAt.Store(0)
+	d.stalledUserTraffic.Store(false)
+}
+
+func (d *Dispatcher) claimStalledUserTraffic(now time.Time, timeout time.Duration) (time.Duration, bool) {
+	startedAt := d.firstUnansweredUserTxAt.Load()
+	if startedAt == 0 {
+		return 0, false
+	}
+	stalledFor := now.Sub(time.Unix(0, startedAt))
+	if stalledFor <= timeout || !d.firstUnansweredUserTxAt.CompareAndSwap(startedAt, 0) {
+		return 0, false
+	}
+	d.stalledUserTraffic.Store(true)
+	return stalledFor, true
 }
 
 // readLoop читает WireGuard-пакеты и распределяет по workers chunk'ами.

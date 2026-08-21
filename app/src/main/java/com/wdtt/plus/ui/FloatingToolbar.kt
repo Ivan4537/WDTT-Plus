@@ -1,5 +1,6 @@
 package com.wdtt.plus.ui
 
+import android.content.Intent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.Spring
@@ -37,7 +38,9 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.wdtt.plus.SettingsStore
+import com.wdtt.plus.SleepBatteryMode
 import com.wdtt.plus.TunnelManager
+import com.wdtt.plus.TunnelService
 import com.wdtt.plus.TunnelStopCoordinator
 import com.wdtt.plus.TunnelStopResult
 import com.wdtt.plus.sanitizeVpnProfileNameInput
@@ -97,6 +100,14 @@ fun FloatingToolbar(
     val trustedWifiSsids by settingsStore.trustedWifiSsids.collectAsStateWithLifecycle(initialValue = emptyList())
     val trustedWifiRuntime by com.wdtt.plus.TrustedWifiManager.state.collectAsStateWithLifecycle()
     val pauseVpnDuringSleep by settingsStore.pauseVpnDuringSleep.collectAsStateWithLifecycle(initialValue = false)
+    val pauseVpnDuringSleepDelayMinutes by
+        settingsStore.pauseVpnDuringSleepDelayMinutes.collectAsStateWithLifecycle(initialValue = 5)
+    val sleepBatteryMode by
+        settingsStore.sleepBatteryMode.collectAsStateWithLifecycle(initialValue = SleepBatteryMode.DELAYED_PAUSE)
+    val resumeVpnDuringSleepDelayMinutes by
+        settingsStore.resumeVpnDuringSleepDelayMinutes.collectAsStateWithLifecycle(initialValue = 5)
+    val sleepBatterySettingsConfigured by
+        settingsStore.sleepBatterySettingsConfigured.collectAsStateWithLifecycle(initialValue = false)
     val customVkCredentialsEnabled by settingsStore.customVkCredentialsEnabled.collectAsStateWithLifecycle(initialValue = false)
     val customVkCredentialsComplete by settingsStore.customVkCredentialsComplete.collectAsStateWithLifecycle(initialValue = false)
     val savedToolbarYFraction by settingsStore.floatingToolbarYFraction.collectAsStateWithLifecycle(
@@ -129,7 +140,9 @@ fun FloatingToolbar(
     var resetInProgress by remember { mutableStateOf(false) }
     var profileNameInput by rememberSaveable { mutableStateOf("") }
     var showTrustedWifiSettings by rememberSaveable { mutableStateOf(false) }
+    var enableTrustedWifiAfterSetup by rememberSaveable { mutableStateOf(false) }
     var showVkClientSettings by rememberSaveable { mutableStateOf(false) }
+    var showSleepTimerSettings by rememberSaveable { mutableStateOf(false) }
 
     val tabWidthDp = 42.dp
     val tabHeightDp = 52.dp
@@ -358,12 +371,19 @@ fun FloatingToolbar(
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clickable { showTrustedWifiSettings = true }
                             .padding(horizontal = 4.dp, vertical = 4.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Column(modifier = Modifier.weight(1f).padding(end = 10.dp)) {
+                        Column(
+                            modifier = Modifier
+                                .weight(1f)
+                                .clickable {
+                                    enableTrustedWifiAfterSetup = false
+                                    showTrustedWifiSettings = true
+                                }
+                                .padding(end = 10.dp)
+                        ) {
                             Text(
                                 "Доверенные сети Wi‑Fi",
                                 style = MaterialTheme.typography.bodyMedium,
@@ -373,9 +393,12 @@ fun FloatingToolbar(
                             Text(
                                 when {
                                     trustedWifiRuntime.waiting -> "VPN ожидает выхода из сети"
-                                    !trustedWifiEnabled -> "Выключено"
-                                    trustedWifiSsids.isEmpty() -> "Сети не добавлены"
-                                    else -> "Добавлено: ${trustedWifiSsids.size}"
+                                    trustedWifiSsids.isEmpty() ->
+                                        "Сети не настроены · нажмите для настройки"
+                                    trustedWifiEnabled ->
+                                        "Включено · сетей: ${trustedWifiSsids.size}"
+                                    else ->
+                                        "Выключено · сохранено сетей: ${trustedWifiSsids.size}"
                                 },
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -384,13 +407,34 @@ fun FloatingToolbar(
                         }
                         Switch(
                             checked = trustedWifiEnabled,
-                            onCheckedChange = null,
+                            onCheckedChange = { enabled ->
+                                if (enabled && trustedWifiSsids.isEmpty()) {
+                                    enableTrustedWifiAfterSetup = true
+                                    showTrustedWifiSettings = true
+                                } else {
+                                    scope.launch {
+                                        settingsStore.saveTrustedWifiEnabled(enabled)
+                                        if (TunnelManager.running.value || trustedWifiRuntime.waiting) {
+                                            runCatching {
+                                                context.startService(
+                                                    Intent(context, TunnelService::class.java).apply {
+                                                        action = "TRUSTED_WIFI_RECHECK"
+                                                    }
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            },
                             modifier = Modifier.scale(0.85f)
                         )
                     }
 
                     Row(
-                        modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 4.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { showSleepTimerSettings = true }
+                            .padding(horizontal = 4.dp, vertical = 4.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
@@ -403,9 +447,39 @@ fun FloatingToolbar(
                             )
                             Text(
                                 if (pauseVpnDuringSleep) {
-                                    "VPN выключается · интернет напрямую"
+                                    when (sleepBatteryMode) {
+                                        SleepBatteryMode.DELAYED_PAUSE ->
+                                            if (pauseVpnDuringSleepDelayMinutes == 0) {
+                                                "Отключение сразу после выключения экрана"
+                                            } else {
+                                                "Отключение через ${formatSleepTimerDuration(pauseVpnDuringSleepDelayMinutes)}"
+                                            }
+                                        SleepBatteryMode.TIMED_PAUSE ->
+                                            if (resumeVpnDuringSleepDelayMinutes == 0) {
+                                                "Таймер 0 мин · VPN останется активным"
+                                            } else {
+                                                "Сразу выключится · включение через ${formatSleepTimerDuration(resumeVpnDuringSleepDelayMinutes)}"
+                                            }
+                                    }
                                 } else {
-                                    "VPN остаётся активным"
+                                    if (sleepBatterySettingsConfigured) {
+                                        when (sleepBatteryMode) {
+                                            SleepBatteryMode.DELAYED_PAUSE ->
+                                                if (pauseVpnDuringSleepDelayMinutes == 0) {
+                                                    "Выключено · сохранено немедленное отключение"
+                                                } else {
+                                                    "Выключено · сохранено отключение через ${formatSleepTimerDuration(pauseVpnDuringSleepDelayMinutes)}"
+                                                }
+                                            SleepBatteryMode.TIMED_PAUSE ->
+                                                if (resumeVpnDuringSleepDelayMinutes == 0) {
+                                                    "Выключено · сохранён таймер 0 мин"
+                                                } else {
+                                                    "Выключено · сохранено включение через ${formatSleepTimerDuration(resumeVpnDuringSleepDelayMinutes)}"
+                                                }
+                                        }
+                                    } else {
+                                        "VPN остаётся активным · нажмите для настройки"
+                                    }
                                 },
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -415,7 +489,27 @@ fun FloatingToolbar(
                         Switch(
                             checked = pauseVpnDuringSleep,
                             onCheckedChange = { enabled ->
-                                scope.launch { settingsStore.savePauseVpnDuringSleep(enabled) }
+                                if (enabled) {
+                                    if (sleepBatterySettingsConfigured) {
+                                        scope.launch {
+                                            settingsStore.savePauseVpnDuringSleep(true)
+                                            TunnelManager.noteSleepBatteryEvent(
+                                                "settings_enabled",
+                                                "Экономия батареи во сне включена; сохранённый сценарий применится при следующем выключении экрана.",
+                                            )
+                                        }
+                                    } else {
+                                        showSleepTimerSettings = true
+                                    }
+                                } else {
+                                    scope.launch {
+                                        settingsStore.savePauseVpnDuringSleep(false)
+                                        TunnelManager.noteSleepBatteryEvent(
+                                            "settings_disabled",
+                                            "Экономия батареи во сне выключена.",
+                                        )
+                                    }
+                                }
                             },
                             modifier = Modifier.scale(0.85f)
                         )
@@ -729,7 +823,11 @@ fun FloatingToolbar(
     if (showTrustedWifiSettings) {
         TrustedWifiSettingsDialog(
             settingsStore = settingsStore,
-            onDismiss = { showTrustedWifiSettings = false }
+            enableAfterFirstNetworkAdded = enableTrustedWifiAfterSetup,
+            onDismiss = {
+                enableTrustedWifiAfterSetup = false
+                showTrustedWifiSettings = false
+            }
         )
     }
 
@@ -739,6 +837,39 @@ fun FloatingToolbar(
             activeClientIds = activeClientIds,
             onClientIdsChange = onClientIdsChange,
             onDismiss = { showVkClientSettings = false }
+        )
+    }
+
+    if (showSleepTimerSettings) {
+        SleepTimerDialog(
+            initialMode = sleepBatteryMode,
+            initialPauseDelayMinutes = pauseVpnDuringSleepDelayMinutes,
+            initialResumeDelayMinutes = resumeVpnDuringSleepDelayMinutes,
+            onApply = { mode, pauseDelayMinutes, resumeDelayMinutes ->
+                scope.launch {
+                    settingsStore.saveSleepBatteryMode(
+                        enabled = true,
+                        mode = mode,
+                        pauseDelayMinutes = pauseDelayMinutes,
+                        resumeDelayMinutes = resumeDelayMinutes,
+                    )
+                    val description = when (mode) {
+                        SleepBatteryMode.DELAYED_PAUSE ->
+                            "отключение VPN через ${formatSleepTimerDuration(pauseDelayMinutes)} после выключения экрана"
+                        SleepBatteryMode.TIMED_PAUSE -> if (resumeDelayMinutes == 0) {
+                            "VPN остаётся активным при таймере 0 мин"
+                        } else {
+                            "немедленное отключение VPN и включение примерно через ${formatSleepTimerDuration(resumeDelayMinutes)}"
+                        }
+                    }
+                    TunnelManager.noteSleepBatteryEvent(
+                        "settings_saved",
+                        "Настройки сохранены: $description.",
+                    )
+                }
+                showSleepTimerSettings = false
+            },
+            onDismiss = { showSleepTimerSettings = false },
         )
     }
 }

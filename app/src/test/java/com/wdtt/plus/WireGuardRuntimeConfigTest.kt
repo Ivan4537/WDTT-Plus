@@ -1,6 +1,7 @@
 package com.wdtt.plus
 
 import com.wireguard.config.Config
+import com.wireguard.config.Peer
 import com.wireguard.crypto.Key
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -41,6 +42,34 @@ class WireGuardRuntimeConfigTest {
     }
 
     @Test
+    fun changedApplicationRoutingReplacesVpnInterface() {
+        val current = config(endpointPort = 9000, excludedApplication = "app.one")
+        val updated = config(endpointPort = 9000, excludedApplication = "app.two")
+
+        assertFalse(
+            shouldReuseRunningWireGuard(
+                tunnelUp = true,
+                currentConfigFingerprint = wireGuardConfigFingerprint(current),
+                updatedConfig = updated,
+            )
+        )
+    }
+
+    @Test
+    fun changedDnsReplacesVpnInterface() {
+        val current = config(endpointPort = 9000, dns = "1.1.1.1")
+        val updated = config(endpointPort = 9000, dns = "8.8.8.8")
+
+        assertFalse(
+            shouldReuseRunningWireGuard(
+                tunnelUp = true,
+                currentConfigFingerprint = wireGuardConfigFingerprint(current),
+                updatedConfig = updated,
+            )
+        )
+    }
+
+    @Test
     fun stoppedVpnInterfaceIsNeverReused() {
         val config = config(endpointPort = 9000)
 
@@ -53,13 +82,30 @@ class WireGuardRuntimeConfigTest {
         )
     }
 
-    private fun config(endpointPort: Int): Config {
+    @Test
+    fun peerWithoutAllowedIpsIsValidForAnEmptyAddressWhitelist() {
+        val peer = Peer.Builder()
+            .parsePublicKey(publicKey)
+            .build()
+
+        assertTrue(peer.allowedIps.isEmpty())
+    }
+
+    private fun config(
+        endpointPort: Int,
+        excludedApplication: String? = null,
+        dns: String = "1.1.1.1",
+    ): Config {
+        val appRouting = excludedApplication
+            ?.let { "ExcludedApplications = $it" }
+            .orEmpty()
         val text = """
             [Interface]
             PrivateKey = $privateKey
             Address = 10.0.0.2/32
-            DNS = 1.1.1.1
+            DNS = $dns
             MTU = 1280
+            $appRouting
 
             [Peer]
             PublicKey = $publicKey

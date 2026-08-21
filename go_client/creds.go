@@ -474,11 +474,19 @@ func fetchVkCreds(ctx context.Context, link string, streamID int) (fetchedTurnCr
 					Lifetime:    lifetime,
 					Provider:    "modern-vkcalls",
 				}, nil
-			} else if isVKCallsFloodError(err) {
-				startVKCallsFloodPause(time.Now())
-				log.Printf("[STREAM %d] [VKCalls] VK временно ограничил анонимный вход; продолжаем резервную legacy-цепочку", streamID)
 			} else {
-				log.Printf("[STREAM %d] [VKCalls] preflight не сработал: %v; продолжаем резервную legacy-цепочку", streamID, err)
+				pause := vkCallsPreflightPauseForError(err)
+				startVKCallsPreflightPause(time.Now(), pause)
+				switch {
+				case isVKCallsFloodError(err):
+					log.Printf("[STREAM %d] [VKCalls] VK временно ограничил анонимный вход; продолжаем резервную legacy-цепочку", streamID)
+				case pause == vkCallsCaptchaPause:
+					log.Printf("[STREAM %d] [VKCalls] VKCalls запросил CAPTCHA; временно не повторяем preflight и продолжаем резервную legacy-цепочку", streamID)
+				case pause > 0:
+					log.Printf("[STREAM %d] [VKCalls] preflight не сработал: %v; временно не повторяем его и продолжаем резервную legacy-цепочку", streamID, err)
+				default:
+					log.Printf("[STREAM %d] [VKCalls] preflight не сработал: %v; продолжаем резервную legacy-цепочку", streamID, err)
+				}
 			}
 		}
 	}
@@ -661,12 +669,12 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 			if captchaErr != nil && captchaErr.RedirectURI != "" && captchaErr.SessionToken != "" {
 				captchaChallengeAttempts++
 				if captchaChallengeAttempts > captchaChallengeAttemptLimit {
-					log.Printf("[STREAM %d] [Captcha] Max fresh challenges reached", streamID)
+					log.Printf("[STREAM %d] [КАПЧА] Достигнут предел новых проверок", streamID)
 					globalCaptchaLockout.Store(time.Now().Add(60 * time.Second).Unix())
 					return "", "", nil, fmt.Errorf("CAPTCHA_WAIT_REQUIRED")
 				}
 				if _, hasStage := captchaSolveStage(captchaStageAttempt); !hasStage {
-					log.Printf("[STREAM %d] [Captcha] Max attempts reached", streamID)
+					log.Printf("[STREAM %d] [КАПЧА] Достигнут предел попыток", streamID)
 					globalCaptchaLockout.Store(time.Now().Add(60 * time.Second).Unix())
 					return "", "", nil, fmt.Errorf("CAPTCHA_WAIT_REQUIRED")
 				}
@@ -674,7 +682,9 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 				successToken, solveErr := solveCaptchaBySelectedMode(ctx, streamID, captchaStageAttempt, captchaErr, client, profile, savedProfile)
 				if solveErr != nil {
 					if errors.Is(solveErr, errCaptchaNextChallenge) {
-						log.Printf("[STREAM %d] [КАПЧА] AUTO: текущая captcha-сессия завершена, запрашиваем свежий challenge: %v", streamID, solveErr)
+						// Причина конкретного сбоя уже обработана на Android. Не выводим
+						// её внутренний английский текст в пользовательский журнал.
+						log.Printf("[STREAM %d] [КАПЧА] AUTO: текущий способ не завершил проверку; запрашиваем новую капчу", streamID)
 						captchaStageAttempt, captchaAutoSoftFailures = captchaNextStageAfterSolverFailure(
 							captchaStageAttempt,
 							solveErr,
@@ -690,7 +700,7 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 						}
 						continue
 					}
-					log.Printf("[STREAM %d] [Captcha] Solve failed: %v", streamID, solveErr)
+					log.Printf("[STREAM %d] [КАПЧА] Текущий способ не решил капчу; ждём безопасного повтора", streamID)
 					globalCaptchaLockout.Store(time.Now().Add(60 * time.Second).Unix())
 					return "", "", nil, fmt.Errorf("CAPTCHA_WAIT_REQUIRED")
 				}
@@ -835,7 +845,12 @@ func solveCaptchaBySelectedMode(
 		token, solveErr = requestWebViewCaptcha(ctx, streamID, captchaErr, "manual", captchaManualWebViewTimeout)
 	}
 	if solveErr == nil {
-		log.Printf("[STREAM %d] [КАПЧА] AUTO: %s решил капчу", streamID, stage)
+		// WebView уже сообщает Android об успехе самостоятельно. Повторный
+		// лог здесь нужен только для встроенного Go-способа, у которого нет
+		// отдельного Android-события завершения.
+		if stage == "Go v2" {
+			log.Printf("[STREAM %d] [КАПЧА] AUTO: %s решил капчу", streamID, stage)
+		}
 		return token, nil
 	}
 	if ctx.Err() != nil {
@@ -957,7 +972,6 @@ func requestWebViewCaptcha(ctx context.Context, streamID int, captchaErr *VkCapt
 		if strings.HasPrefix(lowerResult, "error:") {
 			return "", true, fmt.Errorf("webview captcha failed: %s", result)
 		}
-		log.Printf("[STREAM %d] [КАПЧА] WBV: %s solve succeeded", streamID, mode)
 		return result, true, nil
 	}
 

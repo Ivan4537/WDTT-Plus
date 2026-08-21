@@ -57,6 +57,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.jcraft.jsch.ChannelExec
@@ -73,12 +74,16 @@ import com.wdtt.plus.ServerAdminTarget
 import com.wdtt.plus.SettingsStore
 import com.wdtt.plus.SshCredentials
 import com.wdtt.plus.TunnelManager
+import com.wdtt.plus.VPN_DNS_PROFILE_ID
 import com.wdtt.plus.WDTTColors
+import com.wdtt.plus.WdttTransferCodec
+import com.wdtt.plus.decodeStoredCustomVpnDnsServers
 import com.wdtt.plus.hasMeaningfulAdminProfileFields
 import com.wdtt.plus.hasManagedServerCredentials
 import com.wdtt.plus.latestServerMigrationLevel
 import com.wdtt.plus.createSshSession
 import com.wdtt.plus.normalizeSshPrivateKey
+import com.wdtt.plus.normalizeVpnDnsSelectionId
 import com.wdtt.plus.sshPrivateKeyIssue
 import com.wdtt.plus.sshCredentialsForMode
 import com.wdtt.plus.vpnProfileRestorableName
@@ -109,6 +114,7 @@ import org.json.JSONObject
 
 private const val CMD_TIMEOUT = 900000L // 15 minutes
 private const val DEPLOY_READY_HOLD_MS = 800L
+private const val TUN_STATE_POLL_INTERVAL_MS = 10_000L
 private const val SERVER_BACKUP_FORMAT_VERSION = 2
 private const val MAX_SERVER_BACKUP_FILE_CHARS = 8_000_000
 private const val MAX_SERVER_DATABASE_CHARS = 5_000_000
@@ -137,6 +143,7 @@ private enum class ServerImportMode {
 internal enum class OutboundDialog {
     LocalProxy,
     ExternalProxy,
+    TunInterface,
     WireGuardVps,
     FreeWarp,
     ImportedWireGuard,
@@ -201,6 +208,17 @@ internal fun shouldAutoRefreshOutboundState(
     hasSshAuthentication &&
     checkedTargetKey != targetKey
 
+internal fun shouldPollTunOutboundState(
+    visible: Boolean,
+    expanded: Boolean,
+    dialog: OutboundDialog?,
+    mode: String?,
+    hasSshAuthentication: Boolean,
+): Boolean = hasSshAuthentication && (
+    dialog == OutboundDialog.TunInterface ||
+        (visible && expanded && mode == "tun_interface")
+    )
+
 private enum class ProxyKind(val label: String, val protocol: String) {
     Socks5("SOCKS5", "socks5"),
     Http("HTTP", "http")
@@ -225,6 +243,34 @@ internal fun externalProxyCredentialsIssue(login: String, password: String): Str
     login.any(Char::isISOControl) || password.any(Char::isISOControl) ->
         "Логин и пароль внешнего прокси содержат недопустимые символы."
     else -> null
+}
+
+internal fun tunInterfaceNameIssue(value: String): String? {
+    val name = value.trim()
+    return when {
+        name.isBlank() -> "Укажите имя TUN-интерфейса."
+        name.length > 15 -> "Имя сетевого интерфейса не должно быть длиннее 15 символов."
+        !name.matches(Regex("^[A-Za-z0-9][A-Za-z0-9_.:-]*$")) ->
+            "Имя интерфейса должно начинаться с латинской буквы или цифры; далее допустимы знаки . _ : -"
+        name in setOf("lo", "wdtt0", "wg-wdtt-exit") ->
+            "Интерфейс $name зарезервирован и не может быть выбран как внешний TUN."
+        else -> null
+    }
+}
+
+internal data class TunInterfaceCandidate(
+    val name: String,
+    val isUp: Boolean
+)
+
+internal fun tunInterfaceSelectionIssue(
+    value: String,
+    candidates: List<TunInterfaceCandidate>
+): String? {
+    val nameIssue = tunInterfaceNameIssue(value)
+    if (nameIssue != null) return nameIssue
+    return candidates.firstOrNull { it.name == value.trim() && !it.isUp }
+        ?.let { "Интерфейс ${it.name} найден, но остановлен. Сначала запустите создающую его службу." }
 }
 
 internal fun escapeRedsocksQuotedValue(value: String): String =
@@ -255,11 +301,18 @@ internal data class ServerBackup(
     val botToken: String,
     val dns: String,
     val formatVersion: Int = SERVER_BACKUP_FORMAT_VERSION,
-    val integrityVerified: Boolean = true
+    val integrityVerified: Boolean = true,
+    val ownerProfileFromApp: Boolean = false,
+    val passwordProtected: Boolean = false
 ) {
     val hasWgKeys: Boolean
         get() = !wgKeysDat.isNullOrBlank()
 }
+
+internal data class PreparedServerBackupDatabase(
+    val json: String,
+    val ownerProfileFromApp: Boolean
+)
 
 private data class ServerImportPlan(
     val backup: ServerBackup,
@@ -338,7 +391,8 @@ internal data class OutboundProfileForms(
     val wireGuardExitPassword: String,
     val wireGuardExitPort: String,
     val wireGuardExitDns: String,
-    val importedWireGuardConfig: String
+    val importedWireGuardConfig: String,
+    val tunInterface: String = ""
 )
 
 internal data class OutboundServerSnapshot(
@@ -382,12 +436,23 @@ internal data class OutboundServerSnapshot(
     val wireGuardMatchesWarp: Boolean = false,
     val localProxyServiceEnabled: Boolean = localProxyActive,
     val externalProxyServiceEnabled: Boolean = externalProxyServiceActive,
-    val wireGuardServiceEnabled: Boolean = wireGuardServiceActive
+    val wireGuardServiceEnabled: Boolean = wireGuardServiceActive,
+    val tunInterface: String = "",
+    val tunPresent: Boolean = false,
+    val tunInterfaceActive: Boolean = false,
+    val tunServiceActive: Boolean = false,
+    val tunServiceEnabled: Boolean = false,
+    val tunPolicyRuleActive: Boolean = false,
+    val tunDefaultRouteActive: Boolean = false,
+    val tunForwardRulesActive: Boolean = false,
+    val tunIpForwardActive: Boolean = false,
+    val tunFailClosedActive: Boolean = false
 ) {
     val modeLabel: String
         get() = when (mode) {
             "direct" -> "прямой выход"
             "external_proxy" -> "внешний TCP-прокси"
+            "tun_interface" -> "существующий TUN-интерфейс"
             "warp_free" -> "бесплатный WARP"
             "imported_wg" -> "VPN/WireGuard-файл"
             "wireguard_vps" -> "выход через другой сервер"
@@ -396,6 +461,7 @@ internal data class OutboundServerSnapshot(
 
     fun preferredDialog(): OutboundDialog? = when {
         mode == "external_proxy" -> OutboundDialog.ExternalProxy
+        mode == "tun_interface" -> OutboundDialog.TunInterface
         mode == "wireguard_vps" -> OutboundDialog.WireGuardVps
         mode == "warp_free" -> OutboundDialog.FreeWarp
         mode == "imported_wg" -> OutboundDialog.ImportedWireGuard
@@ -407,6 +473,7 @@ internal data class OutboundServerSnapshot(
         get() = buildList {
             if (externalProxyRouteActive) add("внешний TCP-прокси")
             if (wireGuardRoutingPresent) add("WireGuard-выход")
+            if (tunRoutingPresent) add("TUN-интерфейс")
         }
 
     val externalProxyRoutingPresent: Boolean
@@ -421,12 +488,23 @@ internal data class OutboundServerSnapshot(
     val wireGuardHealthy: Boolean
         get() = wireGuardActive && wireGuardServiceActive && wireGuardServiceEnabled
 
+    val tunRoutingPresent: Boolean
+        get() = tunServiceActive || tunPolicyRuleActive || tunDefaultRouteActive || tunForwardRulesActive
+
+    val tunHealthy: Boolean
+        get() = tunInterfaceActive && tunServiceActive && tunServiceEnabled &&
+            tunPolicyRuleActive && tunDefaultRouteActive && tunForwardRulesActive && tunIpForwardActive
+
     val hasRouteConflict: Boolean
-        get() = externalProxyRouteActive && wireGuardRoutingPresent
+        get() = listOf(
+            externalProxyRouteActive,
+            wireGuardRoutingPresent,
+            tunRoutingPresent
+        ).count { it } > 1
 
     val routeConflictMessage: String?
         get() = if (hasRouteConflict) {
-            "На сервере одновременно остались правила внешнего TCP-прокси и WireGuard-выхода. Это может нарушить интернет у клиентов; нажмите «Вернуть прямой выход», затем включите только один режим."
+            "На сервере одновременно остались несколько маршрутов внешнего выхода WDTT: ${activeRouteLabels.joinToString(" и ")}. Это может нарушить интернет у клиентов; нажмите «Вернуть прямой выход», затем включите только один режим."
         } else {
             null
         }
@@ -519,6 +597,23 @@ internal fun outboundModeIndicator(
         }
     }
 
+    if (dialog == OutboundDialog.TunInterface) {
+        return when {
+            snapshot.hasRouteConflict && snapshot.tunRoutingPresent ->
+                OutboundModeIndicator(OutboundModeVisualState.Error, "конфликт")
+            snapshot.mode == "tun_interface" && snapshot.tunHealthy ->
+                OutboundModeIndicator(OutboundModeVisualState.Active, "активен")
+            snapshot.mode == "tun_interface" && snapshot.tunRoutingPresent ->
+                OutboundModeIndicator(OutboundModeVisualState.Error, "запущен частично")
+            snapshot.mode == "tun_interface" && snapshot.tunPresent ->
+                OutboundModeIndicator(OutboundModeVisualState.Error, "не запущен")
+            snapshot.tunRoutingPresent ->
+                OutboundModeIndicator(OutboundModeVisualState.Warning, "остались правила")
+            snapshot.tunPresent -> OutboundModeIndicator(OutboundModeVisualState.Warning, "настроен")
+            else -> OutboundModeIndicator(OutboundModeVisualState.Off, "выключен")
+        }
+    }
+
     if (dialog == OutboundDialog.FreeWarp) {
         return when {
             snapshot.hasRouteConflict && snapshot.wireGuardRoutingPresent && snapshot.mode == "warp_free" -> OutboundModeIndicator(OutboundModeVisualState.Error, "конфликт")
@@ -561,7 +656,7 @@ internal fun outboundModeIndicator(
 
 private fun OutboundServerSnapshot.outboundModeMismatchWarning(): String? = when {
     routeConflictMessage != null -> routeConflictMessage
-    mode == "direct" && (externalProxyRoutingPresent || wireGuardRoutingPresent) ->
+    mode == "direct" && (externalProxyRoutingPresent || wireGuardRoutingPresent || tunRoutingPresent) ->
         "записан прямой выход, но на сервере остались внешние службы или правила маршрутизации. Нажмите «Вернуть прямой выход» для полной очистки."
     mode == "external_proxy" && externalProxyServiceActive && !externalProxyRouteActive ->
         "служба внешнего TCP-прокси запущена, но правило перенаправления трафика WDTT отсутствует."
@@ -577,10 +672,18 @@ private fun OutboundServerSnapshot.outboundModeMismatchWarning(): String? = when
         "WireGuard-маршрут работает, но автозапуск службы выключен; после перезагрузки сервера режим пропадёт."
     mode in wireGuardOutboundModes && !wireGuardActive ->
         "режим записан как ${modeLabel}, но не все компоненты WireGuard-маршрута запущены."
+    mode == "tun_interface" && tunHealthy.not() ->
+        if (tunFailClosedActive) {
+            "внешний TUN недоступен; аварийная блокировка защищает трафик WDTT от прямого выхода."
+        } else {
+            "режим записан как существующий TUN-интерфейс, но интерфейс, служба или управляемые маршруты запущены не полностью."
+        }
     externalProxyRoutingPresent && mode != "external_proxy" ->
         "на сервере остались компоненты внешнего TCP-прокси, хотя записан режим «${modeLabel}»."
     wireGuardRoutingPresent && mode !in wireGuardOutboundModes ->
         "на сервере остались компоненты WireGuard-выхода, хотя записан режим «${modeLabel}»."
+    tunRoutingPresent && mode != "tun_interface" ->
+        "на сервере остались компоненты выхода через TUN-интерфейс, хотя записан режим «${modeLabel}»."
     else -> null
 }
 
@@ -588,8 +691,11 @@ private fun outboundServerShortState(snapshot: OutboundServerSnapshot): String =
     snapshot.hasRouteConflict -> "конфликт — ${snapshot.activeRouteLabels.joinToString(" и ")}"
     snapshot.externalProxyActive -> "внешний TCP-прокси"
     snapshot.wireGuardActive -> snapshot.modeLabel.takeIf { snapshot.mode in wireGuardOutboundModes } ?: "WireGuard-выход"
+    snapshot.tunHealthy -> "TUN-интерфейс ${snapshot.tunInterface.ifBlank { "не указан" }}"
+    snapshot.tunFailClosedActive -> "TUN недоступен, трафик заблокирован"
     snapshot.externalProxyRoutingPresent -> "внешний TCP-прокси запущен частично"
     snapshot.wireGuardRoutingPresent -> "WireGuard-выход запущен частично"
+    snapshot.tunRoutingPresent -> "TUN-выход запущен частично"
     snapshot.mode != "direct" -> "${snapshot.modeLabel} не запущен"
     else -> "прямой выход"
 }
@@ -649,7 +755,8 @@ internal fun canReturnDirect(snapshot: OutboundServerSnapshot?): Boolean =
     snapshot != null && (
         snapshot.mode != "direct" ||
             snapshot.externalProxyRoutingPresent ||
-            snapshot.wireGuardRoutingPresent
+            snapshot.wireGuardRoutingPresent ||
+            snapshot.tunRoutingPresent
         )
 
 internal fun canDisableOutboundDialog(
@@ -660,6 +767,8 @@ internal fun canDisableOutboundDialog(
     return when (dialog) {
         OutboundDialog.ExternalProxy ->
             snapshot.mode == "external_proxy" || snapshot.externalProxyRoutingPresent
+        OutboundDialog.TunInterface ->
+            snapshot.mode == "tun_interface" || snapshot.tunRoutingPresent
         OutboundDialog.WireGuardVps ->
             snapshot.mode == "wireguard_vps" ||
                 snapshot.orphanedWireGuardDialog() == OutboundDialog.WireGuardVps
@@ -679,6 +788,7 @@ private fun canCheckOutboundDialog(snapshot: OutboundServerSnapshot?, dialog: Ou
         OutboundDialog.WireGuardVps -> snapshot.mode == "wireguard_vps" && snapshot.wireGuardActive
         OutboundDialog.FreeWarp -> snapshot.mode == "warp_free" && snapshot.wireGuardActive
         OutboundDialog.ImportedWireGuard -> snapshot.mode == "imported_wg" && snapshot.wireGuardActive
+        OutboundDialog.TunInterface -> snapshot.mode == "tun_interface" && snapshot.tunHealthy
         else -> false
     }
 }
@@ -698,6 +808,9 @@ private fun canDeleteImportedWireGuard(snapshot: OutboundServerSnapshot?): Boole
 
 private fun canDeleteExternalProxy(snapshot: OutboundServerSnapshot?): Boolean =
     snapshot?.externalProxyPresent == true
+
+private fun canDeleteTunInterface(snapshot: OutboundServerSnapshot?): Boolean =
+    snapshot?.tunPresent == true
 
 private fun canDeleteWireGuardVps(snapshot: OutboundServerSnapshot?): Boolean =
     snapshot != null && (
@@ -719,6 +832,7 @@ private fun outboundDialogServerStateSummary(snapshot: OutboundServerSnapshot, d
     val prefix = when (dialog) {
         OutboundDialog.LocalProxy -> "Прокси на этом VPS"
         OutboundDialog.ExternalProxy -> "Внешний TCP-прокси"
+        OutboundDialog.TunInterface -> "Существующий TUN-интерфейс"
         OutboundDialog.WireGuardVps -> "Выход через другой сервер"
         OutboundDialog.FreeWarp -> "Бесплатный WARP"
         OutboundDialog.ImportedWireGuard -> "VPN/WireGuard-файл"
@@ -740,6 +854,17 @@ private fun outboundDialogServerStateSummary(snapshot: OutboundServerSnapshot, d
                 "Служба или правило внешнего прокси запущены не полностью. Нажмите «Отключить» для очистки либо включите режим заново."
             snapshot.externalProxyPresent -> parts += "Настройки внешнего прокси найдены, но маршрутизация сейчас не активна."
             else -> parts += "Внешний TCP-прокси на сервере не настроен."
+        }
+        OutboundDialog.TunInterface -> when {
+            snapshot.mode == "tun_interface" && snapshot.tunHealthy ->
+                parts += "Маршрутизация WDTT через ${snapshot.tunInterface.ifBlank { "выбранный TUN-интерфейс" }} активна."
+            snapshot.mode == "tun_interface" && snapshot.tunFailClosedActive -> parts +=
+                "Внешний TUN сейчас недоступен. Аварийная блокировка не позволяет трафику WDTT уйти через прямой выход; восстановите TUN или нажмите «Отключить»."
+            snapshot.tunRoutingPresent -> parts +=
+                "Служба или правила TUN-выхода запущены не полностью. Нажмите «Отключить» для очистки либо включите режим заново."
+            snapshot.tunPresent -> parts +=
+                "Настройка TUN-интерфейса сохранена, но маршрутизация сейчас не активна."
+            else -> parts += "TUN-интерфейс для выхода WDTT на сервере не настроен."
         }
         OutboundDialog.WireGuardVps -> when {
             snapshot.mode == "wireguard_vps" && snapshot.wireGuardHealthy -> parts += "WireGuard-выход через другой сервер активен."
@@ -858,6 +983,9 @@ fun DeployTab(
     val savedProtocol by settingsStore.protocol.collectAsStateWithLifecycle(initialValue = "udp")
     val savedSni by settingsStore.sni.collectAsStateWithLifecycle(initialValue = "")
     val savedNoDns by settingsStore.noDns.collectAsStateWithLifecycle(initialValue = false)
+    val savedVpnDns by settingsStore.vpnDnsSettings.collectAsStateWithLifecycle(
+        initialValue = com.wdtt.plus.VpnDnsSettingsSnapshot(profileIndex = activeProfile)
+    )
 
     var ip by remember { mutableStateOf("") }
     var login by remember { mutableStateOf("") }
@@ -902,6 +1030,9 @@ fun DeployTab(
     var isCheckingExistingInstall by remember { mutableStateOf(false) }
     var exportIncludeWgKeys by rememberSaveable { mutableStateOf(true) }
     var pendingExportBackup by remember { mutableStateOf<ServerBackup?>(null) }
+    var pendingExportDocument by remember { mutableStateOf<String?>(null) }
+    var exportPasswordBackup by remember { mutableStateOf<ServerBackup?>(null) }
+    var encryptedImportDocument by remember { mutableStateOf<String?>(null) }
     var selectedImportBackup by remember { mutableStateOf<ServerBackup?>(null) }
     var selectedImportModeName by rememberSaveable { mutableStateOf(ServerImportMode.Replace.name) }
     var migrationBusy by remember { mutableStateOf(false) }
@@ -924,6 +1055,8 @@ fun DeployTab(
     var outboundLastCheckAttemptAt by remember { mutableLongStateOf(0L) }
     var outboundLastCheckError by remember { mutableStateOf("") }
     var outboundAutoCheckedTargetKey by remember { mutableStateOf("") }
+    var tunCandidates by remember { mutableStateOf<List<TunInterfaceCandidate>>(emptyList()) }
+    var tunCandidatesBusy by remember { mutableStateOf(false) }
     val outboundFormsStore = remember { OutboundFormsStore(context) }
     val storedOutboundForms = remember(activeProfile) {
         outboundFormsStore.load(activeProfile)
@@ -981,6 +1114,9 @@ fun DeployTab(
     }
     var freeWarpMtuInput by rememberSaveable(activeProfile) {
         mutableStateOf(storedOutboundForms.warpMtu)
+    }
+    var tunInterfaceInput by rememberSaveable(activeProfile) {
+        mutableStateOf(storedOutboundForms.forms.tunInterface)
     }
 
     var showSuccessBanner by rememberSaveable { mutableStateOf(false) }
@@ -1092,6 +1228,8 @@ fun DeployTab(
         outboundAutoCheckedTargetKey = if (cached?.attempted == true) outboundTargetKey else ""
         outboundStatus = ""
         outboundStatusOwner = null
+        tunCandidates = emptyList()
+        tunCandidatesBusy = false
     }
     LaunchedEffect(activeProfile, outboundTargetKey) {
         serverDiagnosticsReport = null
@@ -1115,6 +1253,7 @@ fun DeployTab(
         wireGuardExitDnsInput,
         freeWarpMtuInput,
         importedWgConfigText,
+        tunInterfaceInput,
     ) {
         kotlinx.coroutines.delay(250)
         outboundFormsStore.save(
@@ -1135,6 +1274,7 @@ fun DeployTab(
                 wireGuardExitPort = wireGuardExitPortInput,
                 wireGuardExitDns = wireGuardExitDnsInput,
                 importedWireGuardConfig = importedWgConfigText,
+                tunInterface = tunInterfaceInput,
             ),
             freeWarpMtuInput,
         )
@@ -1151,13 +1291,15 @@ fun DeployTab(
         ActivityResultContracts.CreateDocument("application/json")
     ) { uri: Uri? ->
         val backup = pendingExportBackup
+        val document = pendingExportDocument
         pendingExportBackup = null
+        pendingExportDocument = null
         if (uri == null) {
             migrationStatus = "Экспорт отменён"
             migrationBusy = false
             return@rememberLauncherForActivityResult
         }
-        if (backup == null) {
+        if (backup == null || document == null) {
             migrationStatus = "Ошибка экспорта: бэкап не был подготовлен"
             migrationBusy = false
             return@rememberLauncherForActivityResult
@@ -1165,8 +1307,11 @@ fun DeployTab(
         migrationStatus = "Сохраняю файл экспорта..."
         scope.launch {
             try {
-                writeServerBackupToUri(context, uri, backup)
-                migrationStatus = "${if (backup.hasWgKeys) "Полный" else "Частичный"} экспорт готов: клиентов ${backup.passwordCount}, устройств ${backup.deviceCount}."
+                writeServerBackupDocumentToUri(context, uri, document)
+                migrationStatus = buildString {
+                    append("${if (backup.hasWgKeys) "Полный" else "Частичный"} защищённый экспорт готов и перечитан: клиентов ${backup.passwordCount}, устройств ${backup.deviceCount}.")
+                    if (backup.ownerProfileFromApp) append(" Актуальные поля профиля владельца взяты из вкладки «Туннель».")
+                }
             } catch (e: Exception) {
                 migrationStatus = "Ошибка экспорта: ${friendlyDeployError(e, "экспорт")}"
                 DeployManager.writeError("Server export error: ${e.message}")
@@ -1183,20 +1328,19 @@ fun DeployTab(
         migrationStatus = "Читаю файл импорта..."
         scope.launch {
             try {
-                val backup = loadServerBackupFromUri(context, uri)
-                selectedImportBackup = backup
-                selectedImportModeName = ServerImportMode.Replace.name
-                migrationStatus = buildString {
-                    append("Выбран ${if (backup.hasWgKeys) "полный" else "частичный"} бэкап: клиентов ${backup.passwordCount}, устройств ${backup.deviceCount}.")
-                    append(
-                        if (backup.integrityVerified) {
-                            " Целостность файла проверена."
-                        } else {
-                            " Это совместимый старый формат без контрольной суммы."
-                        }
-                    )
+                val document = readServerBackupDocumentFromUri(context, uri)
+                if (WdttTransferCodec.isEncryptedServerBackup(document)) {
+                    encryptedImportDocument = document
+                    selectedImportBackup = null
+                    migrationStatus = "Защищённый бэкап прочитан. Введите пароль файла для проверки и импорта."
+                } else {
+                    val backup = parseBackupFile(document)
+                    selectedImportBackup = backup
+                    selectedImportModeName = ServerImportMode.Replace.name
+                    migrationStatus = serverBackupSelectionStatus(backup, encrypted = false)
                 }
             } catch (e: Exception) {
+                encryptedImportDocument = null
                 selectedImportBackup = null
                 migrationStatus = "Ошибка файла импорта: ${friendlyDeployError(e, "файл импорта")}"
                 DeployManager.writeError("Server import file error: ${e.message}")
@@ -1230,6 +1374,8 @@ fun DeployTab(
         listenPort = savedListenPort,
         sni = savedSni,
         noDns = savedNoDns,
+        vpnDnsSelectionId = savedVpnDns.selectionId,
+        vpnDnsCustomServers = savedVpnDns.customServers,
         dtlsPort = if (savedManualPorts) savedServerDtlsPort else 56000,
         wgPort = if (savedManualPorts) savedServerWgPort else 56001,
         profileName = vpnProfileTransferName(activeProfile, profileNames)
@@ -1250,7 +1396,8 @@ fun DeployTab(
         wireGuardExitPassword = wireGuardExitPasswordInput,
         wireGuardExitPort = wireGuardExitPortInput,
         wireGuardExitDns = wireGuardExitDnsInput,
-        importedWireGuardConfig = importedWgConfigText
+        importedWireGuardConfig = importedWgConfigText,
+        tunInterface = tunInterfaceInput
     )
 
     suspend fun syncOwnerProfileToServer(
@@ -1313,6 +1460,13 @@ fun DeployTab(
         )
         settingsStore.saveDeploy(ip.trim(), effectiveLogin, password, savedSshPort.ifBlank { "22" }, connection.dns1, connection.dns2)
         settingsStore.saveWdttLinkMode(false)
+        if (normalizedProfile.vpnDnsStored) {
+            settingsStore.saveVpnDnsSettings(
+                selectionId = normalizedProfile.vpnDnsSelectionId,
+                customServersRaw = normalizedProfile.vpnDnsCustomServers.joinToString(","),
+                profileIndex = activeProfile,
+            )
+        }
         vpnProfileRestorableName(normalizedProfile.profileName)
             .takeIf { it.isNotBlank() }
             ?.let { settingsStore.saveProfileName(activeProfile, it) }
@@ -1361,10 +1515,26 @@ fun DeployTab(
                         profile = deployProfile,
                         level = latestServerMigrationLevel(BuildConfig.VERSION_CODE)
                     )
-                    val ownerProfile = currentOwnerProfile()
+                    val restoredConnection = importPlan
+                        ?.takeIf { it.mode == ServerImportMode.Replace }
+                        ?.let { importedServerConnectionForTarget(it.backup, request) }
+                    if (restoredConnection != null) {
+                        val restoredPorts = restoredConnection.adminProfile.effectivePorts(restoredConnection.ports)
+                        settingsStore.applyImportedServerConnection(
+                            profileIndex = deployProfile,
+                            host = restoredConnection.host,
+                            connectionPassword = restoredConnection.password,
+                            dtlsPort = restoredPorts.first,
+                            wgPort = restoredPorts.second,
+                            ownerProfile = restoredConnection.adminProfile.copy(listenPort = restoredPorts.third)
+                        )
+                    }
+                    val ownerProfile = restoredConnection?.adminProfile ?: currentOwnerProfile()
                     DeployManager.updateProgress(
                         0.97f,
-                        if (hasMeaningfulAdminProfileFields(ownerProfile)) {
+                        if (restoredConnection != null) {
+                            "Обновляю локальный профиль для нового сервера..."
+                        } else if (hasMeaningfulAdminProfileFields(ownerProfile)) {
                             "Сохраняю заданные поля профиля владельца на сервере..."
                         } else {
                             "Поля «Туннеля» стандартные — профиль владельца на сервере не изменяю..."
@@ -1496,6 +1666,35 @@ fun DeployTab(
         )
     }
 
+    fun refreshTunCandidates() {
+        if (tunCandidatesBusy || outboundBusy) return
+        val target = currentOutboundTarget() ?: return
+        val requestTargetKey = outboundTargetKey
+        tunCandidatesBusy = true
+        outboundStatus = "Ищу доступные TUN-интерфейсы на сервере..."
+        outboundStatusOwner = OutboundDialog.TunInterface.name
+        scope.launch {
+            try {
+                val candidates = discoverTunInterfaces(target)
+                if (currentOutboundTargetKey != requestTargetKey) return@launch
+                tunCandidates = candidates
+                outboundStatus = if (candidates.isEmpty()) {
+                    "Автоматически определить TUN-интерфейсы не удалось. Введите точное имя вручную."
+                } else {
+                    "Найдено TUN-интерфейсов: ${candidates.size}. Выберите подходящий или введите другое имя вручную."
+                }
+                outboundStatusOwner = OutboundDialog.TunInterface.name
+            } catch (e: Exception) {
+                if (currentOutboundTargetKey != requestTargetKey) return@launch
+                tunCandidates = emptyList()
+                outboundStatus = "Не удалось получить список TUN-интерфейсов: ${friendlyDeployError(e, "поиск TUN-интерфейсов")}. Имя можно ввести вручную."
+                outboundStatusOwner = OutboundDialog.TunInterface.name
+            } finally {
+                if (currentOutboundTargetKey == requestTargetKey) tunCandidatesBusy = false
+            }
+        }
+    }
+
     fun acceptOutboundSnapshot(requestTargetKey: String, snapshot: OutboundServerSnapshot): Boolean {
         if (currentOutboundTargetKey != requestTargetKey) return false
         outboundSnapshot = snapshot
@@ -1516,14 +1715,17 @@ fun DeployTab(
 
     fun recordOutboundCheckFailure(requestTargetKey: String, error: Throwable) {
         if (currentOutboundTargetKey != requestTargetKey) return
-        outboundSnapshot = null
+        // Сохраняем последнее подтверждённое состояние: карточка всё равно
+        // показывает ошибку проверки, а TUN-монитор сможет повторить опрос
+        // после временного сбоя SSH вместо молчаливой остановки наблюдения.
+        val lastConfirmedSnapshot = outboundSnapshot
         outboundLastCheckAttemptAt = System.currentTimeMillis()
         outboundLastCheckError = friendlyDeployError(error, "выходной IP")
         outboundAutoCheckedTargetKey = requestTargetKey
         OutboundProcessCache.put(
             requestTargetKey,
             OutboundProcessSnapshot(
-                snapshot = null,
+                snapshot = lastConfirmedSnapshot,
                 lastCheckAttemptAt = outboundLastCheckAttemptAt,
                 lastCheckError = outboundLastCheckError,
                 attempted = true
@@ -1655,6 +1857,7 @@ fun DeployTab(
         snapshot.wireGuardExitDns.takeIf { it.isNotBlank() }?.let { wireGuardExitDnsInput = it }
         snapshot.warpMtu.takeIf { raw -> raw.toIntOrNull()?.let { it in 1280..1500 } == true }
             ?.let { freeWarpMtuInput = it }
+        snapshot.tunInterface.takeIf { it.isNotBlank() }?.let { tunInterfaceInput = it }
 
         if (snapshot.importedWireGuardConfig.isNotBlank()) {
             importedWgConfigText = snapshot.importedWireGuardConfig
@@ -1776,6 +1979,12 @@ fun DeployTab(
         outboundStatus = ""
         outboundStatusOwner = dialog.name
         outboundDialog = dialog
+        if (dialog == OutboundDialog.TunInterface) {
+            refreshOutboundSnapshot(showStatus = false)
+            if (tunCandidates.isEmpty()) {
+                refreshTunCandidates()
+            }
+        }
     }
 
     fun dialogStatus(dialog: OutboundDialog): String =
@@ -1800,6 +2009,28 @@ fun DeployTab(
                 checkedTargetKey = outboundAutoCheckedTargetKey
             )
         ) {
+            refreshOutboundSnapshot(showStatus = false)
+        }
+    }
+
+    LaunchedEffect(
+        visible,
+        outboundSectionExpanded,
+        outboundDialog,
+        outboundSnapshot?.mode,
+        outboundTargetKey,
+        primarySshAccessReady,
+    ) {
+        if (!shouldPollTunOutboundState(
+                visible = visible,
+                expanded = outboundSectionExpanded == true,
+                dialog = outboundDialog,
+                mode = outboundSnapshot?.mode,
+                hasSshAuthentication = primarySshAccessReady,
+            )
+        ) return@LaunchedEffect
+        while (true) {
+            kotlinx.coroutines.delay(TUN_STATE_POLL_INTERVAL_MS)
             refreshOutboundSnapshot(showStatus = false)
         }
     }
@@ -2511,6 +2742,60 @@ fun DeployTab(
                         ) { deleteExternalProxy(it) }
                     }
                 )
+                OutboundDialog.TunInterface -> TunInterfaceDialog(
+                    busy = outboundBusy,
+                    candidatesBusy = tunCandidatesBusy,
+                    status = dialogStatus(OutboundDialog.TunInterface),
+                    actionTitle = outboundActionTitle,
+                    progressTitle = if (outboundProgressActive) currentStep else "",
+                    progress = deployProgress,
+                    indicator = outboundModeIndicator(outboundSnapshot, OutboundDialog.TunInterface),
+                    interfaceInput = tunInterfaceInput,
+                    candidates = tunCandidates,
+                    disableEnabled = canDisableOutboundDialog(outboundSnapshot, OutboundDialog.TunInterface),
+                    checkEnabled = canCheckOutboundDialog(outboundSnapshot, OutboundDialog.TunInterface),
+                    deleteEnabled = canDeleteTunInterface(outboundSnapshot),
+                    onInterfaceChanged = { tunInterfaceInput = it.take(15) },
+                    onRefreshCandidates = { refreshTunCandidates() },
+                    onDismiss = { if (!outboundBusy && !tunCandidatesBusy) outboundDialog = null },
+                    onEnable = { interfaceName ->
+                        tunInterfaceInput = interfaceName
+                        val forms = currentOutboundProfileForms().copy(tunInterface = interfaceName)
+                        runOutboundAction(
+                            title = "Включаю выход через TUN-интерфейс",
+                            preflightRouteMode = "tun_interface"
+                        ) {
+                            val result = enableTunInterface(it, interfaceName)
+                            val saveMessage = saveOutboundProfileMessage(
+                                context,
+                                it,
+                                forms,
+                                "Имя TUN-интерфейса сохранено на сервере для восстановления."
+                            )
+                            "$result\n$saveMessage"
+                        }
+                    },
+                    onCheck = {
+                        runOutboundAction("Проверяю выход через TUN-интерфейс") {
+                            val snapshot = readOutboundServerSnapshot(context, it)
+                            outboundSnapshot = snapshot
+                            if (snapshot.mode == "tun_interface" && snapshot.tunHealthy) {
+                                checkTunInterfaceExit(it, snapshot.tunInterface)
+                            } else {
+                                outboundDialogServerStateSummary(snapshot, OutboundDialog.TunInterface)
+                            }
+                        }
+                    },
+                    onDisable = {
+                        runOutboundAction("Возвращаю прямой выход WDTT") { disableOutboundExit(it) }
+                    },
+                    onDelete = {
+                        runOutboundAction(
+                            title = "Удаляю настройку TUN-выхода",
+                            onSuccess = { tunInterfaceInput = "" }
+                        ) { deleteTunInterfaceExit(it) }
+                    }
+                )
                 OutboundDialog.WireGuardVps -> WireGuardExitVpsDialog(
                     busy = outboundBusy,
                     status = dialogStatus(OutboundDialog.WireGuardVps),
@@ -2846,12 +3131,12 @@ fun DeployTab(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             Text(
-                "Файл экспорта содержит секреты доступа. Храните его как пароль от сервера.",
+                "Новый экспорт шифруется отдельным паролем. Пароль не сохраняется — храните и передавайте его отдельно от файла.",
                 style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.error
+                color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             Text(
-                "Новые файлы экспорта получают контрольные суммы. Перед импортом приложение проверяет целостность базы и WireGuard-ключей; старые файлы остаются совместимыми.",
+                "Перед импортом приложение проверяет пароль, подлинность, целостность базы и WireGuard-ключей. Старые незашифрованные файлы остаются совместимыми, но требуют особенно осторожного хранения.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -2908,15 +3193,14 @@ fun DeployTab(
                                     user = effectiveLogin,
                                     credentials = sshCredentials,
                                     port = sshPort,
-                                    includeWgKeys = includeKeys
+                                    includeWgKeys = includeKeys,
+                                    localOwnerProfile = currentOwnerProfile(),
+                                    localPeer = savedPeer
                                 )
-                                pendingExportBackup = backup
-                                migrationStatus = "Бэкап подготовлен: клиентов ${backup.passwordCount}, устройств ${backup.deviceCount}. Выберите место сохранения."
-                                val stamp = SimpleDateFormat("yyyyMMdd-HHmm", Locale.US).format(Date())
-                                val safeHost = ip.replace(Regex("[^A-Za-z0-9_.-]"), "_").ifBlank { "server" }
-                                exportLauncher.launch("wdtt-backup-$safeHost-$stamp.json")
+                                exportPasswordBackup = backup
+                                migrationStatus = "Бэкап подготовлен: клиентов ${backup.passwordCount}, устройств ${backup.deviceCount}. Задайте пароль файла."
                             } catch (e: Exception) {
-                                pendingExportBackup = null
+                                exportPasswordBackup = null
                                 migrationStatus = "Ошибка экспорта: ${friendlyDeployError(e, "экспорт")}"
                                 DeployManager.writeError("Server export prepare error: ${e.message}")
                                 migrationBusy = false
@@ -2961,13 +3245,15 @@ fun DeployTab(
                             color = MaterialTheme.colorScheme.onSurface
                         )
                         Text(
-                            if (backup.integrityVerified) {
-                                "Целостность файла подтверждена."
+                            if (backup.passwordProtected) {
+                                "Файл защищён паролем; подлинность и целостность подтверждены."
+                            } else if (backup.integrityVerified) {
+                                "Целостность подтверждена, но старый файл не зашифрован."
                             } else {
-                                "Старый совместимый формат: контрольной суммы в файле нет."
+                                "Старый незашифрованный формат: контрольной суммы в файле нет."
                             },
                             style = MaterialTheme.typography.bodySmall,
-                            color = if (backup.integrityVerified) {
+                            color = if (backup.passwordProtected) {
                                 MaterialTheme.colorScheme.primary
                             } else {
                                 MaterialTheme.colorScheme.error
@@ -3060,6 +3346,45 @@ fun DeployTab(
                 }
             }
         }
+        }
+
+        exportPasswordBackup?.let { backup ->
+            ServerBackupExportPasswordDialog(
+                backup = backup,
+                onDismiss = {
+                    exportPasswordBackup = null
+                    migrationBusy = false
+                    migrationStatus = "Экспорт отменён"
+                },
+                onReady = { document ->
+                    exportPasswordBackup = null
+                    pendingExportBackup = backup
+                    pendingExportDocument = document
+                    migrationStatus = "Защищённый бэкап подготовлен. Выберите место сохранения."
+                    val stamp = SimpleDateFormat("yyyyMMdd-HHmm", Locale.US).format(Date())
+                    val safeHost = ip.replace(Regex("[^A-Za-z0-9_.-]"), "_").ifBlank { "server" }
+                    exportLauncher.launch("wdtt-backup-$safeHost-$stamp.wdtt-backup")
+                },
+                onError = { message ->
+                    migrationStatus = "Ошибка защиты экспорта: $message"
+                }
+            )
+        }
+
+        encryptedImportDocument?.let { document ->
+            ServerBackupImportPasswordDialog(
+                document = document,
+                onDismiss = {
+                    encryptedImportDocument = null
+                    migrationStatus = "Импорт отменён"
+                },
+                onImported = { backup ->
+                    encryptedImportDocument = null
+                    selectedImportBackup = backup
+                    selectedImportModeName = ServerImportMode.Replace.name
+                    migrationStatus = serverBackupSelectionStatus(backup, encrypted = true)
+                }
+            )
         }
 
         if (showSshKeyDialog) {
@@ -3160,6 +3485,8 @@ fun DeployTab(
                     onConfirm = {
                         pendingDirectImportRequest = null
                         val appContext = context.applicationContext
+                        val importMode = selectedImportMode
+                        val importProfile = activeProfile
                         migrationBusy = true
                         migrationStatus = "Импортирую состояние на сервер..."
                         DeployManager.scope.launch {
@@ -3172,10 +3499,26 @@ fun DeployTab(
                                     context = appContext,
                                     request = request,
                                     backup = backup,
-                                    mode = selectedImportMode,
+                                    mode = importMode,
                                     onProgress = { p, s -> DeployManager.updateProgress(p, s) }
                                 )
-                                migrationStatus = if (ok) "Импорт завершён, wdtt.service перезапущен" else "Ошибка импорта: операция не была применена, подробности записаны в лог деплоя"
+                                if (ok && importMode == ServerImportMode.Replace) {
+                                    val restoredConnection = importedServerConnectionForTarget(backup, request)
+                                    val restoredPorts = restoredConnection.adminProfile.effectivePorts(restoredConnection.ports)
+                                    settingsStore.applyImportedServerConnection(
+                                        profileIndex = importProfile,
+                                        host = restoredConnection.host,
+                                        connectionPassword = restoredConnection.password,
+                                        dtlsPort = restoredPorts.first,
+                                        wgPort = restoredPorts.second,
+                                        ownerProfile = restoredConnection.adminProfile.copy(listenPort = restoredPorts.third)
+                                    )
+                                }
+                                migrationStatus = when {
+                                    !ok -> "Ошибка импорта: операция не была применена, подробности записаны в лог деплоя"
+                                    importMode == ServerImportMode.Replace -> "Импорт завершён, wdtt.service перезапущен, активный VPN-профиль переключён на новый сервер"
+                                    else -> "Импорт завершён, wdtt.service перезапущен"
+                                }
                             } catch (e: Exception) {
                                 migrationStatus = "Ошибка импорта: ${friendlyDeployError(e, "импорт")}"
                                 DeployManager.writeError("Server direct import error: ${e.message}")
@@ -3445,7 +3788,7 @@ private fun OutboundRoutingSection(
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 Text(
-                    "Обычная сеть самого сервера не меняется. Для маскировки выходного IP используйте бесплатный WARP, внешний TCP-прокси, другой сервер или VPN/WireGuard-файл.",
+                    "Обычная сеть самого сервера не меняется. Для другого выходного IP используйте бесплатный WARP, внешний TCP-прокси, существующий TUN-интерфейс, другой сервер или VPN/WireGuard-файл.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -3479,6 +3822,14 @@ private fun OutboundRoutingSection(
                         indicator = outboundModeIndicator(snapshot, OutboundDialog.ExternalProxy)
                     ) {
                         onOpen(OutboundDialog.ExternalProxy)
+                    }
+                    OutboundModeButton(
+                        title = "Существующий TUN-интерфейс",
+                        description = "Направляет весь трафик WDTT в уже настроенный на сервере TUN, например созданный Xray или sing-box.",
+                        enabled = enabled,
+                        indicator = outboundModeIndicator(snapshot, OutboundDialog.TunInterface)
+                    ) {
+                        onOpen(OutboundDialog.TunInterface)
                     }
                     OutboundModeButton(
                         title = "Другой сервер",
@@ -3610,6 +3961,7 @@ private fun OutboundServerStateCard(
         lastCheckError.isNotBlank() -> OutboundModeVisualState.Error
         snapshot == null -> OutboundModeVisualState.Unknown
         snapshot.hasRouteConflict -> OutboundModeVisualState.Error
+        snapshot.mode == "tun_interface" && !snapshot.tunHealthy -> OutboundModeVisualState.Error
         snapshot.outboundModeMismatchWarning() != null -> OutboundModeVisualState.Warning
         snapshot.mode == "direct" && snapshot.activeRouteLabels.isEmpty() -> OutboundModeVisualState.Off
         snapshot.activeRouteLabels.isNotEmpty() -> OutboundModeVisualState.Active
@@ -3701,14 +4053,23 @@ private fun OutboundModeButton(
             Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text(title, fontWeight = FontWeight.SemiBold, color = LocalContentColor.current)
+                    Text(
+                        title,
+                        modifier = Modifier.weight(1f),
+                        fontWeight = FontWeight.SemiBold,
+                        color = LocalContentColor.current,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
                     Text(
                         indicator.text,
+                        modifier = Modifier.padding(start = 8.dp),
                         style = MaterialTheme.typography.labelSmall,
-                        color = outboundIndicatorColor(indicator.state)
+                        color = outboundIndicatorColor(indicator.state),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
                 Text(
@@ -4530,6 +4891,243 @@ private fun FreeWarpDialog(
 }
 
 @Composable
+private fun TunInterfaceDialog(
+    busy: Boolean,
+    candidatesBusy: Boolean,
+    status: String,
+    actionTitle: String,
+    progressTitle: String,
+    progress: Float,
+    indicator: OutboundModeIndicator,
+    interfaceInput: String,
+    candidates: List<TunInterfaceCandidate>,
+    disableEnabled: Boolean,
+    checkEnabled: Boolean,
+    deleteEnabled: Boolean,
+    onInterfaceChanged: (String) -> Unit,
+    onRefreshCandidates: () -> Unit,
+    onDismiss: () -> Unit,
+    onEnable: (String) -> Unit,
+    onCheck: () -> Unit,
+    onDisable: () -> Unit,
+    onDelete: () -> Unit
+) {
+    var confirmDelete by rememberSaveable { mutableStateOf(false) }
+    var showSetupHelp by rememberSaveable { mutableStateOf(false) }
+    val normalizedInterface = interfaceInput.trim()
+    val interfaceIssue = tunInterfaceSelectionIssue(normalizedInterface, candidates)
+    OutboundDialogFrame("Существующий TUN-интерфейс", status, progressTitle, progress, onDismiss) {
+        OutboundDialogStateBanner(indicator)
+        Text(
+            "Использует уже подготовленный на сервере TUN. WDTT Plus добавляет только собственные маршруты клиентской подсети и не меняет конфигурацию Xray, sing-box или другой службы.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Text(
+            "Пока это окно открыто, состояние сервера обновляется автоматически каждые 10 секунд. Если TUN пропадёт, здесь появится предупреждение, а прямой выход трафика WDTT будет заблокирован.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                "Подготовка внешнего TUN",
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.SemiBold
+            )
+            IconButton(
+                onClick = { showSetupHelp = true },
+                enabled = !busy,
+                modifier = Modifier.size(32.dp)
+            ) {
+                Icon(
+                    Icons.AutoMirrored.Filled.HelpOutline,
+                    contentDescription = "Как подготовить TUN-интерфейс",
+                    modifier = Modifier.size(20.dp)
+                )
+            }
+        }
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            verticalArrangement = Arrangement.spacedBy(2.dp)
+        ) {
+            Text("Найденные кандидаты", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+            TextButton(
+                onClick = onRefreshCandidates,
+                enabled = !busy && !candidatesBusy,
+                modifier = Modifier.align(Alignment.Start)
+            ) {
+                if (candidatesBusy) {
+                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                    Spacer(Modifier.width(6.dp))
+                } else {
+                    Icon(Icons.Default.Search, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                }
+                Text(if (candidatesBusy) "Поиск..." else "Обновить")
+            }
+        }
+        if (candidates.isEmpty() && !candidatesBusy) {
+            Text(
+                "Кандидаты не найдены. Точное имя можно ввести вручную ниже.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        } else {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                candidates.forEach { candidate ->
+                    Surface(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable(enabled = !busy && !candidatesBusy) {
+                                onInterfaceChanged(candidate.name)
+                            },
+                        shape = RoundedCornerShape(8.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.25f))
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            RadioButton(
+                                selected = normalizedInterface == candidate.name,
+                                onClick = { onInterfaceChanged(candidate.name) },
+                                enabled = !busy && !candidatesBusy
+                            )
+                            Text(candidate.name, modifier = Modifier.weight(1f), fontWeight = FontWeight.SemiBold)
+                            Text(
+                                if (candidate.isUp) "поднят" else "остановлен",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (candidate.isUp) WDTTColors.connected else MaterialTheme.colorScheme.error
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        OutlinedTextField(
+            value = interfaceInput,
+            onValueChange = onInterfaceChanged,
+            label = { Text("Имя TUN-интерфейса") },
+            placeholder = { Text("xray0") },
+            singleLine = true,
+            isError = interfaceIssue != null && interfaceInput.isNotBlank(),
+            supportingText = {
+                Text(interfaceIssue ?: "Выберите кандидата выше или укажите точное имя вручную.")
+            },
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(16.dp),
+            enabled = !busy
+        )
+        DialogButtons(
+            busy = busy,
+            primaryBusy = actionTitle.contains("Включаю выход через TUN", ignoreCase = true),
+            secondaryBusy = actionTitle.contains("Проверяю выход через TUN", ignoreCase = true),
+            primaryText = "Включить",
+            primaryBusyText = "Включение...",
+            primaryEnabled = interfaceIssue == null,
+            onPrimary = { onEnable(normalizedInterface) },
+            secondaryText = "Проверить",
+            secondaryBusyText = "Проверка...",
+            secondaryEnabled = checkEnabled,
+            onSecondary = onCheck
+        )
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            OutlinedButton(
+                onClick = onDisable,
+                enabled = !busy && disableEnabled,
+                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                shape = RoundedCornerShape(16.dp)
+            ) {
+                Text(if (actionTitle.contains("Возвращаю", true)) "Отключение..." else "Отключить", textAlign = TextAlign.Center)
+            }
+            OutlinedButton(
+                onClick = { confirmDelete = true },
+                enabled = !busy && deleteEnabled,
+                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                shape = RoundedCornerShape(16.dp)
+            ) {
+                Text(if (actionTitle.contains("Удаляю настройку TUN", true)) "Удаление..." else "Удалить", textAlign = TextAlign.Center)
+            }
+        }
+    }
+    if (showSetupHelp) {
+        val configuration = LocalConfiguration.current
+        val helpMaxHeight = (configuration.screenHeightDp.dp * 0.56f).coerceAtMost(460.dp)
+        AlertDialog(
+            onDismissRequest = { showSetupHelp = false },
+            title = {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.Top
+                ) {
+                    Text(
+                        "Как подготовить TUN-интерфейс",
+                        modifier = Modifier.weight(1f)
+                    )
+                    IconButton(
+                        onClick = { showSetupHelp = false },
+                        modifier = Modifier.size(36.dp)
+                    ) {
+                        Icon(
+                            Icons.Default.Close,
+                            contentDescription = "Закрыть",
+                            modifier = Modifier.size(22.dp)
+                        )
+                    }
+                }
+            },
+            text = {
+                Column(
+                    modifier = Modifier
+                        .heightIn(max = helpMaxHeight)
+                        .verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Text("1. Создайте и запустите TUN-интерфейс в Xray, sing-box или другом приложении на этом сервере.")
+                    Text("2. Настройте правила маршрутизации внутри этого приложения. Для правил по доменам включите распознавание доменов там же. WDTT Plus не меняет эти настройки.")
+                    Text("3. Вернитесь сюда, обновите кандидатов и выберите имя поднятого интерфейса. Если его нет в списке, введите точное имя вручную. Системные интерфейсы сервера использовать нельзя.")
+                    Text("4. После включения проверьте выход. Если внешний TUN остановится, клиентский трафик WDTT будет заблокирован до его восстановления или возврата в прямой режим.")
+                    Text("5. Пока открыт блок или окно TUN, WDTT Plus перечитывает состояние сервера каждые 10 секунд. Если внешний TUN пропадёт, приложение покажет предупреждение, а трафик WDTT останется заблокированным до восстановления TUN или возврата в прямой режим.")
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showSetupHelp = false }) { Text("Понятно") }
+            }
+        )
+    }
+    if (confirmDelete) {
+        AlertDialog(
+            onDismissRequest = { if (!busy) confirmDelete = false },
+            title = { Text("Удалить настройку TUN-выхода?") },
+            text = {
+                Text("WDTT Plus удалит только собственную службу, маршруты и сохранённое имя интерфейса. Сам TUN-интерфейс и создавшее его приложение останутся без изменений.")
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        confirmDelete = false
+                        onDelete()
+                    },
+                    enabled = !busy
+                ) { Text("Удалить") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmDelete = false }, enabled = !busy) { Text("Отмена") }
+            }
+        )
+    }
+}
+
+@Composable
 private fun ImportedWireGuardDialog(
     busy: Boolean,
     status: String,
@@ -5111,6 +5709,14 @@ internal fun serverDiagnosticsScript(
       fi
       return 2
     }
+    wdtt_diag_tcp_listen_port() {
+      port="${'$'}1"
+      if wdtt_diag_cmd ss; then
+        ss -H -lnt 2>/dev/null | awk -v needle=":${'$'}port" 'index(${'$'}4, needle) && ${'$'}4 ~ (needle "${'$'}") {found=1} END {exit found ? 0 : 1}'
+        return "${'$'}?"
+      fi
+      return 2
+    }
     wdtt_diag_wireguard_kernel() {
       if [ -d /sys/module/wireguard ] || grep -qw wireguard /proc/modules 2>/dev/null; then
         echo "wireguard в ядре найден"
@@ -5371,6 +5977,50 @@ internal fun serverDiagnosticsScript(
     WG_DEFAULT_ROUTE_ACTIVE=0
     WG_INTERFACE_ACTIVE=0
     WG_SERVICE_ACTIVE=0
+    EXTERNAL_PROXY_CONFIG_PRESENT=0
+    EXTERNAL_PROXY_SERVICE_ACTIVE=0
+    EXTERNAL_PROXY_SERVICE_ENABLED=0
+    EXTERNAL_PROXY_LISTEN_ACTIVE=0
+    EXTERNAL_PROXY_ROUTE_ACTIVE=0
+    EXTERNAL_PROXY_REDIRECT_ACTIVE=0
+    [ -r /etc/wdtt/redsocks.conf ] && EXTERNAL_PROXY_CONFIG_PRESENT=1
+    if wdtt_diag_cmd systemctl && systemctl is-active --quiet wdtt-redsocks.service 2>/dev/null; then
+      EXTERNAL_PROXY_SERVICE_ACTIVE=1
+    fi
+    if wdtt_diag_cmd systemctl && systemctl is-enabled --quiet wdtt-redsocks.service 2>/dev/null; then
+      EXTERNAL_PROXY_SERVICE_ENABLED=1
+    fi
+    wdtt_diag_tcp_listen_port 12345 && EXTERNAL_PROXY_LISTEN_ACTIVE=1
+    LOCAL_PROXY_PRESENT=0
+    LOCAL_PROXY_SERVICE_ACTIVE=0
+    LOCAL_PROXY_SERVICE_ENABLED=0
+    LOCAL_PROXY_LISTEN_ACTIVE=0
+    LOCAL_PROXY_FIREWALL_RULES=0
+    LOCAL_PROXY_PORT="${'$'}(sed -n -E 's/^[[:space:]]*socks[[:space:]].*-p([0-9]+).*/\1/p' /etc/wdtt/3proxy.cfg 2>/dev/null | head -n 1)"
+    if [ -r /etc/wdtt/3proxy.cfg ] || [ -r /etc/wdtt/local-proxy.json ] ||
+       [ -e /etc/systemd/system/wdtt-3proxy.service ]; then
+      LOCAL_PROXY_PRESENT=1
+    fi
+    if wdtt_diag_cmd systemctl && systemctl is-active --quiet wdtt-3proxy.service 2>/dev/null; then
+      LOCAL_PROXY_SERVICE_ACTIVE=1
+      LOCAL_PROXY_PRESENT=1
+    fi
+    if wdtt_diag_cmd systemctl && systemctl is-enabled --quiet wdtt-3proxy.service 2>/dev/null; then
+      LOCAL_PROXY_SERVICE_ENABLED=1
+    fi
+    case "${'$'}LOCAL_PROXY_PORT" in
+      ''|*[!0-9]*) ;;
+      *) wdtt_diag_tcp_listen_port "${'$'}LOCAL_PROXY_PORT" && LOCAL_PROXY_LISTEN_ACTIVE=1 ;;
+    esac
+    TUN_INTERFACE="${'$'}(cat /etc/wdtt-plus/tun-exit/interface 2>/dev/null | head -n 1)"
+    TUN_INTERFACE_ACTIVE=0
+    TUN_SERVICE_ACTIVE=0
+    TUN_POLICY_RULE_ACTIVE=0
+    TUN_DEFAULT_ROUTE_ACTIVE=0
+    TUN_FAIL_CLOSED_ACTIVE=0
+    TUN_FORWARD_RULES_ACTIVE=0
+    TUN_IP_FORWARD_ACTIVE=0
+    [ "${'$'}(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" = "1" ] && TUN_IP_FORWARD_ACTIVE=1
     if wdtt_diag_cmd iptables; then
       NAT_RULES="${'$'}(iptables -t nat -S 2>/dev/null | grep -c 'WDTT\\|wdtt\\|MASQUERADE' 2>/dev/null)"
       FIREWALL_DETAILS="iptables найден; NAT-правил WDTT/MASQUERADE: ${'$'}NAT_RULES."
@@ -5382,6 +6032,11 @@ internal fun serverDiagnosticsScript(
       iptables -t nat -S POSTROUTING 2>/dev/null |
         grep -q -- "-o wg-wdtt-exit .*--comment WDTT_EXIT .*MASQUERADE" &&
         WG_NAT_ACTIVE=1
+      iptables -t nat -C PREROUTING -i wdtt0 -p tcp -j WDTT_PROXY_OUT 2>/dev/null &&
+        EXTERNAL_PROXY_ROUTE_ACTIVE=1
+      iptables -t nat -S WDTT_PROXY_OUT 2>/dev/null |
+        grep -q -- '--to-ports 12345' && EXTERNAL_PROXY_REDIRECT_ACTIVE=1
+      LOCAL_PROXY_FIREWALL_RULES="${'$'}(iptables -S INPUT 2>/dev/null | grep -c -- '--comment WDTT_LOCAL_PROXY' 2>/dev/null)"
     elif wdtt_diag_cmd nft; then
       FIREWALL_DETAILS="iptables не найден, nft найден. Часть скриптов WDTT Plus ожидает iptables-совместимый интерфейс."
       FIREWALL_SEVERITY="WARNING"
@@ -5402,10 +6057,31 @@ internal fun serverDiagnosticsScript(
         grep -Eq '^default([[:space:]].*)? dev wg-wdtt-exit([[:space:]]|${'$'})' &&
         WG_DEFAULT_ROUTE_ACTIVE=1
       ip link show dev wg-wdtt-exit >/dev/null 2>&1 && WG_INTERFACE_ACTIVE=1
+      if [ -n "${'$'}TUN_INTERFACE" ] &&
+         ip -o link show dev "${'$'}TUN_INTERFACE" 2>/dev/null | grep -q '<[^>]*UP[,>]'; then
+        TUN_INTERFACE_ACTIVE=1
+      fi
+      ip rule show 2>/dev/null | grep -Eq 'from [^ ]+ lookup 110([[:space:]]|${'$'})' &&
+        TUN_POLICY_RULE_ACTIVE=1
+      if [ -n "${'$'}TUN_INTERFACE" ] &&
+         ip route show table 110 2>/dev/null |
+           grep -Eq "^default([[:space:]].*)? dev ${'$'}TUN_INTERFACE([[:space:]]|${'$'})"; then
+        TUN_DEFAULT_ROUTE_ACTIVE=1
+      fi
     fi
     if wdtt_diag_cmd systemctl && systemctl is-active --quiet wdtt-wg-exit.service 2>/dev/null; then
       WG_SERVICE_ACTIVE=1
     fi
+    if wdtt_diag_cmd systemctl && systemctl is-active --quiet wdtt-tun-exit.service 2>/dev/null; then
+      TUN_SERVICE_ACTIVE=1
+    fi
+    if wdtt_diag_cmd iptables && [ -n "${'$'}TUN_INTERFACE" ] &&
+       iptables -C FORWARD -i wdtt0 -o "${'$'}TUN_INTERFACE" -m comment --comment WDTT_TUN_EXIT -j ACCEPT 2>/dev/null &&
+       iptables -C FORWARD -i "${'$'}TUN_INTERFACE" -o wdtt0 -m comment --comment WDTT_TUN_EXIT -j ACCEPT 2>/dev/null; then
+      TUN_FORWARD_RULES_ACTIVE=1
+    fi
+    ip route show table 110 2>/dev/null | grep -Eq '^unreachable default([[:space:]]|${'$'})' &&
+      TUN_FAIL_CLOSED_ACTIVE=1
     case "${'$'}OUT_MODE" in
       warp_free|wireguard_vps|imported_wg)
         FIREWALL_DETAILS="${'$'}FIREWALL_DETAILS WireGuard-выход: интерфейс=${'$'}WG_INTERFACE_ACTIVE, служба=${'$'}WG_SERVICE_ACTIVE, правило=${'$'}WG_POLICY_RULE_ACTIVE, маршрут=${'$'}WG_DEFAULT_ROUTE_ACTIVE, NAT=${'$'}WG_NAT_ACTIVE."
@@ -5425,6 +6101,40 @@ internal fun serverDiagnosticsScript(
           FIREWALL_STATUS="WireGuard-выход запущен не полностью"
         fi
         ;;
+      tun_interface)
+        TUN_TEST_SOURCE="${'$'}(ip -4 -o addr show dev wdtt0 scope global 2>/dev/null | awk '{split(${'$'}4, value, "/"); print value[1]; exit}')"
+        TUN_EXIT_IP=""
+        [ -n "${'$'}TUN_TEST_SOURCE" ] && TUN_EXIT_IP="${'$'}(curl -4fsS --interface "${'$'}TUN_TEST_SOURCE" --max-time 12 https://api.ipify.org 2>/dev/null || true)"
+        FIREWALL_DETAILS="${'$'}FIREWALL_DETAILS TUN-выход ${'$'}{TUN_INTERFACE:-не указан}: интерфейс=${'$'}TUN_INTERFACE_ACTIVE, служба=${'$'}TUN_SERVICE_ACTIVE, правило=${'$'}TUN_POLICY_RULE_ACTIVE, маршрут=${'$'}TUN_DEFAULT_ROUTE_ACTIVE, блокировка=${'$'}TUN_FAIL_CLOSED_ACTIVE, FORWARD=${'$'}TUN_FORWARD_RULES_ACTIVE, ip_forward=${'$'}TUN_IP_FORWARD_ACTIVE, проверочный IP=${'$'}{TUN_EXIT_IP:-нет}."
+        if [ "${'$'}TUN_INTERFACE_ACTIVE" = "1" ] &&
+           [ "${'$'}TUN_SERVICE_ACTIVE" = "1" ] &&
+           [ "${'$'}TUN_POLICY_RULE_ACTIVE" = "1" ] &&
+           [ "${'$'}TUN_DEFAULT_ROUTE_ACTIVE" = "1" ] &&
+           [ "${'$'}TUN_FORWARD_RULES_ACTIVE" = "1" ] &&
+           [ "${'$'}TUN_IP_FORWARD_ACTIVE" = "1" ] &&
+           [ -n "${'$'}TUN_EXIT_IP" ]; then
+          FIREWALL_SEVERITY="OK"
+          FIREWALL_STATUS="TUN-выход исправен"
+        else
+          FIREWALL_SEVERITY="ERROR"
+          FIREWALL_STATUS="TUN-выход запущен не полностью"
+        fi
+        ;;
+      external_proxy)
+        FIREWALL_DETAILS="${'$'}FIREWALL_DETAILS Внешний TCP-прокси: конфиг=${'$'}EXTERNAL_PROXY_CONFIG_PRESENT, служба=${'$'}EXTERNAL_PROXY_SERVICE_ACTIVE, автозапуск=${'$'}EXTERNAL_PROXY_SERVICE_ENABLED, порт 12345=${'$'}EXTERNAL_PROXY_LISTEN_ACTIVE, PREROUTING=${'$'}EXTERNAL_PROXY_ROUTE_ACTIVE, REDIRECT=${'$'}EXTERNAL_PROXY_REDIRECT_ACTIVE."
+        if [ "${'$'}EXTERNAL_PROXY_CONFIG_PRESENT" = "1" ] &&
+           [ "${'$'}EXTERNAL_PROXY_SERVICE_ACTIVE" = "1" ] &&
+           [ "${'$'}EXTERNAL_PROXY_SERVICE_ENABLED" = "1" ] &&
+           [ "${'$'}EXTERNAL_PROXY_LISTEN_ACTIVE" = "1" ] &&
+           [ "${'$'}EXTERNAL_PROXY_ROUTE_ACTIVE" = "1" ] &&
+           [ "${'$'}EXTERNAL_PROXY_REDIRECT_ACTIVE" = "1" ]; then
+          FIREWALL_SEVERITY="OK"
+          FIREWALL_STATUS="внешний TCP-прокси настроен"
+        else
+          FIREWALL_SEVERITY="ERROR"
+          FIREWALL_STATUS="внешний TCP-прокси запущен не полностью"
+        fi
+        ;;
       direct|"")
         if [ "${'$'}WDTT_SERVICE_FOR_ROUTING" = "active" ] && [ "${'$'}DIRECT_NAT_ACTIVE" != "1" ]; then
           FIREWALL_SEVERITY="ERROR"
@@ -5434,8 +6144,81 @@ internal fun serverDiagnosticsScript(
           FIREWALL_STATUS="прямой выход настроен"
         fi
         ;;
+      *)
+        FIREWALL_SEVERITY="WARNING"
+        FIREWALL_STATUS="неизвестный режим выхода"
+        FIREWALL_DETAILS="${'$'}FIREWALL_DETAILS В outbound.json записан неизвестный режим: ${'$'}{OUT_MODE:-пусто}."
+        ;;
     esac
-    wdtt_diag_emit "${'$'}FIREWALL_SEVERITY" "Маршрутизация и NAT" "${'$'}FIREWALL_STATUS" "${'$'}FIREWALL_DETAILS" "Для WARP/VPN нужны одновременно активные интерфейс и служба, правило ip rule, маршрут таблицы 100, NAT WDTT_EXIT и успешный HTTPS-выход. Откройте выбранный режим в «Выходной IP и прокси» и нажмите «Установить / восстановить»."
+    ACTIVE_ROUTE_COMPONENTS=0
+    [ "${'$'}EXTERNAL_PROXY_ROUTE_ACTIVE" = "1" ] && ACTIVE_ROUTE_COMPONENTS="${'$'}((ACTIVE_ROUTE_COMPONENTS + 1))"
+    if [ "${'$'}WG_POLICY_RULE_ACTIVE" = "1" ] || [ "${'$'}WG_DEFAULT_ROUTE_ACTIVE" = "1" ] || [ "${'$'}WG_NAT_ACTIVE" = "1" ]; then
+      ACTIVE_ROUTE_COMPONENTS="${'$'}((ACTIVE_ROUTE_COMPONENTS + 1))"
+    fi
+    if [ "${'$'}TUN_POLICY_RULE_ACTIVE" = "1" ] || [ "${'$'}TUN_DEFAULT_ROUTE_ACTIVE" = "1" ] || [ "${'$'}TUN_FORWARD_RULES_ACTIVE" = "1" ]; then
+      ACTIVE_ROUTE_COMPONENTS="${'$'}((ACTIVE_ROUTE_COMPONENTS + 1))"
+    fi
+    if [ "${'$'}ACTIVE_ROUTE_COMPONENTS" -gt 1 ]; then
+      FIREWALL_SEVERITY="ERROR"
+      FIREWALL_STATUS="конфликт маршрутов внешнего выхода"
+      FIREWALL_DETAILS="${'$'}FIREWALL_DETAILS Одновременно найдены компоненты нескольких режимов внешнего выхода."
+    elif [ "${'$'}OUT_MODE" != "external_proxy" ] &&
+         { [ "${'$'}EXTERNAL_PROXY_ROUTE_ACTIVE" = "1" ] || [ "${'$'}EXTERNAL_PROXY_SERVICE_ACTIVE" = "1" ]; }; then
+      FIREWALL_SEVERITY="ERROR"
+      FIREWALL_STATUS="остались компоненты внешнего TCP-прокси"
+    elif { [ "${'$'}OUT_MODE" != "warp_free" ] && [ "${'$'}OUT_MODE" != "wireguard_vps" ] && [ "${'$'}OUT_MODE" != "imported_wg" ]; } &&
+         { [ "${'$'}WG_POLICY_RULE_ACTIVE" = "1" ] || [ "${'$'}WG_DEFAULT_ROUTE_ACTIVE" = "1" ] || [ "${'$'}WG_NAT_ACTIVE" = "1" ]; }; then
+      FIREWALL_SEVERITY="ERROR"
+      FIREWALL_STATUS="остались компоненты WireGuard-выхода"
+    elif [ "${'$'}OUT_MODE" != "tun_interface" ] &&
+         { [ "${'$'}TUN_POLICY_RULE_ACTIVE" = "1" ] || [ "${'$'}TUN_DEFAULT_ROUTE_ACTIVE" = "1" ] || [ "${'$'}TUN_FORWARD_RULES_ACTIVE" = "1" ]; }; then
+      FIREWALL_SEVERITY="ERROR"
+      FIREWALL_STATUS="остались компоненты TUN-выхода"
+    fi
+    wdtt_diag_emit "${'$'}FIREWALL_SEVERITY" "Маршрутизация и NAT" "${'$'}FIREWALL_STATUS" "${'$'}FIREWALL_DETAILS" "Для WARP/VPN нужны активные интерфейс и служба, правило ip rule, маршрут таблицы 100, NAT WDTT_EXIT и успешный HTTPS-выход. Для существующего TUN нужны интерфейс, служба WDTT, таблица 110, помеченные FORWARD-правила и успешный HTTPS-выход. Для внешнего TCP-прокси нужны активные redsocks, автозапуск, локальный порт и оба правила перенаправления. Откройте выбранный режим в «Выходной IP и прокси» и повторите включение."
+
+    EXTERNAL_PROXY_PRESENT=0
+    if [ "${'$'}EXTERNAL_PROXY_CONFIG_PRESENT" = "1" ] ||
+       [ "${'$'}EXTERNAL_PROXY_SERVICE_ACTIVE" = "1" ] ||
+       [ "${'$'}EXTERNAL_PROXY_ROUTE_ACTIVE" = "1" ] ||
+       [ "${'$'}OUT_MODE" = "external_proxy" ]; then
+      EXTERNAL_PROXY_PRESENT=1
+    fi
+    EXTERNAL_PROXY_DETAILS="конфиг=${'$'}EXTERNAL_PROXY_CONFIG_PRESENT, служба=${'$'}EXTERNAL_PROXY_SERVICE_ACTIVE, автозапуск=${'$'}EXTERNAL_PROXY_SERVICE_ENABLED, порт 12345=${'$'}EXTERNAL_PROXY_LISTEN_ACTIVE, правило PREROUTING=${'$'}EXTERNAL_PROXY_ROUTE_ACTIVE, REDIRECT=${'$'}EXTERNAL_PROXY_REDIRECT_ACTIVE. Учётные данные и адрес прокси диагностикой не выводятся."
+    if [ "${'$'}OUT_MODE" = "external_proxy" ]; then
+      if [ "${'$'}EXTERNAL_PROXY_CONFIG_PRESENT" = "1" ] &&
+         [ "${'$'}EXTERNAL_PROXY_SERVICE_ACTIVE" = "1" ] &&
+         [ "${'$'}EXTERNAL_PROXY_SERVICE_ENABLED" = "1" ] &&
+         [ "${'$'}EXTERNAL_PROXY_LISTEN_ACTIVE" = "1" ] &&
+         [ "${'$'}EXTERNAL_PROXY_ROUTE_ACTIVE" = "1" ] &&
+         [ "${'$'}EXTERNAL_PROXY_REDIRECT_ACTIVE" = "1" ]; then
+        wdtt_diag_emit "OK" "Внешний TCP-прокси" "компоненты активны" "${'$'}EXTERNAL_PROXY_DETAILS" "Доступность самого прокси проверяется при включении режима без раскрытия реквизитов в отчёте."
+      else
+        wdtt_diag_emit "ERROR" "Внешний TCP-прокси" "режим запущен не полностью" "${'$'}EXTERNAL_PROXY_DETAILS" "Откройте внешний TCP-прокси в «Выходной IP и прокси» и повторите включение или верните прямой выход."
+      fi
+    elif [ "${'$'}EXTERNAL_PROXY_ROUTE_ACTIVE" = "1" ] || [ "${'$'}EXTERNAL_PROXY_SERVICE_ACTIVE" = "1" ]; then
+      wdtt_diag_emit "ERROR" "Внешний TCP-прокси" "активен вне выбранного режима" "${'$'}EXTERNAL_PROXY_DETAILS" "Верните прямой выход, затем включите только один нужный режим."
+    elif [ "${'$'}EXTERNAL_PROXY_PRESENT" = "1" ]; then
+      wdtt_diag_emit "INFO" "Внешний TCP-прокси" "настроен, но выключен" "${'$'}EXTERNAL_PROXY_DETAILS" "Это нормально, пока выбран другой режим выхода."
+    else
+      wdtt_diag_emit "INFO" "Внешний TCP-прокси" "не настроен" "Компоненты перенаправления redsocks не найдены." ""
+    fi
+
+    LOCAL_PROXY_DETAILS="конфиг=${'$'}LOCAL_PROXY_PRESENT, служба=${'$'}LOCAL_PROXY_SERVICE_ACTIVE, автозапуск=${'$'}LOCAL_PROXY_SERVICE_ENABLED, SOCKS5-порт=${'$'}{LOCAL_PROXY_PORT:-не определён}, порт слушается=${'$'}LOCAL_PROXY_LISTEN_ACTIVE, правил доступа=${'$'}LOCAL_PROXY_FIREWALL_RULES. Учётные данные диагностикой не читаются и не выводятся."
+    if [ "${'$'}LOCAL_PROXY_PRESENT" != "1" ]; then
+      wdtt_diag_emit "INFO" "Прокси на этом VPS (3proxy)" "не установлен" "Локальный SOCKS5/HTTP-прокси не настроен; на работу выбранного выхода WDTT это не влияет." ""
+    elif [ "${'$'}LOCAL_PROXY_SERVICE_ACTIVE" = "1" ] &&
+         [ "${'$'}LOCAL_PROXY_SERVICE_ENABLED" = "1" ] &&
+         [ "${'$'}LOCAL_PROXY_LISTEN_ACTIVE" = "1" ] &&
+         [ "${'$'}LOCAL_PROXY_FIREWALL_RULES" -ge 3 ] 2>/dev/null; then
+      wdtt_diag_emit "OK" "Прокси на этом VPS (3proxy)" "служба и порт активны" "${'$'}LOCAL_PROXY_DETAILS" "Функциональную проверку с логином и паролем запускайте кнопкой «Проверить» в настройках 3proxy."
+    elif [ "${'$'}LOCAL_PROXY_SERVICE_ACTIVE" = "1" ]; then
+      wdtt_diag_emit "WARNING" "Прокси на этом VPS (3proxy)" "запущен не полностью" "${'$'}LOCAL_PROXY_DETAILS" "Повторите установку 3proxy или остановите его, если он больше не нужен."
+    elif [ "${'$'}LOCAL_PROXY_SERVICE_ENABLED" = "1" ]; then
+      wdtt_diag_emit "WARNING" "Прокси на этом VPS (3proxy)" "автозапуск включён, служба не работает" "${'$'}LOCAL_PROXY_DETAILS" "Проверьте журнал wdtt-3proxy.service и повторите установку 3proxy или выключите его."
+    else
+      wdtt_diag_emit "INFO" "Прокси на этом VPS (3proxy)" "настроен, но остановлен" "${'$'}LOCAL_PROXY_DETAILS" "Это не влияет на маршрут клиентов WDTT; включите прокси только если он нужен как отдельная служба."
+    fi
 
     WDTT_SERVICE="${'$'}(wdtt_diag_service_state wdtt.service)"
     WDTT_BIN="${'$'}(wdtt_diag_file_state /usr/local/bin/wdtt-server)"
@@ -5717,9 +6500,9 @@ private class SSHClient(private val session: Session, private val pass: String) 
                         } else if (!line.contains("WDTT_PROGRESS")) {
                             val clean = line.replace(Regex("\u001B\\[[;\\d]*m"), "")
                             result.appendLine(clean)
-                            if (shouldWriteRemoteErrorToUserLog(clean)) {
-                                DeployManager.writeError("REMOTE: $clean")
-                                TunnelManager.addDeployErrorLog("REMOTE: $clean")
+                            remoteErrorMessageForUserLog(clean)?.let { message ->
+                                DeployManager.writeError(message)
+                                TunnelManager.addDeployErrorLog(message)
                             }
                         }
                     }
@@ -5730,8 +6513,9 @@ private class SSHClient(private val session: Session, private val pass: String) 
                         val clean = line.replace(Regex("\u001B\\[[;\\d]*m"), "")
                         result.appendLine(clean)
                         if (clean.isNotBlank() && !clean.startsWith("Warning:")) {
-                            DeployManager.writeError("STDERR: $clean")
-                            TunnelManager.addDeployErrorLog("STDERR: $clean")
+                            val message = "Ошибка на сервере: $clean"
+                            DeployManager.writeError(message)
+                            TunnelManager.addDeployErrorLog(message)
                         }
                     }
                 }
@@ -5865,7 +6649,11 @@ internal fun outboundShellPrelude(): String = """
     WDTT_WG_IFACE="wg-wdtt-exit"
     WDTT_WG_OWNER_FILE="/etc/wdtt-plus/wg-exit/owner"
     WDTT_WG_CONFIG_OWNER_FILE="/etc/wdtt-plus/wg-exit/config-owner"
-    mkdir -p /etc/wdtt /etc/wdtt/outbound /etc/wdtt-plus/wg-exit
+    WDTT_TUN_TABLE="110"
+    WDTT_TUN_PRIORITY="90"
+    WDTT_TUN_CONFIG_FILE="/etc/wdtt-plus/tun-exit/interface"
+    WDTT_TUN_OWNER_FILE="/etc/wdtt-plus/tun-exit/owner"
+    mkdir -p /etc/wdtt /etc/wdtt/outbound /etc/wdtt-plus/wg-exit /etc/wdtt-plus/tun-exit
     wdtt_ext_iface() {
       ip -o route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if (${'$'}i=="dev") {print ${'$'}(i+1); exit}}'
     }
@@ -5892,17 +6680,17 @@ internal fun outboundShellPrelude(): String = """
     }
     wdtt_install_redsocks_tools() {
       if command -v apt-get >/dev/null 2>&1; then
-        wdtt_install_pkg redsocks curl iptables psmisc iproute2
+        wdtt_install_pkg redsocks curl iptables psmisc iproute2 coreutils
       elif command -v dnf >/dev/null 2>&1; then
-        wdtt_install_pkg redsocks curl iptables psmisc iproute
+        wdtt_install_pkg redsocks curl iptables psmisc iproute coreutils
       elif command -v yum >/dev/null 2>&1; then
-        wdtt_install_pkg redsocks curl iptables psmisc iproute
+        wdtt_install_pkg redsocks curl iptables psmisc iproute coreutils
       elif command -v zypper >/dev/null 2>&1; then
-        wdtt_install_pkg redsocks curl iptables psmisc iproute2
+        wdtt_install_pkg redsocks curl iptables psmisc iproute2 coreutils
       elif command -v apk >/dev/null 2>&1; then
-        wdtt_install_pkg redsocks curl iptables psmisc iproute2
+        wdtt_install_pkg redsocks curl iptables psmisc iproute2 coreutils
       elif command -v pacman >/dev/null 2>&1; then
-        wdtt_install_pkg redsocks curl iptables psmisc iproute2
+        wdtt_install_pkg redsocks curl iptables psmisc iproute2 coreutils
       else
         return 1
       fi
@@ -5948,9 +6736,58 @@ internal fun outboundShellPrelude(): String = """
       rm -f "${'$'}WDTT_WG_OWNER_FILE"
       systemctl reset-failed wdtt-wg-exit.service 2>/dev/null || true
     }
+    wdtt_tun_is_owned() {
+      [ "${'$'}(cat "${'$'}WDTT_TUN_OWNER_FILE" 2>/dev/null | head -n 1)" = WDTT_TUN_EXIT_V1 ]
+    }
+    wdtt_tun_reserved_state_present() {
+      [ -e "${'$'}WDTT_TUN_OWNER_FILE" ] && return 0
+      [ -e "${'$'}WDTT_TUN_CONFIG_FILE" ] && return 0
+      [ -e /etc/systemd/system/wdtt-tun-exit.service ] && return 0
+      [ -e /usr/local/lib/wdtt/tun-exit-route ] && return 0
+      [ -e /usr/local/lib/wdtt/tun-exit-watch ] && return 0
+      systemctl is-active --quiet wdtt-tun-exit.service 2>/dev/null && return 0
+      ip rule show 2>/dev/null | grep -Eq "lookup ${'$'}WDTT_TUN_TABLE([[:space:]]|${'$'})" && return 0
+      [ -n "${'$'}(ip route show table "${'$'}WDTT_TUN_TABLE" 2>/dev/null)" ] && return 0
+      command -v iptables >/dev/null 2>&1 &&
+        iptables -S FORWARD 2>/dev/null | grep -q -- '--comment WDTT_TUN_EXIT' && return 0
+      return 1
+    }
+    wdtt_require_tun_cleanup_ownership() {
+      ! wdtt_tun_reserved_state_present || wdtt_tun_is_owned
+    }
+    wdtt_clear_tun_out() {
+      wdtt_require_tun_cleanup_ownership || return 1
+      wdtt_tun_is_owned || return 0
+      systemctl disable --now wdtt-tun-exit.service 2>/dev/null || systemctl stop wdtt-tun-exit.service 2>/dev/null || true
+      if [ -x /usr/local/lib/wdtt/tun-exit-route ]; then
+        /usr/local/lib/wdtt/tun-exit-route down >/dev/null 2>&1 || true
+      else
+        tun_iface="${'$'}(cat "${'$'}WDTT_TUN_CONFIG_FILE" 2>/dev/null | head -n 1)"
+        while ip rule del from "${'$'}WDTT_SUBNET" table "${'$'}WDTT_TUN_TABLE" priority "${'$'}WDTT_TUN_PRIORITY" 2>/dev/null; do :; done
+        ip route flush table "${'$'}WDTT_TUN_TABLE" 2>/dev/null || true
+        if command -v iptables >/dev/null 2>&1 && [ -n "${'$'}tun_iface" ]; then
+          while iptables -D FORWARD -i "${'$'}WDTT_IFACE" -o "${'$'}tun_iface" -m comment --comment WDTT_TUN_EXIT -j ACCEPT 2>/dev/null; do :; done
+          while iptables -D FORWARD -i "${'$'}tun_iface" -o "${'$'}WDTT_IFACE" -m comment --comment WDTT_TUN_EXIT -j ACCEPT 2>/dev/null; do :; done
+        fi
+      fi
+      if command -v iptables >/dev/null 2>&1; then
+        while :; do
+          tun_rule="${'$'}(iptables -S FORWARD 2>/dev/null | grep -- '--comment WDTT_TUN_EXIT' | head -n 1 || true)"
+          [ -n "${'$'}tun_rule" ] || break
+          set -- ${'$'}tun_rule
+          [ "${'$'}{1:-}" = "-A" ] || break
+          shift
+          iptables -D "${'$'}@" 2>/dev/null || break
+        done
+      fi
+      rm -f /run/wdtt-tun-exit.state
+      systemctl reset-failed wdtt-tun-exit.service 2>/dev/null || true
+    }
     wdtt_clear_external_out() {
+      wdtt_require_tun_cleanup_ownership || { echo WDTT_ERROR=tun_exit_not_owned; exit 3; }
       wdtt_clear_proxy_out
       wdtt_clear_wireguard_out
+      wdtt_clear_tun_out
     }
     wdtt_kill_redsocks_listener() {
       rm -f /run/wdtt-redsocks.pid 2>/dev/null || true
@@ -6029,6 +6866,10 @@ private fun outboundReadPrelude(): String = """
     WDTT_WG_IFACE="wg-wdtt-exit"
     WDTT_WG_OWNER_FILE="/etc/wdtt-plus/wg-exit/owner"
     WDTT_WG_CONFIG_OWNER_FILE="/etc/wdtt-plus/wg-exit/config-owner"
+    WDTT_TUN_TABLE="110"
+    WDTT_TUN_PRIORITY="90"
+    WDTT_TUN_CONFIG_FILE="/etc/wdtt-plus/tun-exit/interface"
+    WDTT_TUN_OWNER_FILE="/etc/wdtt-plus/tun-exit/owner"
 """.trimIndent()
 
 internal fun outboundStatusScript(): String = shellScript(
@@ -6042,6 +6883,7 @@ internal fun outboundStatusScript(): String = shellScript(
     case "${'$'}MODE" in
       direct) MODE_LABEL="прямой выход";;
       external_proxy) MODE_LABEL="внешний TCP-прокси";;
+      tun_interface) MODE_LABEL="существующий TUN-интерфейс";;
       warp_free) MODE_LABEL="бесплатный WARP";;
       imported_wg) MODE_LABEL="VPN/WireGuard-файл";;
       wireguard_vps) MODE_LABEL="выход через другой сервер";;
@@ -6056,14 +6898,19 @@ internal fun outboundStatusScript(): String = shellScript(
       direct)
         echo "Проверочный выход WDTT: ${'$'}SERVER_IP (прямой выход)"
         ;;
-      warp_free|imported_wg|wireguard_vps)
+      warp_free|imported_wg|wireguard_vps|tun_interface)
         TEST_SOURCE="${'$'}(wdtt_test_source)"
         WDTT_EXIT_IP=""
         [ -n "${'$'}TEST_SOURCE" ] && WDTT_EXIT_IP="${'$'}(curl -4fsS --interface "${'$'}TEST_SOURCE" --max-time 12 https://api.ipify.org 2>/dev/null || true)"
         if [ -n "${'$'}WDTT_EXIT_IP" ]; then
           echo "Проверочный выход WDTT: ${'$'}WDTT_EXIT_IP"
         else
-          echo "Проверочный выход WDTT: не удалось проверить через ${'$'}WDTT_WG_IFACE"
+          if [ "${'$'}MODE" = "tun_interface" ]; then
+            TUN_STATUS_IFACE="${'$'}(cat "${'$'}WDTT_TUN_CONFIG_FILE" 2>/dev/null | head -n 1)"
+            echo "Проверочный выход WDTT: не удалось проверить через TUN-интерфейс ${'$'}{TUN_STATUS_IFACE:-не указан}"
+          else
+            echo "Проверочный выход WDTT: не удалось проверить через ${'$'}WDTT_WG_IFACE"
+          fi
         fi
         if [ "${'$'}MODE" = "warp_free" ]; then
           WARP_TRACE=""
@@ -6121,6 +6968,34 @@ internal fun outboundStatusScript(): String = shellScript(
     else
       echo "WireGuard ${'$'}WDTT_WG_IFACE: не запущен"
     fi
+    TUN_STATUS_IFACE="${'$'}(cat "${'$'}WDTT_TUN_CONFIG_FILE" 2>/dev/null | head -n 1)"
+    echo "TUN-интерфейс выхода WDTT: ${'$'}{TUN_STATUS_IFACE:-не настроен}"
+    if [ -n "${'$'}TUN_STATUS_IFACE" ] && [ -d "/sys/class/net/${'$'}TUN_STATUS_IFACE" ]; then
+      echo "Состояние TUN-интерфейса: ${'$'}(cat "/sys/class/net/${'$'}TUN_STATUS_IFACE/operstate" 2>/dev/null || echo неизвестно)"
+    else
+      echo "Состояние TUN-интерфейса: не найден"
+    fi
+    if systemctl is-active wdtt-tun-exit.service >/dev/null 2>&1; then echo "Служба TUN-выхода: запущена"; else echo "Служба TUN-выхода: остановлена"; fi
+    if systemctl is-enabled wdtt-tun-exit.service >/dev/null 2>&1; then echo "Автозапуск TUN-выхода: включён"; else echo "Автозапуск TUN-выхода: выключен"; fi
+    if [ "${'$'}(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" = "1" ]; then echo "Пересылка IPv4-пакетов: включена"; else echo "Пересылка IPv4-пакетов: выключена"; fi
+    if [ -n "${'$'}TUN_STATUS_IFACE" ] &&
+       ip rule show 2>/dev/null | grep -Eq "from [^ ]+ lookup ${'$'}WDTT_TUN_TABLE([[:space:]]|${'$'})"; then
+      echo "Правило маршрутизации WDTT через TUN: применено"
+    else
+      echo "Правило маршрутизации WDTT через TUN: отсутствует"
+    fi
+    if [ -n "${'$'}TUN_STATUS_IFACE" ] &&
+       ip route show table "${'$'}WDTT_TUN_TABLE" 2>/dev/null |
+         grep -Eq "^default([[:space:]].*)? dev ${'$'}TUN_STATUS_IFACE([[:space:]]|${'$'})"; then
+      echo "Маршрут по умолчанию через TUN: применён"
+    else
+      echo "Маршрут по умолчанию через TUN: отсутствует"
+    fi
+    if ip route show table "${'$'}WDTT_TUN_TABLE" 2>/dev/null | grep -Eq '^unreachable default([[:space:]]|${'$'})'; then
+      echo "Аварийная блокировка прямого выхода: активна"
+    else
+      echo "Аварийная блокировка прямого выхода: не требуется"
+    fi
     """
 )
 
@@ -6138,6 +7013,52 @@ private suspend fun readOutboundStatus(target: OutboundSshTarget): String = with
         try { session?.disconnect() } catch (_: Exception) {}
     }
 }
+
+internal fun tunInterfaceCandidatesScript(): String = """
+    set -e
+    for iface_path in /sys/class/net/*; do
+      [ -f "${'$'}iface_path/tun_flags" ] || continue
+      iface="${'$'}{iface_path##*/}"
+      case "${'$'}iface" in
+        ''|[!A-Za-z0-9]*|*[!A-Za-z0-9_.:-]*|lo|wdtt0|wg-wdtt-exit) continue;;
+      esac
+      [ "${'$'}{#iface}" -le 15 ] || continue
+      if ip -o link show dev "${'$'}iface" 2>/dev/null | grep -q '<[^>]*UP[,>]'; then
+        state=1
+      else
+        state=0
+      fi
+      printf 'WDTT_TUN_CANDIDATE=%s|%s\n' "${'$'}iface" "${'$'}state"
+    done | sort -u
+""".trimIndent()
+
+internal fun parseTunInterfaceCandidates(output: String): List<TunInterfaceCandidate> =
+    output.lineSequence()
+        .mapNotNull { line ->
+            val value = line.removePrefix("WDTT_TUN_CANDIDATE=")
+            if (value == line) return@mapNotNull null
+            val name = value.substringBefore('|').trim()
+            val state = value.substringAfter('|', "0").trim()
+            if (tunInterfaceNameIssue(name) != null) return@mapNotNull null
+            TunInterfaceCandidate(name = name, isUp = state == "1")
+        }
+        .distinctBy(TunInterfaceCandidate::name)
+        .sortedWith(compareByDescending<TunInterfaceCandidate> { it.isUp }.thenBy { it.name })
+        .take(32)
+        .toList()
+
+private suspend fun discoverTunInterfaces(target: OutboundSshTarget): List<TunInterfaceCandidate> =
+    withContext(Dispatchers.IO) {
+        var session: Session? = null
+        try {
+            session = createSshSession(target.host, target.user, target.credentials, target.port)
+            val output = SSHClient(session, target.pass)
+                .exec(rootCommand(tunInterfaceCandidatesScript()), timeout = 30000L)
+            parseTunInterfaceCandidates(output)
+        } finally {
+            try { session?.disconnect() } catch (_: Exception) {}
+        }
+    }
 
 private fun outboundProfileSaveScript(forms: OutboundProfileForms): String {
     val kindName = ProxyKind.entries.firstOrNull { it.name == forms.externalProxyKindName }?.name.orEmpty()
@@ -6164,7 +7085,8 @@ private fun outboundProfileSaveScript(forms: OutboundProfileForms): String {
         // DNS для клиентов задаётся в основных настройках WDTT, а не в
         // policy-routed WireGuard-выходе.
         b64Line("WG_VPS_DNS_B64", ""),
-        b64Line("IMPORTED_WG_CONFIG_B64", forms.importedWireGuardConfig)
+        b64Line("IMPORTED_WG_CONFIG_B64", forms.importedWireGuardConfig),
+        b64Line("TUN_INTERFACE_B64", forms.tunInterface)
     ).joinToString("\n")
     val profileScript = """
         PROFILE_FILE=/etc/wdtt/outbound-profile.env
@@ -6509,6 +7431,62 @@ internal fun outboundSnapshotScript(): String = shellScript(
       WG_MATCHES_WARP=1
     fi
 
+    TUN_INTERFACE="${'$'}(cat "${'$'}WDTT_TUN_CONFIG_FILE" 2>/dev/null | head -n 1)"
+    if wdtt_profile_has_key TUN_INTERFACE_B64; then
+      TUN_INTERFACE_B64="${'$'}(wdtt_profile_value TUN_INTERFACE_B64)"
+      if [ -z "${'$'}TUN_INTERFACE" ] && [ -n "${'$'}TUN_INTERFACE_B64" ] && command -v base64 >/dev/null 2>&1; then
+        TUN_INTERFACE="${'$'}(printf '%s' "${'$'}TUN_INTERFACE_B64" | base64 -d 2>/dev/null || true)"
+      fi
+    else
+      TUN_INTERFACE_B64="${'$'}(wdtt_b64 "${'$'}TUN_INTERFACE")"
+    fi
+    TUN_PRESENT=0
+    if [ "${'$'}MODE" = "tun_interface" ] || [ -n "${'$'}TUN_INTERFACE" ] ||
+       [ -n "${'$'}TUN_INTERFACE_B64" ] || [ -e "${'$'}WDTT_TUN_OWNER_FILE" ] ||
+       [ -e "${'$'}WDTT_TUN_CONFIG_FILE" ] ||
+       [ -f /etc/systemd/system/wdtt-tun-exit.service ] ||
+       [ -x /usr/local/lib/wdtt/tun-exit-route ] ||
+       [ -x /usr/local/lib/wdtt/tun-exit-watch ]; then
+      TUN_PRESENT=1
+    fi
+    TUN_INTERFACE_ACTIVE=0
+    if [ -n "${'$'}TUN_INTERFACE" ] && [ -d "/sys/class/net/${'$'}TUN_INTERFACE" ] &&
+       ip -o link show dev "${'$'}TUN_INTERFACE" 2>/dev/null | grep -q '<[^>]*UP[,>]'; then
+      TUN_INTERFACE_ACTIVE=1
+    fi
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet wdtt-tun-exit.service 2>/dev/null; then
+      TUN_SERVICE_ACTIVE=1
+      TUN_PRESENT=1
+    else
+      TUN_SERVICE_ACTIVE=0
+    fi
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-enabled --quiet wdtt-tun-exit.service 2>/dev/null; then
+      TUN_SERVICE_ENABLED=1
+    else
+      TUN_SERVICE_ENABLED=0
+    fi
+    TUN_POLICY_RULE_ACTIVE=0
+    [ "${'$'}TUN_PRESENT" = 1 ] &&
+      ip rule show 2>/dev/null | grep -Eq "from [^ ]+ lookup ${'$'}WDTT_TUN_TABLE([[:space:]]|${'$'})" &&
+      TUN_POLICY_RULE_ACTIVE=1
+    TUN_DEFAULT_ROUTE_ACTIVE=0
+    TUN_FAIL_CLOSED_ACTIVE=0
+    if [ -n "${'$'}TUN_INTERFACE" ] &&
+       ip route show table "${'$'}WDTT_TUN_TABLE" 2>/dev/null |
+         grep -Eq "^default([[:space:]].*)? dev ${'$'}TUN_INTERFACE([[:space:]]|${'$'})"; then
+      TUN_DEFAULT_ROUTE_ACTIVE=1
+    fi
+    ip route show table "${'$'}WDTT_TUN_TABLE" 2>/dev/null | grep -Eq '^unreachable default([[:space:]]|${'$'})' &&
+      TUN_FAIL_CLOSED_ACTIVE=1
+    TUN_FORWARD_RULES_ACTIVE=0
+    if command -v iptables >/dev/null 2>&1 && [ -n "${'$'}TUN_INTERFACE" ] &&
+       iptables -C FORWARD -i "${'$'}WDTT_IFACE" -o "${'$'}TUN_INTERFACE" -m comment --comment WDTT_TUN_EXIT -j ACCEPT 2>/dev/null &&
+       iptables -C FORWARD -i "${'$'}TUN_INTERFACE" -o "${'$'}WDTT_IFACE" -m comment --comment WDTT_TUN_EXIT -j ACCEPT 2>/dev/null; then
+      TUN_FORWARD_RULES_ACTIVE=1
+    fi
+    TUN_IP_FORWARD_ACTIVE=0
+    [ "${'$'}(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" = "1" ] && TUN_IP_FORWARD_ACTIVE=1
+
     printf 'WDTT_OUTBOUND_MODE=%s\n' "${'$'}MODE"
     printf 'WDTT_OUTBOUND_DETAIL_B64=%s\n' "$(wdtt_b64 "${'$'}DETAIL")"
     printf 'WDTT_OUTBOUND_UPDATED_AT=%s\n' "${'$'}UPDATED_AT"
@@ -6549,6 +7527,16 @@ internal fun outboundSnapshotScript(): String = shellScript(
     printf 'WDTT_WARP_PRESENT=%s\n' "${'$'}WARP_PRESENT"
     printf 'WDTT_WARP_MTU=%s\n' "${'$'}WG_MTU"
     printf 'WDTT_IMPORTED_WG_CONFIG_B64=%s\n' "${'$'}IMPORTED_WG_CONFIG_B64"
+    printf 'WDTT_TUN_INTERFACE_B64=%s\n' "${'$'}TUN_INTERFACE_B64"
+    printf 'WDTT_TUN_PRESENT=%s\n' "${'$'}TUN_PRESENT"
+    printf 'WDTT_TUN_INTERFACE_ACTIVE=%s\n' "${'$'}TUN_INTERFACE_ACTIVE"
+    printf 'WDTT_TUN_SERVICE_ACTIVE=%s\n' "${'$'}TUN_SERVICE_ACTIVE"
+    printf 'WDTT_TUN_SERVICE_ENABLED=%s\n' "${'$'}TUN_SERVICE_ENABLED"
+    printf 'WDTT_TUN_POLICY_RULE_ACTIVE=%s\n' "${'$'}TUN_POLICY_RULE_ACTIVE"
+    printf 'WDTT_TUN_DEFAULT_ROUTE_ACTIVE=%s\n' "${'$'}TUN_DEFAULT_ROUTE_ACTIVE"
+    printf 'WDTT_TUN_FAIL_CLOSED_ACTIVE=%s\n' "${'$'}TUN_FAIL_CLOSED_ACTIVE"
+    printf 'WDTT_TUN_FORWARD_RULES_ACTIVE=%s\n' "${'$'}TUN_FORWARD_RULES_ACTIVE"
+    printf 'WDTT_TUN_IP_FORWARD_ACTIVE=%s\n' "${'$'}TUN_IP_FORWARD_ACTIVE"
     """
 )
 
@@ -6615,7 +7603,17 @@ private fun parseOutboundServerSnapshot(output: String): OutboundServerSnapshot 
         wireGuardMatchesWarp = flag("WDTT_WG_MATCHES_WARP"),
         localProxyServiceEnabled = flag("WDTT_LOCAL_PROXY_SERVICE_ENABLED"),
         externalProxyServiceEnabled = flag("WDTT_EXTERNAL_PROXY_SERVICE_ENABLED"),
-        wireGuardServiceEnabled = flag("WDTT_WG_SERVICE_ENABLED")
+        wireGuardServiceEnabled = flag("WDTT_WG_SERVICE_ENABLED"),
+        tunInterface = decoded("WDTT_TUN_INTERFACE_B64"),
+        tunPresent = flag("WDTT_TUN_PRESENT"),
+        tunInterfaceActive = flag("WDTT_TUN_INTERFACE_ACTIVE"),
+        tunServiceActive = flag("WDTT_TUN_SERVICE_ACTIVE"),
+        tunServiceEnabled = flag("WDTT_TUN_SERVICE_ENABLED"),
+        tunPolicyRuleActive = flag("WDTT_TUN_POLICY_RULE_ACTIVE"),
+        tunDefaultRouteActive = flag("WDTT_TUN_DEFAULT_ROUTE_ACTIVE"),
+        tunForwardRulesActive = flag("WDTT_TUN_FORWARD_RULES_ACTIVE"),
+        tunIpForwardActive = flag("WDTT_TUN_IP_FORWARD_ACTIVE"),
+        tunFailClosedActive = flag("WDTT_TUN_FAIL_CLOSED_ACTIVE")
     )
 }
 
@@ -6632,6 +7630,13 @@ private fun outboundRestoreSummary(snapshot: OutboundServerSnapshot): String {
     }
     if (snapshot.wireGuardPresent) {
         parts += if (snapshot.wireGuardActive) "WireGuard-выход найден и запущен." else "Поля WireGuard-выхода заполнены."
+    }
+    if (snapshot.tunPresent) {
+        parts += if (snapshot.tunHealthy) {
+            "Выход через TUN-интерфейс ${snapshot.tunInterface} найден и запущен."
+        } else {
+            "Настройка TUN-интерфейса ${snapshot.tunInterface.ifBlank { "без имени" }} найдена, но маршрут сейчас не активен."
+        }
     }
     if (snapshot.mode == "warp_free") {
         parts += if (snapshot.wireGuardActive) {
@@ -6718,31 +7723,34 @@ private suspend fun readOutboundDiagnostics(target: OutboundSshTarget): String =
             """
             echo
             echo "Правила, которые выбирают выход для WDTT-пользователей:"
-            ROUTE_RULES="${'$'}(ip rule show | grep -E '100|wdtt|10\.66\.66' || true)"
+            ROUTE_RULES="${'$'}(ip rule show | grep -E 'lookup (100|110|wdtt)|10\.66\.66' || true)"
             if [ -n "${'$'}ROUTE_RULES" ]; then
               printf '%s\n' "${'$'}ROUTE_RULES"
             else
               echo "Отдельных правил выбора маршрута для WDTT сейчас нет."
             fi
             echo
-            echo "Маршрутная таблица WDTT-пользователей:"
-            WDTT_ROUTES="${'$'}(ip route show table 100 2>/dev/null || true)"
+            echo "Маршрутные таблицы WDTT-пользователей:"
+            WDTT_ROUTES="${'$'}({ ip route show table 100 2>/dev/null; ip route show table 110 2>/dev/null; } || true)"
             if [ -n "${'$'}WDTT_ROUTES" ]; then
               printf '%s\n' "${'$'}WDTT_ROUTES"
             else
               echo "Маршрутная таблица WDTT сейчас пуста."
             fi
             echo
-            echo "Правила перенаправления через прокси или WireGuard:"
-            REDIRECT_RULES="${'$'}(iptables -t nat -S 2>/dev/null | grep -E 'WDTT_PROXY_OUT|WDTT_EXIT|WDTT_LOCAL_PROXY' || true)"
+            echo "Правила перенаправления через прокси, WireGuard или TUN:"
+            REDIRECT_RULES="${'$'}({ iptables -t nat -S 2>/dev/null; iptables -S FORWARD 2>/dev/null; } | grep -E 'WDTT_PROXY_OUT|WDTT_EXIT|WDTT_LOCAL_PROXY|WDTT_TUN_EXIT' || true)"
             if [ -n "${'$'}REDIRECT_RULES" ]; then
               printf '%s\n' "${'$'}REDIRECT_RULES"
             else
-              echo "Правил перенаправления WDTT через прокси или WireGuard сейчас нет."
+              echo "Управляемых правил WDTT через прокси, WireGuard или TUN сейчас нет."
             fi
             echo
             echo "Служба внешнего TCP-прокси WDTT:"
             systemctl status wdtt-redsocks --no-pager -l 2>/dev/null | sed -n '1,12p' || echo "Служба wdtt-redsocks не найдена или systemctl недоступен."
+            echo
+            echo "Служба существующего TUN-интерфейса WDTT:"
+            systemctl status wdtt-tun-exit --no-pager -l 2>/dev/null | sed -n '1,12p' || echo "Служба wdtt-tun-exit не найдена или systemctl недоступен."
             echo
             echo "Локальный порт redsocks:"
             if command -v ss >/dev/null 2>&1; then
@@ -6775,7 +7783,10 @@ private suspend fun readOutboundDiagnostics(target: OutboundSshTarget): String =
 internal fun disableOutboundExitScript(): String = shellScript(
     outboundShellPrelude(),
     """
-    echo "WDTT_PROGRESS|0.25|Останавливаю внешний TCP-прокси и WireGuard-выход, если они включены..."
+    MODE_BEFORE_CLEANUP="${'$'}(sed -n 's/.*"outboundMode"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /etc/wdtt/outbound.json 2>/dev/null | head -n 1)"
+    TUN_OWNED=0
+    [ "${'$'}(cat "${'$'}WDTT_TUN_OWNER_FILE" 2>/dev/null | head -n 1)" = WDTT_TUN_EXIT_V1 ] && TUN_OWNED=1
+    echo "WDTT_PROGRESS|0.25|Останавливаю внешний TCP-прокси, WireGuard- и TUN-выход, если они включены..."
     wdtt_clear_external_out
     if command -v wg >/dev/null 2>&1 && wg show "${'$'}WDTT_WG_IFACE" >/dev/null 2>&1; then
       ip link delete "${'$'}WDTT_WG_IFACE" 2>/dev/null || true
@@ -6790,11 +7801,21 @@ internal fun disableOutboundExitScript(): String = shellScript(
       CLEANUP_LEFT=1
     ip route show table "${'$'}WDTT_TABLE" 2>/dev/null | grep -Eq "^default([[:space:]].*)? dev ${'$'}WDTT_WG_IFACE([[:space:]]|${'$'})" &&
       CLEANUP_LEFT=1
+    if [ "${'$'}TUN_OWNED" = 1 ]; then
+      systemctl is-active --quiet wdtt-tun-exit.service 2>/dev/null && CLEANUP_LEFT=1
+      ip rule show 2>/dev/null | grep -Eq "from [^ ]+ lookup ${'$'}WDTT_TUN_TABLE([[:space:]]|${'$'})" && CLEANUP_LEFT=1
+      [ -n "${'$'}(ip route show table "${'$'}WDTT_TUN_TABLE" 2>/dev/null)" ] && CLEANUP_LEFT=1
+    elif [ "${'$'}MODE_BEFORE_CLEANUP" = "tun_interface" ]; then
+      CLEANUP_LEFT=1
+    fi
     if command -v iptables >/dev/null 2>&1; then
       iptables -t nat -S PREROUTING 2>/dev/null | grep -q -- "-i ${'$'}WDTT_IFACE .* -j WDTT_PROXY_OUT" &&
         CLEANUP_LEFT=1
       iptables -t nat -S POSTROUTING 2>/dev/null | grep -q -- "-o ${'$'}WDTT_WG_IFACE .*--comment WDTT_EXIT .*MASQUERADE" &&
         CLEANUP_LEFT=1
+      if [ "${'$'}TUN_OWNED" = 1 ]; then
+        iptables -S FORWARD 2>/dev/null | grep -q -- '--comment WDTT_TUN_EXIT' && CLEANUP_LEFT=1
+      fi
     fi
     if [ "${'$'}CLEANUP_LEFT" != 0 ]; then
       echo WDTT_ERROR=direct_cleanup_failed
@@ -6803,7 +7824,7 @@ internal fun disableOutboundExitScript(): String = shellScript(
     echo "WDTT_PROGRESS|0.75|Сохраняю режим прямого выхода через текущий сервер..."
     wdtt_write_mode "direct" "прямой выход"
     echo "WDTT_PROGRESS|1.0|Прямой выход включён."
-    echo "Внешний TCP-прокси или WireGuard-выход отключён. WDTT-пользователи снова идут напрямую через текущий сервер."
+    echo "Внешний TCP-прокси, WireGuard- и TUN-выход отключены. WDTT-пользователи снова идут напрямую через текущий сервер."
     """
 )
 
@@ -6811,9 +7832,381 @@ private suspend fun disableOutboundExit(target: OutboundSshTarget): String = wit
     runCheckedRootScript(target, disableOutboundExitScript(), timeout = 30000L)
 }
 
-private suspend fun installLocalProxy(
-    context: Context,
+internal fun buildTunInterfaceExitScript(interfaceName: String): String {
+    require(tunInterfaceNameIssue(interfaceName) == null) {
+        tunInterfaceNameIssue(interfaceName) ?: "некорректное имя TUN-интерфейса"
+    }
+    val quotedInterface = shellQuote(interfaceName.trim())
+    return shellScript(
+        outboundShellPrelude(),
+        """
+        TUN_IFACE=$quotedInterface
+        command -v ip >/dev/null 2>&1 || { echo WDTT_ERROR=iproute_required; exit 2; }
+        command -v iptables >/dev/null 2>&1 || { echo WDTT_ERROR=iptables_required; exit 2; }
+        command -v systemctl >/dev/null 2>&1 || { echo WDTT_ERROR=systemd_required; exit 2; }
+        command -v curl >/dev/null 2>&1 || { echo WDTT_ERROR=curl_not_installed; exit 2; }
+        [ -d "/sys/class/net/${'$'}WDTT_IFACE" ] || { echo WDTT_ERROR=wdtt_iface_not_found; exit 2; }
+        [ -d "/sys/class/net/${'$'}TUN_IFACE" ] || { echo WDTT_ERROR=tun_interface_not_found; exit 2; }
+        ip -o link show dev "${'$'}TUN_IFACE" 2>/dev/null | grep -q '<[^>]*UP[,>]' ||
+          { echo WDTT_ERROR=tun_interface_not_up; exit 2; }
+        EXT_IFACE="${'$'}(wdtt_ext_iface)"
+        [ -n "${'$'}EXT_IFACE" ] || { echo WDTT_ERROR=external_interface_not_found; exit 2; }
+        [ "${'$'}TUN_IFACE" != "${'$'}EXT_IFACE" ] || { echo WDTT_ERROR=tun_interface_is_primary; exit 2; }
+        TUN_OWNED=0
+        [ "${'$'}(cat "${'$'}WDTT_TUN_OWNER_FILE" 2>/dev/null | head -n 1)" = WDTT_TUN_EXIT_V1 ] && TUN_OWNED=1
+        if [ "${'$'}TUN_OWNED" = 0 ]; then
+          TUN_COLLISION=0
+          [ -e /etc/systemd/system/wdtt-tun-exit.service ] && TUN_COLLISION=1
+          [ -e /usr/local/lib/wdtt/tun-exit-route ] && TUN_COLLISION=1
+          [ -e /usr/local/lib/wdtt/tun-exit-watch ] && TUN_COLLISION=1
+          [ -e "${'$'}WDTT_TUN_CONFIG_FILE" ] && TUN_COLLISION=1
+          ip rule show 2>/dev/null | grep -Eq "lookup ${'$'}WDTT_TUN_TABLE([[:space:]]|${'$'})" && TUN_COLLISION=1
+          [ -n "${'$'}(ip route show table "${'$'}WDTT_TUN_TABLE" 2>/dev/null)" ] && TUN_COLLISION=1
+          iptables -S FORWARD 2>/dev/null | grep -q -- '--comment WDTT_TUN_EXIT' && TUN_COLLISION=1
+          [ "${'$'}TUN_COLLISION" = 0 ] || { echo WDTT_ERROR=tun_exit_ownership_conflict; exit 2; }
+        fi
+
+        echo "WDTT_PROGRESS|0.20|Отключаю прежний внешний выход WDTT..."
+        wdtt_clear_external_out
+        TUN_COMMITTED=0
+        tun_rollback() {
+          [ "${'$'}TUN_COMMITTED" = 1 ] && return 0
+          wdtt_clear_tun_out >/dev/null 2>&1 || true
+          wdtt_write_mode "direct" "rollback after TUN setup error" >/dev/null 2>&1 || true
+        }
+        trap tun_rollback EXIT
+        if [ "${'$'}(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" != "1" ]; then
+          printf '1\n' >/proc/sys/net/ipv4/ip_forward 2>/dev/null || true
+        fi
+        if [ "${'$'}(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" != "1" ]; then
+          wdtt_write_mode "direct" "rollback after IPv4 forwarding error"
+          echo WDTT_ERROR=tun_ip_forward_failed
+          exit 3
+        fi
+        echo "WDTT_PROGRESS|0.42|Создаю управляемые маршруты через ${'$'}TUN_IFACE..."
+        mkdir -p /usr/local/lib/wdtt /etc/wdtt-plus/tun-exit
+        printf '%s\n' WDTT_TUN_EXIT_V1 >"${'$'}WDTT_TUN_OWNER_FILE"
+        printf '%s\n' "${'$'}TUN_IFACE" >"${'$'}WDTT_TUN_CONFIG_FILE"
+        chmod 600 "${'$'}WDTT_TUN_OWNER_FILE" "${'$'}WDTT_TUN_CONFIG_FILE"
+
+        cat >/usr/local/lib/wdtt/tun-exit-route <<'WDTT_TUN_ROUTE'
+        #!/bin/sh
+        set -u
+        WDTT_IFACE=wdtt0
+        TUN_IFACE=$quotedInterface
+        WDTT_TUN_TABLE=110
+        WDTT_TUN_PRIORITY=90
+        WDTT_SUBNET="${'$'}(ip -4 route show dev "${'$'}WDTT_IFACE" scope link 2>/dev/null | awk '{print ${'$'}1; exit}')"
+        [ -n "${'$'}WDTT_SUBNET" ] || WDTT_SUBNET=10.66.66.0/24
+        clear_forward_rules() {
+          if command -v iptables >/dev/null 2>&1; then
+            while iptables -D FORWARD -i "${'$'}WDTT_IFACE" -o "${'$'}TUN_IFACE" -m comment --comment WDTT_TUN_EXIT -j ACCEPT 2>/dev/null; do :; done
+            while iptables -D FORWARD -i "${'$'}TUN_IFACE" -o "${'$'}WDTT_IFACE" -m comment --comment WDTT_TUN_EXIT -j ACCEPT 2>/dev/null; do :; done
+          fi
+        }
+        policy_rule_present() {
+          ip rule show 2>/dev/null |
+            grep -Eq "from ${'$'}WDTT_SUBNET lookup ${'$'}WDTT_TUN_TABLE([[:space:]]|${'$'})|from ${'$'}WDTT_SUBNET table ${'$'}WDTT_TUN_TABLE([[:space:]]|${'$'})"
+        }
+        blocked_status() {
+          policy_rule_present || return 1
+          ip route show table "${'$'}WDTT_TUN_TABLE" 2>/dev/null |
+            grep -Eq '^unreachable default([[:space:]]|${'$'})'
+        }
+        cleanup() {
+          while ip rule del from "${'$'}WDTT_SUBNET" table "${'$'}WDTT_TUN_TABLE" priority "${'$'}WDTT_TUN_PRIORITY" 2>/dev/null; do :; done
+          ip route flush table "${'$'}WDTT_TUN_TABLE" 2>/dev/null || true
+          clear_forward_rules
+        }
+        status() {
+          [ "${'$'}(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" = "1" ] || return 1
+          [ -d "/sys/class/net/${'$'}WDTT_IFACE" ] || return 1
+          [ -d "/sys/class/net/${'$'}TUN_IFACE" ] || return 1
+          ip -o link show dev "${'$'}TUN_IFACE" 2>/dev/null | grep -q '<[^>]*UP[,>]' || return 1
+          ip rule show 2>/dev/null | grep -Eq "from [^ ]+ lookup ${'$'}WDTT_TUN_TABLE([[:space:]]|${'$'})" || return 1
+          ip route show table "${'$'}WDTT_TUN_TABLE" 2>/dev/null |
+            grep -Eq "^default([[:space:]].*)? dev ${'$'}TUN_IFACE([[:space:]]|${'$'})" || return 1
+          iptables -C FORWARD -i "${'$'}WDTT_IFACE" -o "${'$'}TUN_IFACE" -m comment --comment WDTT_TUN_EXIT -j ACCEPT 2>/dev/null || return 1
+          iptables -C FORWARD -i "${'$'}TUN_IFACE" -o "${'$'}WDTT_IFACE" -m comment --comment WDTT_TUN_EXIT -j ACCEPT 2>/dev/null || return 1
+        }
+        block() {
+          blocked_status && return 0
+          ip route replace unreachable default table "${'$'}WDTT_TUN_TABLE"
+          policy_rule_present ||
+            ip rule add from "${'$'}WDTT_SUBNET" table "${'$'}WDTT_TUN_TABLE" priority "${'$'}WDTT_TUN_PRIORITY"
+          blocked_status
+        }
+        case "${'$'}{1:-}" in
+          block)
+            block
+            ;;
+          down)
+            cleanup
+            ;;
+          status)
+            status
+            ;;
+          up)
+            if [ "${'$'}(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" != "1" ]; then
+              printf '1\n' >/proc/sys/net/ipv4/ip_forward 2>/dev/null || exit 1
+            fi
+            [ "${'$'}(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" = "1" ] || exit 1
+            [ -d "/sys/class/net/${'$'}WDTT_IFACE" ] || exit 1
+            [ -d "/sys/class/net/${'$'}TUN_IFACE" ] || exit 1
+            ip -o link show dev "${'$'}TUN_IFACE" 2>/dev/null | grep -q '<[^>]*UP[,>]' || exit 1
+            EXT_IFACE="${'$'}(ip -o route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if (${'$'}i=="dev") {print ${'$'}(i+1); exit}}')"
+            [ -n "${'$'}EXT_IFACE" ] && [ "${'$'}TUN_IFACE" != "${'$'}EXT_IFACE" ] || exit 1
+            # Сначала удерживаем подсеть на unreachable-маршруте. Рабочий
+            # default через TUN ставим только после полной подготовки правил.
+            ip route replace unreachable default table "${'$'}WDTT_TUN_TABLE"
+            policy_rule_present ||
+              ip rule add from "${'$'}WDTT_SUBNET" table "${'$'}WDTT_TUN_TABLE" priority "${'$'}WDTT_TUN_PRIORITY"
+            trap 'code=${'$'}?; trap - 0; [ "${'$'}code" -eq 0 ] || block; exit "${'$'}code"' 0
+            clear_forward_rules
+            iptables -A FORWARD -i "${'$'}WDTT_IFACE" -o "${'$'}TUN_IFACE" -m comment --comment WDTT_TUN_EXIT -j ACCEPT
+            iptables -A FORWARD -i "${'$'}TUN_IFACE" -o "${'$'}WDTT_IFACE" -m comment --comment WDTT_TUN_EXIT -j ACCEPT
+            ip route replace default dev "${'$'}TUN_IFACE" table "${'$'}WDTT_TUN_TABLE"
+            status
+            trap - 0
+            ;;
+          *) exit 2;;
+        esac
+        WDTT_TUN_ROUTE
+
+        cat >/usr/local/lib/wdtt/tun-exit-watch <<'WDTT_TUN_WATCH'
+        #!/bin/sh
+        set -u
+        ROUTE_HELPER=/usr/local/lib/wdtt/tun-exit-route
+        STATE_FILE=/run/wdtt-tun-exit.state
+        report_state() {
+          new_state="${'$'}1"
+          old_state="${'$'}(cat "${'$'}STATE_FILE" 2>/dev/null || true)"
+          [ "${'$'}new_state" = "${'$'}old_state" ] && return 0
+          printf '%s\n' "${'$'}new_state" >"${'$'}STATE_FILE" 2>/dev/null || true
+          if command -v logger >/dev/null 2>&1; then
+            case "${'$'}new_state" in
+              active) logger -t wdtt-tun-exit "TUN route is active";;
+              blocked) logger -t wdtt-tun-exit "TUN unavailable; WDTT direct exit is blocked";;
+              error) logger -t wdtt-tun-exit "TUN unavailable; fail-closed route could not be confirmed";;
+            esac
+          fi
+        }
+        stop_watch() {
+          trap - INT TERM EXIT
+          "${'$'}ROUTE_HELPER" down >/dev/null 2>&1 || true
+          rm -f "${'$'}STATE_FILE"
+          exit 0
+        }
+        trap stop_watch INT TERM EXIT
+        while :; do
+          if "${'$'}ROUTE_HELPER" status >/dev/null 2>&1; then
+            report_state active
+          elif "${'$'}ROUTE_HELPER" up >/dev/null 2>&1; then
+            report_state active
+          elif "${'$'}ROUTE_HELPER" block >/dev/null 2>&1; then
+            report_state blocked
+          else
+            report_state error
+          fi
+          sleep 10 &
+          wait "${'$'}!"
+        done
+        WDTT_TUN_WATCH
+        chmod 700 /usr/local/lib/wdtt/tun-exit-route /usr/local/lib/wdtt/tun-exit-watch
+
+        cat >/etc/systemd/system/wdtt-tun-exit.service <<'WDTT_TUN_SERVICE'
+        [Unit]
+        Description=WDTT Plus policy-routed existing TUN exit
+        After=network-online.target wdtt.service
+        Wants=network-online.target
+
+        [Service]
+        Type=simple
+        ExecStart=/usr/local/lib/wdtt/tun-exit-watch
+        ExecStop=/usr/local/lib/wdtt/tun-exit-route down
+        Restart=always
+        RestartSec=5s
+
+        [Install]
+        WantedBy=multi-user.target
+        WDTT_TUN_SERVICE
+        systemctl daemon-reload
+        if ! systemctl enable --now wdtt-tun-exit.service >/tmp/wdtt-tun-exit-start.log 2>&1; then
+          tail -n 12 /tmp/wdtt-tun-exit-start.log 2>/dev/null || true
+          wdtt_clear_tun_out
+          wdtt_write_mode "direct" "rollback after TUN service start error"
+          rm -f /tmp/wdtt-tun-exit-start.log
+          echo WDTT_ERROR=tun_exit_service_inactive
+          exit 3
+        fi
+        TUN_READY=0
+        for attempt in 1 2 3 4 5 6 7 8 9 10; do
+          if systemctl is-active --quiet wdtt-tun-exit.service 2>/dev/null &&
+             /usr/local/lib/wdtt/tun-exit-route status >/dev/null 2>&1; then
+            TUN_READY=1
+            break
+          fi
+          sleep 1
+        done
+        if [ "${'$'}TUN_READY" != 1 ]; then
+          tail -n 12 /tmp/wdtt-tun-exit-start.log 2>/dev/null || true
+          wdtt_clear_tun_out
+          wdtt_write_mode "direct" "rollback after TUN route error"
+          rm -f /tmp/wdtt-tun-exit-start.log
+          echo WDTT_ERROR=tun_exit_route_inactive
+          exit 3
+        fi
+        rm -f /tmp/wdtt-tun-exit-start.log
+        echo "WDTT_PROGRESS|0.78|Проверяю реальный выход трафика WDTT через ${'$'}TUN_IFACE..."
+        TEST_SOURCE="${'$'}(wdtt_test_source)"
+        [ -n "${'$'}TEST_SOURCE" ] || {
+          wdtt_clear_tun_out
+          wdtt_write_mode "direct" "rollback after missing WDTT test source"
+          echo WDTT_ERROR=wdtt_test_source_missing
+          exit 3
+        }
+        EXIT_IP="${'$'}(curl -4fsS --interface "${'$'}TEST_SOURCE" --connect-timeout 5 --max-time 18 https://api.ipify.org 2>/tmp/wdtt-tun-exit-test.err || true)"
+        if [ -z "${'$'}EXIT_IP" ]; then
+          tail -n 10 /tmp/wdtt-tun-exit-test.err 2>/dev/null || true
+          rm -f /tmp/wdtt-tun-exit-test.err
+          wdtt_clear_tun_out
+          wdtt_write_mode "direct" "rollback after TUN traffic test error"
+          echo WDTT_ERROR=tun_exit_check_failed
+          exit 3
+        fi
+        rm -f /tmp/wdtt-tun-exit-test.err
+        echo "WDTT_PROGRESS|0.94|Сохраняю режим выхода через TUN-интерфейс..."
+        wdtt_write_mode "tun_interface" "${'$'}TUN_IFACE"
+        TUN_COMMITTED=1
+        trap - EXIT
+        echo "WDTT_PROGRESS|1.0|Выход через TUN-интерфейс включён."
+        echo "TUN-выход включён только для WDTT-пользователей. Интерфейс: ${'$'}TUN_IFACE. Проверочный IP: ${'$'}EXIT_IP"
+        """
+    )
+}
+
+private suspend fun enableTunInterface(
     target: OutboundSshTarget,
+    interfaceName: String
+): String = withContext(Dispatchers.IO) {
+    runCheckedRootScript(target, buildTunInterfaceExitScript(interfaceName), timeout = 60000L)
+}
+
+internal fun checkTunInterfaceExitScript(interfaceName: String): String {
+    require(tunInterfaceNameIssue(interfaceName) == null) {
+        tunInterfaceNameIssue(interfaceName) ?: "некорректное имя TUN-интерфейса"
+    }
+    return shellScript(
+        outboundShellPrelude(),
+        """
+        TUN_IFACE=${shellQuote(interfaceName.trim())}
+        [ "${'$'}(cat "${'$'}WDTT_TUN_OWNER_FILE" 2>/dev/null | head -n 1)" = WDTT_TUN_EXIT_V1 ] ||
+          { echo WDTT_ERROR=tun_exit_not_owned; exit 3; }
+        [ "${'$'}(cat "${'$'}WDTT_TUN_CONFIG_FILE" 2>/dev/null | head -n 1)" = "${'$'}TUN_IFACE" ] ||
+          { echo WDTT_ERROR=tun_interface_mismatch; exit 3; }
+        systemctl is-active --quiet wdtt-tun-exit.service 2>/dev/null || { echo WDTT_ERROR=tun_exit_service_inactive; exit 3; }
+        /usr/local/lib/wdtt/tun-exit-route status >/dev/null 2>&1 || { echo WDTT_ERROR=tun_exit_route_inactive; exit 3; }
+        TEST_SOURCE="${'$'}(wdtt_test_source)"
+        [ -n "${'$'}TEST_SOURCE" ] || { echo WDTT_ERROR=wdtt_test_source_missing; exit 3; }
+        EXIT_IP="${'$'}(curl -4fsS --interface "${'$'}TEST_SOURCE" --connect-timeout 5 --max-time 18 https://api.ipify.org 2>/dev/null || true)"
+        [ -n "${'$'}EXIT_IP" ] || { echo WDTT_ERROR=tun_exit_check_failed; exit 3; }
+        echo "Проверка успешна: WDTT-пользователи выходят через TUN-интерфейс ${'$'}TUN_IFACE. Проверочный IP: ${'$'}EXIT_IP"
+        """
+    )
+}
+
+private suspend fun checkTunInterfaceExit(
+    target: OutboundSshTarget,
+    interfaceName: String
+): String = withContext(Dispatchers.IO) {
+    runCheckedRootScript(target, checkTunInterfaceExitScript(interfaceName), timeout = 30000L)
+}
+
+internal fun deleteTunInterfaceExitScript(): String = shellScript(
+    outboundShellPrelude(),
+    """
+    MODE="${'$'}(sed -n 's/.*"outboundMode"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /etc/wdtt/outbound.json 2>/dev/null | head -n 1)"
+    wdtt_require_tun_cleanup_ownership || { echo WDTT_ERROR=tun_exit_not_owned; exit 3; }
+    echo "WDTT_PROGRESS|0.25|Останавливаю управляемый TUN-выход WDTT..."
+    wdtt_clear_tun_out
+    if [ "${'$'}MODE" = "tun_interface" ]; then
+      wdtt_write_mode "direct" "прямой выход"
+    fi
+    echo "WDTT_PROGRESS|0.55|Удаляю только файлы маршрутизации WDTT..."
+    rm -f /etc/systemd/system/wdtt-tun-exit.service \
+      /usr/local/lib/wdtt/tun-exit-route \
+      /usr/local/lib/wdtt/tun-exit-watch \
+      /run/wdtt-tun-exit.state \
+      "${'$'}WDTT_TUN_CONFIG_FILE" \
+      "${'$'}WDTT_TUN_OWNER_FILE"
+    rmdir /etc/wdtt-plus/tun-exit 2>/dev/null || true
+    if [ -f /etc/wdtt/outbound-profile.env ]; then
+      tmp_profile=/etc/wdtt/outbound-profile.env.tmp
+      grep -v '^TUN_INTERFACE_B64=' /etc/wdtt/outbound-profile.env >"${'$'}tmp_profile" 2>/dev/null || true
+      chmod 600 "${'$'}tmp_profile"
+      mv "${'$'}tmp_profile" /etc/wdtt/outbound-profile.env
+    fi
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl reset-failed wdtt-tun-exit.service 2>/dev/null || true
+    TUN_REMOVE_LEFT=0
+    systemctl is-active --quiet wdtt-tun-exit.service 2>/dev/null && TUN_REMOVE_LEFT=1
+    systemctl is-enabled --quiet wdtt-tun-exit.service 2>/dev/null && TUN_REMOVE_LEFT=1
+    ip rule show 2>/dev/null | grep -Eq "from [^ ]+ lookup ${'$'}WDTT_TUN_TABLE([[:space:]]|${'$'})" && TUN_REMOVE_LEFT=1
+    [ -n "${'$'}(ip route show table "${'$'}WDTT_TUN_TABLE" 2>/dev/null)" ] && TUN_REMOVE_LEFT=1
+    command -v iptables >/dev/null 2>&1 && iptables -S FORWARD 2>/dev/null | grep -q 'WDTT_TUN_EXIT' && TUN_REMOVE_LEFT=1
+    [ -e /etc/systemd/system/wdtt-tun-exit.service ] && TUN_REMOVE_LEFT=1
+    [ -e /usr/local/lib/wdtt/tun-exit-route ] && TUN_REMOVE_LEFT=1
+    [ -e /usr/local/lib/wdtt/tun-exit-watch ] && TUN_REMOVE_LEFT=1
+    [ -e "${'$'}WDTT_TUN_CONFIG_FILE" ] && TUN_REMOVE_LEFT=1
+    [ -e "${'$'}WDTT_TUN_OWNER_FILE" ] && TUN_REMOVE_LEFT=1
+    grep -q '^TUN_INTERFACE_B64=' /etc/wdtt/outbound-profile.env 2>/dev/null && TUN_REMOVE_LEFT=1
+    if [ "${'$'}TUN_REMOVE_LEFT" != 0 ]; then
+      echo WDTT_ERROR=tun_exit_remove_failed
+      exit 3
+    fi
+    echo "WDTT_PROGRESS|1.0|Настройка TUN-выхода удалена."
+    echo "Служба и маршруты WDTT удалены. Сам TUN-интерфейс и создавшее его приложение не изменялись."
+    """
+)
+
+private suspend fun deleteTunInterfaceExit(target: OutboundSshTarget): String = withContext(Dispatchers.IO) {
+    runCheckedRootScript(target, deleteTunInterfaceExitScript(), timeout = 30000L)
+}
+
+internal fun localProxyFirewallScript(port: Int): String {
+    require(port in 1..65533) { "порт SOCKS5 должен быть от 1 до 65533" }
+    val httpPort = port + 1
+    val adminPort = port + 2
+    return """
+        #!/bin/sh
+        set -eu
+        set -f
+        action="${'$'}{1:-}"
+        cleanup() {
+          command -v iptables >/dev/null 2>&1 || return 0
+          while :; do
+            rule="${'$'}(iptables -S INPUT 2>/dev/null | grep 'WDTT_LOCAL_PROXY' | head -n 1 || true)"
+            [ -n "${'$'}rule" ] || break
+            set -- ${'$'}rule
+            [ "${'$'}{1:-}" = "-A" ] || break
+            shift
+            iptables -D "${'$'}@" 2>/dev/null || break
+          done
+        }
+        if [ "${'$'}action" = down ]; then
+          cleanup
+          exit 0
+        fi
+        [ "${'$'}action" = up ] || exit 2
+        command -v iptables >/dev/null 2>&1 || exit 0
+        cleanup
+        iptables -I INPUT -p tcp --dport $port -m comment --comment WDTT_LOCAL_PROXY -j ACCEPT
+        iptables -I INPUT -p tcp --dport $httpPort -m comment --comment WDTT_LOCAL_PROXY -j ACCEPT
+        iptables -I INPUT -p tcp --dport $adminPort -m comment --comment WDTT_LOCAL_PROXY -j ACCEPT
+    """.trimIndent() + "\n"
+}
+
+internal fun buildLocalProxyInstallScript(
     port: Int,
     login: String,
     proxyPassword: String
@@ -6823,6 +8216,7 @@ private suspend fun installLocalProxy(
         localProxyCredentialsIssue(login, proxyPassword).orEmpty()
     }
     val httpPort = (port + 1).coerceAtMost(65535)
+    val firewallScriptBase64 = encodeBase64Text(localProxyFirewallScript(port))
     val script = shellScript(
         outboundShellPrelude(),
         """
@@ -6906,7 +8300,7 @@ private suspend fun installLocalProxy(
         wdtt_progress 0.08 "Определяю систему и права..."
         command -v systemctl >/dev/null 2>&1 || { echo WDTT_ERROR=systemd_required; exit 2; }
         wdtt_progress 0.18 "Готовлю пакетный менеджер..."
-        install_pkg curl ca-certificates || true
+        install_pkg curl ca-certificates coreutils || true
         THREEPROXY_BIN="${'$'}(command -v 3proxy || true)"
         INSTALLED_THREEPROXY_VERSION="${'$'}(cat /etc/wdtt/3proxy-version 2>/dev/null || true)"
         if [ -z "${'$'}THREEPROXY_BIN" ] || [ "${'$'}INSTALLED_THREEPROXY_VERSION" != "${'$'}THREEPROXY_VERSION" ]; then
@@ -6933,27 +8327,9 @@ private suspend fun installLocalProxy(
         EOF
         chmod 600 /etc/wdtt/3proxy.cfg
         mkdir -p /usr/local/lib/wdtt
-        cat >/usr/local/lib/wdtt/local-proxy-firewall <<EOF
-        #!/bin/sh
-        set -eu
-        action="${'$'}{1:-}"
-        cleanup() {
-          if command -v iptables >/dev/null 2>&1; then
-            iptables -S INPUT 2>/dev/null | grep 'WDTT_LOCAL_PROXY' | sed 's/^-A /iptables -D /' |
-              while read -r cmd; do ${'$'}cmd 2>/dev/null || true; done
-          fi
-        }
-        if [ "${'$'}{action}" = down ]; then
-          cleanup
-          exit 0
-        fi
-        [ "${'$'}{action}" = up ] || exit 2
-        command -v iptables >/dev/null 2>&1 || exit 0
-        cleanup
-        iptables -I INPUT -p tcp --dport $port -m comment --comment WDTT_LOCAL_PROXY -j ACCEPT
-        iptables -I INPUT -p tcp --dport $httpPort -m comment --comment WDTT_LOCAL_PROXY -j ACCEPT
-        iptables -I INPUT -p tcp --dport ${httpPort + 1} -m comment --comment WDTT_LOCAL_PROXY -j ACCEPT
-        EOF
+        command -v base64 >/dev/null 2>&1 || { echo WDTT_ERROR=local_proxy_helper_write_failed; exit 2; }
+        printf '%s' ${shellQuote(firewallScriptBase64)} | base64 -d >/usr/local/lib/wdtt/local-proxy-firewall ||
+          { echo WDTT_ERROR=local_proxy_helper_write_failed; exit 2; }
         chmod 700 /usr/local/lib/wdtt/local-proxy-firewall
         wdtt_progress 0.82 "Настраиваю службу wdtt-3proxy..."
         cat >/etc/systemd/system/wdtt-3proxy.service <<EOF
@@ -6974,6 +8350,7 @@ private suspend fun installLocalProxy(
         WantedBy=multi-user.target
         EOF
         systemctl daemon-reload
+        systemctl reset-failed wdtt-3proxy 2>/dev/null || true
         wdtt_progress 0.88 "Запускаю прокси-службу..."
         if ! systemctl enable wdtt-3proxy >/dev/null ||
            ! systemctl restart wdtt-3proxy >/dev/null ||
@@ -7010,8 +8387,21 @@ private suspend fun installLocalProxy(
         echo "Веб-страница 3proxy: http://${'$'}SERVER_IP:${'$'}ADMIN_PORT/"
         """
     )
-    return runRootScript(context, target, script, timeout = CMD_TIMEOUT)
+    return script
 }
+
+private suspend fun installLocalProxy(
+    context: Context,
+    target: OutboundSshTarget,
+    port: Int,
+    login: String,
+    proxyPassword: String
+): String = runRootScript(
+    context = context,
+    target = target,
+    script = buildLocalProxyInstallScript(port, login, proxyPassword),
+    timeout = CMD_TIMEOUT,
+)
 
 private suspend fun checkLocalProxy(
     context: Context,
@@ -7138,6 +8528,33 @@ private suspend fun checkExternalProxy(
     return runRootScript(context, target, script, timeout = 30000L)
 }
 
+internal fun externalProxyRoutesScript(): String = """
+    #!/bin/sh
+    set -eu
+    action="${'$'}{1:-}"
+    PROXY_IP="${'$'}{2:-}"
+    WDTT_IFACE=wdtt0
+    cleanup() {
+      while iptables -t nat -D PREROUTING -i "${'$'}WDTT_IFACE" -p tcp -j WDTT_PROXY_OUT 2>/dev/null; do :; done
+      iptables -t nat -F WDTT_PROXY_OUT 2>/dev/null || true
+      iptables -t nat -X WDTT_PROXY_OUT 2>/dev/null || true
+    }
+    if [ "${'$'}action" = down ]; then
+      cleanup
+      exit 0
+    fi
+    [ "${'$'}action" = up ] || exit 2
+    [ -n "${'$'}PROXY_IP" ] || exit 2
+    cleanup
+    iptables -t nat -N WDTT_PROXY_OUT
+    for net in 0.0.0.0/8 10.0.0.0/8 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4; do
+      iptables -t nat -A WDTT_PROXY_OUT -d "${'$'}net" -j RETURN
+    done
+    iptables -t nat -A WDTT_PROXY_OUT -d "${'$'}PROXY_IP" -j RETURN
+    iptables -t nat -A WDTT_PROXY_OUT -p tcp -j REDIRECT --to-ports 12345
+    iptables -t nat -A PREROUTING -i "${'$'}WDTT_IFACE" -p tcp -j WDTT_PROXY_OUT
+""".trimIndent() + "\n"
+
 private suspend fun enableExternalProxy(
     context: Context,
     target: OutboundSshTarget,
@@ -7153,6 +8570,7 @@ private suspend fun enableExternalProxy(
         externalProxyCredentialsIssue(login, proxyPassword).orEmpty()
     }
     val redsocksType = if (kind == ProxyKind.Socks5) "socks5" else "http-connect"
+    val routesScriptBase64 = encodeBase64Text(externalProxyRoutesScript())
     val script = shellScript(
         outboundShellPrelude(),
         """
@@ -7202,31 +8620,9 @@ private suspend fun enableExternalProxy(
         EOF
         chmod 600 /etc/wdtt/redsocks.conf
         mkdir -p /usr/local/lib/wdtt
-        cat >/usr/local/lib/wdtt/redsocks-routes <<EOF
-        #!/bin/sh
-        set -eu
-        action="${'$'}{1:-}"
-        WDTT_IFACE=wdtt0
-        PROXY_IP=${'$'}PROXY_IP
-        cleanup() {
-          while iptables -t nat -D PREROUTING -i "${'$'}{WDTT_IFACE}" -p tcp -j WDTT_PROXY_OUT 2>/dev/null; do :; done
-          iptables -t nat -F WDTT_PROXY_OUT 2>/dev/null || true
-          iptables -t nat -X WDTT_PROXY_OUT 2>/dev/null || true
-        }
-        if [ "${'$'}{action}" = down ]; then
-          cleanup
-          exit 0
-        fi
-        [ "${'$'}{action}" = up ] || exit 2
-        cleanup
-        iptables -t nat -N WDTT_PROXY_OUT
-        for net in 0.0.0.0/8 10.0.0.0/8 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4; do
-          iptables -t nat -A WDTT_PROXY_OUT -d "${'$'}{net}" -j RETURN
-        done
-        [ -n "${'$'}{PROXY_IP}" ] && iptables -t nat -A WDTT_PROXY_OUT -d "${'$'}{PROXY_IP}" -j RETURN
-        iptables -t nat -A WDTT_PROXY_OUT -p tcp -j REDIRECT --to-ports 12345
-        iptables -t nat -A PREROUTING -i "${'$'}{WDTT_IFACE}" -p tcp -j WDTT_PROXY_OUT
-        EOF
+        command -v base64 >/dev/null 2>&1 || { echo WDTT_ERROR=external_proxy_helper_write_failed; exit 2; }
+        printf '%s' ${shellQuote(routesScriptBase64)} | base64 -d >/usr/local/lib/wdtt/redsocks-routes ||
+          { echo WDTT_ERROR=external_proxy_helper_write_failed; exit 2; }
         chmod 700 /usr/local/lib/wdtt/redsocks-routes
         wdtt_progress 0.76 "Настраиваю службу перенаправления WDTT..."
         cat >/etc/systemd/system/wdtt-redsocks.service <<EOF
@@ -7238,8 +8634,8 @@ private suspend fun enableExternalProxy(
         [Service]
         Type=forking
         ExecStart=${'$'}REDSOCKS_BIN -c /etc/wdtt/redsocks.conf -p /run/wdtt-redsocks.pid
-        ExecStartPost=/usr/local/lib/wdtt/redsocks-routes up
-        ExecStopPost=/usr/local/lib/wdtt/redsocks-routes down
+        ExecStartPost=/usr/local/lib/wdtt/redsocks-routes up ${'$'}PROXY_IP
+        ExecStopPost=/usr/local/lib/wdtt/redsocks-routes down ${'$'}PROXY_IP
         PIDFile=/run/wdtt-redsocks.pid
         Restart=on-failure
 
@@ -7258,7 +8654,7 @@ private suspend fun enableExternalProxy(
           exit 3
         fi
         wdtt_progress 0.92 "Направляю обычные TCP-подключения WDTT через внешний TCP-прокси..."
-        /usr/local/lib/wdtt/redsocks-routes up ||
+        /usr/local/lib/wdtt/redsocks-routes up "${'$'}PROXY_IP" ||
           { echo WDTT_ERROR=external_proxy_route_install_failed; wdtt_clear_external_out; wdtt_write_mode "direct" "rollback after external proxy route error"; exit 3; }
         wdtt_progress 0.96 "Проверяю путь WDTT через внешний TCP-прокси..."
         if ! wdtt_test_redsocks_path "${'$'}PROXY_IP"; then
@@ -8690,6 +10086,8 @@ private suspend fun installWireGuardExitVps(
             systemctl is-enabled --quiet wdtt-wg-exit.service 2>/dev/null && touch "${'$'}CURRENT_BACKUP_DIR/wg_was_enabled" || true
             systemctl is-active --quiet wdtt-redsocks.service 2>/dev/null && touch "${'$'}CURRENT_BACKUP_DIR/proxy_was_active" || true
             systemctl is-enabled --quiet wdtt-redsocks.service 2>/dev/null && touch "${'$'}CURRENT_BACKUP_DIR/proxy_was_enabled" || true
+            systemctl is-active --quiet wdtt-tun-exit.service 2>/dev/null && touch "${'$'}CURRENT_BACKUP_DIR/tun_was_active" || true
+            systemctl is-enabled --quiet wdtt-tun-exit.service 2>/dev/null && touch "${'$'}CURRENT_BACKUP_DIR/tun_was_enabled" || true
             systemctl is-active --quiet wdtt-warp-watchdog.timer 2>/dev/null && touch "${'$'}CURRENT_BACKUP_DIR/warp_timer_was_active" || true
             systemctl is-enabled --quiet wdtt-warp-watchdog.timer 2>/dev/null && touch "${'$'}CURRENT_BACKUP_DIR/warp_timer_was_enabled" || true
             chmod 600 "${'$'}CURRENT_BACKUP_DIR"/*
@@ -8827,11 +10225,17 @@ private suspend fun installWireGuardExitVps(
                 if [ -f "${'$'}BACKUP_DIR/proxy_was_enabled" ]; then
                   systemctl enable wdtt-redsocks.service >/dev/null 2>&1 || true
                 fi
+                if [ -f "${'$'}BACKUP_DIR/tun_was_enabled" ]; then
+                  systemctl enable wdtt-tun-exit.service >/dev/null 2>&1 || true
+                fi
                 if [ -f "${'$'}BACKUP_DIR/wg_was_active" ]; then
                   systemctl restart wdtt-wg-exit.service >/dev/null 2>&1 || true
                 fi
                 if [ -f "${'$'}BACKUP_DIR/proxy_was_active" ]; then
                   systemctl restart wdtt-redsocks.service >/dev/null 2>&1 || true
+                fi
+                if [ -f "${'$'}BACKUP_DIR/tun_was_active" ]; then
+                  systemctl restart wdtt-tun-exit.service >/dev/null 2>&1 || true
                 fi
                 if [ -f "${'$'}BACKUP_DIR/warp_timer_was_enabled" ]; then
                   systemctl enable wdtt-warp-watchdog.timer >/dev/null 2>&1 || true
@@ -8845,6 +10249,11 @@ private suspend fun installWireGuardExitVps(
                 fi
                 if [ -f "${'$'}BACKUP_DIR/proxy_was_active" ] &&
                    ! systemctl is-active --quiet wdtt-redsocks.service 2>/dev/null; then
+                  exit 3
+                fi
+                if [ -f "${'$'}BACKUP_DIR/tun_was_active" ] &&
+                   { ! systemctl is-active --quiet wdtt-tun-exit.service 2>/dev/null ||
+                     ! /usr/local/lib/wdtt/tun-exit-route status >/dev/null 2>&1; }; then
                   exit 3
                 fi
                 if [ -f "${'$'}BACKUP_DIR/warp_timer_was_active" ] &&
@@ -8949,13 +10358,24 @@ private suspend fun checkExistingInstall(
 private fun markerValue(output: String, name: String): String? =
     Regex("^$name=(.*)$", setOf(RegexOption.MULTILINE)).find(output)?.groupValues?.getOrNull(1)?.trim()
 
-internal fun shouldWriteRemoteErrorToUserLog(line: String): Boolean =
-    !line.startsWith("WDTT_ERROR=") &&
-        (
-            line.contains("[✗]") ||
-                line.contains("FAIL") ||
-                (line.contains("error", true) && !line.contains("2>/dev/null"))
-            )
+private val remoteMachineMarkerRegex = Regex("^[A-Z][A-Z0-9_]*=.*$")
+
+internal fun shouldWriteRemoteErrorToUserLog(line: String): Boolean {
+    val clean = line.trim()
+    if (clean.isBlank() || remoteMachineMarkerRegex.matches(clean)) return false
+    return clean.contains("[✗]") ||
+        clean.contains("FAIL") ||
+        (clean.contains("error", true) && !clean.contains("2>/dev/null"))
+}
+
+internal fun remoteErrorMessageForUserLog(line: String): String? {
+    if (!shouldWriteRemoteErrorToUserLog(line)) return null
+    val detail = line.trim()
+        .removePrefix("FAIL:")
+        .removePrefix("[✗]")
+        .trim()
+    return "Ошибка на сервере: ${detail.ifBlank { "операция не выполнена" }}"
+}
 
 private fun compactRemoteTail(raw: String): String {
     val lines = raw.lineSequence()
@@ -9022,12 +10442,16 @@ private fun friendlyDeployError(error: Throwable, operation: String): String {
             "приложение отправило команду остановки, но служба wdtt-3proxy всё ещё запущена или осталась в автозапуске. Проверьте права пользователя SSH."
         "local_proxy_remove_failed" in lower ->
             "сервер не подтвердил полное удаление локального прокси. Служба, конфигурация или правило firewall ещё остались; повторите удаление и откройте диагностику сервера."
+        "local_proxy_helper_write_failed" in lower ->
+            "не удалось безопасно записать служебный скрипт firewall для 3proxy. Проверьте наличие coreutils/base64 и права записи в /usr/local/lib/wdtt."
         "local_proxy_firewall_failed" in lower ->
             "прокси запустился, но сервер не смог открыть его порты в firewall. Служба остановлена, чтобы интерфейс не показывал неработающий режим."
         "external_proxy_check_failed" in lower ->
             "внешний TCP-прокси не ответил на проверку. Проверьте адрес, порт, логин и пароль."
         "external_proxy_service_inactive" in lower ->
             "служба перенаправления через внешний TCP-прокси не запустилась. Приложение откатило правила и вернуло прямой выход, чтобы интернет через VPN не остался сломанным."
+        "external_proxy_helper_write_failed" in lower ->
+            "не удалось безопасно записать служебный скрипт маршрутизации внешнего прокси. Проверьте наличие coreutils/base64 и права записи в /usr/local/lib/wdtt."
         "external_proxy_route_install_failed" in lower ->
             "служба внешнего прокси запустилась, но сервер не применил постоянное правило маршрутизации WDTT. Режим отключён и прямой выход сохранён."
         "external_proxy_apply_failed" in lower ->
@@ -9048,8 +10472,34 @@ private fun friendlyDeployError(error: Throwable, operation: String): String {
             "на сервере не найдены инструменты WireGuard, без них этот режим не включить."
         "wireguard_exit_service_inactive" in lower ->
             withTail("служба WireGuard-выхода не запустилась. Приложение удалило частично созданный интерфейс и маршруты и сохранило прямой выход. Откройте диагностику, чтобы увидеть причину запуска systemd.")
+        "tun_interface_not_found" in lower ->
+            "выбранный TUN-интерфейс не найден на сервере. Запустите создающую его службу и обновите список кандидатов."
+        "tun_interface_not_up" in lower ->
+            "выбранный TUN-интерфейс найден, но не поднят. Сначала запустите создающую его службу."
+        "tun_interface_is_primary" in lower ->
+            "основной сетевой интерфейс сервера нельзя использовать как TUN-выход WDTT. Выберите интерфейс, созданный TUN-службой."
+        "tun_interface_mismatch" in lower ->
+            "активная служба TUN-выхода настроена на другой интерфейс. Обновите состояние и включите нужный интерфейс заново."
+        "tun_exit_service_inactive" in lower ->
+            withTail("служба маршрутизации через TUN-интерфейс не запустилась. Частичные правила удалены, прямой выход сохранён.")
+        "tun_exit_route_inactive" in lower ->
+            "служба TUN-выхода запущена, но не смогла применить все управляемые маршруты и правила. Режим отключён и прямой выход сохранён."
+        "tun_ip_forward_failed" in lower ->
+            "сервер не разрешил включить пересылку IPv4-пакетов, без которой трафик клиентов нельзя передать из WDTT в TUN. Прежний внешний режим отключён, прямой выход сохранён."
+        "tun_exit_check_failed" in lower ->
+            withTail("маршруты через TUN применились, но реальный HTTPS-трафик WDTT через них не прошёл. Режим отключён и прямой выход сохранён; проверьте маршрутизацию TUN-приложения.")
+        "tun_exit_remove_failed" in lower ->
+            "сервер не подтвердил полное удаление управляемой TUN-службы или её правил. Сам внешний TUN-интерфейс приложение не удаляло."
+        "tun_exit_ownership_conflict" in lower ->
+            "таблица маршрутизации 110 или служебные пути TUN-выхода уже заняты конфигурацией, которой WDTT Plus не владеет. Приложение ничего не удалило; освободите конфликт вручную или выберите другой сервер."
+        "tun_exit_not_owned" in lower ->
+            "служебные файлы TUN-выхода не имеют маркера WDTT Plus. Для безопасности приложение отказалось их удалять."
+        "external_interface_not_found" in lower ->
+            "не удалось определить основной сетевой интерфейс сервера, поэтому безопасно отделить его от TUN-выхода нельзя."
+        "iproute_required" in lower ->
+            "на сервере не найден набор команд iproute2, необходимый для управляемой маршрутизации."
         "direct_cleanup_failed" in lower ->
-            "сервер не подтвердил полную остановку прежнего WireGuard/прокси-выхода. Запустите «Диагностику» и не включайте другой режим, пока оставшийся маршрут не будет устранён."
+            "сервер не подтвердил полную остановку прежнего WireGuard, TUN или прокси-выхода. Запустите «Диагностику» и не включайте другой режим, пока оставшийся маршрут не будет устранён."
         "wireguard_not_active" in lower ->
             "WireGuard-выход WDTT сейчас не запущен. Включите «Бесплатный WARP», «Другой сервер» или «VPN/WireGuard-файл», затем повторите проверку."
         "wireguard_exit_check_failed" in lower ->
@@ -9324,6 +10774,8 @@ private fun validateAdminProfile(profile: JSONObject?) {
     profile.optStringLength("secondary_vk_hash", 512, "admin_profile")
     profile.optStringLength("profile_name", 48, "admin_profile")
     profile.optStringLength("sni", 253, "admin_profile")
+    profile.optStringLength("vpn_dns_selection", 32, "admin_profile")
+    profile.optStringLength("vpn_dns_custom", 64, "admin_profile")
     if (profile.has("workers_per_hash")) {
         require(profile.optInt("workers_per_hash", 0) in 1..128) { "workers_per_hash в admin_profile должен быть 1..128" }
     }
@@ -9332,6 +10784,16 @@ private fun validateAdminProfile(profile: JSONObject?) {
     }
     if (profile.has("listen_port")) {
         require(profile.optInt("listen_port", 0) in 1..65535) { "listen_port в admin_profile некорректен" }
+    }
+    if (profile.has("vpn_dns_selection")) {
+        val rawSelection = profile.optString("vpn_dns_selection").trim().lowercase()
+        require(normalizeVpnDnsSelectionId(rawSelection) == rawSelection) {
+            "vpn_dns_selection в admin_profile некорректен"
+        }
+        val custom = decodeStoredCustomVpnDnsServers(profile.optString("vpn_dns_custom", ""))
+        require(rawSelection != com.wdtt.plus.VPN_DNS_CUSTOM_ID || custom.isNotEmpty()) {
+            "для custom DNS в admin_profile нужны IPv4-адреса"
+        }
     }
     val ports = profile.optString("ports", "")
     require(ports.isBlank() || ports.isValidPortsSpec()) { "ports в admin_profile некорректны" }
@@ -9410,8 +10872,8 @@ internal fun validatePasswordsDbForPreserving(
 
 private fun validateWgKeysDat(value: String) {
     val lines = value.trim().lines().map { it.trim() }.filter { it.isNotBlank() }
-    require(lines.size >= 4) { "wg-keys.dat должен содержать 4 ключа" }
-    lines.take(4).forEachIndexed { index, key ->
+    require(lines.size == 4) { "wg-keys.dat должен содержать ровно 4 ключа" }
+    lines.forEachIndexed { index, key ->
         require(key.isValidBase64Key()) { "ключ WireGuard #${index + 1} некорректен" }
     }
 }
@@ -9422,7 +10884,8 @@ internal fun parseBackup(
     createdAt: String,
     sourceHost: String,
     formatVersion: Int = SERVER_BACKUP_FORMAT_VERSION,
-    integrityVerified: Boolean = true
+    integrityVerified: Boolean = true,
+    ownerProfileFromApp: Boolean = false
 ): ServerBackup {
     require(passwordsJson.length <= MAX_SERVER_DATABASE_CHARS) { "база в бэкапе слишком большая" }
     require(wgKeysDat == null || wgKeysDat.length <= MAX_SERVER_WG_KEYS_CHARS) {
@@ -9449,7 +10912,8 @@ internal fun parseBackup(
         botToken = db.optString("bot_token"),
         dns = db.optString("dns"),
         formatVersion = formatVersion,
-        integrityVerified = integrityVerified
+        integrityVerified = integrityVerified,
+        ownerProfileFromApp = ownerProfileFromApp
     )
 }
 
@@ -9463,6 +10927,7 @@ internal fun backupToJson(backup: ServerBackup): String {
         .put("passwords_json_sha256", sha256Text(backup.passwordsJson))
         .put("password_count", backup.passwordCount)
         .put("device_count", backup.deviceCount)
+        .put("owner_profile_source", if (backup.ownerProfileFromApp) "app" else "server")
     if (!backup.wgKeysDat.isNullOrBlank()) {
         obj
             .put("wg_keys_dat_b64", encodeBase64Text(backup.wgKeysDat))
@@ -9509,12 +10974,13 @@ internal fun parseBackupFile(raw: String): ServerBackup {
         createdAt = obj.optString("created_at", "неизвестно"),
         sourceHost = obj.optString("source_host", "неизвестно"),
         formatVersion = version,
-        integrityVerified = version >= 2
+        integrityVerified = version >= 2,
+        ownerProfileFromApp = obj.optString("owner_profile_source") == "app"
     )
 }
 
-private suspend fun loadServerBackupFromUri(context: Context, uri: Uri): ServerBackup = withContext(Dispatchers.IO) {
-    val raw = context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { reader ->
+private suspend fun readServerBackupDocumentFromUri(context: Context, uri: Uri): String = withContext(Dispatchers.IO) {
+    context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { reader ->
         val result = StringBuilder()
         val buffer = CharArray(16 * 1024)
         while (true) {
@@ -9527,13 +10993,68 @@ private suspend fun loadServerBackupFromUri(context: Context, uri: Uri): ServerB
         }
         result.toString()
     } ?: throw IllegalArgumentException("не удалось открыть файл")
-    parseBackupFile(raw)
 }
 
-private suspend fun writeServerBackupToUri(context: Context, outputUri: Uri, backup: ServerBackup) = withContext(Dispatchers.IO) {
-    context.contentResolver.openOutputStream(outputUri)?.use { out ->
-        out.write(backupToJson(backup).toByteArray(Charsets.UTF_8))
+private suspend fun writeServerBackupDocumentToUri(context: Context, outputUri: Uri, document: String) = withContext(Dispatchers.IO) {
+    require(document.length <= MAX_SERVER_BACKUP_FILE_CHARS) { "файл бэкапа слишком большой" }
+    context.contentResolver.openOutputStream(outputUri, "wt")?.use { out ->
+        out.write(document.toByteArray(Charsets.UTF_8))
+        out.flush()
     } ?: throw IllegalStateException("не удалось записать файл")
+    val saved = readServerBackupDocumentFromUri(context, outputUri)
+    require(saved == document) {
+        "сохранённый файл не совпал с подготовленным бэкапом; выберите другое место"
+    }
+}
+
+private fun serverBackupSelectionStatus(backup: ServerBackup, encrypted: Boolean): String = buildString {
+    append("Выбран ${if (backup.hasWgKeys) "полный" else "частичный"} бэкап: клиентов ${backup.passwordCount}, устройств ${backup.deviceCount}.")
+    append(if (encrypted) " Пароль и подлинность файла проверены." else if (backup.integrityVerified) " Целостность файла проверена, но файл не зашифрован." else " Это совместимый старый незашифрованный формат без контрольной суммы.")
+    if (backup.ownerProfileFromApp) append(" Профиль владельца сохранён из вкладки «Туннель».")
+}
+
+private fun normalizedServerAddress(value: String): String =
+    value.trim().trimEnd('.').lowercase(Locale.ROOT)
+
+internal fun prepareServerDatabaseForBackup(
+    sourceJson: String,
+    localOwnerProfile: ServerAdminProfileInfo?,
+    localPeer: String,
+    sourceHost: String
+): PreparedServerBackupDatabase {
+    val db = JSONObject(sourceJson)
+    validatePasswordsDbStructure(db)
+    val localAddress = normalizedServerAddress(localPeer)
+    val belongsToSource = localAddress.isNotBlank() && sequenceOf(
+        sourceHost,
+        db.optString("public_ip")
+    ).map(::normalizedServerAddress).any { it.isNotBlank() && it == localAddress }
+    if (!belongsToSource || localOwnerProfile == null) {
+        return PreparedServerBackupDatabase(db.toString(), ownerProfileFromApp = false)
+    }
+
+    val profile = db.optJSONObject("admin_profile")
+        ?.let { JSONObject(it.toString()) }
+        ?: JSONObject()
+    profile
+        .put("vk_hashes", localOwnerProfile.vkHashes.trim())
+        .put("secondary_vk_hash", localOwnerProfile.secondaryVkHash.trim())
+        .put("profile_name", vpnProfileRestorableName(localOwnerProfile.profileName))
+        .put("workers_per_hash", localOwnerProfile.workersPerHash.coerceIn(1, 128))
+        .put("protocol", localOwnerProfile.protocol.trim().lowercase().takeIf { it == "udp" || it == "tcp" } ?: "udp")
+        .put("listen_port", localOwnerProfile.listenPort.coerceIn(1, 65535))
+        .put("sni", localOwnerProfile.sni.trim())
+        .put("no_dns", localOwnerProfile.noDns)
+        .put("ports", localOwnerProfile.ports)
+        .put("updated_at", System.currentTimeMillis() / 1000L)
+    if (localOwnerProfile.vpnDnsStored) {
+        profile
+            .put("vpn_dns_selection", normalizeVpnDnsSelectionId(localOwnerProfile.vpnDnsSelectionId))
+            .put("vpn_dns_custom", localOwnerProfile.vpnDnsCustomServers.joinToString(","))
+    }
+    db.put("admin_profile", profile)
+    validatePasswordsDbStructure(db)
+    return PreparedServerBackupDatabase(db.toString(), ownerProfileFromApp = true)
 }
 
 private suspend fun readServerBackup(
@@ -9541,7 +11062,9 @@ private suspend fun readServerBackup(
     user: String,
     credentials: SshCredentials,
     port: Int,
-    includeWgKeys: Boolean
+    includeWgKeys: Boolean,
+    localOwnerProfile: ServerAdminProfileInfo?,
+    localPeer: String
 ): ServerBackup = withContext(Dispatchers.IO) {
     var session: Session? = null
     try {
@@ -9562,11 +11085,18 @@ private suspend fun readServerBackup(
         if (includeWgKeys && wgKeys.isNullOrBlank()) {
             throw IllegalStateException("полный экспорт невозможен: на сервере не найден корректный /etc/wdtt/wg-keys.dat. Выполните установку сервера или выберите частичный экспорт")
         }
+        val prepared = prepareServerDatabaseForBackup(
+            sourceJson = passwordsJson,
+            localOwnerProfile = localOwnerProfile,
+            localPeer = localPeer,
+            sourceHost = host
+        )
         parseBackup(
-            passwordsJson = passwordsJson,
+            passwordsJson = prepared.json,
             wgKeysDat = wgKeys,
             createdAt = SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault()).format(Date()),
-            sourceHost = host
+            sourceHost = host,
+            ownerProfileFromApp = prepared.ownerProfileFromApp
         )
     } finally {
         try { session?.disconnect() } catch (_: Exception) {}
@@ -9580,6 +11110,16 @@ private fun readRemotePasswordsJson(ssh: SSHClient): String? {
     )
     val dbB64 = markerValue(output, "WDTT_DB_B64") ?: return null
     return decodeBase64Text(dbB64)
+}
+
+private fun readRemoteWgKeysDat(ssh: SSHClient): String? {
+    val output = ssh.exec(
+        rootCommand("if [ -f /etc/wdtt/wg-keys.dat ]; then printf 'WDTT_WG_KEYS_B64='; base64 /etc/wdtt/wg-keys.dat | tr -d '\\n'; printf '\\n'; fi"),
+        timeout = 20_000L
+    )
+    val encoded = markerValue(output, "WDTT_WG_KEYS_B64") ?: return null
+    require(encoded.length <= 5_500) { "wg-keys.dat на сервере слишком большой" }
+    return decodeBase64Text(encoded).also(::validateWgKeysDat)
 }
 
 private fun parsePortsTriple(value: String): Triple<Int, Int, Int> {
@@ -9604,6 +11144,8 @@ private fun buildOwnerProfile(
     listenPort: Int,
     sni: String,
     noDns: Boolean,
+    vpnDnsSelectionId: String,
+    vpnDnsCustomServers: List<String>,
     dtlsPort: Int,
     wgPort: Int,
     profileName: String = ""
@@ -9623,6 +11165,9 @@ private fun buildOwnerProfile(
         listenPort = safeListenPort,
         sni = sni.trim(),
         noDns = noDns,
+        vpnDnsSelectionId = normalizeVpnDnsSelectionId(vpnDnsSelectionId),
+        vpnDnsCustomServers = vpnDnsCustomServers,
+        vpnDnsStored = true,
         ports = ports.asPortsSpec()
     )
 }
@@ -9649,6 +11194,13 @@ private fun parseOwnerProfileFromDb(json: JSONObject?, defaultPorts: String): Se
         listenPort = listenPort,
         sni = json?.optString("sni", "").orEmpty().trim(),
         noDns = json?.optBoolean("no_dns", false) ?: false,
+        vpnDnsSelectionId = normalizeVpnDnsSelectionId(
+            json?.optString("vpn_dns_selection", VPN_DNS_PROFILE_ID)
+        ),
+        vpnDnsCustomServers = decodeStoredCustomVpnDnsServers(
+            json?.optString("vpn_dns_custom", "").orEmpty()
+        ),
+        vpnDnsStored = json?.has("vpn_dns_selection") == true,
         ports = Triple(ports.first, ports.second, listenPort).asPortsSpec(),
         deviceIds = deviceIds,
         updatedAt = json?.optLong("updated_at", 0L) ?: 0L
@@ -9670,6 +11222,9 @@ private data class OwnerProfileComparable(
     val listenPort: Int,
     val sni: String,
     val noDns: Boolean,
+    val vpnDnsSelectionId: String,
+    val vpnDnsCustomServers: List<String>,
+    val vpnDnsStored: Boolean,
     val ports: String
 )
 
@@ -9684,6 +11239,9 @@ private fun ServerAdminProfileInfo.comparableOwnerProfile(): OwnerProfileCompara
         listenPort = ports.third,
         sni = sni.trim(),
         noDns = noDns,
+        vpnDnsSelectionId = normalizeVpnDnsSelectionId(vpnDnsSelectionId),
+        vpnDnsCustomServers = vpnDnsCustomServers,
+        vpnDnsStored = vpnDnsStored,
         ports = ports.asPortsSpec()
     )
 }
@@ -9691,8 +11249,25 @@ private fun ServerAdminProfileInfo.comparableOwnerProfile(): OwnerProfileCompara
 private fun ownerProfilesDiffer(server: ServerAdminProfileInfo, local: ServerAdminProfileInfo): Boolean =
     server.comparableOwnerProfile().let { serverComparable ->
         local.comparableOwnerProfile().let { localComparable ->
-            serverComparable.copy(profileName = "") != localComparable.copy(profileName = "") ||
-                (serverComparable.profileName.isNotBlank() && serverComparable.profileName != localComparable.profileName)
+            serverComparable.copy(
+                profileName = "",
+                vpnDnsSelectionId = VPN_DNS_PROFILE_ID,
+                vpnDnsCustomServers = emptyList(),
+                vpnDnsStored = false,
+            ) != localComparable.copy(
+                profileName = "",
+                vpnDnsSelectionId = VPN_DNS_PROFILE_ID,
+                vpnDnsCustomServers = emptyList(),
+                vpnDnsStored = false,
+            ) ||
+                (serverComparable.profileName.isNotBlank() && serverComparable.profileName != localComparable.profileName) ||
+                (
+                    serverComparable.vpnDnsStored &&
+                        (
+                            serverComparable.vpnDnsSelectionId != localComparable.vpnDnsSelectionId ||
+                                serverComparable.vpnDnsCustomServers != localComparable.vpnDnsCustomServers
+                            )
+                    )
         }
     }
 
@@ -9726,6 +11301,15 @@ private fun ownerProfileDiffLines(server: ServerAdminProfileInfo, local: ServerA
     }
     if (serverComparable.noDns != localComparable.noDns) {
         lines += "No DNS: сервер — ${if (serverComparable.noDns) "включено" else "выключено"}, приложение — ${if (localComparable.noDns) "включено" else "выключено"}"
+    }
+    if (
+        serverComparable.vpnDnsStored &&
+        (
+            serverComparable.vpnDnsSelectionId != localComparable.vpnDnsSelectionId ||
+                serverComparable.vpnDnsCustomServers != localComparable.vpnDnsCustomServers
+            )
+    ) {
+        lines += "DNS внутри VPN: сервер — ${server.vpnDnsDisplayLabel}, приложение — ${local.vpnDnsDisplayLabel}"
     }
     return lines.ifEmpty { listOf("Отличия есть только в служебных данных профиля.") }
 }
@@ -9763,6 +11347,16 @@ private fun ownerProfileInstallDiffLines(
         }
         if (localComparable.noDns && !serverComparable.noDns) {
             add("No DNS: сервер — выключено, приложение — включено")
+        }
+        if (
+            localComparable.vpnDnsStored &&
+            (
+                !serverComparable.vpnDnsStored ||
+                    serverComparable.vpnDnsSelectionId != localComparable.vpnDnsSelectionId ||
+                    serverComparable.vpnDnsCustomServers != localComparable.vpnDnsCustomServers
+                )
+        ) {
+            add("DNS внутри VPN: сервер — ${server.vpnDnsDisplayLabel}, приложение — ${local.vpnDnsDisplayLabel}")
         }
     }
 }
@@ -9845,8 +11439,14 @@ internal fun outboundProfilesDiffer(
     val importedWireGuardDiffers = importedWireGuardConfigured &&
         text(server.importedWireGuardConfig) != text(local.importedWireGuardConfig)
 
+    val tunConfigured = server.mode == "tun_interface" ||
+        server.tunInterface.isNotBlank() ||
+        local.tunInterface.isNotBlank()
+    val tunDiffers = tunConfigured &&
+        text(server.tunInterface) != text(local.tunInterface)
+
     return localProxyDiffers || externalProxyDiffers ||
-        wireGuardVpsDiffers || importedWireGuardDiffers
+        wireGuardVpsDiffers || importedWireGuardDiffers || tunDiffers
 }
 
 private suspend fun compareDeployWithServer(
@@ -10144,6 +11744,24 @@ private fun normalizeDbForTarget(
     )
 }
 
+private fun importedServerConnectionForTarget(
+    backup: ServerBackup,
+    request: DeployRequest
+): ExistingServerConnection {
+    val normalizedJson = normalizeDbForTarget(
+        backup = backup,
+        currentDbJson = null,
+        mode = ServerImportMode.Replace,
+        request = request
+    )
+    val normalized = JSONObject(normalizedJson)
+    return selectExistingServerConnection(
+        dbJson = normalizedJson,
+        fallbackHost = request.host,
+        adminMainPassword = normalized.optString("main_password")
+    )
+}
+
 private fun applyServerImport(
     context: Context,
     ssh: SSHClient,
@@ -10167,6 +11785,7 @@ private fun applyServerImport(
             ssh.upload(wgFile, remoteWgFile, permissions = 0b110000000)
         }
         val command = buildString {
+            append("set -e; ")
             append("systemctl stop wdtt 2>/dev/null || true; ")
             append("mkdir -p /etc/wdtt; ")
             append("install -m 600 ${shellQuote(remoteDbFile)} /etc/wdtt/passwords.json; ")
@@ -10174,13 +11793,27 @@ private fun applyServerImport(
             if (replaceWgKeys) {
                 append("install -m 600 ${shellQuote(remoteWgFile)} /etc/wdtt/wg-keys.dat; rm -f ${shellQuote(remoteWgFile)}; ")
             }
+            append("echo WDTT_IMPORT_FILES=1; ")
             if (restartService) {
-                append("systemctl restart wdtt 2>/dev/null || true; ")
-                append("systemctl is-active wdtt 2>/dev/null || true; ")
+                append("systemctl restart wdtt; ")
+                append("systemctl is-active --quiet wdtt; ")
+                append("echo WDTT_IMPORT_SERVICE=active; ")
             }
         }
         val output = ssh.exec(rootCommand(command), timeout = 60000L)
-        if (restartService && !Regex("^active$", RegexOption.MULTILINE).containsMatchIn(output)) {
+        if (markerValue(output, "WDTT_IMPORT_FILES") != "1") {
+            throw IllegalStateException(
+                compactRemoteTail(output).ifBlank { "сервер не подтвердил запись импортируемых файлов" }
+            )
+        }
+        if (replaceWgKeys) {
+            val installedWgKeys = readRemoteWgKeysDat(ssh)
+                ?: throw IllegalStateException("после импорта не найдены WireGuard-ключи")
+            require(installedWgKeys.trim() == backup.wgKeysDat.orEmpty().trim()) {
+                "WireGuard-ключи на сервере не совпали с бэкапом"
+            }
+        }
+        if (restartService && markerValue(output, "WDTT_IMPORT_SERVICE") != "active") {
             throw IllegalStateException("wdtt.service не стал active после импорта")
         }
     } finally {
@@ -10691,6 +12324,8 @@ internal fun validateImportedServerState(
                 "profile_name",
                 "protocol",
                 "sni",
+                "vpn_dns_selection",
+                "vpn_dns_custom",
                 "ports"
             ).forEach { field ->
                 require(expectedProfile.optString(field, "") == actualProfile?.optString(field, "").orEmpty()) {
@@ -11019,6 +12654,153 @@ private suspend fun performUninstall(
 }
 
 // ==================== Dialogs ====================
+
+@Composable
+private fun ServerBackupExportPasswordDialog(
+    backup: ServerBackup,
+    onDismiss: () -> Unit,
+    onReady: (String) -> Unit,
+    onError: (String) -> Unit
+) {
+    val scope = rememberCoroutineScope()
+    var password by remember { mutableStateOf("") }
+    var repeatPassword by remember { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    val validationError = when {
+        password.isNotEmpty() && password.length < 8 -> "Минимум 8 символов."
+        repeatPassword.isNotEmpty() && password != repeatPassword -> "Пароли не совпадают."
+        else -> null
+    }
+
+    AlertDialog(
+        onDismissRequest = { if (!busy) onDismiss() },
+        title = { Text("Защитить бэкап") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    "В файле будут главный и клиентские пароли${if (backup.hasWgKeys) ", приватные WireGuard-ключи" else ""}. Задайте отдельный пароль и храните его отдельно от бэкапа.",
+                    style = MaterialTheme.typography.bodyMedium
+                )
+                OutlinedTextField(
+                    value = password,
+                    onValueChange = { password = it.take(256); error = null },
+                    label = { Text("Пароль файла") },
+                    visualTransformation = PasswordVisualTransformation(),
+                    singleLine = true,
+                    enabled = !busy,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = repeatPassword,
+                    onValueChange = { repeatPassword = it.take(256); error = null },
+                    label = { Text("Повторите пароль") },
+                    visualTransformation = PasswordVisualTransformation(),
+                    singleLine = true,
+                    enabled = !busy,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                (error ?: validationError)?.let {
+                    Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                }
+                if (busy) Text("Шифрую и проверяю бэкап...", style = MaterialTheme.typography.bodySmall)
+            }
+        },
+        confirmButton = {
+            Button(
+                enabled = !busy && password.length >= 8 && password == repeatPassword,
+                onClick = {
+                    busy = true
+                    error = null
+                    val chars = password.toCharArray()
+                    scope.launch {
+                        runCatching {
+                            withContext(Dispatchers.Default) {
+                                WdttTransferCodec.encryptServerBackup(backupToJson(backup), chars)
+                            }
+                        }.onSuccess { document ->
+                            password = ""
+                            repeatPassword = ""
+                            onReady(document)
+                        }.onFailure {
+                            val message = it.message ?: "Не удалось зашифровать бэкап."
+                            error = message
+                            onError(message)
+                        }
+                        chars.fill('\u0000')
+                        busy = false
+                    }
+                }
+            ) { Text("Продолжить") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss, enabled = !busy) { Text("Отмена") }
+        }
+    )
+}
+
+@Composable
+private fun ServerBackupImportPasswordDialog(
+    document: String,
+    onDismiss: () -> Unit,
+    onImported: (ServerBackup) -> Unit
+) {
+    val scope = rememberCoroutineScope()
+    var password by remember { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+
+    AlertDialog(
+        onDismissRequest = { if (!busy) onDismiss() },
+        title = { Text("Пароль бэкапа") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("Введите пароль, заданный при экспорте. Проверка не изменяет сервер.")
+                OutlinedTextField(
+                    value = password,
+                    onValueChange = { password = it.take(256); error = null },
+                    label = { Text("Пароль файла") },
+                    visualTransformation = PasswordVisualTransformation(),
+                    singleLine = true,
+                    enabled = !busy,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                error?.let {
+                    Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                }
+                if (busy) Text("Расшифровываю и проверяю данные...", style = MaterialTheme.typography.bodySmall)
+            }
+        },
+        confirmButton = {
+            Button(
+                enabled = !busy && password.isNotEmpty(),
+                onClick = {
+                    busy = true
+                    error = null
+                    val chars = password.toCharArray()
+                    scope.launch {
+                        runCatching {
+                            withContext(Dispatchers.Default) {
+                                parseBackupFile(WdttTransferCodec.decryptServerBackup(document, chars))
+                                    .copy(passwordProtected = true)
+                            }
+                        }.onSuccess { backup ->
+                            password = ""
+                            onImported(backup)
+                        }.onFailure {
+                            error = it.message ?: "Не удалось открыть бэкап."
+                        }
+                        chars.fill('\u0000')
+                        busy = false
+                    }
+                }
+            ) { Text("Проверить") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss, enabled = !busy) { Text("Отмена") }
+        }
+    )
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable

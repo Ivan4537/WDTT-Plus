@@ -19,9 +19,12 @@ import javax.crypto.spec.SecretKeySpec
 private const val TRANSFER_FORMAT = "wdtt-plus-transfer"
 private const val TRANSFER_VERSION = 1
 private const val ADMIN_KIND = "admin-settings"
+private const val SERVER_BACKUP_KIND = "server-backup"
 private const val PBKDF2_ITERATIONS = 210_000
 private const val KEY_BITS = 256
 private const val GCM_TAG_BITS = 128
+private const val MAX_TRANSFER_DOCUMENT_CHARS = 12_000_000
+private const val MAX_TRANSFER_PLAINTEXT_BYTES = 8_000_000
 
 data class AdminTransferPreview(
     val createdAt: Long,
@@ -100,20 +103,31 @@ object WdttTransferCodec {
     }
 
     fun encryptAdminSettings(settingsJson: String, password: CharArray): String {
+        return encryptDocument(settingsJson, password, ADMIN_KIND)
+    }
+
+    fun encryptServerBackup(backupJson: String, password: CharArray): String {
+        return encryptDocument(backupJson, password, SERVER_BACKUP_KIND)
+    }
+
+    private fun encryptDocument(value: String, password: CharArray, kind: String): String {
         require(password.size >= 8) { "Пароль должен содержать не меньше 8 символов." }
+        require(value.toByteArray(StandardCharsets.UTF_8).size <= MAX_TRANSFER_PLAINTEXT_BYTES) {
+            "Данные для передачи слишком большие."
+        }
         val salt = ByteArray(16).also(random::nextBytes)
         val iv = ByteArray(12).also(random::nextBytes)
         val key = deriveKey(password, salt, PBKDF2_ITERATIONS)
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.ENCRYPT_MODE, key, GCMParameterSpec(GCM_TAG_BITS, iv))
-        val compressed = gzip(settingsJson.toByteArray(StandardCharsets.UTF_8))
+        val compressed = gzip(value.toByteArray(StandardCharsets.UTF_8))
         val encrypted = cipher.doFinal(compressed)
         key.encoded?.fill(0)
 
         return JSONObject()
             .put("format", TRANSFER_FORMAT)
             .put("version", TRANSFER_VERSION)
-            .put("kind", ADMIN_KIND)
+            .put("kind", kind)
             .put("createdAt", System.currentTimeMillis())
             .put("sourceVersion", BuildConfig.VERSION_NAME)
             .put("kdf", "PBKDF2-HMAC-SHA256")
@@ -125,10 +139,11 @@ object WdttTransferCodec {
     }
 
     fun isAdminTransfer(value: String): Boolean = runCatching {
-        val json = JSONObject(value.trim())
-        json.optString("format") == TRANSFER_FORMAT &&
-            json.optInt("version") == TRANSFER_VERSION &&
-            json.optString("kind") == ADMIN_KIND
+        hasEnvelopeKind(value, ADMIN_KIND)
+    }.getOrDefault(false)
+
+    fun isEncryptedServerBackup(value: String): Boolean = runCatching {
+        hasEnvelopeKind(value, SERVER_BACKUP_KIND)
     }.getOrDefault(false)
 
     fun documentFormat(value: String): String? = runCatching {
@@ -145,19 +160,33 @@ object WdttTransferCodec {
     }
 
     fun decryptAdminSettings(value: String, password: CharArray): String {
+        return decryptDocument(value, password, ADMIN_KIND)
+    }
+
+    fun decryptServerBackup(value: String, password: CharArray): String {
+        return decryptDocument(value, password, SERVER_BACKUP_KIND)
+    }
+
+    private fun decryptDocument(value: String, password: CharArray, kind: String): String {
         require(password.isNotEmpty()) { "Введите пароль файла." }
-        val json = requireAdminEnvelope(value)
+        val json = requireEnvelope(value, kind)
         val iterations = json.optInt("iterations", 0)
         require(iterations in 100_000..1_000_000) { "Некорректные параметры защиты файла." }
-        val salt = Base64.getDecoder().decode(json.getString("salt"))
-        val iv = Base64.getDecoder().decode(json.getString("iv"))
-        val encrypted = Base64.getDecoder().decode(json.getString("data"))
+        val data = json.getString("data")
+        require(data.length <= 10_700_000) { "Файл передачи слишком большой." }
+        val salt = runCatching { Base64.getDecoder().decode(json.getString("salt")) }
+            .getOrElse { throw IllegalArgumentException("Файл передачи повреждён.") }
+        val iv = runCatching { Base64.getDecoder().decode(json.getString("iv")) }
+            .getOrElse { throw IllegalArgumentException("Файл передачи повреждён.") }
+        val encrypted = runCatching { Base64.getDecoder().decode(data) }
+            .getOrElse { throw IllegalArgumentException("Файл передачи повреждён.") }
         require(salt.size == 16 && iv.size == 12) { "Файл передачи повреждён." }
         val key = deriveKey(password, salt, iterations)
         return try {
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
             cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(GCM_TAG_BITS, iv))
-            ungzip(cipher.doFinal(encrypted)).toString(StandardCharsets.UTF_8)
+            ungzip(cipher.doFinal(encrypted), MAX_TRANSFER_PLAINTEXT_BYTES)
+                .toString(StandardCharsets.UTF_8)
         } catch (_: Exception) {
             throw IllegalArgumentException("Неверный пароль или файл повреждён.")
         } finally {
@@ -166,11 +195,27 @@ object WdttTransferCodec {
     }
 
     private fun requireAdminEnvelope(value: String): JSONObject {
+        return requireEnvelope(value, ADMIN_KIND)
+    }
+
+    private fun hasEnvelopeKind(value: String, kind: String): Boolean {
+        if (value.length > MAX_TRANSFER_DOCUMENT_CHARS) return false
+        val json = JSONObject(value.trim())
+        return json.optString("format") == TRANSFER_FORMAT &&
+            json.optInt("version") == TRANSFER_VERSION &&
+            json.optString("kind") == kind
+    }
+
+    private fun requireEnvelope(value: String, kind: String): JSONObject {
+        require(value.length <= MAX_TRANSFER_DOCUMENT_CHARS) { "Файл передачи слишком большой." }
         val json = runCatching { JSONObject(value.trim()) }
             .getOrElse { throw IllegalArgumentException("Файл передачи повреждён или имеет неизвестный формат.") }
         require(json.optString("format") == TRANSFER_FORMAT) { "Это не файл передачи WDTT Plus." }
         require(json.optInt("version") == TRANSFER_VERSION) { "Версия файла пока не поддерживается." }
-        require(json.optString("kind") == ADMIN_KIND) { "В файле нет настроек администратора." }
+        require(json.optString("kind") == kind) {
+            if (kind == ADMIN_KIND) "В файле нет настроек администратора."
+            else "В файле нет резервной копии сервера."
+        }
         return json
     }
 
@@ -189,8 +234,21 @@ object WdttTransferCodec {
         output.toByteArray()
     }
 
-    private fun ungzip(value: ByteArray): ByteArray =
-        GZIPInputStream(ByteArrayInputStream(value)).use { it.readBytes() }
+    private fun ungzip(value: ByteArray, maxBytes: Int): ByteArray =
+        GZIPInputStream(ByteArrayInputStream(value)).use { input ->
+            ByteArrayOutputStream().use { output ->
+                val buffer = ByteArray(16 * 1024)
+                var total = 0
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read < 0) break
+                    total += read
+                    require(total <= maxBytes) { "Распакованные данные слишком большие." }
+                    output.write(buffer, 0, read)
+                }
+                output.toByteArray()
+            }
+        }
 
     private fun encode(value: String): String = URLEncoder.encode(value, StandardCharsets.UTF_8.name())
         .replace("+", "%20")

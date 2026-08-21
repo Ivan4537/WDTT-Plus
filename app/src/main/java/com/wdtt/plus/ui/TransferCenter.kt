@@ -146,9 +146,7 @@ fun TransferCenterDialog(
                 }
                 Text("Получить профиль", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                 Text(
-                    "Добавьте профиль через камеру, изображение или файл. "
-                        + "Если сервис выдал обновление, приложение применит его "
-                        + "к связанному профилю.",
+                    "Добавьте профиль через камеру, изображение или файл. Через эти же кнопки можно получить защищённые настройки администратора: предварительно включать админ-режим не нужно. После ввода пароля приложение покажет подтверждение, импортирует настройки и активирует режим администратора.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -218,7 +216,7 @@ fun TransferCenterDialog(
                     HorizontalDivider()
                     Text("Настройки администратора", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                     Text(
-                        "Все три VPN-профиля, параметры деплоя, пароли, токен бота, исключения и настройки выхода. Данные шифруются указанным паролем.",
+                        "Все три VPN-профиля, параметры деплоя, пароли, токен бота, исключения и настройки выхода. Данные шифруются указанным паролем. Приватные SSH-ключи и конфигурации служб на VPS не передаются.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -353,7 +351,7 @@ fun AdminImportDialog(
                         modifier = Modifier.fillMaxWidth().onFocusChanged { passwordFocused = it.isFocused }
                     )
                 } else {
-                    Text("Будут заменены все три VPN-профиля и локальные настройки администратора. Текущие данные приложения восстановить автоматически не получится.")
+                    Text("Будут заменены все три VPN-профиля и локальные настройки администратора. Текущие данные приложения восстановить автоматически не получится. Приватные SSH-ключи и конфигурации служб на VPS не входят в передачу: при необходимости добавьте их отдельно.")
                 }
                 error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             }

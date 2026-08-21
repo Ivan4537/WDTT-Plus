@@ -5,9 +5,164 @@ import (
 	"errors"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestStartPacerSchedulesMaximumPowerWithoutBurst(t *testing.T) {
+	const workerCount = 108
+	base := time.Unix(1_700_000_000, 0)
+	interval := workerStartInterval(4, false)
+	pacer := newStartPacer(interval)
+
+	for worker := 0; worker < workerCount; worker++ {
+		got := pacer.reserve(base)
+		want := base.Add(time.Duration(worker) * interval)
+		if !got.Equal(want) {
+			t.Fatalf("worker %d scheduled at %v, want %v", worker+1, got, want)
+		}
+	}
+
+	lastStart := time.Duration(workerCount-1) * interval
+	if lastStart > 11*time.Second {
+		t.Fatalf("maximum-power startup window = %v, want at most 11s", lastStart)
+	}
+}
+
+func TestStartPacerDoesNotCatchUpWithBurstAfterIdle(t *testing.T) {
+	base := time.Unix(1_700_000_000, 0)
+	interval := workerStartInterval(4, false)
+	pacer := newStartPacer(interval)
+	if got := pacer.reserve(base); !got.Equal(base) {
+		t.Fatalf("first start = %v, want immediate", got)
+	}
+
+	afterIdle := base.Add(10 * time.Second)
+	if got := pacer.reserve(afterIdle); !got.Equal(afterIdle) {
+		t.Fatalf("first start after idle = %v, want %v", got, afterIdle)
+	}
+	if got := pacer.reserve(afterIdle); !got.Equal(afterIdle.Add(interval)) {
+		t.Fatalf("second start after idle = %v, want paced start", got)
+	}
+}
+
+func TestWorkerStartIntervalRespectsHashCountAndRtNetwork(t *testing.T) {
+	if got := workerStartInterval(1, false); got != 150*time.Millisecond {
+		t.Fatalf("one-hash interval = %v, want 150ms", got)
+	}
+	if got := workerStartInterval(2, false); got != 125*time.Millisecond {
+		t.Fatalf("two-hash interval = %v, want 125ms", got)
+	}
+	if got := workerStartInterval(4, false); got != 100*time.Millisecond {
+		t.Fatalf("four-hash interval = %v, want 100ms", got)
+	}
+	if got := workerStartInterval(4, true); got != 125*time.Millisecond {
+		t.Fatalf("RT-network interval = %v, want 125ms", got)
+	}
+}
+
+func TestWorkerDistributionByHashUsesAllHashesWithoutOverloadingOne(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		workerCount int
+		hashCount   int
+		want        []int
+	}{
+		{name: "27 workers across four hashes", workerCount: 27, hashCount: 4, want: []int{9, 9, 9, 0}},
+		{name: "36 workers across four hashes", workerCount: 36, hashCount: 4, want: []int{9, 9, 9, 9}},
+		{name: "maximum workers across four hashes", workerCount: 108, hashCount: 4, want: []int{27, 27, 27, 27}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := workerDistributionByHash(tc.workerCount, tc.hashCount); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("distribution = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestStartPacerWaitHonorsCancellation(t *testing.T) {
+	pacer := newStartPacer(time.Hour)
+	if err := pacer.wait(context.Background()); err != nil {
+		t.Fatalf("first immediate start failed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	started := time.Now()
+	if err := pacer.wait(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled wait error = %v, want context.Canceled", err)
+	}
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("cancelled wait took %v", elapsed)
+	}
+}
+
+func TestCredentialRequestGateSerializesMaximumPowerRequests(t *testing.T) {
+	const requestCount = 108 / workersPerGroup
+	gate := newCredentialRequestGate(0)
+	start := make(chan struct{})
+	var active atomic.Int32
+	var maximum atomic.Int32
+	var wg sync.WaitGroup
+
+	for requestID := 0; requestID < requestCount; requestID++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			result := gate.fetch(context.Background(), func() (string, string, []string, error) {
+				current := active.Add(1)
+				for {
+					observed := maximum.Load()
+					if current <= observed || maximum.CompareAndSwap(observed, current) {
+						break
+					}
+				}
+				time.Sleep(time.Millisecond)
+				active.Add(-1)
+				return "user", "pass", []string{"turn:example.test:3478"}, nil
+			})
+			if result.err != nil {
+				t.Errorf("credential request failed: %v", result.err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if got := maximum.Load(); got != 1 {
+		t.Fatalf("maximum concurrent credential requests = %d, want 1", got)
+	}
+}
+
+func TestCredentialRequestGateWaitHonorsCancellation(t *testing.T) {
+	gate := newCredentialRequestGate(0)
+	requestStarted := make(chan struct{})
+	releaseRequest := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		gate.fetch(context.Background(), func() (string, string, []string, error) {
+			close(requestStarted)
+			<-releaseRequest
+			return "", "", nil, nil
+		})
+	}()
+	<-requestStarted
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result := gate.fetch(ctx, func() (string, string, []string, error) {
+		t.Fatal("cancelled request must not execute")
+		return "", "", nil, nil
+	})
+	if !errors.Is(result.err, context.Canceled) {
+		t.Fatalf("cancelled credential wait error = %v, want context.Canceled", result.err)
+	}
+	close(releaseRequest)
+	<-done
+}
 
 func TestTerminalGroupCredentialErrors(t *testing.T) {
 	for _, message := range []string{"INVALID_JOIN_LINK", "ANON_BLOCKED", "CALL_FULL", "FATAL_AUTH"} {
@@ -206,38 +361,42 @@ func TestWrapHandshakeTimeoutAllowsFourFlightsBeforeFastRetry(t *testing.T) {
 	}
 }
 
-func TestConfigFirstStartGateOnlyBlocksFollowingWorkersWhenEnabled(t *testing.T) {
+func TestConfigFirstStartGateBlocksEveryWorkerExceptTheConfigWorker(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	regular := newConfigFirstStartGate(false)
-	if err := regular.wait(ctx, 1); err != nil {
+	if err := regular.wait(ctx, false); err != nil {
 		t.Fatalf("regular start path was blocked: %v", err)
 	}
 
 	managed := newConfigFirstStartGate(true)
-	if err := managed.wait(ctx, 0); err != nil {
+	if err := managed.wait(ctx, true); err != nil {
 		t.Fatalf("config worker was blocked: %v", err)
 	}
 
-	waitDone := make(chan error, 1)
-	go func() {
-		waitDone <- managed.wait(ctx, 1)
-	}()
+	waitDone := make(chan error, 2)
+	for range 2 {
+		go func() {
+			waitDone <- managed.wait(ctx, false)
+		}()
+	}
 	select {
 	case err := <-waitDone:
-		t.Fatalf("following worker passed before GETCONF: %v", err)
+		t.Fatalf("another worker passed before GETCONF: %v", err)
 	case <-time.After(20 * time.Millisecond):
 	}
 
 	managed.release()
-	select {
-	case err := <-waitDone:
-		if err != nil {
-			t.Fatalf("following worker failed after GETCONF: %v", err)
+	for range 2 {
+		select {
+		case err := <-waitDone:
+			if err != nil {
+				t.Fatalf("worker failed after GETCONF: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("worker did not start after GETCONF")
 		}
-	case <-time.After(time.Second):
-		t.Fatal("following worker did not start after GETCONF")
 	}
 }
 

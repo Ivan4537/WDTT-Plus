@@ -114,6 +114,86 @@ private val vkHttpsTargets = listOf(
 suspend fun collectClientNetworkDiagnostics(context: Context): ClientNetworkDiagnosticsReport =
     collectClientNetworkDiagnostics(context, retryOnNetworkChange = true)
 
+internal suspend fun collectVpnDnsRuntimeDiagnostic(
+    context: Context,
+    settings: VpnDnsSettingsSnapshot,
+    tunnelRunning: Boolean,
+    runningProfile: Int?,
+): DeviceCheckItem? = withContext(Dispatchers.IO) {
+    if (
+        !tunnelRunning ||
+        runningProfile != settings.profileIndex ||
+        settings.selectionId == VPN_DNS_PROFILE_ID ||
+        settings.configuredServers.isEmpty()
+    ) {
+        return@withContext null
+    }
+
+    val connectivityManager = context.getSystemService(ConnectivityManager::class.java)
+        ?: return@withContext null
+    val network = runCatching { connectivityManager.activeNetwork }.getOrNull()
+    val capabilities = network?.let {
+        runCatching { connectivityManager.getNetworkCapabilities(it) }.getOrNull()
+    }
+    if (network == null || capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) != true) {
+        return@withContext DeviceCheckItem(
+            title = "Доступность выбранного DNS внутри VPN",
+            status = "VPN-сеть Android не найдена",
+            details = "Туннель отмечен как запущенный, но Android не вернул активную VPN-сеть для безопасной проверки выбранного DNS.",
+            recommendation = "Подождите несколько секунд и повторите проверку. Если интернет не работает, переподключите VPN.",
+            severity = DeviceCheckSeverity.Warning,
+        )
+    }
+
+    val servers = settings.configuredServers.distinct()
+    val results = coroutineScope {
+        servers.flatMap { server ->
+            listOf(
+                async(Dispatchers.IO) {
+                    timedProbe("$server UDP") {
+                        directDnsQuery(network, server, useTcp = false, host = "example.com")
+                    }
+                },
+                async(Dispatchers.IO) {
+                    timedProbe("$server TCP") {
+                        directDnsQuery(network, server, useTcp = true, host = "example.com")
+                    }
+                },
+            )
+        }.awaitAll()
+    }
+    val networkAfterProbe = runCatching { connectivityManager.activeNetwork }.getOrNull()
+    if (networkAfterProbe != network) {
+        return@withContext DeviceCheckItem(
+            title = "Доступность выбранного DNS внутри VPN",
+            status = "сеть изменилась во время проверки",
+            details = "Результаты для прежней VPN-сети отброшены.",
+            recommendation = "Дождитесь устойчивого подключения и повторите проверку устройства.",
+            severity = DeviceCheckSeverity.Info,
+        )
+    }
+
+    val respondingServers = servers.count { server ->
+        results.any { result -> result.success && result.label.startsWith("$server ") }
+    }
+    DeviceCheckItem(
+        title = "Доступность выбранного DNS внутри VPN",
+        status = "$respondingServers из ${servers.size} серверов отвечают",
+        details = results.joinToString(". ") { it.display() } +
+            ". Проверка выполнена через активную VPN-сеть; достаточно ответа по UDP или TCP.",
+        recommendation = if (respondingServers == servers.size) {
+            ""
+        } else {
+            "Выберите другой вариант в «Туннель → DNS внутри VPN» либо верните «Как в профиле» и повторите проверку."
+        },
+        severity = if (respondingServers == servers.size) {
+            DeviceCheckSeverity.Ok
+        } else {
+            DeviceCheckSeverity.Warning
+        },
+    )
+}
+
 private suspend fun collectClientNetworkDiagnostics(
     context: Context,
     retryOnNetworkChange: Boolean
@@ -464,9 +544,14 @@ private suspend fun probeClientDns(network: Network): List<NetworkProbeResult> =
     }.awaitAll()
 }
 
-private fun directDnsQuery(network: Network, server: String, useTcp: Boolean): String {
+private fun directDnsQuery(
+    network: Network,
+    server: String,
+    useTcp: Boolean,
+    host: String = clientDnsProbeHost,
+): String {
     val queryId = (SystemClock.elapsedRealtimeNanos() and 0xffff).toInt()
-    val query = buildDnsQuery(clientDnsProbeHost, queryId)
+    val query = buildDnsQuery(host, queryId)
     val response = if (useTcp) {
         Socket().use { socket ->
             network.bindSocket(socket)

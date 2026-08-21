@@ -15,7 +15,6 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -42,7 +41,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -89,20 +87,19 @@ private const val BACKGROUND_LOCATION_PERMISSION = "android.permission.ACCESS_BA
 @Composable
 fun TrustedWifiSettingsDialog(
     settingsStore: SettingsStore,
+    enableAfterFirstNetworkAdded: Boolean = false,
     onDismiss: () -> Unit
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val configuration = LocalConfiguration.current
-    val enabledState by remember(settingsStore) {
-        settingsStore.trustedWifiEnabled.map { value: Boolean -> value as Boolean? }
-    }.collectAsStateWithLifecycle(initialValue = null)
+    val maxDialogHeight = (configuration.screenHeightDp.dp - 32.dp).coerceAtLeast(360.dp)
+    val maxScrollableContentHeight = (maxDialogHeight - 112.dp).coerceAtLeast(220.dp)
     val trustedSsidsState by remember(settingsStore) {
         settingsStore.trustedWifiSsids.map { value: List<String> -> value as List<String>? }
     }.collectAsStateWithLifecycle(initialValue = null)
-    val enabled = enabledState == true
     val trustedSsids = trustedSsidsState.orEmpty()
-    val settingsReady = enabledState != null && trustedSsidsState != null
+    val settingsReady = trustedSsidsState != null
     val runtimeState by TrustedWifiManager.state.collectAsStateWithLifecycle()
     var currentWifi by remember { mutableStateOf(ConnectedWifiState(connected = false)) }
     var pendingAction by remember { mutableStateOf<TrustedWifiUiAction?>(null) }
@@ -130,6 +127,9 @@ fun TrustedWifiSettingsDialog(
                     currentWifi = wifi
                     if (wifi.ssidAvailable) {
                         val added = settingsStore.addTrustedWifiSsid(wifi.ssid)
+                        if (enableAfterFirstNetworkAdded) {
+                            settingsStore.saveTrustedWifiEnabled(true)
+                        }
                         val message = if (added) {
                             "Сеть «${wifi.ssid}» добавлена"
                         } else {
@@ -199,14 +199,15 @@ fun TrustedWifiSettingsDialog(
         properties = DialogProperties(usePlatformDefaultWidth = false)
     ) {
         Box(
-            modifier = Modifier.fillMaxSize(),
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(vertical = 16.dp),
             contentAlignment = Alignment.Center
         ) {
             Surface(
                 modifier = Modifier
                     .fillMaxWidth(0.92f)
-                    .fillMaxHeight(0.9f)
-                    .heightIn(max = (configuration.screenHeightDp.dp - 32.dp).coerceAtLeast(360.dp)),
+                    .heightIn(max = maxDialogHeight),
                 shape = RoundedCornerShape(30.dp),
                 color = MaterialTheme.colorScheme.surface,
                 tonalElevation = 8.dp,
@@ -215,7 +216,6 @@ fun TrustedWifiSettingsDialog(
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .verticalScroll(rememberScrollState())
                         .padding(18.dp),
                     verticalArrangement = Arrangement.spacedBy(14.dp)
                 ) {
@@ -249,43 +249,34 @@ fun TrustedWifiSettingsDialog(
                         }
                     }
 
-                    if (!settingsReady) {
-                        Box(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(180.dp),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            CircularProgressIndicator()
-                        }
-                    } else {
-                        Surface(
-                            modifier = Modifier.fillMaxWidth(),
-                            shape = RoundedCornerShape(18.dp),
-                            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f)
-                        ) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth().padding(14.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = maxScrollableContentHeight)
+                            .verticalScroll(rememberScrollState()),
+                        verticalArrangement = Arrangement.spacedBy(14.dp),
+                    ) {
+                        if (!settingsReady) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(180.dp),
+                                contentAlignment = Alignment.Center
                             ) {
-                                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                    Text("Автоматическое ожидание", fontWeight = FontWeight.SemiBold)
-                                    Text(
-                                        "VPN выключается в выбранных сетях и восстанавливается после выхода из них.",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                }
-                                Switch(
-                                    checked = enabled,
-                                    onCheckedChange = { checked ->
-                                        if (checked) requestAction(TrustedWifiUiAction.Enable)
-                                        else scope.launch {
-                                            settingsStore.saveTrustedWifiEnabled(false)
-                                            recheckService()
-                                        }
-                                    }
+                                CircularProgressIndicator()
+                            }
+                        } else {
+                        if (enableAfterFirstNetworkAdded && trustedSsids.isEmpty()) {
+                            Surface(
+                                modifier = Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(18.dp),
+                                color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.6f),
+                            ) {
+                                Text(
+                                    "Добавьте хотя бы одну сеть — после этого режим включится автоматически.",
+                                    modifier = Modifier.padding(14.dp),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onPrimaryContainer,
                                 )
                             }
                         }
@@ -387,6 +378,7 @@ fun TrustedWifiSettingsDialog(
                                 color = MaterialTheme.colorScheme.error
                             )
                         }
+                        }
                     }
                 }
             }
@@ -428,7 +420,11 @@ fun TrustedWifiSettingsDialog(
                                 Toast.makeText(context, "Сеть «$clean» добавлена", Toast.LENGTH_SHORT).show()
                                 manualInput = ""
                                 showManualInput = false
-                                recheckService()
+                                if (enableAfterFirstNetworkAdded) {
+                                    requestAction(TrustedWifiUiAction.Enable)
+                                } else {
+                                    recheckService()
+                                }
                             } else {
                                 Toast.makeText(context, "Сеть «$clean» уже есть в списке", Toast.LENGTH_SHORT).show()
                             }

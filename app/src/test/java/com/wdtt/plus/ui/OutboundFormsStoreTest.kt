@@ -31,5 +31,6 @@ class OutboundFormsStoreTest {
         assertTrue(OutboundFormsStore.isSecretPlainKey("profile_1_wg_exit_password"))
         assertTrue(OutboundFormsStore.isSecretPlainKey("local_proxy_password"))
         assertFalse(OutboundFormsStore.isSecretPlainKey("profile_1_external_proxy_host"))
+        assertFalse(OutboundFormsStore.isSecretPlainKey("profile_1_tun_interface"))
     }
 }

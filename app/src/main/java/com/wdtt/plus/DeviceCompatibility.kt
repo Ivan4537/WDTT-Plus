@@ -162,6 +162,288 @@ internal fun pageSizeCompatibilityItem(
     )
 }
 
+internal fun tunnelHealthItem(
+    running: Boolean,
+    activeWorkers: Int,
+    issue: ConnectionIssue?,
+    confirmedNetworkFailure: Boolean,
+): DeviceCheckItem = when {
+    !running -> DeviceCheckItem(
+        title = "Текущее подключение VPN",
+        status = "не активно",
+        details = "VPN сейчас не подключён. Это не мешает проверке устройства; пункт фиксирует текущее состояние туннеля.",
+        recommendation = issue?.let { "${it.title}: ${it.action}" }.orEmpty(),
+        severity = DeviceCheckSeverity.Info,
+    )
+    confirmedNetworkFailure -> DeviceCheckItem(
+        title = "Текущее подключение VPN",
+        status = "нет ответа на пользовательский трафик",
+        details = "VPN-интерфейс включён, активных каналов: $activeWorkers, но приложение подтвердило отсутствие ответов на переданный трафик.",
+        recommendation = issue?.let { "${it.title}: ${it.action}" }
+            ?: "WDTT Plus автоматически проверит восстановление и при необходимости переподключит VPN.",
+        severity = DeviceCheckSeverity.Warning,
+    )
+    issue != null -> DeviceCheckItem(
+        title = "Текущее подключение VPN",
+        status = "обнаружена проблема",
+        details = "VPN-интерфейс включён, активных каналов: $activeWorkers. Приложение обнаружило состояние, требующее внимания.",
+        recommendation = "${issue.title}: ${issue.action}",
+        severity = DeviceCheckSeverity.Warning,
+    )
+    activeWorkers <= 0 -> DeviceCheckItem(
+        title = "Текущее подключение VPN",
+        status = "нет активных каналов",
+        details = "VPN подключён, но сейчас нет активных транспортных каналов.",
+        recommendation = "Подождите автоматического восстановления. Если каналы не появятся, переподключите VPN и приложите новый отчёт.",
+        severity = DeviceCheckSeverity.Warning,
+    )
+    else -> DeviceCheckItem(
+        title = "Текущее подключение VPN",
+        status = "активно",
+        details = "VPN подключён. Активных каналов: $activeWorkers.",
+        severity = DeviceCheckSeverity.Ok,
+    )
+}
+
+internal fun sleepBatteryModeItem(
+    enabled: Boolean,
+    mode: SleepBatteryMode,
+    pauseDelayMinutes: Int,
+    resumeDelayMinutes: Int,
+    runtime: SleepBatteryRuntimeState,
+    notificationsGranted: Boolean,
+    batteryOptimizationsIgnored: Boolean?,
+): DeviceCheckItem {
+    if (!enabled) {
+        return DeviceCheckItem(
+            title = "Экономия батареи во сне",
+            status = "выключена",
+            details = "При выключенном экране WDTT Plus не будет намеренно останавливать VPN по сценарию сна.",
+            severity = DeviceCheckSeverity.Info,
+        )
+    }
+
+    val normalizedPause = normalizeSleepPauseDelayMinutes(pauseDelayMinutes)
+    val normalizedResume = normalizeSleepPauseDelayMinutes(resumeDelayMinutes)
+    val status = when (mode) {
+        SleepBatteryMode.DELAYED_PAUSE -> if (normalizedPause == 0) {
+            "отключение сразу после выключения экрана"
+        } else {
+            "отключение через ${sleepDelayDescription(normalizedPause)}"
+        }
+        SleepBatteryMode.TIMED_PAUSE -> if (normalizedResume == 0) {
+            "таймер 0 мин, VPN остаётся активным"
+        } else {
+            "пауза примерно на ${sleepDelayDescription(normalizedResume)}"
+        }
+    }
+    val runtimeText = when (runtime.phase) {
+        SleepBatteryRuntimePhase.IDLE -> "сценарий сейчас не выполняется"
+        SleepBatteryRuntimePhase.WAITING_TO_PAUSE -> "идёт отсчёт до отключения VPN"
+        SleepBatteryRuntimePhase.PAUSED_UNTIL_SCREEN_ON -> "VPN отключён до включения экрана"
+        SleepBatteryRuntimePhase.WAITING_TO_RESUME -> "VPN отключён, ожидается таймер включения"
+        SleepBatteryRuntimePhase.RESUMED_UNTIL_SCREEN_ON -> "VPN уже включён таймером"
+    }
+    val timedResumeNeedsAttention =
+        mode == SleepBatteryMode.TIMED_PAUSE && normalizedResume > 0
+    val severity = when {
+        !notificationsGranted -> DeviceCheckSeverity.Warning
+        timedResumeNeedsAttention && batteryOptimizationsIgnored == false -> DeviceCheckSeverity.Warning
+        else -> DeviceCheckSeverity.Ok
+    }
+    val recommendation = when {
+        !notificationsGranted ->
+            "Разрешите уведомления WDTT Plus, чтобы видеть отсчёт и быстрые действия сценария сна."
+        timedResumeNeedsAttention && batteryOptimizationsIgnored == false ->
+            "Снимите ограничения батареи с WDTT Plus, если Android задерживает включение VPN по таймеру."
+        else -> ""
+    }
+    val timerNote = if (timedResumeNeedsAttention) {
+        " Android может немного отложить таймер в глубоком сне; включение экрана всегда завершает сценарий сразу."
+    } else {
+        " Включение экрана завершает текущий сценарий."
+    }
+    return DeviceCheckItem(
+        title = "Экономия батареи во сне",
+        status = status,
+        details = "Текущее состояние: $runtimeText.$timerNote Во время паузы интернет телефона идёт напрямую, без VPN.",
+        recommendation = recommendation,
+        severity = severity,
+        action = when {
+            !notificationsGranted -> DeviceCheckAction.AppSettings
+            timedResumeNeedsAttention && batteryOptimizationsIgnored == false ->
+                DeviceCheckAction.BatterySettings
+            else -> null
+        },
+    )
+}
+
+internal fun trustedWifiModeItem(
+    enabled: Boolean,
+    savedNetworkCount: Int,
+    waiting: Boolean,
+    waitingSsid: String,
+    accessProblem: TrustedWifiAccessProblem?,
+): DeviceCheckItem {
+    if (!enabled) {
+        return DeviceCheckItem(
+            title = "Доверенные Wi-Fi",
+            status = "выключены",
+            details = "VPN не будет автоматически останавливаться при подключении к сохранённым Wi-Fi сетям.",
+            severity = DeviceCheckSeverity.Info,
+        )
+    }
+
+    val accessRecommendation = when (accessProblem) {
+        TrustedWifiAccessProblem.ForegroundPermission ->
+            "Разрешите WDTT Plus доступ к местоположению или ближайшим устройствам, чтобы Android возвращал имя Wi-Fi."
+        TrustedWifiAccessProblem.BackgroundPermission ->
+            "Разрешите фоновый доступ к местоположению, чтобы доверенная сеть определялась при закрытом приложении."
+        TrustedWifiAccessProblem.LocationDisabled ->
+            "Включите определение местоположения Android, иначе система скрывает имя текущей Wi-Fi сети."
+        null -> ""
+    }
+    val accessAction = when (accessProblem) {
+        TrustedWifiAccessProblem.LocationDisabled -> DeviceCheckAction.NetworkSettings
+        TrustedWifiAccessProblem.ForegroundPermission,
+        TrustedWifiAccessProblem.BackgroundPermission -> DeviceCheckAction.AppSettings
+        null -> null
+    }
+    val cleanCount = savedNetworkCount.coerceAtLeast(0)
+    val status = when {
+        cleanCount == 0 -> "включены, сети не сохранены"
+        accessProblem != null -> "включены, нет доступа к имени Wi-Fi"
+        waiting -> "VPN ожидает выхода из доверенной сети"
+        else -> "включены, сетей: $cleanCount"
+    }
+    val details = when {
+        cleanCount == 0 ->
+            "Автоматика включена, но без сохранённых сетей она не сможет приостанавливать VPN."
+        accessProblem != null ->
+            "Сохранено сетей: $cleanCount. Android не позволяет приложению надёжно определить текущую Wi-Fi сеть в нужном режиме."
+        waiting -> {
+            val network = waitingSsid.trim().takeIf(String::isNotEmpty)?.let { " «$it»" }.orEmpty()
+            "VPN намеренно выключен в доверенной сети$network и восстановится после подтверждённого перехода на другую сеть."
+        }
+        else ->
+            "Сохранено сетей: $cleanCount. VPN будет останавливаться только в них и восстанавливаться после выхода из доверенной сети."
+    }
+    return DeviceCheckItem(
+        title = "Доверенные Wi-Fi",
+        status = status,
+        details = details,
+        recommendation = when {
+            cleanCount == 0 -> "Добавьте хотя бы одну сеть или выключите эту автоматику."
+            accessProblem != null -> accessRecommendation
+            else -> ""
+        },
+        severity = if (cleanCount == 0 || accessProblem != null) {
+            DeviceCheckSeverity.Warning
+        } else {
+            DeviceCheckSeverity.Ok
+        },
+        action = accessAction,
+    )
+}
+
+internal fun vpnRoutingModeItem(
+    snapshot: VpnRoutingSettingsSnapshot,
+    installedPackages: Set<String>,
+    ownPackageName: String,
+): DeviceCheckItem {
+    val selectedPackages = decodeStoredVpnPackages(snapshot.appPackages)
+        .filterNot { isAlwaysBypassedVpnPackage(it, ownPackageName) }
+    val installedSelected = selectedPackages.filter { it in installedPackages }
+    val missingPackages = selectedPackages.filterNot { it in installedPackages }
+    val addressCount = snapshot.addressRules.size
+    val domainCount = snapshot.addressRules.count { it.type == VpnAddressType.DOMAIN }
+    val mode = if (snapshot.isWhitelist) "БС" else "ЧС"
+    val counts = "приложений: ${selectedPackages.size}, адресов: $addressCount" +
+        if (domainCount > 0) ", доменов: $domainCount" else ""
+
+    val warning = when {
+        snapshot.isWhitelist && selectedPackages.isEmpty() && addressCount == 0 ->
+            "Белый список пуст: при подключении профиль намеренно не пропускает трафик приложений через VPN."
+        snapshot.isWhitelist && selectedPackages.isNotEmpty() && installedSelected.isEmpty() ->
+            "Ни одно выбранное приложение сейчас не установлено: профиль не пропускает трафик приложений через VPN."
+        missingPackages.isNotEmpty() ->
+            "Часть выбранных приложений не установлена (${missingPackages.size}); их правила начнут действовать после установки."
+        else -> null
+    }
+    val behavior = when {
+        snapshot.isWhitelist && selectedPackages.isEmpty() && addressCount > 0 ->
+            "Адресные правила применяются ко всем приложениям, кроме обязательных системных исключений WDTT Plus."
+        snapshot.isWhitelist ->
+            "Через VPN идут только выбранные установленные приложения и заданные адресные направления."
+        selectedPackages.isEmpty() && addressCount == 0 ->
+            "Пользовательских исключений нет; через VPN идёт весь поддерживаемый трафик, кроме обязательных исключений WDTT Plus."
+        else ->
+            "Выбранные приложения и адреса обходят VPN, остальной поддерживаемый трафик идёт через туннель."
+    }
+    return DeviceCheckItem(
+        title = "Маршрутизация приложений и адресов",
+        status = "профиль ${snapshot.profileIndex + 1}: $mode, $counts",
+        details = listOfNotNull(behavior, warning).joinToString(" "),
+        recommendation = if (warning != null) {
+            "Проверьте активный профиль во вкладке «Исключения»; предупреждение не изменяет настройки автоматически."
+        } else {
+            ""
+        },
+        severity = if (warning != null) DeviceCheckSeverity.Warning else DeviceCheckSeverity.Ok,
+    )
+}
+
+internal fun vpnDnsModeItem(
+    settings: VpnDnsSettingsSnapshot,
+    tunnelRunning: Boolean,
+    runningProfile: Int?,
+    profileName: String? = null,
+): DeviceCheckItem {
+    val appliesNow = tunnelRunning && runningProfile == settings.profileIndex
+    val customInvalid = settings.selectionId == VPN_DNS_CUSTOM_ID &&
+        settings.customServers.isEmpty()
+    val serverText = settings.configuredServers.joinToString(", ")
+    val status = when {
+        customInvalid -> "свой DNS не заполнен"
+        settings.selectionId == VPN_DNS_PROFILE_ID -> "как в WireGuard-профиле"
+        else -> "${settings.title}: $serverText"
+    }
+    val details = buildString {
+        val displayName = profileName?.takeIf { it.isNotBlank() } ?: "Профиль ${settings.profileIndex + 1}"
+        append("Настройка относится к «")
+        append(displayName)
+        append("» и управляет DNS внутри системного VPN-интерфейса Android. ")
+        when {
+            customInvalid -> append("При подключении безопасно сохранится DNS из WireGuard-профиля.")
+            settings.selectionId == VPN_DNS_PROFILE_ID ->
+                append("Фактические адреса предоставляет сервер вместе с WireGuard-конфигурацией.")
+            settings.isSmartDns ->
+                append("Это сторонний Smart DNS; отдельные сервисы могут направляться через его шлюзы.")
+            else -> append("Выбранные адреса передаются Android VPN-интерфейсу.")
+        }
+        if (appliesNow) {
+            append(" Сейчас запущен этот профиль.")
+        } else if (tunnelRunning) {
+            append(" Сейчас запущен другой профиль; настройка применится при запуске этого профиля.")
+        }
+    }
+    return DeviceCheckItem(
+        title = "DNS внутри VPN",
+        status = status,
+        details = details,
+        recommendation = when {
+            customInvalid -> "Откройте «Туннель → DNS внутри VPN» и укажите один или два IPv4-адреса либо выберите готовый вариант."
+            settings.isSmartDns -> "Учитывайте политику конфиденциальности стороннего сервиса и проверяйте нужные сайты после его выбора."
+            else -> ""
+        },
+        severity = when {
+            customInvalid -> DeviceCheckSeverity.Warning
+            settings.isSmartDns -> DeviceCheckSeverity.Info
+            else -> DeviceCheckSeverity.Ok
+        },
+    )
+}
+
 object DeviceCompatibility {
     const val APP_VERSION_ITEM_TITLE = "Версия WDTT Plus"
     private const val MIN_RECOMMENDED_SDK = 29
@@ -552,20 +834,18 @@ object DeviceCompatibility {
                 severity = DeviceCheckSeverity.Ok
             )
         } else if (running) {
-            DeviceCheckItem(
-                title = "Текущее подключение VPN",
-                status = "активно",
-                details = "VPN подключён. Активных каналов: $activeWorkers.",
-                recommendation = issue?.let { "${it.title}: ${it.action}" }.orEmpty(),
-                severity = if (activeWorkers > 0) DeviceCheckSeverity.Ok else DeviceCheckSeverity.Warning
+            tunnelHealthItem(
+                running = true,
+                activeWorkers = activeWorkers,
+                issue = issue,
+                confirmedNetworkFailure = TunnelManager.hasConfirmedNetworkFailureSince(0L),
             )
         } else {
-            DeviceCheckItem(
-                title = "Текущее подключение VPN",
-                status = "не активно",
-                details = "VPN сейчас не подключён. Это не мешает проверке устройства; пункт фиксирует текущее состояние туннеля.",
-                recommendation = issue?.let { "${it.title}: ${it.action}" }.orEmpty(),
-                severity = DeviceCheckSeverity.Info
+            tunnelHealthItem(
+                running = false,
+                activeWorkers = activeWorkers,
+                issue = issue,
+                confirmedNetworkFailure = false,
             )
         }
     }

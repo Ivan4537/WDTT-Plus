@@ -1,5 +1,6 @@
 package com.wdtt.plus.ui
 
+import com.wdtt.plus.ServerAdminProfileInfo
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
@@ -357,6 +358,62 @@ class ServerMigrationTest {
     }
 
     @Test
+    fun exportUsesCurrentOwnerProfileWhenTunnelPointsToSourceServer() {
+        val source = database("client-a", "Телефон")
+        source.getJSONObject("admin_profile")
+            .put("vk_hashes", "old-owner-hash")
+            .put("device_ids", JSONArray().put("owner-phone"))
+
+        val prepared = prepareServerDatabaseForBackup(
+            sourceJson = source.toString(),
+            localOwnerProfile = ServerAdminProfileInfo(
+                vkHashes = "new-owner-hash-1,new-owner-hash-2",
+                secondaryVkHash = "new-reserve-hash",
+                profileName = "Новый сервер",
+                workersPerHash = 24,
+                protocol = "tcp",
+                listenPort = 9100,
+                sni = "example.org",
+                noDns = true,
+                vpnDnsSelectionId = "custom",
+                vpnDnsCustomServers = listOf("10.0.0.53"),
+                vpnDnsStored = true,
+                ports = "56100,56101,9100"
+            ),
+            localPeer = "OLD.EXAMPLE.ORG.",
+            sourceHost = "old.example.org"
+        )
+
+        val profile = JSONObject(prepared.json).getJSONObject("admin_profile")
+        assertTrue(prepared.ownerProfileFromApp)
+        assertEquals("new-owner-hash-1,new-owner-hash-2", profile.getString("vk_hashes"))
+        assertEquals("new-reserve-hash", profile.getString("secondary_vk_hash"))
+        assertEquals("56100,56101,9100", profile.getString("ports"))
+        assertEquals("owner-phone", profile.getJSONArray("device_ids").getString(0))
+        assertEquals("custom", profile.getString("vpn_dns_selection"))
+        assertEquals("10.0.0.53", profile.getString("vpn_dns_custom"))
+    }
+
+    @Test
+    fun exportDoesNotMixOwnerProfileFromAnotherServer() {
+        val source = database("client-a", "Телефон")
+        source.getJSONObject("admin_profile").put("vk_hashes", "server-owner-hash")
+
+        val prepared = prepareServerDatabaseForBackup(
+            sourceJson = source.toString(),
+            localOwnerProfile = ServerAdminProfileInfo(vkHashes = "other-server-hash"),
+            localPeer = "other.example.org",
+            sourceHost = "old.example.org"
+        )
+
+        assertFalse(prepared.ownerProfileFromApp)
+        assertEquals(
+            "server-owner-hash",
+            JSONObject(prepared.json).getJSONObject("admin_profile").getString("vk_hashes")
+        )
+    }
+
+    @Test
     fun versionTwoBackupRoundTripVerifiesIntegrity() {
         val source = database("client-a", "Телефон")
         val keys = List(4) { "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" }.joinToString("\n")
@@ -375,6 +432,33 @@ class ServerMigrationTest {
         assertTrue(decoded.integrityVerified)
         assertTrue(decoded.hasWgKeys)
         assertEquals(source.toString(), decoded.passwordsJson)
+    }
+
+    @Test
+    fun versionTwoBackupKeepsOwnerProfileSourceMarker() {
+        val backup = parseBackup(
+            passwordsJson = database("client-a", "Телефон").toString(),
+            wgKeysDat = null,
+            createdAt = "05.08.2026 23:00",
+            sourceHost = "old.example.org",
+            ownerProfileFromApp = true
+        )
+
+        val decoded = parseBackupFile(backupToJson(backup))
+
+        assertTrue(decoded.ownerProfileFromApp)
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun backupRejectsAdditionalWireGuardKeyLines() {
+        val keys = List(5) { "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" }.joinToString("\n")
+
+        parseBackup(
+            passwordsJson = database("client-a", "Телефон").toString(),
+            wgKeysDat = keys,
+            createdAt = "05.08.2026 23:00",
+            sourceHost = "old.example.org"
+        )
     }
 
     @Test(expected = IllegalArgumentException::class)

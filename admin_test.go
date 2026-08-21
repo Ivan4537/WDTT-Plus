@@ -256,6 +256,8 @@ func TestAdminSocketAppliesClientChangesWithoutRestart(t *testing.T) {
 		"--sni", "owner.example.com",
 		"--ports", "56010,56011,9010",
 		"--no-dns",
+		"--vpn-dns-selection", "custom",
+		"--vpn-dns-custom", "111.88.96.50,111.88.96.51",
 	)
 	listedOwner := request("list")
 	if listedOwner.Server == nil {
@@ -270,6 +272,8 @@ func TestAdminSocketAppliesClientChangesWithoutRestart(t *testing.T) {
 		profile.ListenPort != 9010 ||
 		profile.SNI != "owner.example.com" ||
 		!profile.NoDNS ||
+		profile.VpnDNSSelection != "custom" ||
+		profile.VpnDNSCustom != "111.88.96.50,111.88.96.51" ||
 		profile.Ports != "56010,56011,9010" ||
 		profile.UpdatedAt == 0 {
 		t.Fatalf("owner profile was not returned intact: %#v", profile)
@@ -294,8 +298,16 @@ func TestAdminSocketAppliesClientChangesWithoutRestart(t *testing.T) {
 		patchedOwner.ListenPort != profile.ListenPort ||
 		patchedOwner.SNI != profile.SNI ||
 		patchedOwner.NoDNS != profile.NoDNS ||
+		patchedOwner.VpnDNSSelection != profile.VpnDNSSelection ||
+		patchedOwner.VpnDNSCustom != profile.VpnDNSCustom ||
 		patchedOwner.Ports != profile.Ports {
 		t.Fatalf("owner profile patch erased fields that were not provided: before=%#v after=%#v", profile, patchedOwner)
+	}
+
+	request("update-admin-profile", "--vpn-dns-selection", "cloudflare", "--vpn-dns-custom", "")
+	publicDNSOwner := request("list").Server.AdminProfile
+	if publicDNSOwner.VpnDNSSelection != "cloudflare" || publicDNSOwner.VpnDNSCustom != "" {
+		t.Fatalf("owner VPN DNS selection did not clear stale custom addresses: %#v", publicDNSOwner)
 	}
 
 	dbMutex.Lock()

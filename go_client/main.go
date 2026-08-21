@@ -264,6 +264,7 @@ func main() {
 	}()
 
 	var pauseFlag int32
+	var activeDispatcher atomic.Pointer[Dispatcher]
 
 	// STDIN для PAUSE/RESUME/STOP и CAPTCHA_RESULT
 	go func() {
@@ -277,6 +278,16 @@ func main() {
 			case line == "RESUME":
 				log.Printf("[STDIN] Команда RESUME")
 				atomic.StoreInt32(&pauseFlag, 0)
+			case line == "DEVICE_SLEEP":
+				if dispatcher := activeDispatcher.Load(); dispatcher != nil {
+					dispatcher.resetUserTrafficHealth()
+				}
+				log.Printf("[STDIN] Экран выключен, таймер пользовательского трафика сброшен")
+			case line == "DEVICE_WAKE":
+				if dispatcher := activeDispatcher.Load(); dispatcher != nil {
+					dispatcher.resetUserTrafficHealth()
+				}
+				log.Printf("[STDIN] Экран включён, проверка пользовательского трафика начнётся заново")
 			case line == "STOP":
 				log.Printf("[STDIN] Команда STOP")
 				cancel()
@@ -311,7 +322,7 @@ func main() {
 	configFirstStart := flag.Bool(
 		"config-first-start",
 		false,
-		"дождаться GETCONF перед запуском остальных воркеров единственной группы",
+		"дождаться GETCONF перед запуском остальных воркеров",
 	)
 	hashFallback := flag.Bool(
 		"hash-fallback",
@@ -450,7 +461,7 @@ func main() {
 		*numW = workersPerGroup
 	}
 	*numW = (*numW / workersPerGroup) * workersPerGroup
-	useConfigFirstStart := *configFirstStart && *numW == workersPerGroup
+	useConfigFirstStart := *configFirstStart
 	useHashFallback := *hashFallback && *numW == workersPerGroup
 
 	var masqueManager *warpMasqueManager
@@ -547,6 +558,7 @@ func main() {
 	go stats.RunLoop(shutdownCh)
 
 	disp := NewDispatcher(ctx, localConn, stats)
+	activeDispatcher.Store(disp)
 	defer disp.Shutdown()
 
 	configCh := make(chan string, 1)
@@ -587,22 +599,25 @@ func main() {
 
 	var wg sync.WaitGroup
 	workerIDCounter := 1
-
-	var prevWaitReady <-chan struct{}
+	startInterval := workerStartInterval(len(hashes), *turnStreamFirst)
+	workerStarts := newStartPacer(startInterval)
+	credentialRequests := newCredentialRequestGate(credentialRequestCooldown)
+	configStartGate := newConfigFirstStartGate(useConfigFirstStart)
+	primaryCredentialsReady := make(chan struct{})
+	log.Printf(
+		"[КЛИЕНТ] Быстрый запуск: новый воркер каждые %v, запросы реквизитов последовательные",
+		startInterval,
+	)
+	log.Printf("[КЛИЕНТ] Распределение потоков по VK-хешам: %v", workerDistributionByHash(*numW, len(hashes)))
 
 	for g := 0; g < numGroups; g++ {
 		isFirst := (g == 0)
-
-		var myWaitReady <-chan struct{}
-		var mySignalReady chan<- struct{}
-
-		if g > 0 {
-			myWaitReady = prevWaitReady
-		}
-		if g < numGroups-1 {
-			ch := make(chan struct{})
-			mySignalReady = ch
-			prevWaitReady = ch
+		var waitForPrimaryCredentials <-chan struct{}
+		var signalPrimaryCredentials chan<- struct{}
+		if isFirst {
+			signalPrimaryCredentials = primaryCredentialsReady
+		} else {
+			waitForPrimaryCredentials = primaryCredentialsReady
 		}
 
 		ids := make([]int, workersPerGroup)
@@ -618,12 +633,21 @@ func main() {
 		}
 
 		wg.Add(1)
-		go func(groupID int, isFirstGroup bool, configChan chan<- string, workerIds []int, startHashIndex int, waitR <-chan struct{}, sigR chan<- struct{}) {
+		go func(
+			groupID int,
+			isFirstGroup bool,
+			configChan chan<- string,
+			workerIds []int,
+			startHashIndex int,
+			waitPrimary <-chan struct{},
+			signalPrimary chan<- struct{},
+		) {
 			defer wg.Done()
 			WorkerGroup(ctx, cancel, groupID, startHashIndex, tp, peer, disp, localPort,
-				isFirstGroup, configChan, workerIds, *numW, useConfigFirstStart, useHashFallback, &pauseFlag,
-				*deviceID, *connPassword, *deviceInfo, transportSession, stats, *turnStreamFirst, waitR, sigR)
-		}(gID, isFirst, cc, ids, g, myWaitReady, mySignalReady)
+				isFirstGroup, configChan, workerIds, *numW, useHashFallback, &pauseFlag,
+				*deviceID, *connPassword, *deviceInfo, transportSession, stats, *turnStreamFirst,
+				configStartGate, workerStarts, credentialRequests, waitPrimary, signalPrimary)
+		}(gID, isFirst, cc, ids, g, waitForPrimaryCredentials, signalPrimaryCredentials)
 	}
 
 	wg.Wait()

@@ -121,9 +121,17 @@ import com.wdtt.plus.RemoteUiActionLauncher
 import com.wdtt.plus.RT_MASQUE_CONFIG_FILE_NAME
 import com.wdtt.plus.RtMasqueEnrollmentState
 import com.wdtt.plus.SettingsStore
+import com.wdtt.plus.SleepBatteryMode
+import com.wdtt.plus.SleepBatteryRuntimePhase
+import com.wdtt.plus.SleepBatteryRuntimeState
 import com.wdtt.plus.TunnelManager
 import com.wdtt.plus.TrustedWifiManager
+import com.wdtt.plus.decodeStoredVpnPackages
 import com.wdtt.plus.trustedWifiAccessProblem
+import com.wdtt.plus.sleepBatteryModeItem
+import com.wdtt.plus.trustedWifiModeItem
+import com.wdtt.plus.vpnRoutingModeItem
+import com.wdtt.plus.vpnProfileDisplayName
 import com.wdtt.plus.inspectRtMasqueEnrollment
 import com.wdtt.plus.UPDATE_DIALOG_ACTION_POSTPONED
 import com.wdtt.plus.UPDATE_DIALOG_ACTION_UPDATE
@@ -359,8 +367,62 @@ fun InfoTab(
             releaseDate = releaseDate,
             latestRelease = latestRelease
         )
-        val workers = runCatching { settingsStore.workersPerHash.first() }.getOrNull()
-        val tunnelProfile = runCatching { settingsStore.tunnelProfileSnapshot() }.getOrNull()
+        val selectedProfile = runCatching { settingsStore.activeProfile.first() }.getOrDefault(0)
+        val savedTunnelProfile = runCatching { settingsStore.activeTunnelProfile.first() }.getOrNull()
+        val diagnosticProfile = TunnelManager.activeTunnelProfile.value
+            ?: savedTunnelProfile
+            ?: selectedProfile
+        val profileNames = runCatching { settingsStore.profileNames.first() }.getOrDefault(emptyList())
+        val diagnosticProfileName = vpnProfileDisplayName(diagnosticProfile, profileNames)
+        val tunnelProfile = runCatching {
+            settingsStore.tunnelProfileSnapshot(diagnosticProfile)
+        }.getOrNull()
+        val workers = tunnelProfile?.workersPerHash
+            ?: runCatching { settingsStore.workersPerHash.first() }.getOrNull()
+        val routingSnapshot = runCatching {
+            settingsStore.vpnRoutingSettingsForProfile(diagnosticProfile)
+        }.getOrNull()
+        val vpnDnsSnapshot = runCatching {
+            settingsStore.vpnDnsSettingsForProfile(diagnosticProfile)
+        }.getOrNull()
+        val installedPackages = withContext(Dispatchers.Default) {
+            runCatching {
+                @Suppress("DEPRECATION")
+                context.packageManager.getInstalledApplications(0)
+                    .mapTo(linkedSetOf()) { it.packageName }
+            }.getOrDefault(emptySet())
+        }
+        val trustedWifiEnabled = runCatching { settingsStore.trustedWifiEnabled.first() }.getOrDefault(false)
+        val trustedWifiSsids = runCatching { settingsStore.trustedWifiSsids.first() }.getOrDefault(emptyList())
+        val trustedWifiRuntime = TrustedWifiManager.state.value
+        val trustedWifiWaiting = trustedWifiRuntime.waiting ||
+            runCatching { settingsStore.trustedWifiWaiting.first() }.getOrDefault(false)
+        val trustedWifiWaitingSsid = trustedWifiRuntime.ssid.ifBlank {
+            runCatching { settingsStore.trustedWifiWaitingSsid.first() }.getOrDefault("")
+        }
+        val trustedWifiProblem = if (trustedWifiEnabled) {
+            trustedWifiAccessProblem(context.applicationContext)
+        } else {
+            null
+        }
+        val sleepEnabled = runCatching { settingsStore.pauseVpnDuringSleep.first() }.getOrDefault(false)
+        val sleepMode = runCatching { settingsStore.sleepBatteryMode.first() }
+            .getOrDefault(SleepBatteryMode.DELAYED_PAUSE)
+        val sleepPauseDelay = runCatching {
+            settingsStore.pauseVpnDuringSleepDelayMinutes.first()
+        }.getOrDefault(0)
+        val sleepResumeDelay = runCatching {
+            settingsStore.resumeVpnDuringSleepDelayMinutes.first()
+        }.getOrDefault(0)
+        val sleepRuntime = runCatching { settingsStore.sleepBatteryRuntimeState.first() }
+            .getOrDefault(SleepBatteryRuntimeState())
+        val notificationsGranted = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+            context.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) ==
+            PackageManager.PERMISSION_GRANTED
+        val batteryOptimizationsIgnored = runCatching {
+            context.getSystemService(PowerManager::class.java)
+                ?.isIgnoringBatteryOptimizations(context.packageName)
+        }.getOrNull()
         val diagnosticsSummary = withContext(Dispatchers.Default) {
             buildSupportReportSummary(context.applicationContext, settingsStore)
         }
@@ -383,6 +445,26 @@ fun InfoTab(
                 )
             )
         }
+        val vpnDnsRuntimeItem = vpnDnsSnapshot?.let { settings ->
+            try {
+                com.wdtt.plus.collectVpnDnsRuntimeDiagnostic(
+                    context = context.applicationContext,
+                    settings = settings,
+                    tunnelRunning = TunnelManager.running.value,
+                    runningProfile = TunnelManager.activeTunnelProfile.value,
+                )
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                com.wdtt.plus.DeviceCheckItem(
+                    title = "Доступность выбранного DNS внутри VPN",
+                    status = "проверка не выполнена",
+                    details = error.message?.take(180) ?: error.javaClass.simpleName,
+                    recommendation = "Повторите проверку при активном VPN этого профиля.",
+                    severity = com.wdtt.plus.DeviceCheckSeverity.Warning,
+                )
+            }
+        }
         val report = withContext(Dispatchers.Default) {
             DeviceCompatibility.check(
                 context = context.applicationContext,
@@ -391,13 +473,46 @@ fun InfoTab(
             )
         }
         return report.copy(
-            summaryLines = diagnosticsSummary + clientNetworkDiagnostics.summaryLines,
+            summaryLines = diagnosticsSummary + clientNetworkDiagnostics.summaryLines +
+                listOfNotNull(vpnDnsRuntimeItem?.let { "DNS внутри VPN: ${it.status}" }),
             items = listOf(versionItem) +
                 report.items.filterNot {
                     it.title == DeviceCompatibility.APP_VERSION_ITEM_TITLE ||
                         it.title == "Сеть Android"
                 } + listOfNotNull(
-                    tunnelProfile?.let { DeviceCompatibility.rtNetworkModeItem(context, it) }
+                    tunnelProfile?.let { DeviceCompatibility.rtNetworkModeItem(context, it) },
+                    sleepBatteryModeItem(
+                        enabled = sleepEnabled,
+                        mode = sleepMode,
+                        pauseDelayMinutes = sleepPauseDelay,
+                        resumeDelayMinutes = sleepResumeDelay,
+                        runtime = sleepRuntime,
+                        notificationsGranted = notificationsGranted,
+                        batteryOptimizationsIgnored = batteryOptimizationsIgnored,
+                    ),
+                    trustedWifiModeItem(
+                        enabled = trustedWifiEnabled,
+                        savedNetworkCount = trustedWifiSsids.size,
+                        waiting = trustedWifiWaiting,
+                        waitingSsid = trustedWifiWaitingSsid,
+                        accessProblem = trustedWifiProblem,
+                    ),
+                    routingSnapshot?.let {
+                        vpnRoutingModeItem(
+                            snapshot = it,
+                            installedPackages = installedPackages,
+                            ownPackageName = context.packageName,
+                        )
+                    },
+                    vpnDnsSnapshot?.let {
+                        com.wdtt.plus.vpnDnsModeItem(
+                            settings = it,
+                            tunnelRunning = TunnelManager.running.value,
+                            runningProfile = TunnelManager.activeTunnelProfile.value,
+                            profileName = diagnosticProfileName,
+                        )
+                    },
+                    vpnDnsRuntimeItem,
                 ) +
                 clientNetworkDiagnostics.items
         )
@@ -1904,6 +2019,29 @@ private fun diagnosticText(block: () -> Any?): String =
 
 private fun formatMiB(bytes: Long): String = "${bytes.coerceAtLeast(0L) / (1024L * 1024L)} МБ"
 
+internal fun sleepBatteryModeDiagnosticText(mode: SleepBatteryMode): String = when (mode) {
+    SleepBatteryMode.DELAYED_PAUSE -> "отключить VPN после задержки до включения экрана"
+    SleepBatteryMode.TIMED_PAUSE -> "отключить VPN сразу и включить по таймеру"
+}
+
+internal fun sleepBatteryRuntimeDiagnosticText(
+    runtime: SleepBatteryRuntimeState,
+    nowMs: Long = System.currentTimeMillis(),
+): String {
+    val phase = when (runtime.phase) {
+        SleepBatteryRuntimePhase.IDLE -> "ожидание выключения экрана"
+        SleepBatteryRuntimePhase.WAITING_TO_PAUSE -> "ожидание отключения VPN"
+        SleepBatteryRuntimePhase.PAUSED_UNTIL_SCREEN_ON -> "VPN отключён до включения экрана"
+        SleepBatteryRuntimePhase.WAITING_TO_RESUME -> "VPN отключён, ожидается включение по таймеру"
+        SleepBatteryRuntimePhase.RESUMED_UNTIL_SCREEN_ON -> "VPN включён таймером до включения экрана"
+    }
+    if (runtime.deadlineMs <= 0L) return phase
+    val remainingMs = (runtime.deadlineMs - nowMs).coerceAtLeast(0L)
+    val remainingMinutes = remainingMs / 60_000L + if (remainingMs % 60_000L == 0L) 0L else 1L
+    val boundedMinutes = remainingMinutes.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+    return "$phase, осталось ${formatSleepTimerDuration(boundedMinutes)}"
+}
+
 private suspend fun buildSupportReportSummary(context: Context, settingsStore: SettingsStore): List<String> {
     val androidVersion = Build.VERSION.RELEASE ?: "?"
     val sdkInt = Build.VERSION.SDK_INT
@@ -2025,7 +2163,20 @@ private suspend fun buildSupportReportSummary(context: Context, settingsStore: S
             "density=${displayMetrics.densityDpi} dpi, fontScale=${context.resources.configuration.fontScale}"
     }
 
-    val activeProfile = runCatching { settingsStore.activeProfile.first() + 1 }.getOrNull()
+    val selectedProfileIndex = runCatching { settingsStore.activeProfile.first() }.getOrNull()
+    val savedTunnelProfileIndex = runCatching { settingsStore.activeTunnelProfile.first() }.getOrNull()
+    val diagnosticProfileIndex = TunnelManager.activeTunnelProfile.value
+        ?: savedTunnelProfileIndex
+        ?: selectedProfileIndex
+    val activeProfile = diagnosticProfileIndex?.plus(1)
+    val routingSettings = diagnosticProfileIndex?.let { profile ->
+        runCatching { settingsStore.vpnRoutingSettingsForProfile(profile) }.getOrNull()
+    }
+    val vpnDnsSettings = diagnosticProfileIndex?.let { profile ->
+        runCatching { settingsStore.vpnDnsSettingsForProfile(profile) }.getOrNull()
+    }
+    val routingPackages = routingSettings?.let { decodeStoredVpnPackages(it.appPackages) }.orEmpty()
+    val routingDomains = routingSettings?.addressRules?.count { it.type == com.wdtt.plus.VpnAddressType.DOMAIN }
     val workers = runCatching { settingsStore.workersPerHash.first() }.getOrNull()
     val vkHashes = runCatching { settingsStore.vkHashes.first() }.getOrDefault("")
     val hashCount = vkHashes
@@ -2060,6 +2211,13 @@ private suspend fun buildSupportReportSummary(context: Context, settingsStore: S
     val loggingEnabled = runCatching { settingsStore.loggingEnabled.first() }.getOrNull()
     val trustedWifiEnabled = runCatching { settingsStore.trustedWifiEnabled.first() }.getOrNull()
     val trustedWifiCount = runCatching { settingsStore.trustedWifiSsids.first().size }.getOrNull()
+    val trustedWifiWaiting = TrustedWifiManager.state.value.waiting ||
+        runCatching { settingsStore.trustedWifiWaiting.first() }.getOrDefault(false)
+    val sleepBatteryEnabled = runCatching { settingsStore.pauseVpnDuringSleep.first() }.getOrNull()
+    val sleepBatteryPauseDelay = runCatching { settingsStore.pauseVpnDuringSleepDelayMinutes.first() }.getOrNull()
+    val sleepBatteryMode = runCatching { settingsStore.sleepBatteryMode.first() }.getOrNull()
+    val sleepBatteryResumeDelay = runCatching { settingsStore.resumeVpnDuringSleepDelayMinutes.first() }.getOrNull()
+    val sleepBatteryRuntime = runCatching { settingsStore.sleepBatteryRuntimeState.first() }.getOrNull()
     val trustedWifiAccess = if (trustedWifiEnabled == true) {
         when (trustedWifiAccessProblem(context)) {
             com.wdtt.plus.TrustedWifiAccessProblem.ForegroundPermission -> "нет доступа к имени Wi-Fi"
@@ -2070,9 +2228,16 @@ private suspend fun buildSupportReportSummary(context: Context, settingsStore: S
     } else {
         "не требуется"
     }
+    val confirmedNetworkFailure = TunnelManager.hasConfirmedNetworkFailureSince(0L)
     val tunnelIssue = TunnelManager.connectionIssue.value?.let { issue ->
         "${issue.title}: ${issue.action}"
-    }.orEmpty().ifBlank { "нет" }
+    }.orEmpty().ifBlank {
+        if (confirmedNetworkFailure) {
+            "пользовательский трафик передан, но ответы не получены"
+        } else {
+            "нет"
+        }
+    }
 
     return buildString {
         appendLine("Версия приложения: ${BuildConfig.VERSION_NAME}")
@@ -2112,13 +2277,31 @@ private suspend fun buildSupportReportSummary(context: Context, settingsStore: S
         appendLine("VPN-разрешение: $vpnPermission")
         appendLine(
             "Доверенные Wi-Fi: включено=${trustedWifiEnabled ?: "недоступно"}, " +
-                "сетей=${trustedWifiCount ?: "недоступно"}, ожидание=${TrustedWifiManager.state.value.waiting}, доступ=$trustedWifiAccess"
+                "сетей=${trustedWifiCount ?: "недоступно"}, ожидание=$trustedWifiWaiting, доступ=$trustedWifiAccess"
+        )
+        appendLine(
+            "Экономия батареи во сне: включено=${sleepBatteryEnabled ?: "недоступно"}, " +
+                "режим=${sleepBatteryMode?.let(::sleepBatteryModeDiagnosticText) ?: "недоступно"}, " +
+                "отключение через=${sleepBatteryPauseDelay?.let(::formatSleepTimerDuration) ?: "недоступно"}, " +
+                "включение через=${sleepBatteryResumeDelay?.let(::formatSleepTimerDuration) ?: "недоступно"}, " +
+                "состояние=${sleepBatteryRuntime?.let(::sleepBatteryRuntimeDiagnosticText) ?: "недоступно"}"
         )
         appendLine("Локаль: ${diagnosticText { Locale.getDefault().toLanguageTag() }}")
         appendLine("Часовой пояс: ${diagnosticText { TimeZone.getDefault().id }}")
         appendLine("Туннель: запущен=${TunnelManager.running.value}, активных=${TunnelManager.activeWorkers.value}")
         appendLine("Последняя проблема: $tunnelIssue")
         appendLine("Профиль: ${activeProfile ?: "недоступно"}")
+        appendLine(
+            "Маршрутизация профиля: режим=${routingSettings?.let { if (it.isWhitelist) "БС" else "ЧС" } ?: "недоступно"}, " +
+                "приложений=${routingSettings?.let { routingPackages.size } ?: "недоступно"}, " +
+                "адресов=${routingSettings?.addressRules?.size ?: "недоступно"}, " +
+                "доменов=${routingDomains ?: "недоступно"}"
+        )
+        appendLine(
+            "DNS внутри VPN: ${vpnDnsSettings?.title ?: "недоступно"}, " +
+                "адреса=${vpnDnsSettings?.configuredServers?.joinToString(", ")?.ifBlank { "из WireGuard-профиля" } ?: "недоступно"}, " +
+                "smart=${vpnDnsSettings?.isSmartDns ?: "недоступно"}"
+        )
         appendLine("Потоки: ${workers ?: "недоступно"}")
         appendLine("VK-хеши: заполнено $hashCount, запасной=${hasSecondaryHash ?: "недоступно"}")
         appendLine("Быстрый VKCalls: ${vkCallsEnabled ?: "недоступно"}")

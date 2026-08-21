@@ -21,10 +21,12 @@ import (
 )
 
 const (
-	vkCallsClientID   = "8093730"
-	vkCallsAPIVersion = "5.276"
-	vkCallsUserAgent  = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
-	vkCallsFloodPause = 60 * time.Second
+	vkCallsClientID              = "8093730"
+	vkCallsAPIVersion            = "5.276"
+	vkCallsUserAgent             = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+	vkCallsFloodPause            = 60 * time.Second
+	vkCallsTransientFailurePause = 45 * time.Second
+	vkCallsCaptchaPause          = 2 * time.Minute
 )
 
 var (
@@ -54,7 +56,25 @@ func isVKCallsFloodError(err error) bool {
 }
 
 func startVKCallsFloodPause(now time.Time) {
-	vkCallsFloodUntil.Store(now.Add(vkCallsFloodPause).UnixNano())
+	startVKCallsPreflightPause(now, vkCallsFloodPause)
+}
+
+// startVKCallsPreflightPause is a small circuit breaker for the optional
+// VKCalls path.  A fresh worker group must not repeat the same failed
+// anonymous flow while the legacy provider is already handling the session.
+// It deliberately affects only preflight: it never delays TURN handshakes or
+// workers that already have credentials.
+func startVKCallsPreflightPause(now time.Time, duration time.Duration) {
+	if duration <= 0 {
+		return
+	}
+	target := now.Add(duration).UnixNano()
+	for {
+		current := vkCallsFloodUntil.Load()
+		if current >= target || vkCallsFloodUntil.CompareAndSwap(current, target) {
+			return
+		}
+	}
 }
 
 func vkCallsFloodPauseRemaining(now time.Time) time.Duration {
@@ -63,6 +83,25 @@ func vkCallsFloodPauseRemaining(now time.Time) time.Duration {
 		return 0
 	}
 	return remaining
+}
+
+func vkCallsPreflightPauseForError(err error) time.Duration {
+	if err == nil {
+		return 0
+	}
+	if isVKCallsFloodError(err) {
+		return vkCallsFloodPause
+	}
+	var captchaErr *VkCaptchaError
+	if errors.As(err, &captchaErr) {
+		return vkCallsCaptchaPause
+	}
+	if strings.Contains(err.Error(), "INVALID_JOIN_LINK") ||
+		strings.Contains(err.Error(), "ANON_BLOCKED") ||
+		strings.Contains(err.Error(), "CALL_FULL") {
+		return 0
+	}
+	return vkCallsTransientFailurePause
 }
 
 func stableVKCallsUUID(scope string) string {

@@ -697,7 +697,6 @@ func RunSession(
 
 	var lastServerRxAt atomic.Int64
 	lastServerRxAt.Store(time.Now().UnixNano())
-	var lastUserTrafficAt atomic.Int64
 	var keepalivePongSeen atomic.Int32
 	policyLimitCh := make(chan int, 1)
 
@@ -745,11 +744,8 @@ func RunSession(
 					return
 				}
 
-				lastTxUnix := lastUserTrafficAt.Load()
-				if lastTxUnix > lastRxUnix &&
-					now.Sub(time.Unix(0, lastTxUnix)) > unansweredUserTrafficTimeout &&
-					now.Sub(lastRx) > unansweredUserTrafficTimeout {
-					log.Printf("[ВОРКЕР #%d] [HEALTH] отправлен пользовательский трафик, но ответа сервера нет %.0f сек, перезапуск воркера", sessionID, now.Sub(lastRx).Seconds())
+				if stalledFor, stalled := d.claimStalledUserTraffic(now, unansweredUserTrafficTimeout); stalled {
+					log.Printf("[ВОРКЕР #%d] [HEALTH] отправлен пользовательский трафик, но ответа сервера нет %.0f сек, перезапуск воркера", sessionID, stalledFor.Seconds())
 					sessCancel()
 					return
 				}
@@ -769,6 +765,7 @@ func RunSession(
 				if !ok {
 					return
 				}
+				userTraffic := isWireGuardUserDataPacket(pkt)
 				_ = dtlsConn.SetWriteDeadline(time.Now().Add(sessionReadTimeout))
 				_, writeErr := dtlsConn.Write(pkt)
 				putPktBuf(pkt)
@@ -776,7 +773,9 @@ func RunSession(
 					log.Printf("[ВОРКЕР #%d] Ошибка Writer: %v", sessionID, writeErr)
 					return
 				}
-				lastUserTrafficAt.Store(time.Now().UnixNano())
+				if userTraffic {
+					d.noteUserTrafficSent(time.Now())
+				}
 			}
 		}
 	}()
@@ -816,9 +815,18 @@ func RunSession(
 
 			// Skip keepalive pong from server
 			if n == 1 && pkt[0] == keepaliveByte {
-				keepalivePongSeen.Store(1)
+				if keepalivePongSeen.CompareAndSwap(0, 1) {
+					// Один сигнал на нативный процесс: Android использует его для
+					// проверки таймерного возобновления, не засоряя лог каждым pong.
+					log.Printf("[HEALTH] сервер ответил на keepalive")
+				}
 				putPktBuf(pkt)
 				continue
+			}
+			if isWireGuardUserDataPacket(pkt[:n]) {
+				if d.noteUserTrafficResponse() {
+					log.Printf("[HEALTH] пользовательский трафик снова получает ответы")
+				}
 			}
 
 			pkt = pkt[:n]

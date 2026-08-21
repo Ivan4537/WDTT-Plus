@@ -2068,6 +2068,7 @@ private fun ServerToolsDialog(
 	                                    InfoLine("Протокол", state.adminProfile.protocol)
 	                                    InfoLine("SNI", state.adminProfile.sni.ifBlank { "не задан" })
 	                                    InfoLine("No DNS", if (state.adminProfile.noDns) "включено" else "выключено")
+	                                    InfoLine("DNS внутри VPN", state.adminProfile.vpnDnsDisplayLabel)
 	                                    HorizontalDivider()
 	                                    Text("Будет записано при установке", fontWeight = FontWeight.Bold)
 	                                    InfoLine("VK-хеши владельца", secretPresenceLabel(localAdminProfile.vkHashes))
@@ -2077,6 +2078,7 @@ private fun ServerToolsDialog(
 	                                    InfoLine("Протокол", localAdminProfile.protocol)
 	                                    InfoLine("SNI", localAdminProfile.sni.ifBlank { "не задан" })
 	                                    InfoLine("No DNS", if (localAdminProfile.noDns) "включено" else "выключено")
+	                                    InfoLine("DNS внутри VPN", localAdminProfile.vpnDnsDisplayLabel)
 	                                    Text(
 	                                        "Это обзор без редактирования и отдельного сохранения. Чтобы изменить профиль владельца, заполните поля во вкладках «Туннель» и «Деплой», затем нажмите «Установить» и подтвердите установку с сохранением данных или с нуля.",
 	                                        style = MaterialTheme.typography.bodySmall,

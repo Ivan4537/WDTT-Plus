@@ -41,6 +41,7 @@ internal class OutboundFormsStore(context: Context) {
                 wireGuardExitPort = string(profile, WG_EXIT_PORT, "51820"),
                 wireGuardExitDns = string(profile, WG_EXIT_DNS, "1.1.1.1,8.8.8.8"),
                 importedWireGuardConfig = secret(profile, IMPORTED_WG_CONFIG),
+                tunInterface = string(profile, TUN_INTERFACE, ""),
             ),
             warpMtu = string(profile, WARP_MTU, "1280"),
         )
@@ -60,6 +61,7 @@ internal class OutboundFormsStore(context: Context) {
             .putString(key(profile, WG_EXIT_USER), forms.wireGuardExitUser)
             .putString(key(profile, WG_EXIT_PORT), forms.wireGuardExitPort)
             .putString(key(profile, WG_EXIT_DNS), forms.wireGuardExitDns)
+            .putString(key(profile, TUN_INTERFACE), forms.tunInterface)
             .putString(key(profile, WARP_MTU), warpMtu)
 
         editor.putSecret(profile, LOCAL_PROXY_PASSWORD, forms.localProxyPassword)
@@ -132,6 +134,7 @@ internal class OutboundFormsStore(context: Context) {
         private const val WG_EXIT_DNS = "wg_exit_dns"
         private const val WARP_MTU = "warp_mtu"
         private const val IMPORTED_WG_CONFIG = "imported_wg_config"
+        private const val TUN_INTERFACE = "tun_interface"
 
         private val NON_SECRET_NAMES = listOf(
             LOCAL_PROXY_PORT,
@@ -146,6 +149,7 @@ internal class OutboundFormsStore(context: Context) {
             WG_EXIT_PORT,
             WG_EXIT_DNS,
             WARP_MTU,
+            TUN_INTERFACE,
         )
         private val SECRET_NAMES = listOf(
             LOCAL_PROXY_PASSWORD,

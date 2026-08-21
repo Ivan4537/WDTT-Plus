@@ -162,7 +162,9 @@ class TransferCodecTest {
             vkHashes = "hash-value",
             profileName = "Домашний сервер",
             workersPerHash = 24,
-            noDns = true
+            noDns = true,
+            vpnDnsSelectionId = "quad9",
+            vpnDnsStored = true,
         )
         assertEquals(
             listOf(
@@ -170,11 +172,14 @@ class TransferCodecTest {
                 "--vk-hashes", "hash-value",
                 "--profile-name", "Домашний сервер",
                 "--workers", "24",
-                "--no-dns"
+                "--no-dns",
+                "--vpn-dns-selection", "quad9",
+                "--vpn-dns-custom", "",
             ),
             buildAdminProfilePatchArgs(custom)
         )
         assertTrue(hasMeaningfulAdminProfileFields(custom))
+        assertFalse(buildAdminProfilePatchArgs(custom, includeVpnDns = false).contains("--vpn-dns-selection"))
     }
 
     @Test
@@ -317,5 +322,29 @@ class TransferCodecTest {
         val encrypted = WdttTransferCodec.encryptAdminSettings("{}", "correct-password".toCharArray())
 
         WdttTransferCodec.decryptAdminSettings(encrypted, "wrong-password".toCharArray())
+    }
+
+    @Test
+    fun serverBackup_isEncryptedAndUsesSeparateEnvelopeKind() {
+        val plain = JSONObject()
+            .put("format", "wdtt-server-backup")
+            .put("version", 2)
+            .put("secret", "owner-and-client-passwords")
+            .toString()
+        val password = "отдельный пароль 123".toCharArray()
+
+        val encrypted = WdttTransferCodec.encryptServerBackup(plain, password)
+
+        assertTrue(WdttTransferCodec.isEncryptedServerBackup(encrypted))
+        assertFalse(WdttTransferCodec.isAdminTransfer(encrypted))
+        assertFalse(encrypted.contains("owner-and-client-passwords"))
+        assertEquals(plain, WdttTransferCodec.decryptServerBackup(encrypted, password))
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun serverBackup_rejectsWrongPassword() {
+        val encrypted = WdttTransferCodec.encryptServerBackup("{}", "correct-password".toCharArray())
+
+        WdttTransferCodec.decryptServerBackup(encrypted, "wrong-password".toCharArray())
     }
 }

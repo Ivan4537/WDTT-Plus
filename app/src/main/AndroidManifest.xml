@@ -121,6 +121,19 @@
                 android:value="persistent_vpn_tunnel_transport" />
         </service>
 
+        <!--
+            GoBackend добавляет свой VpnService из зависимости. WDTT Plus не
+            реализует системный сценарий «Всегда включённый VPN»: он конфликтует
+            с ручной передачей единственного VPN-слота другому приложению.
+        -->
+        <service
+            android:name="com.wireguard.android.backend.GoBackend$VpnService"
+            tools:node="merge">
+            <meta-data
+                android:name="android.net.VpnService.SUPPORTS_ALWAYS_ON"
+                android:value="false" />
+        </service>
+
         <service
             android:name=".QuickToggleTileService"
             android:exported="true"

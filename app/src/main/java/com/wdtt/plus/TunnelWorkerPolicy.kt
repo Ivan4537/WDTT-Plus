@@ -12,3 +12,35 @@ internal fun normalizeTunnelWorkerCount(requested: Int, profileMaxWorkers: Int =
         TUNNEL_WORKERS_PER_GROUP) * TUNNEL_WORKERS_PER_GROUP
     return rounded.coerceIn(TUNNEL_WORKERS_PER_GROUP, maximum)
 }
+
+internal fun reconcileTunnelWorkerCountForProfileLimit(
+    selectedWorkers: Int,
+    previousProfileMaxWorkers: Int?,
+    currentProfileMaxWorkers: Int,
+    remoteManaged: Boolean,
+): Int {
+    val normalizedCurrent = normalizeTunnelWorkerCount(
+        selectedWorkers,
+        currentProfileMaxWorkers,
+    )
+    if (!remoteManaged || currentProfileMaxWorkers !in TUNNEL_WORKERS_PER_GROUP..APP_MAX_WORKERS) {
+        return normalizedCurrent
+    }
+    if (currentProfileMaxWorkers % TUNNEL_WORKERS_PER_GROUP != 0) return normalizedCurrent
+
+    val previousLimit = previousProfileMaxWorkers?.takeIf {
+        it in TUNNEL_WORKERS_PER_GROUP..APP_MAX_WORKERS &&
+            it % TUNNEL_WORKERS_PER_GROUP == 0
+    }
+    if (previousLimit == null) return currentProfileMaxWorkers
+
+    val selectedAtPreviousCeiling = normalizeTunnelWorkerCount(
+        selectedWorkers,
+        previousLimit,
+    ) == previousLimit
+    return if (currentProfileMaxWorkers > previousLimit && selectedAtPreviousCeiling) {
+        currentProfileMaxWorkers
+    } else {
+        normalizedCurrent
+    }
+}

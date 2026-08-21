@@ -36,37 +36,64 @@ internal fun trustedWifiResumeRetryPlan(retryCount: Int): TrustedWifiResumeRetry
         TrustedWifiResumeRetryPlan(delayMs = 30_000L, keepCpuAwake = false)
     }
 
-internal class TrustedWifiValidatedNetworkTracker<T : Any> {
+internal class TrustedWifiResumeNetworkTracker<T : Any> {
     private val validatedNetworks = ConcurrentHashMap.newKeySet<T>()
+    private val limitedNonWifiNetworks = ConcurrentHashMap.newKeySet<T>()
     private val wifiNetworks = ConcurrentHashMap.newKeySet<T>()
 
     @Synchronized
-    fun update(network: T, validated: Boolean, wifi: Boolean) {
-        if (validated) validatedNetworks.add(network) else validatedNetworks.remove(network)
+    fun update(
+        network: T,
+        internetCapable: Boolean,
+        validated: Boolean,
+        wifi: Boolean,
+    ) {
+        if (internetCapable && validated) {
+            validatedNetworks.add(network)
+        } else {
+            validatedNetworks.remove(network)
+        }
+        if (internetCapable && !wifi) {
+            limitedNonWifiNetworks.add(network)
+        } else {
+            limitedNonWifiNetworks.remove(network)
+        }
         if (wifi) wifiNetworks.add(network) else wifiNetworks.remove(network)
     }
 
     @Synchronized
     fun lost(network: T) {
         validatedNetworks.remove(network)
+        limitedNonWifiNetworks.remove(network)
         wifiNetworks.remove(network)
     }
 
     @Synchronized
     fun forgetWifi() {
-        wifiNetworks.forEach { network -> validatedNetworks.remove(network) }
+        wifiNetworks.forEach { network ->
+            validatedNetworks.remove(network)
+            limitedNonWifiNetworks.remove(network)
+        }
         wifiNetworks.clear()
     }
 
     @Synchronized
-    fun hasUsableNetwork(): Boolean = validatedNetworks.isNotEmpty()
+    fun hasUsableNetwork(): Boolean =
+        validatedNetworks.isNotEmpty() || limitedNonWifiNetworks.isNotEmpty()
 
     @Synchronized
     fun clear() {
         validatedNetworks.clear()
+        limitedNonWifiNetworks.clear()
         wifiNetworks.clear()
     }
 }
+
+internal fun isUsableTrustedWifiResumeNetwork(
+    internetCapable: Boolean,
+    validated: Boolean,
+    wifi: Boolean,
+): Boolean = internetCapable && (validated || !wifi)
 
 object TrustedWifiManager {
     private val _state = MutableStateFlow(TrustedWifiRuntimeState())

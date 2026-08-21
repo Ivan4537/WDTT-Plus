@@ -630,6 +630,18 @@ func normalizeAdminProfileForStorage(profile AdminProfileEntry, defaultPorts str
 		profile.ListenPort = adminProfileDefaultListenPort(profile.Ports)
 	}
 	profile.SNI = normalizeAdminProfileSNI(profile.SNI)
+	profile.VpnDNSSelection = normalizeAdminProfileVpnDNSSelection(profile.VpnDNSSelection)
+	if profile.VpnDNSSelection == "custom" {
+		custom, err := normalizeAdminProfileVpnDNSCustom(profile.VpnDNSCustom)
+		if err != nil || custom == "" {
+			profile.VpnDNSSelection = ""
+			profile.VpnDNSCustom = ""
+		} else {
+			profile.VpnDNSCustom = custom
+		}
+	} else {
+		profile.VpnDNSCustom = ""
+	}
 	profile.DeviceIDs = normalizeAdminProfileDeviceIDs(profile.DeviceIDs)
 	return profile
 }
@@ -663,6 +675,47 @@ func normalizeAdminProfileSNI(value string) string {
 		value = string([]rune(value)[:253])
 	}
 	return value
+}
+
+func normalizeAdminProfileVpnDNSSelection(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	switch value {
+	case "profile", "custom", "cloudflare", "google", "quad9", "adguard", "xbox", "comss":
+		return value
+	default:
+		return ""
+	}
+}
+
+func normalizeAdminProfileVpnDNSCustom(value string) (string, error) {
+	parts := strings.FieldsFunc(value, func(r rune) bool {
+		return r == ',' || r == ';' || r == ' ' || r == '\t' || r == '\n' || r == '\r'
+	})
+	if len(parts) == 0 {
+		return "", nil
+	}
+	if len(parts) > 2 {
+		return "", errors.New("можно сохранить не больше двух DNS-адресов VPN")
+	}
+	seen := make(map[string]struct{}, len(parts))
+	normalized := make([]string, 0, len(parts))
+	for _, raw := range parts {
+		value := strings.TrimSpace(raw)
+		parsed := net.ParseIP(value)
+		ipv4 := parsed.To4()
+		if parsed == nil || ipv4 == nil || value != net.IP(ipv4).String() {
+			return "", errors.New("DNS внутри VPN должен быть IPv4-адресом")
+		}
+		if ipv4.IsUnspecified() || ipv4.IsLoopback() || ipv4.IsMulticast() || value == "255.255.255.255" {
+			return "", errors.New("DNS внутри VPN содержит недопустимый IPv4-адрес")
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		normalized = append(normalized, value)
+	}
+	return strings.Join(normalized, ","), nil
 }
 
 func normalizeAdminProfileName(value string) string {
@@ -1727,6 +1780,8 @@ func adminUpdateAdminProfile(configDir string, loaded *Database, args []string) 
 	listenPort := fs.Int("listen-port", 0, "локальный порт клиента")
 	sni := fs.String("sni", "", "SNI клиента")
 	noDNS := fs.Bool("no-dns", false, "отключить DNS-перехват")
+	vpnDNSSelection := fs.String("vpn-dns-selection", "", "вариант DNS внутри VPN")
+	vpnDNSCustom := fs.String("vpn-dns-custom", "", "свои IPv4-адреса DNS внутри VPN")
 	ports := fs.String("ports", "", "DTLS,WG,TUN")
 	if err := fs.Parse(args); err != nil {
 		return adminResponse{}, err
@@ -1794,6 +1849,25 @@ func adminUpdateAdminProfile(configDir string, loaded *Database, args []string) 
 	}
 	if provided["no-dns"] {
 		profile.NoDNS = *noDNS
+	}
+	if provided["vpn-dns-selection"] {
+		profile.VpnDNSSelection = normalizeAdminProfileVpnDNSSelection(*vpnDNSSelection)
+		if profile.VpnDNSSelection == "" {
+			return adminResponse{}, errors.New("неизвестный вариант DNS внутри VPN")
+		}
+	}
+	if provided["vpn-dns-custom"] {
+		custom, err := normalizeAdminProfileVpnDNSCustom(*vpnDNSCustom)
+		if err != nil {
+			return adminResponse{}, err
+		}
+		profile.VpnDNSCustom = custom
+	}
+	if profile.VpnDNSSelection == "custom" && profile.VpnDNSCustom == "" {
+		return adminResponse{}, errors.New("для своего DNS внутри VPN нужен хотя бы один IPv4-адрес")
+	}
+	if profile.VpnDNSSelection != "custom" {
+		profile.VpnDNSCustom = ""
 	}
 	profile.UpdatedAt = time.Now().Unix()
 	profile = normalizeAdminProfileForStorage(profile, loaded.DefaultPorts)

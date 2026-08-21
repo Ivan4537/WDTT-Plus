@@ -4,10 +4,20 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.ContextWrapper
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
+import android.os.Handler
+import android.os.Looper
 import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.spring
-import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
@@ -43,8 +53,13 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerEventType
@@ -102,6 +117,7 @@ import com.wdtt.plus.TunnelStopCoordinator
 import com.wdtt.plus.TunnelStopResult
 import com.wdtt.plus.TunnelTransition
 import com.wdtt.plus.TUNNEL_PROFILE_INDEX_EXTRA
+import com.wdtt.plus.VpnDnsSettingsSnapshot
 import com.wdtt.plus.normalizeTunnelWorkerCount
 import com.wdtt.plus.normalizeRtTurnSni
 import com.wdtt.plus.shouldUseManagedConfigFirstStart
@@ -306,6 +322,11 @@ fun SettingsTabContent(
     val savedServerWgPort = profileSnapshot.serverWgPort
     val savedListenPort = profileSnapshot.listenPort
     val savedSni = profileSnapshot.sni
+    val vpnDnsSettings = VpnDnsSettingsSnapshot(
+        profileIndex = profileSnapshot.profileIndex,
+        selectionId = profileSnapshot.vpnDnsSelectionId,
+        customServers = profileSnapshot.vpnDnsCustomServers,
+    )
     val savedCaptchaMode = profileSnapshot.captchaMode
     val savedCaptchaMethod = profileSnapshot.captchaSolveMethod
     val activeProfile = profileSnapshot.profileIndex
@@ -348,10 +369,12 @@ fun SettingsTabContent(
     val compactTunnelInterface = usesCompactTunnelInterface(interfaceRole)
 
     val tunnelRunning by TunnelManager.running.collectAsStateWithLifecycle()
+    val activeWorkers by TunnelManager.activeWorkers.collectAsStateWithLifecycle()
     val warpResetBlockedMessage = "Для сброса отключите VPN"
     val tunnelTransition by TunnelManager.transition.collectAsStateWithLifecycle()
     val trustedWifiState by TrustedWifiManager.state.collectAsStateWithLifecycle()
     val trustedWifiWaiting = trustedWifiState.waiting
+    val underlyingNetworkAvailable = rememberUnderlyingNetworkAvailable()
     val connectionIssue by TunnelManager.connectionIssue.collectAsStateWithLifecycle()
     val standaloneConnectionIssue =
         connectionIssue?.takeIf { it.isStandaloneUiIssue }
@@ -413,6 +436,8 @@ fun SettingsTabContent(
     var showRtMasqueServerBootstrapHelp by rememberSaveable { mutableStateOf(false) }
     var showRtMasqueConsent by rememberSaveable { mutableStateOf(false) }
     var showRtMasqueResetConfirm by rememberSaveable { mutableStateOf(false) }
+    var showVpnDnsSettings by rememberSaveable { mutableStateOf(false) }
+    var showLaunchParameters by rememberSaveable { mutableStateOf(false) }
     var serverDtlsPortInput by remember(activeProfile, savedServerDtlsPort) {
         mutableStateOf(savedServerDtlsPort.toString())
     }
@@ -470,6 +495,23 @@ fun SettingsTabContent(
     }
 
     val currentWorkers = workersInput.coerceIn(WORKERS_PER_GROUP.toFloat(), dynamicMaxWorkers)
+    val launchParametersSummary = remember(
+        currentWorkers,
+        vpnDnsSettings,
+        vkCallsPreflight,
+        autoCaptchaEnabled,
+        rtNetwork,
+        rtMasque,
+    ) {
+        tunnelLaunchParametersSummary(
+            workers = currentWorkers.toInt(),
+            dnsSettings = vpnDnsSettings,
+            vkCallsPreflight = vkCallsPreflight,
+            autoCaptchaEnabled = autoCaptchaEnabled,
+            rtNetwork = rtNetwork,
+            rtMasque = rtMasque,
+        )
+    }
 
     val hashErrors = remember(vkHash1, vkHash2, vkHash3, vkHash4) {
         buildList {
@@ -1010,6 +1052,96 @@ fun SettingsTabContent(
         )
     }
 
+    if (showLaunchParameters) {
+        TunnelLaunchParametersDialog(
+            vpnDnsSettings = vpnDnsSettings,
+            onOpenDnsSettings = { showVpnDnsSettings = true },
+            currentWorkers = currentWorkers,
+            dynamicMaxWorkers = dynamicMaxWorkers,
+            profileMaxWorkers = profileMaxWorkers,
+            tunnelRunning = tunnelRunning,
+            vkCallsPreflight = vkCallsPreflight,
+            autoCaptchaEnabled = autoCaptchaEnabled,
+            rtNetwork = rtNetwork,
+            onWorkersChange = { selected ->
+                workersInput = roundToGroup(selected, dynamicMaxWorkers)
+            },
+            onWorkersChangeFinished = { selected ->
+                saveWorkersNow(roundToGroup(selected, dynamicMaxWorkers))
+            },
+            onPowerHelp = { showPowerHelp = true },
+            onVkCallsHelp = { showVkCallsHelp = true },
+            onVkCallsChange = { enabled ->
+                scope.launch { settingsStore.saveVkCallsPreflight(enabled) }
+            },
+            onAutoCaptchaHelp = { showAutoCaptchaHelp = true },
+            onAutoCaptchaChange = { enabled ->
+                autoCaptchaEnabled = enabled
+                scope.launch { settingsStore.saveCaptchaPreference(enabled) }
+            },
+            onRtNetworkSettings = { showRtNetworkSettings = true },
+            onRtNetworkHelp = { showRtNetworkHelp = true },
+            onRtNetworkChange = { enabled ->
+                saveJob?.cancel()
+                val nextSni = if (enabled) {
+                    normalizeRtTurnSni(rtTurnSniInput) ?: DEFAULT_RT_TURN_SNI
+                } else {
+                    rtTurnSniInput.trim()
+                }
+                rtTurnSniInput = nextSni
+                scope.launch { settingsStore.saveRtNetwork(enabled, nextSni) }
+                if (enabled) showRtNetworkSettings = true
+            },
+            onDismiss = { showLaunchParameters = false },
+        )
+    }
+
+    if (showVpnDnsSettings) {
+        VpnDnsSettingsDialog(
+            initialSettings = vpnDnsSettings,
+            onApply = { selectionId, customServers ->
+                scope.launch {
+                    runCatching {
+                        settingsStore.saveVpnDnsSettings(
+                            selectionId = selectionId,
+                            customServersRaw = customServers,
+                            profileIndex = activeProfile,
+                        )
+                    }.onSuccess { saved ->
+                        showVpnDnsSettings = false
+                        TunnelManager.noteVpnDnsEvent(
+                            key = "settings_${saved.profileIndex}_${saved.selectionId}",
+                            message = buildString {
+                                append("Для профиля «")
+                                append(vpnProfileDisplayName(saved.profileIndex, profileNames))
+                                append("» выбран режим DNS «")
+                                append(saved.title)
+                                append("».")
+                                if (
+                                    tunnelRunning &&
+                                    TunnelManager.activeTunnelProfile.value == saved.profileIndex
+                                ) {
+                                    append(" Обновляем системный VPN-интерфейс.")
+                                } else {
+                                    append(" Настройка применится при следующем подключении этого профиля.")
+                                }
+                            },
+                            warning = false,
+                        )
+                        TunnelManager.scheduleWireGuardReload(saved.profileIndex)
+                    }.onFailure { error ->
+                        Toast.makeText(
+                            context,
+                            error.message ?: "Не удалось сохранить DNS.",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    }
+                }
+            },
+            onDismiss = { showVpnDnsSettings = false },
+        )
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -1135,235 +1267,38 @@ fun SettingsTabContent(
 
             Spacer(Modifier.height(8.dp))
 
-            // ═══ Мощность + Капча ═══
-                AppSectionCard(
-                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
-                    verticalArrangement = Arrangement.spacedBy(0.dp)
+            AppSectionCard(
+                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                OutlinedButton(
+                    onClick = { showLaunchParameters = true },
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                    shape = RoundedCornerShape(16.dp),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
                 ) {
-                    // — Мощность —
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
-                            Text(
-                                "Мощность",
-                                style = MaterialTheme.typography.titleMedium,
-                                color = MaterialTheme.colorScheme.primary,
-                                fontWeight = FontWeight.SemiBold
-                            )
-                            IconButton(
-                                onClick = { showPowerHelp = true },
-                                modifier = Modifier.size(28.dp)
-                            ) {
-                                Icon(
-                                    Icons.AutoMirrored.Filled.HelpOutline,
-                                    contentDescription = "Что такое мощность",
-                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.size(18.dp)
-                                )
-                            }
-                        }
-                        Text(
-                            text = "${currentWorkers.toInt()}",
-                            style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-                            color = MaterialTheme.colorScheme.primary
-                        )
-                    }
-
-                    Spacer(Modifier.height(2.dp))
-
-                    val maxWorkers = dynamicMaxWorkers
-                    val minWorkers = WORKERS_PER_GROUP.toFloat()
-                    val currentWorkersVal = roundToGroup(currentWorkers.coerceIn(minWorkers, maxWorkers), maxWorkers)
-                    val hasProfileWorkerLimit = profileMaxWorkers >= WORKERS_PER_GROUP
-
-                    CompactSteppedSlider(
-                        value = currentWorkersVal,
-                        onValueChange = { raw ->
-                            val rounded = roundToGroup(raw, maxWorkers)
-                            workersInput = rounded
-                        },
-                        onValueChangeFinished = { selected ->
-                            saveWorkersNow(roundToGroup(selected, maxWorkers))
-                        },
-                        valueRange = minWorkers..maxWorkers,
-                        stepSize = WORKERS_PER_GROUP.toFloat(),
-                        enabled = !tunnelRunning && maxWorkers > minWorkers,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-
-                    if (hasProfileWorkerLimit) {
-                        Text(
-                            text = "Для этого профиля доступно до $profileMaxWorkers потоков. Повысить значение выше нельзя.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                        Spacer(Modifier.height(4.dp))
-                    }
-
-                    // — Разделитель —
-                    HorizontalDivider(
-                        modifier = Modifier.padding(vertical = 2.dp),
-                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
-                    )
-
-                    // — VKCalls preflight —
-                    Row(
-                        modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Row(
-                            modifier = Modifier.weight(1f),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
-                            Text(
-                                "Быстрый VKCalls",
-                                style = MaterialTheme.typography.bodyMedium,
-                                fontWeight = FontWeight.Medium
-                            )
-                            IconButton(
-                                onClick = { showVkCallsHelp = true },
-                                modifier = Modifier.size(28.dp)
-                            ) {
-                                Icon(
-                                    Icons.AutoMirrored.Filled.HelpOutline,
-                                    contentDescription = "Как работает VKCalls",
-                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.size(18.dp)
-                                )
-                            }
-                        }
-                        Switch(
-                            checked = vkCallsPreflight,
-                            enabled = !tunnelRunning,
-                            onCheckedChange = { enabled ->
-                                scope.launch { settingsStore.saveVkCallsPreflight(enabled) }
-                            }
-                        )
-                    }
-
-                    HorizontalDivider(
-                        modifier = Modifier.padding(vertical = 2.dp),
-                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
-                    )
-
-                    // — Режим капчи —
-                    Row(
-                        modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Column(
-                            modifier = Modifier.weight(1f),
-                            verticalArrangement = Arrangement.spacedBy(2.dp)
-                        ) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(6.dp)
-                            ) {
-                                Text(
-                                    if (autoCaptchaEnabled) "Авто капча" else "Всегда вручную",
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    fontWeight = FontWeight.Medium
-                                )
-                                IconButton(
-                                    onClick = { showAutoCaptchaHelp = true },
-                                    modifier = Modifier.size(28.dp)
-                                ) {
-                                    Icon(
-                                        Icons.AutoMirrored.Filled.HelpOutline,
-                                        contentDescription = "Как работает режим капчи",
-                                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        modifier = Modifier.size(18.dp)
-                                    )
-                                }
-                            }
-                        }
-                        Switch(
-                            checked = autoCaptchaEnabled,
-                            onCheckedChange = { enabled ->
-                                autoCaptchaEnabled = enabled
-                                scope.launch {
-                                    settingsStore.saveCaptchaPreference(enabled)
-                                }
-                            }
-                        )
-                    }
-
-                    HorizontalDivider(
-                        modifier = Modifier.padding(vertical = 2.dp),
-                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
-                    )
-
-                    // — Ограниченная мобильная сеть Ростелекома —
-                    Row(
-                        modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Row(
-                            modifier = Modifier.weight(1f),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
-                            Text(
-                                "Сеть РТ",
-                                modifier = Modifier
-                                    .clickable { showRtNetworkSettings = true }
-                                    .padding(vertical = 10.dp),
-                                style = MaterialTheme.typography.bodyMedium,
-                                fontWeight = FontWeight.Medium
-                            )
-                            IconButton(
-                                onClick = { showRtNetworkHelp = true },
-                                modifier = Modifier.size(28.dp),
-                            ) {
-                                Icon(
-                                    Icons.AutoMirrored.Filled.HelpOutline,
-                                    contentDescription = "Как работает Сеть РТ",
-                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.size(18.dp),
-                                )
-                            }
-                        }
-                        Switch(
-                            checked = rtNetwork,
-                            enabled = !tunnelRunning,
-                            onCheckedChange = { enabled ->
-                                saveJob?.cancel()
-                                val nextSni = if (enabled) {
-                                    normalizeRtTurnSni(rtTurnSniInput) ?: DEFAULT_RT_TURN_SNI
-                                } else {
-                                    rtTurnSniInput.trim()
-                                }
-                                rtTurnSniInput = nextSni
-                                scope.launch { settingsStore.saveRtNetwork(enabled, nextSni) }
-                                if (enabled) showRtNetworkSettings = true
-                            }
-                        )
-                    }
-
+                    FlexibleButtonText("Параметры", fontWeight = FontWeight.SemiBold)
                 }
+                Text(
+                    text = launchParametersSummary,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    lineHeight = 17.sp
+                )
             }
 
         // ═══ Кнопки: Секреты + Подключить ═══
         val tunnelSecretsMissing = savedConnectionPassword.isBlank()
 
-        Row(
-            modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Min),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             if (showManualConnectionFields) {
                 OutlinedButton(
                     onClick = { showSecretsDialog = true },
-                    modifier = Modifier.weight(1f).fillMaxHeight().heightIn(min = 52.dp),
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp),
                     shape = RoundedCornerShape(16.dp),
                     contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp),
                     colors = ButtonDefaults.outlinedButtonColors(
@@ -1384,15 +1319,21 @@ fun SettingsTabContent(
                 }
             }
 
-            val buttonColor by animateColorAsState(
-                targetValue = if (tunnelRunning || trustedWifiWaiting) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
-                animationSpec = tween(400),
-                label = "btn_color"
-            )
-
-            Button(
+            AnimatedTunnelPowerButton(
+                running = tunnelRunning,
+                waiting = trustedWifiWaiting,
+                transition = tunnelTransition,
+                activeWorkers = activeWorkers,
+                targetWorkers = currentWorkers.toInt(),
+                cooldownActive = cooldownActive,
+                underlyingNetworkAvailable = underlyingNetworkAvailable,
+                connectionErrorTitle = standaloneConnectionIssue
+                    ?.takeIf { it.isError }
+                    ?.title,
+                enabled = tunnelTransition == TunnelTransition.IDLE &&
+                    ((isValid && !cooldownActive) || tunnelRunning || trustedWifiWaiting),
                 onClick = {
-                    if (tunnelTransition != TunnelTransition.IDLE) return@Button
+                    if (tunnelTransition != TunnelTransition.IDLE) return@AnimatedTunnelPowerButton
                     if (tunnelRunning || trustedWifiWaiting) {
                         TunnelManager.noteStopRequested()
                         context.startService(
@@ -1403,37 +1344,7 @@ fun SettingsTabContent(
                         checkAccessAndStart()
                     }
                 },
-                enabled = tunnelTransition == TunnelTransition.IDLE &&
-                    ((isValid && !cooldownActive) || tunnelRunning || trustedWifiWaiting),
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxHeight()
-                    .heightIn(min = 52.dp),
-                shape = RoundedCornerShape(16.dp),
-                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = buttonColor,
-                    contentColor = MaterialTheme.colorScheme.onPrimary
-                )
-            ) {
-                Icon(
-                    imageVector = if (tunnelRunning || trustedWifiWaiting) Icons.Default.Stop else Icons.Default.PowerSettingsNew,
-                    contentDescription = null,
-                    modifier = Modifier.size(20.dp)
-                )
-                Spacer(Modifier.width(6.dp))
-                FlexibleButtonText(
-                    text = when {
-                        tunnelTransition == TunnelTransition.STOPPING -> "Отключаю…"
-                        tunnelTransition == TunnelTransition.STARTING -> "Подключаю…"
-                        tunnelRunning -> "Остановить"
-                        trustedWifiWaiting -> "Отменить ожидание"
-                        cooldownActive -> "Подождите..."
-                        else -> "Подключить"
-                    },
-                    fontWeight = FontWeight.Bold
-                )
-            }
+            )
         }
 
         if (trustedWifiWaiting) {
@@ -1497,6 +1408,7 @@ fun SettingsTabContent(
                 }
             }
         }
+    }
     }
 
     if (showRtNetworkSettings) {
@@ -2250,6 +2162,769 @@ private fun AccessLifecycleActionButton(
             )
             Spacer(Modifier.width(5.dp))
             FlexibleButtonText(label)
+        }
+    }
+}
+
+private fun tunnelLaunchParametersSummary(
+    workers: Int,
+    dnsSettings: VpnDnsSettingsSnapshot,
+    vkCallsPreflight: Boolean,
+    autoCaptchaEnabled: Boolean,
+    rtNetwork: Boolean,
+    rtMasque: Boolean,
+): String {
+    val rtText = when {
+        rtNetwork && rtMasque -> "РТ + MASQUE"
+        rtNetwork -> "РТ вкл"
+        else -> "РТ выкл"
+    }
+    return buildList {
+        add("$workers потоков")
+        add("DNS: ${dnsSettings.title}")
+        add(if (vkCallsPreflight) "VKCalls вкл" else "VKCalls выкл")
+        add(if (autoCaptchaEnabled) "Капча авто" else "Капча вручную")
+        add(rtText)
+    }.joinToString(" · ")
+}
+
+@Composable
+private fun TunnelLaunchParametersDialog(
+    vpnDnsSettings: VpnDnsSettingsSnapshot,
+    onOpenDnsSettings: () -> Unit,
+    currentWorkers: Float,
+    dynamicMaxWorkers: Float,
+    profileMaxWorkers: Int,
+    tunnelRunning: Boolean,
+    vkCallsPreflight: Boolean,
+    autoCaptchaEnabled: Boolean,
+    rtNetwork: Boolean,
+    onWorkersChange: (Float) -> Unit,
+    onWorkersChangeFinished: (Float) -> Unit,
+    onPowerHelp: () -> Unit,
+    onVkCallsHelp: () -> Unit,
+    onVkCallsChange: (Boolean) -> Unit,
+    onAutoCaptchaHelp: () -> Unit,
+    onAutoCaptchaChange: (Boolean) -> Unit,
+    onRtNetworkSettings: () -> Unit,
+    onRtNetworkHelp: () -> Unit,
+    onRtNetworkChange: (Boolean) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        BoxWithConstraints(
+            modifier = Modifier.fillMaxSize().padding(8.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth(0.95f)
+                    .heightIn(max = maxHeight * 0.92f),
+                shape = RoundedCornerShape(24.dp),
+                color = MaterialTheme.colorScheme.surface,
+                contentColor = MaterialTheme.colorScheme.onSurface,
+                tonalElevation = 8.dp,
+            ) {
+                Column(
+                    modifier = Modifier.padding(20.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            "Параметры",
+                            modifier = Modifier.weight(1f),
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                        IconButton(onClick = onDismiss) {
+                            Icon(Icons.Default.Close, contentDescription = "Закрыть")
+                        }
+                    }
+
+                    Column(
+                        modifier = Modifier
+                            .weight(1f, fill = false)
+                            .verticalScroll(rememberScrollState()),
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        Text(
+                            "Изменения сохраняются сразу и будут использованы при следующем запуске VPN.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+
+                        VpnDnsSettingsCard(
+                            settings = vpnDnsSettings,
+                            onClick = onOpenDnsSettings,
+                        )
+
+                        AppSectionCard(
+                            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
+                            verticalArrangement = Arrangement.spacedBy(0.dp),
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                ) {
+                                    Text(
+                                        "Мощность",
+                                        style = MaterialTheme.typography.titleMedium,
+                                        color = MaterialTheme.colorScheme.primary,
+                                        fontWeight = FontWeight.SemiBold,
+                                    )
+                                    IconButton(
+                                        onClick = onPowerHelp,
+                                        modifier = Modifier.size(28.dp),
+                                    ) {
+                                        Icon(
+                                            Icons.AutoMirrored.Filled.HelpOutline,
+                                            contentDescription = "Что такое мощность",
+                                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            modifier = Modifier.size(18.dp),
+                                        )
+                                    }
+                                }
+                                Text(
+                                    text = "${currentWorkers.toInt()}",
+                                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                                    color = MaterialTheme.colorScheme.primary,
+                                )
+                            }
+
+                            Spacer(Modifier.height(2.dp))
+
+                            val minWorkers = WORKERS_PER_GROUP.toFloat()
+                            val currentWorkersVal = roundToGroup(
+                                currentWorkers.coerceIn(minWorkers, dynamicMaxWorkers),
+                                dynamicMaxWorkers,
+                            )
+
+                            CompactSteppedSlider(
+                                value = currentWorkersVal,
+                                onValueChange = onWorkersChange,
+                                onValueChangeFinished = onWorkersChangeFinished,
+                                valueRange = minWorkers..dynamicMaxWorkers,
+                                stepSize = WORKERS_PER_GROUP.toFloat(),
+                                enabled = !tunnelRunning && dynamicMaxWorkers > minWorkers,
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+
+                            if (profileMaxWorkers >= WORKERS_PER_GROUP) {
+                                Text(
+                                    text = "Для этого профиля доступен выбор от ${WORKERS_PER_GROUP.toInt()} до $profileMaxWorkers потоков. Повысить значение выше нельзя.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                                Spacer(Modifier.height(4.dp))
+                            }
+
+                            HorizontalDivider(
+                                modifier = Modifier.padding(vertical = 2.dp),
+                                color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f),
+                            )
+
+                            LaunchParameterSwitchRow(
+                                title = "Быстрый VKCalls",
+                                checked = vkCallsPreflight,
+                                enabled = !tunnelRunning,
+                                onCheckedChange = onVkCallsChange,
+                                onHelp = onVkCallsHelp,
+                                helpDescription = "Как работает VKCalls",
+                            )
+
+                            HorizontalDivider(
+                                modifier = Modifier.padding(vertical = 2.dp),
+                                color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f),
+                            )
+
+                            LaunchParameterSwitchRow(
+                                title = if (autoCaptchaEnabled) "Авто капча" else "Всегда вручную",
+                                checked = autoCaptchaEnabled,
+                                enabled = true,
+                                onCheckedChange = onAutoCaptchaChange,
+                                onHelp = onAutoCaptchaHelp,
+                                helpDescription = "Как работает режим капчи",
+                            )
+
+                            HorizontalDivider(
+                                modifier = Modifier.padding(vertical = 2.dp),
+                                color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f),
+                            )
+
+                            LaunchParameterSwitchRow(
+                                title = "Сеть РТ",
+                                checked = rtNetwork,
+                                enabled = !tunnelRunning,
+                                onCheckedChange = onRtNetworkChange,
+                                onHelp = onRtNetworkHelp,
+                                helpDescription = "Как работает Сеть РТ",
+                                onTitleClick = onRtNetworkSettings,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun LaunchParameterSwitchRow(
+    title: String,
+    checked: Boolean,
+    enabled: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+    onHelp: () -> Unit,
+    helpDescription: String,
+    onTitleClick: (() -> Unit)? = null,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Row(
+            modifier = Modifier.weight(1f),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text(
+                title,
+                modifier = if (onTitleClick != null) {
+                    Modifier.clickable(onClick = onTitleClick).padding(vertical = 10.dp)
+                } else {
+                    Modifier
+                },
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.Medium,
+            )
+            IconButton(
+                onClick = onHelp,
+                modifier = Modifier.size(28.dp),
+            ) {
+                Icon(
+                    Icons.AutoMirrored.Filled.HelpOutline,
+                    contentDescription = helpDescription,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(18.dp),
+                )
+            }
+        }
+        Switch(
+            checked = checked,
+            enabled = enabled,
+            onCheckedChange = onCheckedChange,
+        )
+    }
+}
+
+@Composable
+private fun AnimatedTunnelPowerButton(
+    running: Boolean,
+    waiting: Boolean,
+    transition: TunnelTransition,
+    activeWorkers: Int,
+    targetWorkers: Int,
+    cooldownActive: Boolean,
+    underlyingNetworkAvailable: Boolean,
+    connectionErrorTitle: String?,
+    enabled: Boolean,
+    onClick: () -> Unit,
+) {
+    val primary = MaterialTheme.colorScheme.primary
+    val onPrimary = MaterialTheme.colorScheme.onPrimary
+    val outline = MaterialTheme.colorScheme.outline
+    val error = MaterialTheme.colorScheme.error
+    val isStarting = transition == TunnelTransition.STARTING
+    val isStopping = transition == TunnelTransition.STOPPING
+    val boundedTargetWorkers = targetWorkers.coerceAtLeast(0)
+    val connectionVisible = running || waiting || isStarting || isStopping
+    val statusState = tunnelPowerVisualState(
+        running = running,
+        waitingForTrustedWifi = waiting,
+        starting = isStarting,
+        stopping = isStopping,
+        activeWorkers = activeWorkers,
+        underlyingNetworkAvailable = underlyingNetworkAvailable,
+        hasConnectionError = connectionErrorTitle != null,
+        cooldownActive = cooldownActive,
+    )
+    val activeWorkerProgress by animateFloatAsState(
+        targetValue = activeWorkers.coerceIn(0, boundedTargetWorkers).toFloat(),
+        animationSpec = tween(durationMillis = 700),
+        label = "tunnel_active_workers_progress",
+    )
+    val connectionAlpha by animateFloatAsState(
+        targetValue = if (connectionVisible) 1f else 0f,
+        animationSpec = tween(durationMillis = 350),
+        label = "tunnel_connection_alpha",
+    )
+    // Импульсы запуска живут независимо от того, насколько быстро сменится
+    // состояние туннеля: короткий STARTING не должен обрывать волну.
+    val startBurst = remember { Animatable(1f) }
+    val stopBurst = remember { Animatable(1f) }
+    val fullWorkersBurst = remember { Animatable(1f) }
+    val workerGrowthBurst = remember { Animatable(1f) }
+    var fullWorkersBurstPlayed by remember { mutableStateOf(false) }
+    var observedWorkerCount by remember { mutableIntStateOf(activeWorkers.coerceAtLeast(0)) }
+    var startBurstRequest by remember { mutableIntStateOf(0) }
+    var stopBurstRequest by remember { mutableIntStateOf(0) }
+    var fullWorkersBurstRequest by remember { mutableIntStateOf(0) }
+    var workerGrowthBurstRequest by remember { mutableIntStateOf(0) }
+    LaunchedEffect(startBurstRequest) {
+        if (startBurstRequest > 0) {
+            startBurst.snapTo(0f)
+            startBurst.animateTo(1f, animationSpec = tween(durationMillis = 2_800))
+        }
+    }
+    LaunchedEffect(stopBurstRequest) {
+        if (stopBurstRequest > 0) {
+            stopBurst.snapTo(0f)
+            stopBurst.animateTo(1f, animationSpec = tween(durationMillis = 2_800))
+        }
+    }
+    LaunchedEffect(running, isStarting) {
+        if (!running && !isStarting) {
+            fullWorkersBurstPlayed = false
+            fullWorkersBurst.snapTo(1f)
+            workerGrowthBurst.snapTo(1f)
+        }
+    }
+    // Небольшой импульс сообщает именно о появлении очередного рабочего
+    // потока. При полной мощности остаётся отдельная, более заметная волна.
+    LaunchedEffect(running, activeWorkers, boundedTargetWorkers) {
+        val currentWorkers = activeWorkers.coerceIn(0, boundedTargetWorkers)
+        if (
+            running &&
+            currentWorkers > observedWorkerCount &&
+            currentWorkers < boundedTargetWorkers
+        ) {
+            workerGrowthBurstRequest++
+        }
+        observedWorkerCount = currentWorkers
+    }
+    LaunchedEffect(running, boundedTargetWorkers, activeWorkers) {
+        if (
+            running &&
+            boundedTargetWorkers > 0 &&
+            activeWorkers >= boundedTargetWorkers &&
+            !fullWorkersBurstPlayed
+        ) {
+            fullWorkersBurstPlayed = true
+            fullWorkersBurstRequest++
+        }
+    }
+    LaunchedEffect(fullWorkersBurstRequest) {
+        if (fullWorkersBurstRequest > 0) {
+            fullWorkersBurst.snapTo(0f)
+            fullWorkersBurst.animateTo(1f, animationSpec = tween(durationMillis = 3_000))
+        }
+    }
+    LaunchedEffect(workerGrowthBurstRequest) {
+        if (workerGrowthBurstRequest > 0) {
+            workerGrowthBurst.snapTo(0f)
+            workerGrowthBurst.animateTo(1f, animationSpec = tween(durationMillis = 1_650))
+        }
+    }
+    val status = when (statusState) {
+        TunnelPowerVisualState.Stopping -> TunnelPowerStatus("Отключение…", primary)
+        TunnelPowerVisualState.Connecting -> TunnelPowerStatus(
+            if (boundedTargetWorkers > 0) "Подключение… · 0/$boundedTargetWorkers потоков"
+            else "Подключение…",
+            primary,
+        )
+        TunnelPowerVisualState.Connected -> TunnelPowerStatus(
+            if (boundedTargetWorkers > 0) {
+                "Подключено · ${activeWorkers.coerceIn(0, boundedTargetWorkers)}/$boundedTargetWorkers потоков"
+            } else {
+                "Подключено"
+            },
+            primary,
+        )
+        TunnelPowerVisualState.NoNetwork -> TunnelPowerStatus("Нет сети", MaterialTheme.colorScheme.tertiary)
+        TunnelPowerVisualState.WaitingForTrustedWifi -> TunnelPowerStatus(
+            "Ожидание выхода из доверенной сети",
+            MaterialTheme.colorScheme.secondary,
+        )
+        TunnelPowerVisualState.Error -> TunnelPowerStatus(connectionErrorTitle.orEmpty(), error)
+        TunnelPowerVisualState.CoolingDown -> TunnelPowerStatus(
+            "Подождите…",
+            MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        TunnelPowerVisualState.Off -> TunnelPowerStatus(
+            "Выключено",
+            MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+    val enabledAlpha = if (enabled) 1f else 0.48f
+    val centerColor = when (statusState) {
+        TunnelPowerVisualState.Error -> error
+        TunnelPowerVisualState.NoNetwork -> MaterialTheme.colorScheme.tertiary
+        TunnelPowerVisualState.Stopping,
+        TunnelPowerVisualState.WaitingForTrustedWifi -> MaterialTheme.colorScheme.secondary
+        TunnelPowerVisualState.Connecting,
+        TunnelPowerVisualState.Connected -> primary
+        TunnelPowerVisualState.CoolingDown,
+        TunnelPowerVisualState.Off -> primary.copy(alpha = 0.58f)
+    }
+    val icon = when (statusState) {
+        TunnelPowerVisualState.Error,
+        TunnelPowerVisualState.NoNetwork -> Icons.Default.WarningAmber
+        TunnelPowerVisualState.WaitingForTrustedWifi -> Icons.Default.Schedule
+        TunnelPowerVisualState.Stopping,
+        TunnelPowerVisualState.Connected -> Icons.Default.Stop
+        TunnelPowerVisualState.Connecting,
+        TunnelPowerVisualState.CoolingDown,
+        TunnelPowerVisualState.Off -> Icons.Default.PowerSettingsNew
+    }
+
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        Box(
+            modifier = Modifier
+                .padding(top = 2.dp)
+                .size(184.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Canvas(modifier = Modifier.matchParentSize()) {
+                val center = Offset(size.width / 2f, size.height / 2f)
+                val minSide = minOf(size.width, size.height)
+                val buttonRadius = minSide * 0.25f
+                // Ячейки почти касаются кнопки, но сохраняют тонкий "воздух"
+                // между собой и центральным кругом.
+                val segmentRadius = minSide * 0.315f
+
+                fun drawPulse(
+                    progress: Float,
+                    color: Color,
+                    strength: Float,
+                    reverse: Boolean = false,
+                ) {
+                    repeat(3) { index ->
+                        val delay = index * 0.17f
+                        if (progress < delay) return@repeat
+                        val localProgress = ((progress - delay) / (1f - delay)).coerceIn(0f, 1f)
+                        val phase = if (reverse) 1f - localProgress else localProgress
+                        if (phase > 0f) {
+                            val maxRadius = minSide * 0.49f
+                            val waveRadius = buttonRadius + 3.dp.toPx() +
+                                phase * (maxRadius - buttonRadius - 3.dp.toPx())
+                            // Цвет у источника плотнее, а с удалением от
+                            // кнопки постепенно растворяется в прозрачности.
+                            val fadeRadius = maxRadius
+                            drawCircle(
+                                brush = Brush.radialGradient(
+                                    colorStops = arrayOf(
+                                        0f to color.copy(alpha = strength * 0.44f * enabledAlpha),
+                                        (buttonRadius / fadeRadius).coerceIn(0f, 1f) to
+                                            color.copy(alpha = strength * 0.38f * enabledAlpha),
+                                        0.82f to color.copy(alpha = strength * 0.11f * enabledAlpha),
+                                        1f to Color.Transparent,
+                                    ),
+                                    center = center,
+                                    radius = fadeRadius,
+                                ),
+                                radius = waveRadius,
+                                center = center,
+                                style = Stroke(width = (6f - phase * 2.4f).dp.toPx()),
+                            )
+                        }
+                    }
+                }
+                if (startBurst.value < 1f) {
+                    drawPulse(startBurst.value, primary, strength = 0.82f)
+                }
+                if (stopBurst.value < 1f) {
+                    drawPulse(stopBurst.value, primary, strength = 0.70f, reverse = true)
+                }
+                if (fullWorkersBurst.value < 1f) {
+                    drawPulse(fullWorkersBurst.value, primary, strength = 1f)
+                }
+                if (workerGrowthBurst.value < 1f) {
+                    // Во время набора потоков волна заметна только вблизи
+                    // кнопки и ячеек. Она не конкурирует с полной волной,
+                    // которая проигрывается один раз при максимуме.
+                    repeat(2) { index ->
+                        val delay = index * 0.26f
+                        if (workerGrowthBurst.value < delay) return@repeat
+                        val phase = ((workerGrowthBurst.value - delay) / (1f - delay))
+                            .coerceIn(0f, 1f)
+                        val maxRadius = minSide * 0.385f
+                        val waveRadius = buttonRadius + 3.dp.toPx() +
+                            phase * (maxRadius - buttonRadius - 3.dp.toPx())
+                        drawCircle(
+                            brush = Brush.radialGradient(
+                                colorStops = arrayOf(
+                                    0f to primary.copy(alpha = 0.14f * enabledAlpha),
+                                    (buttonRadius / maxRadius).coerceIn(0f, 1f) to
+                                        primary.copy(alpha = 0.11f * enabledAlpha),
+                                    0.78f to primary.copy(alpha = 0.035f * enabledAlpha),
+                                    1f to Color.Transparent,
+                                ),
+                                center = center,
+                                radius = maxRadius,
+                            ),
+                            radius = waveRadius,
+                            center = center,
+                            style = Stroke(width = (3.5f - phase * 1.6f).dp.toPx()),
+                        )
+                    }
+                }
+
+                val segmentCount = boundedTargetWorkers.coerceIn(1, 128)
+                val step = 360f / segmentCount
+                // Сегменты всегда делят всё кольцо: при малом числе потоков
+                // каждый становится шире, а не оставляет вокруг себя пустоту.
+                // Толщина уменьшается только для очень большого числа ячеек.
+                val stepRadians = Math.toRadians(step.toDouble()).toFloat()
+                val segmentStroke = minOf(
+                    11.dp.toPx(),
+                    segmentRadius * stepRadians * 0.72f,
+                )
+                val visualGap = minOf(2.dp.toPx(), maxOf(0.75.dp.toPx(), segmentStroke * 0.18f))
+                val gapAngle = Math.toDegrees((visualGap / segmentRadius).toDouble()).toFloat()
+                val sweep = (step - gapAngle).coerceAtLeast(step * 0.32f)
+                val outerRadius = segmentRadius + segmentStroke / 2f
+                val innerRadius = segmentRadius - segmentStroke / 2f
+
+                fun segmentPath(startAngle: Float, segmentSweep: Float): Path {
+                    val outerBounds = Rect(
+                        center.x - outerRadius,
+                        center.y - outerRadius,
+                        center.x + outerRadius,
+                        center.y + outerRadius,
+                    )
+                    val innerBounds = Rect(
+                        center.x - innerRadius,
+                        center.y - innerRadius,
+                        center.x + innerRadius,
+                        center.y + innerRadius,
+                    )
+                    return Path().apply {
+                        arcTo(outerBounds, startAngle, segmentSweep, forceMoveTo = true)
+                        arcTo(innerBounds, startAngle + segmentSweep, -segmentSweep, forceMoveTo = false)
+                        close()
+                    }
+                }
+                repeat(segmentCount) { index ->
+                    val activeFraction = (activeWorkerProgress - index).coerceIn(0f, 1f)
+                    val startAngle = -90f + index * step + (step - sweep) / 2f
+                    val outlinePath = segmentPath(startAngle, sweep)
+                    drawPath(
+                        path = outlinePath,
+                        color = outline.copy(alpha = (if (connectionVisible) 0.24f else 0.15f) * enabledAlpha),
+                    )
+                    if (activeFraction > 0f && connectionAlpha > 0.01f) {
+                        val fillSweep = sweep * activeFraction
+                        val fillPath = segmentPath(startAngle, fillSweep)
+                        // Свечение остаётся в пределах небольшой щели между
+                        // секторными ячейками и не превращает кольцо в дугу.
+                        drawPath(
+                            path = fillPath,
+                            color = primary.copy(alpha = 0.16f * activeFraction * connectionAlpha * enabledAlpha),
+                            style = Stroke(width = 2.5.dp.toPx()),
+                        )
+                        drawPath(
+                            path = fillPath,
+                            color = primary.copy(alpha = (0.58f + 0.42f * activeFraction) * connectionAlpha * enabledAlpha),
+                        )
+                    }
+                }
+            }
+
+            Surface(
+                modifier = Modifier
+                    .size(96.dp)
+                    .clip(CircleShape)
+                    .clickable(
+                        enabled = enabled,
+                        onClick = {
+                            if (running || waiting) {
+                                stopBurstRequest++
+                            } else {
+                                startBurstRequest++
+                            }
+                            onClick()
+                        },
+                    ),
+                shape = CircleShape,
+                color = centerColor.copy(alpha = if (running || waiting || isStarting || isStopping) 0.96f else 0.72f),
+                contentColor = onPrimary,
+                tonalElevation = if (connectionVisible) 10.dp else 2.dp,
+                shadowElevation = if (connectionVisible) 10.dp else 3.dp,
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    if (statusState == TunnelPowerVisualState.Connecting) {
+                        ConnectingTunnelParticleRing(
+                            modifier = Modifier.size(52.dp),
+                            color = onPrimary.copy(alpha = enabledAlpha),
+                        )
+                    } else {
+                        Icon(
+                            imageVector = icon,
+                            contentDescription = status.text,
+                            modifier = Modifier.size(42.dp),
+                            tint = onPrimary.copy(alpha = enabledAlpha),
+                        )
+                    }
+                }
+            }
+        }
+        Text(
+            text = status.text,
+            style = MaterialTheme.typography.titleSmall,
+            fontWeight = FontWeight.SemiBold,
+            textAlign = TextAlign.Center,
+            color = status.color.copy(alpha = enabledAlpha),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp),
+        )
+    }
+}
+
+private data class TunnelPowerStatus(
+    val text: String,
+    val color: Color,
+)
+
+internal enum class TunnelPowerVisualState {
+    Off,
+    Connecting,
+    Connected,
+    NoNetwork,
+    WaitingForTrustedWifi,
+    Stopping,
+    Error,
+    CoolingDown,
+}
+
+/**
+ * Системный TUN может быть создан и без внешней сети. Не называем такое
+ * состояние подключённым: для этого нужен хотя бы один живой поток.
+ */
+internal fun tunnelPowerVisualState(
+    running: Boolean,
+    waitingForTrustedWifi: Boolean,
+    starting: Boolean,
+    stopping: Boolean,
+    activeWorkers: Int,
+    underlyingNetworkAvailable: Boolean,
+    hasConnectionError: Boolean,
+    cooldownActive: Boolean,
+): TunnelPowerVisualState = when {
+    stopping -> TunnelPowerVisualState.Stopping
+    waitingForTrustedWifi -> TunnelPowerVisualState.WaitingForTrustedWifi
+    (starting || running) && !underlyingNetworkAvailable -> TunnelPowerVisualState.NoNetwork
+    hasConnectionError -> TunnelPowerVisualState.Error
+    starting || running && activeWorkers <= 0 -> TunnelPowerVisualState.Connecting
+    running -> TunnelPowerVisualState.Connected
+    cooldownActive -> TunnelPowerVisualState.CoolingDown
+    else -> TunnelPowerVisualState.Off
+}
+
+@Composable
+private fun rememberUnderlyingNetworkAvailable(): Boolean {
+    val context = LocalContext.current.applicationContext
+    var available by remember(context) {
+        mutableStateOf(hasUnderlyingInternetNetwork(context))
+    }
+    DisposableEffect(context) {
+        val connectivity = context.getSystemService(ConnectivityManager::class.java)
+        val mainHandler = Handler(Looper.getMainLooper())
+        if (connectivity == null) {
+            onDispose { }
+        } else {
+            fun refresh() {
+                mainHandler.post {
+                    available = hasUnderlyingInternetNetwork(context)
+                }
+            }
+            val callback = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) = refresh()
+                override fun onLost(network: Network) = refresh()
+                override fun onCapabilitiesChanged(
+                    network: Network,
+                    networkCapabilities: NetworkCapabilities,
+                ) = refresh()
+            }
+            runCatching {
+                connectivity.registerNetworkCallback(
+                    NetworkRequest.Builder()
+                        .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                        .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                        .build(),
+                    callback,
+                )
+            }
+            onDispose {
+                runCatching { connectivity.unregisterNetworkCallback(callback) }
+            }
+        }
+    }
+    return available
+}
+
+private fun hasUnderlyingInternetNetwork(context: Context): Boolean = runCatching {
+    val connectivity = context.getSystemService(ConnectivityManager::class.java) ?: return@runCatching false
+    connectivity.allNetworks.any { network ->
+        val capabilities = connectivity.getNetworkCapabilities(network) ?: return@any false
+        capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+            capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+    }
+}.getOrDefault(false)
+
+/**
+ * Индикатор запуска не вращается: частицы образуют цельное кольцо и вместе
+ * мягко "дышат". Он существует только пока видна фаза STARTING, поэтому не
+ * держит кадры и анимацию в работающем/фоновом состоянии.
+ */
+@Composable
+private fun ConnectingTunnelParticleRing(
+    modifier: Modifier = Modifier,
+    color: Color,
+) {
+    val breathing = rememberInfiniteTransition(label = "tunnel_connecting_breathing")
+    val pulse by breathing.animateFloat(
+        initialValue = 0.93f,
+        targetValue = 1.07f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1_150),
+            repeatMode = RepeatMode.Reverse,
+        ),
+        label = "tunnel_connecting_breathing_scale",
+    )
+    Canvas(modifier = modifier) {
+        val center = Offset(size.width / 2f, size.height / 2f)
+        val radius = size.minDimension * 0.31f * pulse
+        val dotRadius = size.minDimension * 0.055f * (0.94f + (pulse - 0.93f) * 0.7f)
+        repeat(12) { index ->
+            val angle = Math.toRadians((-90f + index * 30f).toDouble())
+            val point = Offset(
+                x = center.x + kotlin.math.cos(angle).toFloat() * radius,
+                y = center.y + kotlin.math.sin(angle).toFloat() * radius,
+            )
+            drawCircle(
+                color = color.copy(alpha = 0.52f + (index % 3) * 0.12f),
+                radius = dotRadius,
+                center = point,
+            )
         }
     }
 }

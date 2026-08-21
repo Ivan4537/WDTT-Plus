@@ -26,12 +26,30 @@ data class ServerAdminProfileInfo(
     val listenPort: Int = 9000,
     val sni: String = "",
     val noDns: Boolean = false,
+    val vpnDnsSelectionId: String = VPN_DNS_PROFILE_ID,
+    val vpnDnsCustomServers: List<String> = emptyList(),
+    val vpnDnsStored: Boolean = false,
     val ports: String = "56000,56001,9000",
     val deviceIds: List<String> = emptyList(),
     val updatedAt: Long = 0
 ) {
     val hasSavedFields: Boolean
         get() = updatedAt > 0L || vkHashes.isNotBlank() || secondaryVkHash.isNotBlank() || vpnProfileRestorableName(profileName).isNotBlank()
+
+    val vpnDnsDisplayLabel: String
+        get() {
+            if (!vpnDnsStored) return "не сохранён"
+            val settings = VpnDnsSettingsSnapshot(
+                profileIndex = 0,
+                selectionId = vpnDnsSelectionId,
+                customServers = vpnDnsCustomServers,
+            )
+            return if (settings.configuredServers.isEmpty()) {
+                settings.title
+            } else {
+                "${settings.title} (${settings.configuredServers.joinToString(", ")})"
+            }
+        }
 }
 
 data class ServerAdminState(
@@ -289,7 +307,19 @@ object ServerAdminClient {
     suspend fun updateAdminProfileFromTunnel(
         target: ServerAdminTarget,
         profile: ServerAdminProfileInfo
-    ): ServerAdminActionResult = runArgsAction(target, buildAdminProfilePatchArgs(profile))
+    ): ServerAdminActionResult {
+        return try {
+            runArgsAction(target, buildAdminProfilePatchArgs(profile))
+        } catch (error: IllegalStateException) {
+            val legacyArgs = buildAdminProfilePatchArgs(profile, includeVpnDns = false)
+            val dnsArgsWereAdded = legacyArgs != buildAdminProfilePatchArgs(profile)
+            val oldServer = error.message.orEmpty().contains("сервер ещё не поддерживает", ignoreCase = true)
+            if (!dnsArgsWereAdded || !oldServer) throw error
+            runArgsAction(target, legacyArgs).copy(
+                message = "Профиль обновлён, но DNS внутри VPN не сохранён: обновите серверную часть.",
+            )
+        }
+    }
 
     suspend fun refreshPublicHost(target: ServerAdminTarget): ServerAdminActionResult =
         runArgsAction(target, listOf("refresh-public-ip"))
@@ -436,6 +466,13 @@ object ServerAdminClient {
             listenPort = listenPort,
             sni = json?.optString("sni", "").orEmpty().trim(),
             noDns = json?.optBoolean("no_dns", false) ?: false,
+            vpnDnsSelectionId = normalizeVpnDnsSelectionId(
+                json?.optString("vpn_dns_selection", VPN_DNS_PROFILE_ID)
+            ),
+            vpnDnsCustomServers = decodeStoredCustomVpnDnsServers(
+                json?.optString("vpn_dns_custom", "").orEmpty()
+            ),
+            vpnDnsStored = json?.has("vpn_dns_selection") == true,
             ports = ports,
             deviceIds = deviceIds,
             updatedAt = json?.optLong("updated_at", 0L) ?: 0L
@@ -559,7 +596,10 @@ object ServerAdminClient {
 internal fun hasMeaningfulAdminProfileFields(profile: ServerAdminProfileInfo): Boolean =
     buildAdminProfilePatchArgs(profile).size > 1
 
-internal fun buildAdminProfilePatchArgs(profile: ServerAdminProfileInfo): List<String> = buildList {
+internal fun buildAdminProfilePatchArgs(
+    profile: ServerAdminProfileInfo,
+    includeVpnDns: Boolean = true,
+): List<String> = buildList {
     add("update-admin-profile")
     profile.vkHashes.trim().takeIf { it.isNotBlank() }?.let {
         add("--vk-hashes")
@@ -594,6 +634,12 @@ internal fun buildAdminProfilePatchArgs(profile: ServerAdminProfileInfo): List<S
         add(it)
     }
     if (profile.noDns) add("--no-dns")
+    if (includeVpnDns && profile.vpnDnsStored) {
+        add("--vpn-dns-selection")
+        add(normalizeVpnDnsSelectionId(profile.vpnDnsSelectionId))
+        add("--vpn-dns-custom")
+        add(profile.vpnDnsCustomServers.joinToString(","))
+    }
 }
 
 private class AdminSshClient(private val session: Session, private val sudoPassword: String) {

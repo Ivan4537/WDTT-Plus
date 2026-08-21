@@ -10,13 +10,22 @@ import com.wireguard.config.Config
 import com.wireguard.config.Interface
 import com.wireguard.config.Peer
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runInterruptible
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayInputStream
+import java.net.InetAddress
 import java.security.MessageDigest
+import java.util.concurrent.ConcurrentHashMap
 
 class WireGuardHelper(context: Context) {
     private val appContext = context.applicationContext
@@ -62,10 +71,6 @@ class WireGuardHelper(context: Context) {
 
             val builder = Interface.Builder()
                 .parseAddresses(parsedConfig.`interface`.addresses.joinToString(", ") { it.toString() })
-            
-            if (parsedConfig.`interface`.dnsServers.isNotEmpty()) {
-                builder.parseDnsServers(parsedConfig.`interface`.dnsServers.joinToString(", ") { it.hostAddress ?: "" })
-            }
             if (parsedConfig.`interface`.listenPort.isPresent) {
                 builder.parseListenPort(parsedConfig.`interface`.listenPort.get().toString())
             }
@@ -81,12 +86,71 @@ class WireGuardHelper(context: Context) {
             // 1. Пакеты, которые всегда исключаются (наше приложение, ВК)
             // 2. Получаю настройки пользователя
             val settingsStore = SettingsStore(appContext)
-            val selectedPackages = settingsStore.vpnAppPackages.first()
+            val runningProfile = TunnelManager.activeTunnelProfile.value
+            val routingSettings = if (runningProfile != null) {
+                settingsStore.vpnRoutingSettingsForProfile(runningProfile)
+            } else {
+                settingsStore.vpnRoutingSettings.first()
+            }
+            val dnsSettings = if (runningProfile != null) {
+                settingsStore.vpnDnsSettingsForProfile(runningProfile)
+            } else {
+                settingsStore.vpnDnsSettings.first()
+            }
+            val profileLabel = vpnProfileDisplayName(
+                dnsSettings.profileIndex,
+                settingsStore.profileNames.first(),
+            )
+            val profileDnsServers = parsedConfig.`interface`.dnsServers
+                .mapNotNull { it.hostAddress }
+            val effectiveDns = resolveEffectiveVpnDns(
+                settings = dnsSettings,
+                profileServers = profileDnsServers,
+            )
+            if (effectiveDns.servers.isNotEmpty()) {
+                builder.parseDnsServers(effectiveDns.servers.joinToString(", "))
+            }
+            TunnelManager.noteVpnDnsEvent(
+                key = "applied_${dnsSettings.profileIndex}_${effectiveDns.selectionId}",
+                message = vpnDnsAppliedLogMessage(profileLabel, effectiveDns),
+                warning = effectiveDns.fellBackToProfile,
+            )
+            val selectedPackages = routingSettings.appPackages
                 .split(",")
                 .map { it.trim() }
                 .filter { it.isNotEmpty() }
                 .toSet()
-            val isWhitelist = settingsStore.isWhitelist.first()
+            val isWhitelist = routingSettings.isWhitelist
+            val addressRules = routingSettings.addressRules
+            val resolvedDomains = resolveAddressRuleDomains(addressRules)
+            val addressRouting = runCatching {
+                resolveVpnAddressRouting(
+                    isWhitelist = isWhitelist,
+                    rules = addressRules,
+                    domainResolver = { domain -> resolvedDomains[domain].orEmpty() },
+                )
+            }.getOrElse { error ->
+                Log.e("WG", "Address routing fallback: ${error.readableMessage()}")
+                TunnelManager.noteAddressRoutingWarning(
+                    key = "fallback",
+                    message = if (isWhitelist) {
+                        "Правила адресов не применены: ${error.message ?: "ошибка списка"}. " +
+                            "БС адресов временно закрыт до исправления списка."
+                    } else {
+                        "Правила адресов не применены: ${error.message ?: "ошибка списка"}. " +
+                            "VPN продолжает работать без адресных исключений."
+                    },
+                )
+                VpnAddressRoutingResult(
+                    allowedIps = if (isWhitelist) emptyList() else listOf("0.0.0.0/0"),
+                )
+            }
+            val effectiveAllowedIps = effectiveWireGuardAllowedIps(
+                isWhitelist = isWhitelist,
+                addressRulesConfigured = addressRules.isNotEmpty(),
+                addressRouting = addressRouting,
+                vpnDnsIpv4 = effectiveDns.servers.filter(::isIpv4Literal),
+            )
             val installedPackages = appContext.packageManager
                 .getInstalledApplications(0)
                 .map { it.packageName }
@@ -95,13 +159,18 @@ class WireGuardHelper(context: Context) {
                 isWhitelist = isWhitelist,
                 selectedPackages = selectedPackages,
                 installedPackages = installedPackages,
-                ownPackageName = appContext.packageName
+                ownPackageName = appContext.packageName,
+                addressWhitelistConfigured = isWhitelist && addressRules.isNotEmpty(),
             )
             if (routing.included.isNotEmpty()) {
                 builder.includeApplications(routing.included)
             } else if (routing.excluded.isNotEmpty()) {
                 builder.excludeApplications(routing.excluded)
             }
+            val routedAllowedIps = applyVpnAppRoutingToAllowedIps(
+                routing = routing,
+                allowedIps = effectiveAllowedIps,
+            )
 
             val newInterface = builder.build()
 
@@ -114,8 +183,31 @@ class WireGuardHelper(context: Context) {
                 if (peer.endpoint.isPresent) peerBuilder.parseEndpoint(peer.endpoint.get().toString())
                 if (peer.persistentKeepalive.isPresent) peerBuilder.parsePersistentKeepalive(peer.persistentKeepalive.get().toString())
             }
-            // Override AllowedIPs
-            peerBuilder.parseAllowedIPs("0.0.0.0/0")
+            // Android строит маршруты назначения из AllowedIPs. Пустой БС адресов
+            // оставляет peer без маршрутов: VPN поднят, но пользовательский трафик в него
+            // не попадёт. Для ЧС здесь уже рассчитано дополнение выбранных IPv4/CIDR.
+            if (routedAllowedIps.isNotEmpty()) {
+                peerBuilder.parseAllowedIPs(routedAllowedIps.joinToString(", "))
+            }
+            if (addressRouting.unresolvedDomains.isNotEmpty()) {
+                val previewDomains = addressRouting.unresolvedDomains.take(3)
+                val preview = previewDomains.joinToString(", ")
+                val remaining = addressRouting.unresolvedDomains.size - previewDomains.size
+                Log.w(
+                    "WG",
+                    "Address routing: unresolved domains=" +
+                        addressRouting.unresolvedDomains.joinToString(", "),
+                )
+                TunnelManager.noteAddressRoutingWarning(
+                    key = "unresolved_domains",
+                    message = buildString {
+                        append("Не удалось определить IPv4: ")
+                        append(preview)
+                        if (remaining > 0) append(" и ещё $remaining")
+                        append(". Эти домены не применены; переподключите VPN после восстановления DNS.")
+                    },
+                )
+            }
             
             val finalConfig = Config.Builder()
                 .setInterface(newInterface)
@@ -140,22 +232,27 @@ class WireGuardHelper(context: Context) {
 
             ensureGoBackendServiceStarted()
 
-            sharedTunnel?.let { existingTunnel ->
-                try {
-                    existingTunnel.suppressDownCallback = true
-                    backend.setState(existingTunnel, Tunnel.State.DOWN, null)
-                } catch (e: Exception) {
-                    Log.w("WG", "Failed to stop previous tunnel before restart: ${e.readableMessage()}")
-                }
-                sharedTunnel = null
-                sharedConfigFingerprint = null
-                delay(150)
-            }
-
+            // GoBackend умеет сам восстановить предыдущую конфигурацию, если новая не
+            // поднимется. Не выключаем рабочий tunnel заранее, иначе этот rollback теряется.
+            val previousTunnel = sharedTunnel
+            val previousFingerprint = sharedConfigFingerprint
+            previousTunnel?.suppressDownCallback = true
             val nextTunnel = WgTunnel {
-                TunnelManager.onWireGuardInterfaceDropped()
+                notifyWireGuardInterfaceDropped()
             }
-            setTunnelUpWithRetry(nextTunnel, finalConfig)
+            try {
+                setTunnelUpWithRetry(nextTunnel, finalConfig)
+            } catch (error: Exception) {
+                previousTunnel?.suppressDownCallback = false
+                val previousRestored = previousTunnel != null && runCatching {
+                    backend.getState(previousTunnel) == Tunnel.State.UP
+                }.getOrDefault(false)
+                if (previousRestored) {
+                    sharedTunnel = previousTunnel
+                    sharedConfigFingerprint = previousFingerprint
+                }
+                throw error
+            }
             sharedTunnel = nextTunnel
             sharedConfigFingerprint = wireGuardConfigFingerprint(finalConfig)
             Log.d("WG", "WireGuard tunnel started successfully")
@@ -169,20 +266,51 @@ class WireGuardHelper(context: Context) {
 
     suspend fun reloadTunnel() = wgMutex.withLock {
         withContext(Dispatchers.IO) {
-            val currentTunnel = sharedTunnel ?: return@withContext
+            if (sharedTunnel == null) return@withContext
             try {
                 val configFlow = TunnelManager.config.first() ?: return@withContext
-                currentTunnel.suppressDownCallback = true
-                backend.setState(currentTunnel, Tunnel.State.DOWN, null)
-                sharedTunnel = null
-                sharedConfigFingerprint = null
-                delay(150)
                 startTunnelLocked(configFlow)
-                Log.d("WG", "WireGuard tunnel reloaded for new exceptions")
+                Log.d("WG", "WireGuard tunnel reloaded for updated profile settings")
             } catch (e: Exception) {
                 Log.e("WG", "Failed to reload WireGuard: ${e.readableMessage()}")
+                TunnelManager.noteVpnInterfaceReloadWarning(
+                    message = "Новые настройки маршрутизации или DNS не применились: ${e.readableMessage()}. " +
+                        "Рабочая конфигурация сохранена, если Android смог её восстановить.",
+                )
             }
         }
+    }
+
+    private suspend fun resolveAddressRuleDomains(
+        rules: List<VpnAddressRule>,
+    ): Map<String, List<String>> {
+        val domains = rules.asSequence()
+            .filter { it.type == VpnAddressType.DOMAIN }
+            .map(VpnAddressRule::value)
+            .distinct()
+            .toList()
+        if (domains.isEmpty()) return emptyMap()
+
+        val resolved = ConcurrentHashMap<String, List<String>>()
+        val concurrency = Semaphore(16)
+        withTimeoutOrNull(5_000L) {
+            coroutineScope {
+                domains.map { domain ->
+                    async(Dispatchers.IO) {
+                        concurrency.withPermit {
+                            val addresses = runCatching {
+                                runInterruptible {
+                                    InetAddress.getAllByName(domain)
+                                        .mapNotNull(InetAddress::getHostAddress)
+                                }
+                            }.getOrDefault(emptyList())
+                            resolved[domain] = addresses
+                        }
+                    }
+                }.forEach { it.await() }
+            }
+        }
+        return resolved
     }
 
     suspend fun isTunnelUp(): Boolean = wgMutex.withLock {
@@ -209,6 +337,51 @@ class WireGuardHelper(context: Context) {
             }
         }
     }
+
+    private fun notifyWireGuardInterfaceDropped() {
+        val slotTransferred = isVpnSlotTransferred()
+        TunnelManager.onWireGuardInterfaceDropped(slotTransferred)
+        if (slotTransferred) {
+            requestVpnSlotHandoverStop()
+            return
+        }
+
+        // При смене VPN Android может уничтожить старый VpnService чуть раньше,
+        // чем обновит владельца разрешения. Несколько коротких проверок закрывают
+        // эту гонку, не добавляя постоянного polling: ветка выполняется только
+        // после внешнего DOWN-сигнала от WireGuard.
+        TunnelManager.scope.launch {
+            repeat(20) {
+                delay(250L)
+                if (isVpnSlotTransferred()) {
+                    TunnelManager.onWireGuardInterfaceDropped(vpnSlotTransferred = true)
+                    requestVpnSlotHandoverStop()
+                    return@launch
+                }
+            }
+        }
+    }
+
+    /**
+     * Не полагаемся только на StateFlow: callback WireGuard приходит в момент,
+     * когда Android уже передаёт единственный VPN-слот. Доставляем сигнал в
+     * работающую foreground-службу сразу, чтобы она закрыла нативный клиент и
+     * не смогла запустить WireGuard повторно в этой сессии.
+     */
+    private fun requestVpnSlotHandoverStop() {
+        runCatching {
+            appContext.startService(
+                Intent(appContext, TunnelService::class.java).apply {
+                    action = ACTION_VPN_SLOT_REVOKED
+                }
+            )
+        }.onFailure {
+            Log.w("WG", "Не удалось немедленно передать остановку VPN-службе: ${it.readableMessage()}")
+        }
+    }
+
+    private fun isVpnSlotTransferred(): Boolean =
+        runCatching { VpnService.prepare(appContext) != null }.getOrDefault(false)
 
     private suspend fun ensureGoBackendServiceStarted() {
         withContext(Dispatchers.Main) {
