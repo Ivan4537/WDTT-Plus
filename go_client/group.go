@@ -21,6 +21,7 @@ const (
 	refreshedCredsRetryMin       = 500 * time.Millisecond
 	refreshedCredsRetrySlot      = 250 * time.Millisecond
 	refreshedCredsRetryJitterMax = 250 * time.Millisecond
+	turnCapacityRetrySlot        = 250 * time.Millisecond
 	// VK-реквизиты запрашиваются последовательно. Меньший интервал старта
 	// воркеров не должен превращать их в burst запросов к VK.
 	credentialRequestCooldown = 100 * time.Millisecond
@@ -254,6 +255,25 @@ func workerPolicyRetryDelay(round int) time.Duration {
 	return delay
 }
 
+// turnCapacityRetryDelay backs off retries after a TURN 486/508 response.
+// Unlike an authentication failure, this is an admission-control response
+// from a remote relay: immediately making all nine workers retry only keeps
+// that relay saturated and makes the next successful allocation less likely.
+// Keep the ceiling short so that a relay which frees capacity is discovered
+// promptly, while normal (non-capacity-limited) startup remains untouched.
+func turnCapacityRetryDelay(round int) time.Duration {
+	switch {
+	case round <= 1:
+		return 3 * time.Second
+	case round == 2:
+		return 6 * time.Second
+	case round == 3:
+		return 12 * time.Second
+	default:
+		return 20 * time.Second
+	}
+}
+
 // wait объединяет одновременные отказы всех воркеров в одно окно повтора.
 // Небольшой разброс не даёт девяти DTLS-handshake стартовать в одну миллисекунду.
 func (g *workerPolicyRetryGate) wait(ctx context.Context, workerID int) (bool, int, error) {
@@ -283,6 +303,49 @@ func (g *workerPolicyRetryGate) wait(ctx context.Context, workerID int) (bool, i
 }
 
 func (g *workerPolicyRetryGate) reset() {
+	g.mu.Lock()
+	g.blockedUntil = time.Time{}
+	g.round = 0
+	g.mu.Unlock()
+}
+
+// turnCapacityRetryGate is deliberately per credential group. Different
+// groups may use different VK/TURN credentials, so one saturated relay must
+// not slow a healthy group with another hash. The slot offset keeps a retry
+// round from turning into nine simultaneous Allocate requests.
+type turnCapacityRetryGate struct {
+	mu           sync.Mutex
+	blockedUntil time.Time
+	round        int
+}
+
+func (g *turnCapacityRetryGate) wait(ctx context.Context, workerID int) (bool, int, error) {
+	g.mu.Lock()
+	now := time.Now()
+	startedRound := !now.Before(g.blockedUntil)
+	if startedRound {
+		g.round++
+		g.blockedUntil = now.Add(turnCapacityRetryDelay(g.round))
+	}
+	round := g.round
+	retryAt := g.blockedUntil.Add(time.Duration(workerID%workersPerGroup) * turnCapacityRetrySlot)
+	g.mu.Unlock()
+
+	wait := time.Until(retryAt)
+	if wait <= 0 {
+		return startedRound, round, nil
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return startedRound, round, nil
+	case <-ctx.Done():
+		return startedRound, round, ctx.Err()
+	}
+}
+
+func (g *turnCapacityRetryGate) reset() {
 	g.mu.Lock()
 	g.blockedUntil = time.Time{}
 	g.round = 0
@@ -445,6 +508,7 @@ func WorkerGroup(
 	var refreshMu sync.Mutex
 	var lastCredRefresh atomic.Int64
 	var policyRetryGate workerPolicyRetryGate
+	var turnCapacityGate turnCapacityRetryGate
 
 	refreshCreds := func(reason string, failedRevision uint64) credentialRefreshResult {
 		refreshMu.Lock()
@@ -560,7 +624,7 @@ func WorkerGroup(
 				configDelivered, sessErr := RunSession(ctx, tp, peer, d, localPort,
 					getConf, cc, requireConfig, onConfigDelivered, wid, &credsSnapshot,
 					deviceID, password, deviceInfo,
-					transportSession, stats, turnStreamFirst)
+					transportSession, stats, turnStreamFirst, turnCapacityGate.reset)
 				refreshResult := credentialRefreshNone
 
 				if getConf {
@@ -625,7 +689,14 @@ func WorkerGroup(
 						log.Printf("[ВОРКЕР #%d] [TURN] Ошибка allocation/кредов, обновляем TURN-креды и повторяем (попытка %d): %s", wid, attempt, errStr)
 						refreshResult = refreshCreds("TURN allocation error", credsRevision)
 					} else if turnCapacityLimited {
-						log.Printf("[ВОРКЕР #%d] [TURN] Узел временно ограничил новые allocation; сохраняем креды и повторяем другие TURN-пути (попытка %d): %s", wid, attempt, errStr)
+						startedRound, round, waitErr := turnCapacityGate.wait(ctx, wid)
+						if startedRound {
+							log.Printf("[ВОРКЕР #%d] [TURN] Узел временно ограничил новые allocation; снижаем темп повторов (раунд %d), креды сохранены: %s", wid, round, errStr)
+						}
+						if waitErr != nil {
+							return
+						}
+						continue
 					} else {
 						log.Printf("[ВОРКЕР #%d] Ошибка (попытка %d): %s", wid, attempt, errStr)
 					}

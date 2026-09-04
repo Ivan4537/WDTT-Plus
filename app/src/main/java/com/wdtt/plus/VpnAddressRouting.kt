@@ -6,6 +6,7 @@ import java.net.IDN
 
 internal const val MAX_VPN_ADDRESS_RULES = 128
 internal const val MAX_VPN_ADDRESS_IMPORT_BYTES = 1024 * 1024
+private const val MAX_VPN_ROUTING_APP_PACKAGES = 5_000
 private const val MAX_WIREGUARD_ALLOWED_IPS = 4096
 private const val MAX_EFFECTIVE_IPV4_PREFIXES = 128
 private const val IPV4_BITS = 32
@@ -69,16 +70,25 @@ internal data class VpnRoutingDocument(
     val whitelistAddresses: List<VpnAddressRule>,
 )
 
-internal fun encodeVpnRoutingDocument(document: VpnRoutingDocument): String =
-    JSONObject().apply {
+internal fun encodeVpnRoutingDocument(document: VpnRoutingDocument): String {
+    val blacklistApps = normalizeVpnRoutingDocumentPackages(document.blacklistApps)
+    val whitelistApps = normalizeVpnRoutingDocumentPackages(document.whitelistApps)
+    val blacklistAddresses = normalizeVpnRoutingDocumentAddresses(document.blacklistAddresses)
+    val whitelistAddresses = normalizeVpnRoutingDocumentAddresses(document.whitelistAddresses)
+    val encoded = JSONObject().apply {
         put("format", "wdtt-plus-routing")
         put("version", 1)
         put("isWhitelist", document.isWhitelist)
-        put("blacklistApps", JSONArray(document.blacklistApps.distinct().sorted()))
-        put("whitelistApps", JSONArray(document.whitelistApps.distinct().sorted()))
-        put("blacklistAddresses", JSONArray(encodeVpnAddressRules(document.blacklistAddresses)))
-        put("whitelistAddresses", JSONArray(encodeVpnAddressRules(document.whitelistAddresses)))
+        put("blacklistApps", JSONArray(blacklistApps))
+        put("whitelistApps", JSONArray(whitelistApps))
+        put("blacklistAddresses", JSONArray(encodeVpnAddressRules(blacklistAddresses)))
+        put("whitelistAddresses", JSONArray(encodeVpnAddressRules(whitelistAddresses)))
     }.toString(2)
+    require(encoded.toByteArray(Charsets.UTF_8).size <= MAX_VPN_ADDRESS_IMPORT_BYTES) {
+        "Маршрутизация слишком большая для экспорта. Сократите списки приложений."
+    }
+    return encoded
+}
 
 internal fun decodeVpnRoutingDocument(raw: String): VpnRoutingDocument {
     require(raw.toByteArray(Charsets.UTF_8).size <= MAX_VPN_ADDRESS_IMPORT_BYTES) {
@@ -157,7 +167,23 @@ internal fun normalizeVpnAddressRules(rawValue: String): List<VpnAddressRule> {
         entries.forEachIndexed { index, entry ->
             val range = parseIpv4Range(entry)
             val normalized = if (range == null) {
-                listOf(normalizeVpnAddressRule(entry))
+                runCatching {
+                    val rule = normalizeVpnAddressRule(entry)
+                    require(
+                        rule.type != VpnAddressType.DOMAIN || '.' in rule.value
+                    ) {
+                        "Одноуровневое имя не подходит: это доменная зона или неполный адрес. " +
+                            "Укажите точный домен с точкой, например example.ru. " +
+                            "Зоны .ru и маски *.ru пока не поддерживаются."
+                    }
+                    listOf(rule)
+                }
+                    .getOrElse { error ->
+                        throw IllegalArgumentException(
+                            "Строка ${index + 1}: ${error.message ?: "некорректный адрес."}",
+                            error,
+                        )
+                    }
             } else if (range.first == range.last) {
                 listOf(VpnAddressRule(VpnAddressType.IP, formatIpv4(range.first)))
             } else {
@@ -175,9 +201,13 @@ internal fun normalizeVpnAddressRules(rawValue: String): List<VpnAddressRule> {
     return rules.distinct()
 }
 
-internal fun encodeVpnAddressRules(rules: List<VpnAddressRule>): String =
-    JSONArray().apply {
-        rules.distinct().take(MAX_VPN_ADDRESS_RULES).forEach { rule ->
+internal fun encodeVpnAddressRules(rules: List<VpnAddressRule>): String {
+    val distinctRules = rules.distinct()
+    require(distinctRules.size <= MAX_VPN_ADDRESS_RULES) {
+        "В одном списке может быть не больше $MAX_VPN_ADDRESS_RULES адресов."
+    }
+    return JSONArray().apply {
+        distinctRules.forEach { rule ->
             put(
                 JSONObject()
                     .put("type", rule.type.storedValue)
@@ -185,6 +215,7 @@ internal fun encodeVpnAddressRules(rules: List<VpnAddressRule>): String =
             )
         }
     }.toString()
+}
 
 internal fun decodeVpnAddressRules(raw: String): List<VpnAddressRule> {
     if (raw.isBlank()) return emptyList()
@@ -328,7 +359,9 @@ private fun extractBareHostWithPort(rawValue: String): String? {
 private fun parseVpnPackagesJson(root: JSONObject, key: String): List<String> {
     val array = root.optJSONArray(key)
         ?: throw IllegalArgumentException("В файле нет списка $key.")
-    require(array.length() <= 5_000) { "Список приложений в файле слишком большой." }
+    require(array.length() <= MAX_VPN_ROUTING_APP_PACKAGES) {
+        "Список приложений в файле слишком большой."
+    }
     // В Android встречается системный пакет `android` без точки, поэтому формат
     // должен принимать и его: файл, созданный самим приложением, обязан импортироваться.
     val packagePattern = Regex("[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z0-9_]+)*")
@@ -341,6 +374,38 @@ private fun parseVpnPackagesJson(root: JSONObject, key: String): List<String> {
             add(packageName)
         }
     }.distinct().sorted()
+}
+
+private fun normalizeVpnRoutingDocumentPackages(packages: List<String>): List<String> {
+    val normalized = packages.map(String::trim).distinct().sorted()
+    require(normalized.size <= MAX_VPN_ROUTING_APP_PACKAGES) {
+        "Список приложений слишком большой для экспорта."
+    }
+    val packagePattern = Regex("[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z0-9_]+)*")
+    normalized.forEachIndexed { index, packageName ->
+        require(packageName.length in 1..255 && packagePattern.matches(packageName)) {
+            "Некорректный пакет приложения в записи №${index + 1}."
+        }
+    }
+    return normalized
+}
+
+private fun normalizeVpnRoutingDocumentAddresses(
+    rules: List<VpnAddressRule>,
+): List<VpnAddressRule> {
+    val normalized = rules.mapIndexed { index, rule ->
+        runCatching { normalizeVpnAddressRule(rule.value, rule.type) }
+            .getOrElse { error ->
+                throw IllegalArgumentException(
+                    "Некорректный адрес в записи №${index + 1}: ${error.message ?: "ошибка правила."}",
+                    error,
+                )
+            }
+    }.distinct()
+    require(normalized.size <= MAX_VPN_ADDRESS_RULES) {
+        "В одном экспортируемом списке может быть не больше $MAX_VPN_ADDRESS_RULES адресов."
+    }
+    return normalized
 }
 
 private fun parseVpnAddressRulesJson(root: JSONObject, key: String): List<VpnAddressRule> {

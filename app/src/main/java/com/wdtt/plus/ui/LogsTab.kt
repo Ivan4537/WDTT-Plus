@@ -6,6 +6,7 @@ import android.content.Context
 import android.widget.Toast
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.focusGroup
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
@@ -50,7 +51,7 @@ fun LogsTab(
         firstVisibleItemScrollOffset
     )
 
-    Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+    Column(modifier = Modifier.fillMaxSize().focusGroup().padding(16.dp)) {
         // Toolbar
         Row(
             modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
@@ -85,7 +86,15 @@ fun LogsTab(
             verticalArrangement = Arrangement.spacedBy(0.dp)
         ) {
             Row(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .remoteToggleableRow(value = loggingEnabled) { enabled ->
+                        scope.launch {
+                            settingsStore.saveLoggingEnabled(enabled)
+                            if (!enabled) TunnelManager.clearLogs()
+                        }
+                    }
+                    .padding(horizontal = 8.dp, vertical = 6.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
@@ -98,14 +107,7 @@ fun LogsTab(
                 )
                 Switch(
                     checked = loggingEnabled,
-                    onCheckedChange = { enabled ->
-                        scope.launch {
-                            settingsStore.saveLoggingEnabled(enabled)
-                            if (!enabled) {
-                                TunnelManager.clearLogs()
-                            }
-                        }
-                    }
+                    onCheckedChange = null,
                 )
             }
         }
@@ -171,7 +173,10 @@ fun LogLine(entry: LogEntry, sessionActive: Boolean) {
     )
 
     Row(
-        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .remoteReadableItem(RoundedCornerShape(8.dp))
+            .padding(horizontal = 4.dp, vertical = 4.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Surface(

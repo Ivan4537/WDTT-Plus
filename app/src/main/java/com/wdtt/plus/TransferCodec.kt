@@ -23,8 +23,8 @@ private const val SERVER_BACKUP_KIND = "server-backup"
 private const val PBKDF2_ITERATIONS = 210_000
 private const val KEY_BITS = 256
 private const val GCM_TAG_BITS = 128
-private const val MAX_TRANSFER_DOCUMENT_CHARS = 12_000_000
-private const val MAX_TRANSFER_PLAINTEXT_BYTES = 8_000_000
+private const val MAX_TRANSFER_DOCUMENT_CHARS = 24_000_000
+private const val MAX_TRANSFER_PLAINTEXT_BYTES = 16_000_000
 
 data class AdminTransferPreview(
     val createdAt: Long,
@@ -173,7 +173,7 @@ object WdttTransferCodec {
         val iterations = json.optInt("iterations", 0)
         require(iterations in 100_000..1_000_000) { "Некорректные параметры защиты файла." }
         val data = json.getString("data")
-        require(data.length <= 10_700_000) { "Файл передачи слишком большой." }
+        require(data.length <= MAX_TRANSFER_DOCUMENT_CHARS) { "Файл передачи слишком большой." }
         val salt = runCatching { Base64.getDecoder().decode(json.getString("salt")) }
             .getOrElse { throw IllegalArgumentException("Файл передачи повреждён.") }
         val iv = runCatching { Base64.getDecoder().decode(json.getString("iv")) }

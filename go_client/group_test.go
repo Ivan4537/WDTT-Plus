@@ -273,6 +273,21 @@ func TestCredentialRefreshRetryUsesShortBoundedJitter(t *testing.T) {
 	}
 }
 
+func TestTURNCapacityRetryBackoffIsBounded(t *testing.T) {
+	want := []time.Duration{
+		3 * time.Second,
+		6 * time.Second,
+		12 * time.Second,
+		20 * time.Second,
+		20 * time.Second,
+	}
+	for index, expected := range want {
+		if got := turnCapacityRetryDelay(index + 1); got != expected {
+			t.Fatalf("round %d delay = %v, want %v", index+1, got, expected)
+		}
+	}
+}
+
 func TestCredentialRevisionsStayIndependentAtMaximumPower(t *testing.T) {
 	const groupCount = 108 / workersPerGroup
 	states := make([]*groupCredentialsState, groupCount)
@@ -409,5 +424,32 @@ func TestWebViewTimeoutOrdering(t *testing.T) {
 	}
 	if captchaSelectedWebViewTimeout <= 270*time.Second {
 		t.Fatalf("selected timeout %v must cover two auto attempts plus manual fallback", captchaSelectedWebViewTimeout)
+	}
+}
+
+func TestWorkerDistributionCoversEverySupportedWorkerAndHashCombination(t *testing.T) {
+	for workers := workersPerGroup; workers <= 108; workers += workersPerGroup {
+		for hashes := 1; hashes <= 4; hashes++ {
+			distribution := workerDistributionByHash(workers, hashes)
+			if len(distribution) != hashes {
+				t.Fatalf("workers=%d hashes=%d distribution=%v", workers, hashes, distribution)
+			}
+			total := 0
+			for _, count := range distribution {
+				if count%workersPerGroup != 0 {
+					t.Fatalf("group was split: workers=%d hashes=%d distribution=%v", workers, hashes, distribution)
+				}
+				total += count
+			}
+			if total != workers {
+				t.Fatalf("workers=%d hashes=%d distributed=%d", workers, hashes, total)
+			}
+		}
+	}
+	maximum := workerDistributionByHash(108, 4)
+	for index, count := range maximum {
+		if count != 27 {
+			t.Fatalf("four hashes do not cover all 108 workers: hash=%d distribution=%v", index+1, maximum)
+		}
 	}
 }

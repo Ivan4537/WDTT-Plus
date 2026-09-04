@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -18,6 +19,7 @@ const (
 	botThreeProxyVersion      = "0.9.7"
 	botThreeProxySourceURL    = "https://github.com/3proxy/3proxy/archive/refs/tags/0.9.7.tar.gz"
 	botThreeProxySourceSHA256 = "efe862ef8b7c0ddf7b1c45d6b5d72f0b7cd0a3c54447419c7f1bd2239a06fc30"
+	botPasswordPageSize       = 8
 )
 
 func defaultPortsSpec() string {
@@ -569,12 +571,13 @@ func markerLine(output, name string) string {
 func outboundBotPrelude() string {
 	return `
 set -e
+umask 077
 WDTT_SUBNET="$(ip -4 route show dev wdtt0 scope link 2>/dev/null | awk '{print $1; exit}')"
 [ -n "$WDTT_SUBNET" ] || WDTT_SUBNET="10.66.66.0/24"
 WDTT_IFACE="wdtt0"
 WDTT_TABLE="100"
 WDTT_WG_IFACE="wg-wdtt-exit"
-mkdir -p /etc/wdtt /etc/wdtt/outbound /etc/wdtt-plus/wg-exit
+install -d -m 0700 /etc/wdtt /etc/wdtt/outbound /etc/wdtt-plus /etc/wdtt-plus/wg-exit
 wdtt_ext_iface() {
   ip -o route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}'
 }
@@ -718,6 +721,7 @@ wdtt_write_mode() {
   "updatedAt": "$(date -Is)"
 }
 EOF
+  chmod 0600 /etc/wdtt/outbound.json
 }
 `
 }
@@ -883,7 +887,7 @@ func sendOutboundMenu(token string, adminID int64, messageID int) int {
 			inlineButton("☁️ Бесплатный WARP", "out_warp"),
 		},
 		[]map[string]interface{}{inlineButton("↩️ Вернуть прямой выход", "out_direct")},
-		[]map[string]interface{}{inlineButton("◀️ Назад", "settings")},
+		[]map[string]interface{}{inlineButton("◀️ Назад", "mainmenu")},
 	))
 }
 
@@ -900,7 +904,6 @@ func sendBotCommandResult(token string, adminID int64, messageID int, title, out
 		fmt.Sprintf("%s\n\n`%s`", title, mdCode(limitText(strings.TrimSpace(output), 2800))),
 		inlineKeyboard(
 			[]map[string]interface{}{inlineButton("◀️ Назад", back)},
-			[]map[string]interface{}{inlineButton("◀️ Настройки", "settings")},
 		),
 	)
 }
@@ -914,7 +917,6 @@ func sendBotScriptResult(token string, adminID int64, messageID int, title, outp
 		}
 		return sendOrEditTelegram(token, adminID, messageID, text, inlineKeyboard(
 			[]map[string]interface{}{inlineButton("◀️ Назад", back)},
-			[]map[string]interface{}{inlineButton("◀️ Настройки", "settings")},
 		))
 	}
 	return sendBotCommandResult(token, adminID, messageID, "✅ "+title, output, back)
@@ -1459,29 +1461,34 @@ func sendMainMenu(token string, adminID int64, messageID int) int {
 	dbMutex.Lock()
 	passwords := len(db.Passwords)
 	devices := len(db.Devices)
-	dnsValue := db.DNS
-	defaultPorts := db.DefaultPorts
-	publicIPValue := db.PublicIP
+	expired := 0
+	deactivated := 0
+	for _, entry := range db.Passwords {
+		if entry == nil {
+			continue
+		}
+		if isPasswordExpired(entry) {
+			expired++
+		}
+		if entry.IsDeactivated {
+			deactivated++
+		}
+	}
 	dbMutex.Unlock()
-	if dnsValue == "" {
-		dnsValue = getServerDNS()
-	}
-	if defaultPorts == "" {
-		defaultPorts = defaultPortsSpec()
-	}
-	if publicIPValue == "" {
-		publicIPValue = "автоматически: " + getPublicIP()
-	} else {
-		publicIPValue = "задан вручную: " + publicIPValue
-	}
 	text := fmt.Sprintf(
-		"🤖 *WDTT VPN Manager*\n\nПароли: %d/%d\nУстройства: %d\nDNS: `%s`\nПорты ссылок: `%s`\nАдрес сервера для ссылок: `%s`",
-		passwords, maxGeneratedPasswords, devices, mdCode(dnsValue), mdCode(defaultPorts), mdCode(publicIPValue),
+		"🤖 *WDTT Manager*\n\nКлиенты: `%d/%d`\nУстройства: `%d`\nОтключены: `%d`\nИстекли: `%d`\n\nВыберите раздел.",
+		passwords, maxGeneratedPasswords, devices, deactivated, expired,
 	)
 	return sendOrEditTelegram(token, adminID, messageID, text, inlineKeyboard(
-		[]map[string]interface{}{inlineButton("➕ Новый пароль", "menu_new")},
-		[]map[string]interface{}{inlineButton("🔐 Управление доступами", "backlist")},
-		[]map[string]interface{}{inlineButton("⚙️ Настройки сервера", "settings")},
+		[]map[string]interface{}{
+			inlineButton("📊 Статус", "status"),
+			inlineButton("🔐 Клиенты", "backlist"),
+		},
+		[]map[string]interface{}{
+			inlineButton("🌐 Выход", "settings_outbound"),
+			inlineButton("⚙️ Сервер", "settings"),
+		},
+		[]map[string]interface{}{inlineButton("➕ Новый клиент", "menu_new")},
 	))
 }
 
@@ -1529,36 +1536,125 @@ func sendSettingsMenu(token string, adminID int64, messageID int) int {
 		publicIPLabel = "задан вручную: " + publicIPLabel
 	}
 	text := fmt.Sprintf(
-		"⚙️ *Настройки сервера*\n\nDNS WG-клиентов: `%s`\nЛимит ключей: `%d`\nПорты быстрых ссылок: `%s`\nАдрес сервера для ссылок: `%s`\n\nПароли: %d/%d\nУстройства: %d\nИстёкших ключей: %d\nЗабытых устройств: %d\nТрафик всего: %.2f MB ↓ / %.2f MB ↑\n\nИзменения DNS применятся к новым конфигам клиентов. Сетевые порты самого сервера меняются через systemd/флаги и требуют перезапуска.",
-		mdCode(dnsValue), maxGeneratedPasswords, mdCode(defaultPorts), mdCode(publicIPLabel),
+		"⚙️ *Сервер*\n\nКлиенты: `%d/%d`\nУстройства: `%d`\nИстекли: `%d`\nЗабытые устройства: `%d`\nТрафик всего: `%s`\n\nDNS: `%s`\nСсылки: `%s`\nАдрес: `%s`\n\nНастройки разнесены по разделам, чтобы не держать все действия на одном экране.",
 		passwords, maxGeneratedPasswords, devices, expired, orphanDevices,
-		float64(totalTraffic.Down)/(1024*1024), float64(totalTraffic.Up)/(1024*1024),
+		mdCode(formatTrafficTotals(totalTraffic)),
+		mdCode(dnsValue), mdCode(defaultPorts), mdCode(publicIPLabel),
+	)
+	return sendOrEditTelegram(token, adminID, messageID, text, inlineKeyboard(
+		[]map[string]interface{}{
+			inlineButton("🔗 Ссылки и DNS", "settings_links"),
+			inlineButton("🔢 Лимит", "settings_limit"),
+		},
+		[]map[string]interface{}{
+			inlineButton("👤 Владелец", "settings_owner_profile"),
+			inlineButton("🧹 Обслуживание", "settings_maintenance"),
+		},
+		[]map[string]interface{}{inlineButton("◀️ Назад", "mainmenu")},
+	))
+}
+
+func sendStatusMenu(token string, adminID int64, messageID int) int {
+	dbMutex.Lock()
+	passwords := len(db.Passwords)
+	devices := len(db.Devices)
+	expired := 0
+	deactivated := 0
+	bound := 0
+	for _, entry := range db.Passwords {
+		if entry == nil {
+			continue
+		}
+		if isPasswordExpired(entry) {
+			expired++
+		}
+		if entry.IsDeactivated {
+			deactivated++
+		}
+		if entry.DeviceID != "" {
+			bound++
+		}
+	}
+	totalToday := databaseTrafficTotals(1)
+	totalWeek := databaseTrafficTotals(7)
+	totalAll := databaseTrafficTotals(0)
+	dbMutex.Unlock()
+
+	text := fmt.Sprintf(
+		"📊 *Статус WDTT*\n\nКлиенты: `%d/%d`\nПривязаны к устройствам: `%d`\nУстройства в базе: `%d`\nОтключены: `%d`\nИстекли: `%d`\n\nТрафик сегодня: `%s`\n7 дней: `%s`\nВсего: `%s`",
+		passwords, maxGeneratedPasswords, bound, devices, deactivated, expired,
+		mdCode(formatTrafficTotals(totalToday)),
+		mdCode(formatTrafficTotals(totalWeek)),
+		mdCode(formatTrafficTotals(totalAll)),
+	)
+	return sendOrEditTelegram(token, adminID, messageID, text, inlineKeyboard(
+		[]map[string]interface{}{
+			inlineButton("🔄 Обновить", "status"),
+			inlineButton("🔐 Клиенты", "backlist"),
+		},
+		[]map[string]interface{}{inlineButton("📊 Трафик", "status_traffic")},
+		[]map[string]interface{}{inlineButton("◀️ Назад", "mainmenu")},
+	))
+}
+
+func sendLinksSettingsMenu(token string, adminID int64, messageID int) int {
+	dbMutex.Lock()
+	dnsValue := db.DNS
+	defaultPorts := db.DefaultPorts
+	publicIPValue := db.PublicIP
+	dbMutex.Unlock()
+	if dnsValue == "" {
+		dnsValue = getServerDNS()
+	}
+	if defaultPorts == "" {
+		defaultPorts = defaultPortsSpec()
+	}
+	publicIPLabel := publicIPValue
+	if publicIPLabel == "" {
+		publicIPLabel = "автоматически: " + getPublicIP()
+	} else {
+		publicIPLabel = "вручную: " + publicIPLabel
+	}
+	text := fmt.Sprintf(
+		"🔗 *Ссылки и DNS*\n\nDNS новых WG-конфигов: `%s`\nПорты быстрых ссылок: `%s`\nАдрес в новых ссылках: `%s`\n\nЭти настройки влияют на новые ссылки и конфиги. Реальные systemd-порты меняются отдельно.",
+		mdCode(dnsValue), mdCode(defaultPorts), mdCode(publicIPLabel),
 	)
 	return sendOrEditTelegram(token, adminID, messageID, text, inlineKeyboard(
 		[]map[string]interface{}{
 			inlineButton("🌐 DNS", "settings_dns"),
-			inlineButton("🔢 Лимит ключей", "settings_limit"),
+			inlineButton("⚙️ Порты", "settings_ports"),
 		},
+		[]map[string]interface{}{inlineButton("📍 Адрес ссылок", "settings_ip")},
+		[]map[string]interface{}{inlineButton("◀️ Назад", "settings")},
+	))
+}
+
+func sendMaintenanceMenu(token string, adminID int64, messageID int) int {
+	dbMutex.Lock()
+	expired := 0
+	for _, entry := range db.Passwords {
+		if entry != nil && isPasswordExpired(entry) {
+			expired++
+		}
+	}
+	orphanDevices := len(collectOrphanDevicesLocked())
+	total := databaseTrafficTotals(0)
+	dbMutex.Unlock()
+	text := fmt.Sprintf(
+		"🧹 *Обслуживание*\n\nИстекшие ключи: `%d`\nЗабытые устройства: `%d`\nУчтенный трафик: `%s`\n\nЗдесь только сервисные операции. Перезапуск нужен после обновления бинарника или systemd-флагов.",
+		expired, orphanDevices, mdCode(formatTrafficTotals(total)),
+	)
+	return sendOrEditTelegram(token, adminID, messageID, text, inlineKeyboard(
 		[]map[string]interface{}{
-			inlineButton("⚙️ Порты ссылок", "settings_ports"),
-			inlineButton("📍 Адрес сервера для ссылок", "settings_ip"),
-		},
-		[]map[string]interface{}{
-			inlineButton("👤 Профиль владельца", "settings_owner_profile"),
-		},
-		[]map[string]interface{}{
-			inlineButton("🧹 Очистить истёкшие", "settings_cleanup_expired"),
-			inlineButton("📱 Забытые устройства", "settings_cleanup_orphans"),
+			inlineButton("🧹 Истекшие", "settings_cleanup_expired"),
+			inlineButton("📱 Забытые", "settings_cleanup_orphans"),
 		},
 		[]map[string]interface{}{
 			inlineButton("📊 Трафик", "settings_traffic"),
-			inlineButton("📊 Сбросить трафик", "settings_reset_traffic"),
+			inlineButton("📊 Сброс", "settings_reset_traffic"),
 		},
-		[]map[string]interface{}{
-			inlineButton("🌐 Выходной IP и прокси", "settings_outbound"),
-		},
-		[]map[string]interface{}{inlineButton("🔄 Перезапустить WDTT", "restart_server")},
-		[]map[string]interface{}{inlineButton("◀️ Главное меню", "mainmenu")},
+		[]map[string]interface{}{inlineButton("🔄 Перезапуск WDTT", "restart_server")},
+		[]map[string]interface{}{inlineButton("◀️ Назад", "settings")},
 	))
 }
 
@@ -1591,7 +1687,7 @@ func sendOrphanDevicesMenu(token string, adminID int64, messageID int) int {
 		return sendOrEditTelegram(token, adminID, messageID,
 			"📱 *Забытые устройства*\n\nТаких устройств нет.\n\nЗабытое устройство — это запись в базе устройств, которая больше не привязана ни к одному паролю. Обычно появляется после удаления, истечения или отвязки ключа.",
 			inlineKeyboard(
-				[]map[string]interface{}{inlineButton("◀️ Назад", "settings")},
+				[]map[string]interface{}{inlineButton("◀️ Назад", "settings_maintenance")},
 			),
 		)
 	}
@@ -1615,7 +1711,7 @@ func sendOrphanDevicesMenu(token string, adminID int64, messageID int) int {
 	)
 	return sendOrEditTelegram(token, adminID, messageID, text, inlineKeyboard(
 		[]map[string]interface{}{inlineButton("🗑 Удалить все забытые", "confirm_cleanup_orphans")},
-		[]map[string]interface{}{inlineButton("◀️ Назад", "settings")},
+		[]map[string]interface{}{inlineButton("◀️ Назад", "settings_maintenance")},
 	))
 }
 
@@ -1637,7 +1733,7 @@ func sendExpiredPasswordsMenu(token string, adminID int64, messageID int) int {
 		return sendOrEditTelegram(token, adminID, messageID,
 			"🧹 *Истёкшие ключи*\n\nИстёкших ключей нет.",
 			inlineKeyboard(
-				[]map[string]interface{}{inlineButton("◀️ Назад", "settings")},
+				[]map[string]interface{}{inlineButton("◀️ Назад", "settings_maintenance")},
 			),
 		)
 	}
@@ -1649,7 +1745,7 @@ func sendExpiredPasswordsMenu(token string, adminID int64, messageID int) int {
 	text := fmt.Sprintf("🧹 *Истёкшие ключи: %d*\n\n%s\n\nУдалить эти ключи и связанные с ними устройства?", len(expired), strings.Join(lines, "\n"))
 	return sendOrEditTelegram(token, adminID, messageID, text, inlineKeyboard(
 		[]map[string]interface{}{inlineButton("🗑 Удалить истёкшие", "confirm_cleanup_expired")},
-		[]map[string]interface{}{inlineButton("◀️ Назад", "settings")},
+		[]map[string]interface{}{inlineButton("◀️ Назад", "settings_maintenance")},
 	))
 }
 
@@ -1667,7 +1763,7 @@ func sendDNSSettingsMenu(token string, adminID int64, messageID int) int {
 	return sendOrEditTelegram(token, adminID, messageID, text, inlineKeyboard(
 		[]map[string]interface{}{inlineButton("✏️ Изменить DNS", "settings_dns_edit")},
 		[]map[string]interface{}{inlineButton("Поставить 1.1.1.1", "set_dns_1.1.1.1")},
-		[]map[string]interface{}{inlineButton("◀️ Назад", "settings")},
+		[]map[string]interface{}{inlineButton("◀️ Назад", "settings_links")},
 	))
 }
 
@@ -1703,7 +1799,7 @@ func sendDefaultPortsSettingsMenu(token string, adminID int64, messageID int) in
 	return sendOrEditTelegram(token, adminID, messageID, text, inlineKeyboard(
 		[]map[string]interface{}{inlineButton("✏️ Изменить порты ссылок", "settings_ports_edit")},
 		[]map[string]interface{}{inlineButton("56000,56001,9000", "set_default_ports_56000,56001,9000")},
-		[]map[string]interface{}{inlineButton("◀️ Назад", "settings")},
+		[]map[string]interface{}{inlineButton("◀️ Назад", "settings_links")},
 	))
 }
 
@@ -1816,7 +1912,7 @@ func sendPublicIPSettingsMenu(token string, adminID int64, messageID int) int {
 	return sendOrEditTelegram(token, adminID, messageID, text, inlineKeyboard(
 		[]map[string]interface{}{inlineButton("✏️ Ввести адрес", "settings_ip_edit")},
 		[]map[string]interface{}{modeButton},
-		[]map[string]interface{}{inlineButton("◀️ Назад", "settings")},
+		[]map[string]interface{}{inlineButton("◀️ Назад", "settings_links")},
 	))
 }
 
@@ -1835,7 +1931,7 @@ func sendRefreshIPMenu(token string, adminID int64, messageID int) int {
 	)
 	return sendOrEditTelegram(token, adminID, messageID, text, inlineKeyboard(
 		[]map[string]interface{}{inlineButton("🔎 Определить IP", "confirm_refresh_ip")},
-		[]map[string]interface{}{inlineButton("◀️ Назад", "settings")},
+		[]map[string]interface{}{inlineButton("◀️ Назад", "settings_links")},
 	))
 }
 
@@ -1850,11 +1946,11 @@ func sendResetTrafficMenu(token string, adminID int64, messageID int) int {
 	)
 	return sendOrEditTelegram(token, adminID, messageID, text, inlineKeyboard(
 		[]map[string]interface{}{inlineButton("📊 Сбросить счётчики", "confirm_reset_traffic")},
-		[]map[string]interface{}{inlineButton("◀️ Назад", "settings")},
+		[]map[string]interface{}{inlineButton("◀️ Назад", "settings_maintenance")},
 	))
 }
 
-func sendTrafficMenu(token string, adminID int64, messageID int) int {
+func sendTrafficMenu(token string, adminID int64, messageID int, back string) int {
 	dbMutex.Lock()
 	totalToday := databaseTrafficTotals(1)
 	totalWeek := databaseTrafficTotals(7)
@@ -1872,11 +1968,14 @@ func sendTrafficMenu(token string, adminID int64, messageID int) int {
 	text += "\n\n*Администратор:*\n" + trafficPeriodReport(adminToday, adminWeek, adminMonth, adminAll)
 	text += fmt.Sprintf("\n\nКлиентских паролей: `%d`\nПодробности по каждому клиенту доступны в карточке пароля.", clientCount)
 
-	return sendOrEditTelegram(token, adminID, messageID, text, inlineKeyboard(
-		[]map[string]interface{}{inlineButton("🔐 К доступам", "backlist")},
-		[]map[string]interface{}{inlineButton("📊 Сбросить трафик", "settings_reset_traffic")},
-		[]map[string]interface{}{inlineButton("◀️ Назад", "settings")},
-	))
+	rows := [][]map[string]interface{}{
+		{inlineButton("🔐 К доступам", "backlist")},
+	}
+	if back == "settings_maintenance" {
+		rows = append(rows, []map[string]interface{}{inlineButton("📊 Сбросить трафик", "settings_reset_traffic")})
+	}
+	rows = append(rows, []map[string]interface{}{inlineButton("◀️ Назад", back)})
+	return sendOrEditTelegram(token, adminID, messageID, text, inlineKeyboard(rows...))
 }
 
 func sendRestartServerMenu(token string, adminID int64, messageID int) int {
@@ -1884,7 +1983,7 @@ func sendRestartServerMenu(token string, adminID int64, messageID int) int {
 		"🔄 *Перезапуск сервера*\n\nКоманда выполнит `systemctl restart wdtt`.\n\nТекущие подключения оборвутся и клиенты переподключатся заново. Используйте после обновления бинарника или изменения systemd-флагов.",
 		inlineKeyboard(
 			[]map[string]interface{}{inlineButton("🔄 Перезапустить", "confirm_restart_server")},
-			[]map[string]interface{}{inlineButton("◀️ Назад", "settings")},
+			[]map[string]interface{}{inlineButton("◀️ Назад", "settings_maintenance")},
 		),
 	)
 }
@@ -2121,7 +2220,7 @@ func showNewClientPasswordMode(token string, adminID int64, messageID int) int {
 		inlineKeyboard(
 			[]map[string]interface{}{inlineButton("🎲 Создать автоматически", "new_password_auto")},
 			[]map[string]interface{}{inlineButton("⌨️ Задать вручную", "new_password_manual")},
-			[]map[string]interface{}{inlineButton("◀️ Отмена", "mainmenu")},
+			[]map[string]interface{}{inlineButton("Отмена", "mainmenu")},
 		),
 	)
 }
@@ -2156,7 +2255,7 @@ func sendBotClientCreated(token string, adminID int64, messageID int, password s
 		inlineKeyboard(
 			[]map[string]interface{}{inlineButton("🔍 Открыть клиента", "viewpass_"+password)},
 			[]map[string]interface{}{inlineButton("🔐 К списку", "backlist")},
-			[]map[string]interface{}{inlineButton("◀️ Главное меню", "mainmenu")},
+			[]map[string]interface{}{inlineButton("🏠 Главное меню", "mainmenu")},
 		),
 	)
 }
@@ -2270,11 +2369,82 @@ func startNewPasswordFlow(token string, adminID int64, wgDev wgDevice, waitingFo
 	if limitReached {
 		return sendOrEditTelegram(token, adminID, messageID, fmt.Sprintf("❌ Лимит паролей: максимум %d активных. Удалите ненужный пароль через список доступов.", maxGeneratedPasswords), inlineKeyboard(
 			[]map[string]interface{}{inlineButton("🔐 К списку", "backlist")},
-			[]map[string]interface{}{inlineButton("◀️ Главное меню", "mainmenu")},
+			[]map[string]interface{}{inlineButton("🏠 Главное меню", "mainmenu")},
 		))
 	}
 	*waitingForDays = false
 	return showNewPasswordDaysMenu(token, adminID, messageID)
+}
+
+type botPasswordListItem struct {
+	Password string
+	Entry    *PasswordEntry
+}
+
+func botPasswordSortKey(password string, entry *PasswordEntry) string {
+	if entry != nil && strings.TrimSpace(entry.Label) != "" {
+		return strings.ToLower(entry.Label) + "\x00" + strings.ToLower(password)
+	}
+	return strings.ToLower(password)
+}
+
+func sortedBotPasswordItems(passwords map[string]*PasswordEntry) []botPasswordListItem {
+	items := make([]botPasswordListItem, 0, len(passwords))
+	for password, entry := range passwords {
+		if entry == nil {
+			continue
+		}
+		items = append(items, botPasswordListItem{Password: password, Entry: entry})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		left := botPasswordSortKey(items[i].Password, items[i].Entry)
+		right := botPasswordSortKey(items[j].Password, items[j].Entry)
+		if left == right {
+			return items[i].Password < items[j].Password
+		}
+		return left < right
+	})
+	return items
+}
+
+func clampBotPasswordPage(page, total int) int {
+	if total <= 0 {
+		return 0
+	}
+	pages := (total + botPasswordPageSize - 1) / botPasswordPageSize
+	if page < 0 {
+		return 0
+	}
+	if page >= pages {
+		return pages - 1
+	}
+	return page
+}
+
+func botPasswordPaginationRow(page, total int) []map[string]interface{} {
+	if total <= botPasswordPageSize {
+		return nil
+	}
+	page = clampBotPasswordPage(page, total)
+	start := page * botPasswordPageSize
+	end := start + botPasswordPageSize
+	if end > total {
+		end = total
+	}
+	row := []map[string]interface{}{}
+	if behind := start; behind > 0 {
+		row = append(row, inlineButton(
+			fmt.Sprintf("◀️ Назад (%d)", behind),
+			fmt.Sprintf("listpage_%d", page-1),
+		))
+	}
+	if ahead := total - end; ahead > 0 {
+		row = append(row, inlineButton(
+			fmt.Sprintf("Вперёд (%d) ▶️", ahead),
+			fmt.Sprintf("listpage_%d", page+1),
+		))
+	}
+	return row
 }
 
 func botLoop(token string, adminIDstr string, wgDev wgDevice) {
@@ -2288,7 +2458,7 @@ func botLoop(token string, adminIDstr string, wgDev wgDevice) {
 
 	// Устанавливаем команды для синей кнопки Menu
 	go func() {
-		cmds := `{"commands":[{"command":"start","description":"Главное меню"},{"command":"new","description":"Создать временный пароль"},{"command":"list","description":"Управление доступами"},{"command":"settings","description":"Настройки сервера"}]}`
+		cmds := `{"commands":[{"command":"start","description":"Главное меню"},{"command":"status","description":"Краткий статус"},{"command":"new","description":"Создать клиента"},{"command":"list","description":"Клиенты"},{"command":"outbound","description":"Выходной IP"},{"command":"settings","description":"Сервер"}]}`
 		resp, err := http.Post(fmt.Sprintf("https://api.telegram.org/bot%s/setMyCommands", token), "application/json", strings.NewReader(cmds))
 		if err == nil {
 			resp.Body.Close()
@@ -2320,7 +2490,7 @@ func botLoop(token string, adminIDstr string, wgDev wgDevice) {
 	var promptMessageID int
 
 	for {
-		url := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?timeout=60&offset=%d", token, offset)
+		url := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?timeout=60&offset=%d&allowed_updates=%%5B%%22message%%22%%2C%%22callback_query%%22%%5D", token, offset)
 		resp, err := client.Get(url)
 		if err != nil {
 			time.Sleep(2 * time.Second)
@@ -2376,7 +2546,7 @@ func botLoop(token string, adminIDstr string, wgDev wgDevice) {
 					if !exists || entry == nil {
 						dbMutex.Unlock()
 						sendOrEditTelegram(token, adminID, menuMessageID, "❌ Пароль не найден", inlineKeyboard(
-							[]map[string]interface{}{inlineButton("◀️ К списку", "backlist")},
+							[]map[string]interface{}{inlineButton("◀️ Назад", "backlist")},
 						))
 						continue
 					}
@@ -2469,7 +2639,7 @@ func botLoop(token string, adminIDstr string, wgDev wgDevice) {
 						"callback_data": "exportclient_" + pass,
 					})
 					kb = append(kb, map[string]interface{}{
-						"text":          "◀️ Назад к списку",
+						"text":          "◀️ Назад",
 						"callback_data": "backlist",
 					})
 					var keyboard [][]map[string]interface{}
@@ -2497,6 +2667,17 @@ func botLoop(token string, adminIDstr string, wgDev wgDevice) {
 					editMode = ""
 					editPassword = ""
 					promptMessageID = sendMainMenu(token, adminID, menuMessageID)
+				} else if data == "status" {
+					waitingForDays = false
+					waitingForPorts = false
+					waitingForHash = false
+					waitingForLabel = false
+					waitingForNewClientPassword = false
+					waitingForClientImport = false
+					waitingForSetting = ""
+					editMode = ""
+					editPassword = ""
+					promptMessageID = sendStatusMenu(token, adminID, menuMessageID)
 				} else if data == "settings" {
 					waitingForDays = false
 					waitingForPorts = false
@@ -2508,6 +2689,16 @@ func botLoop(token string, adminIDstr string, wgDev wgDevice) {
 					editMode = ""
 					editPassword = ""
 					promptMessageID = sendSettingsMenu(token, adminID, menuMessageID)
+				} else if data == "settings_links" {
+					waitingForSetting = ""
+					editMode = ""
+					editPassword = ""
+					promptMessageID = sendLinksSettingsMenu(token, adminID, menuMessageID)
+				} else if data == "settings_maintenance" {
+					waitingForSetting = ""
+					editMode = ""
+					editPassword = ""
+					promptMessageID = sendMaintenanceMenu(token, adminID, menuMessageID)
 				} else if data == "menu_new" {
 					waitingForDays = false
 					waitingForPorts = false
@@ -2565,7 +2756,7 @@ func botLoop(token string, adminIDstr string, wgDev wgDevice) {
 					waitingForNewClientPassword = true
 					promptMessageID = sendOrEditTelegram(token, adminID, menuMessageID,
 						"⌨️ Введите пароль клиента из 16 символов. Допустимы безопасные латинские буквы и цифры без неоднозначных `0`, `1`, `I`, `i`, `O`, `o` и `l`.\n\nСервер проверит формат, уникальность и совпадение с главным паролем.",
-						inlineKeyboard([]map[string]interface{}{inlineButton("◀️ Отмена", "mainmenu")}),
+						inlineKeyboard([]map[string]interface{}{inlineButton("Отмена", "mainmenu")}),
 					)
 				} else if data == "import_client" {
 					waitingForClientImport = true
@@ -2793,8 +2984,7 @@ func botLoop(token string, adminIDstr string, wgDev wgDevice) {
 						continue
 					}
 					promptMessageID = sendOrEditTelegram(token, adminID, menuMessageID, fmt.Sprintf("🔗 *Ссылка владельца:*\n`%s`\n\nЭта ссылка использует главный пароль и профиль владельца. Не пересылайте её как клиентский доступ.", mdCode(link)), inlineKeyboard(
-						[]map[string]interface{}{inlineButton("◀️ Профиль владельца", "settings_owner_profile")},
-						[]map[string]interface{}{inlineButton("◀️ Главное меню", "mainmenu")},
+						[]map[string]interface{}{inlineButton("◀️ Назад", "settings_owner_profile")},
 					))
 				} else if data == "owner_hash_edit" {
 					waitingForSetting = "owner_hash"
@@ -2828,13 +3018,13 @@ func botLoop(token string, adminIDstr string, wgDev wgDevice) {
 					waitingForSetting = "dns"
 					promptMessageID = sendOrEditTelegram(token, adminID, menuMessageID, "🌐 Введите DNS для WireGuard-клиентов.\n\nМожно несколько через запятую, например: `1.1.1.1,8.8.8.8`.", inlineKeyboard(
 						[]map[string]interface{}{inlineButton("1.1.1.1", "set_dns_1.1.1.1")},
-						[]map[string]interface{}{inlineButton("◀️ Назад", "settings")},
+						[]map[string]interface{}{inlineButton("◀️ Назад", "settings_links")},
 					))
 				} else if strings.HasPrefix(data, "set_dns_") {
 					dnsValue := strings.TrimPrefix(data, "set_dns_")
 					normalized, err := normalizeDNSInput(dnsValue)
 					if err != nil {
-						promptMessageID = sendSettingsMenu(token, adminID, menuMessageID)
+						promptMessageID = sendLinksSettingsMenu(token, adminID, menuMessageID)
 						continue
 					}
 					dbMutex.Lock()
@@ -2842,7 +3032,7 @@ func botLoop(token string, adminIDstr string, wgDev wgDevice) {
 					setServerDNS(normalized)
 					saveDB()
 					dbMutex.Unlock()
-					promptMessageID = sendSettingsMenu(token, adminID, menuMessageID)
+					promptMessageID = sendLinksSettingsMenu(token, adminID, menuMessageID)
 				} else if data == "settings_limit" {
 					promptMessageID = sendLimitSettingsMenu(token, adminID, menuMessageID)
 				} else if data == "settings_limit_edit" {
@@ -2872,12 +3062,12 @@ func botLoop(token string, adminIDstr string, wgDev wgDevice) {
 					waitingForSetting = "default_ports"
 					promptMessageID = sendOrEditTelegram(token, adminID, menuMessageID, "⚙️ Введите порты быстрых ссылок по умолчанию.\n\nФормат: `DTLS,WG,TUN`, например `56000,56001,9000`.", inlineKeyboard(
 						[]map[string]interface{}{inlineButton("56000,56001,9000", "set_default_ports_56000,56001,9000")},
-						[]map[string]interface{}{inlineButton("◀️ Назад", "settings")},
+						[]map[string]interface{}{inlineButton("◀️ Назад", "settings_links")},
 					))
 				} else if strings.HasPrefix(data, "set_default_ports_") {
 					ports, err := parsePortsSpec(strings.TrimPrefix(data, "set_default_ports_"))
 					if err != nil {
-						promptMessageID = sendSettingsMenu(token, adminID, menuMessageID)
+						promptMessageID = sendLinksSettingsMenu(token, adminID, menuMessageID)
 						continue
 					}
 					dbMutex.Lock()
@@ -2885,14 +3075,14 @@ func botLoop(token string, adminIDstr string, wgDev wgDevice) {
 					setServerDefaultPorts(ports)
 					saveDB()
 					dbMutex.Unlock()
-					promptMessageID = sendSettingsMenu(token, adminID, menuMessageID)
+					promptMessageID = sendLinksSettingsMenu(token, adminID, menuMessageID)
 				} else if data == "settings_ip" {
 					promptMessageID = sendPublicIPSettingsMenu(token, adminID, menuMessageID)
 				} else if data == "settings_ip_edit" {
 					waitingForSetting = "public_ip"
 					promptMessageID = sendOrEditTelegram(token, adminID, menuMessageID, "📍 Введите адрес сервера для новых ссылок.\n\nМожно указать домен или IP без `http://` и без порта, например `site.ru`. Либо нажмите кнопку автоматического определения ниже.", inlineKeyboard(
 						[]map[string]interface{}{inlineButton("Определять автоматически", "set_public_ip_auto")},
-						[]map[string]interface{}{inlineButton("◀️ Назад", "settings")},
+						[]map[string]interface{}{inlineButton("◀️ Назад", "settings_links")},
 					))
 				} else if data == "set_public_ip_auto" {
 					dbMutex.Lock()
@@ -2901,15 +3091,14 @@ func botLoop(token string, adminIDstr string, wgDev wgDevice) {
 					publicIP = ""
 					saveDB()
 					dbMutex.Unlock()
-					promptMessageID = sendSettingsMenu(token, adminID, menuMessageID)
+					promptMessageID = sendLinksSettingsMenu(token, adminID, menuMessageID)
 				} else if data == "settings_refresh_ip" {
 					promptMessageID = sendRefreshIPMenu(token, adminID, menuMessageID)
 				} else if data == "confirm_refresh_ip" {
 					publicIP = ""
 					ip := getPublicIP()
 					promptMessageID = sendOrEditTelegram(token, adminID, menuMessageID, fmt.Sprintf("🔎 Публичный IP сервера определён: `%s`", mdCode(ip)), inlineKeyboard(
-						[]map[string]interface{}{inlineButton("◀️ Назад", "settings")},
-						[]map[string]interface{}{inlineButton("◀️ Главное меню", "mainmenu")},
+						[]map[string]interface{}{inlineButton("◀️ Назад", "settings_links")},
 					))
 				} else if data == "settings_outbound" {
 					waitingForSetting = ""
@@ -3026,7 +3215,7 @@ func botLoop(token string, adminIDstr string, wgDev wgDevice) {
 				} else if data == "confirm_cleanup_expired" {
 					removed := cleanupExpiredPasswords(wgDev)
 					promptMessageID = sendOrEditTelegram(token, adminID, menuMessageID, fmt.Sprintf("🧹 Удалено истёкших ключей: `%d`", removed), inlineKeyboard(
-						[]map[string]interface{}{inlineButton("◀️ Назад", "settings")},
+						[]map[string]interface{}{inlineButton("◀️ Назад", "settings_maintenance")},
 					))
 				} else if data == "settings_cleanup_orphans" {
 					promptMessageID = sendOrphanDevicesMenu(token, adminID, menuMessageID)
@@ -3052,10 +3241,12 @@ func botLoop(token string, adminIDstr string, wgDev wgDevice) {
 					}
 					dbMutex.Unlock()
 					promptMessageID = sendOrEditTelegram(token, adminID, menuMessageID, fmt.Sprintf("📱 Удалено забытых устройств: `%d`", removed), inlineKeyboard(
-						[]map[string]interface{}{inlineButton("◀️ Назад", "settings")},
+						[]map[string]interface{}{inlineButton("◀️ Назад", "settings_maintenance")},
 					))
 				} else if data == "settings_traffic" {
-					promptMessageID = sendTrafficMenu(token, adminID, menuMessageID)
+					promptMessageID = sendTrafficMenu(token, adminID, menuMessageID, "settings_maintenance")
+				} else if data == "status_traffic" {
+					promptMessageID = sendTrafficMenu(token, adminID, menuMessageID, "status")
 				} else if data == "settings_reset_traffic" {
 					promptMessageID = sendResetTrafficMenu(token, adminID, menuMessageID)
 				} else if data == "confirm_reset_traffic" {
@@ -3074,7 +3265,7 @@ func botLoop(token string, adminIDstr string, wgDev wgDevice) {
 					saveDB()
 					dbMutex.Unlock()
 					promptMessageID = sendOrEditTelegram(token, adminID, menuMessageID, "📊 Счётчики трафика сброшены", inlineKeyboard(
-						[]map[string]interface{}{inlineButton("◀️ Назад", "settings")},
+						[]map[string]interface{}{inlineButton("◀️ Назад", "settings_maintenance")},
 					))
 				} else if data == "restart_server" {
 					promptMessageID = sendRestartServerMenu(token, adminID, menuMessageID)
@@ -3084,14 +3275,12 @@ func botLoop(token string, adminIDstr string, wgDev wgDevice) {
 						out, err := runCmd("systemctl", "restart", "wdtt")
 						if err != nil {
 							sendOrEditTelegram(token, adminID, menuMessageID, fmt.Sprintf("❌ Не удалось перезапустить сервис:\n`%s`", mdCode(strings.TrimSpace(out))), inlineKeyboard(
-								[]map[string]interface{}{inlineButton("◀️ Назад", "settings")},
-								[]map[string]interface{}{inlineButton("◀️ Главное меню", "mainmenu")},
+								[]map[string]interface{}{inlineButton("◀️ Назад", "settings_maintenance")},
 							))
 							return
 						}
 						sendOrEditTelegram(token, adminID, menuMessageID, "✅ wdtt.service перезапущен", inlineKeyboard(
-							[]map[string]interface{}{inlineButton("◀️ Назад", "settings")},
-							[]map[string]interface{}{inlineButton("◀️ Главное меню", "mainmenu")},
+							[]map[string]interface{}{inlineButton("◀️ Назад", "settings_maintenance")},
 						))
 					}()
 				} else if strings.HasPrefix(data, "deact_") {
@@ -3260,6 +3449,12 @@ func botLoop(token string, adminIDstr string, wgDev wgDevice) {
 					pendingPasswordChangeOld = ""
 					pendingPasswordChangeNew = ""
 					promptMessageID = sendPasswordList(token, adminID, wgDev, menuMessageID)
+				} else if strings.HasPrefix(data, "listpage_") {
+					page, err := strconv.Atoi(strings.TrimPrefix(data, "listpage_"))
+					if err != nil {
+						page = 0
+					}
+					promptMessageID = sendPasswordListPage(token, adminID, wgDev, menuMessageID, page)
 				} else if data == "ports_def" {
 					waitingForDays = false
 					waitingForPorts = false
@@ -3316,10 +3511,14 @@ func botLoop(token string, adminIDstr string, wgDev wgDevice) {
 
 				if commandName == "/start" || commandName == "/help" {
 					promptMessageID = sendMainMenu(token, adminID, promptMessageID)
+				} else if commandName == "/status" {
+					promptMessageID = sendStatusMenu(token, adminID, promptMessageID)
 				} else if commandName == "/new" {
 					promptMessageID = startNewPasswordFlow(token, adminID, wgDev, &waitingForDays, promptMessageID)
 				} else if commandName == "/list" {
 					promptMessageID = sendPasswordList(token, adminID, wgDev, promptMessageID)
+				} else if commandName == "/outbound" {
+					promptMessageID = sendOutboundMenu(token, adminID, promptMessageID)
 				} else if commandName == "/settings" {
 					promptMessageID = sendSettingsMenu(token, adminID, promptMessageID)
 				}
@@ -3366,7 +3565,7 @@ func botLoop(token string, adminIDstr string, wgDev wgDevice) {
 				deleteTelegramMessage(token, adminID, msg.MessageID)
 				if _, err := normalizeClientPassword(cmd); err != nil {
 					promptMessageID = sendOrEditTelegram(token, adminID, promptMessageID, "❌ "+mdCode(err.Error())+"\n\nВведите пароль ещё раз.", inlineKeyboard(
-						[]map[string]interface{}{inlineButton("◀️ Отмена", "mainmenu")},
+						[]map[string]interface{}{inlineButton("Отмена", "mainmenu")},
 					))
 					continue
 				}
@@ -3394,7 +3593,7 @@ func botLoop(token string, adminIDstr string, wgDev wgDevice) {
 					if err != nil {
 						waitingForSetting = "dns"
 						promptMessageID = sendOrEditTelegram(token, adminID, promptMessageID, fmt.Sprintf("❌ %s.\n\nВведите DNS ещё раз, например: `1.1.1.1,8.8.8.8`.", err.Error()), inlineKeyboard(
-							[]map[string]interface{}{inlineButton("◀️ Назад", "settings")},
+							[]map[string]interface{}{inlineButton("◀️ Назад", "settings_links")},
 						))
 						continue
 					}
@@ -3403,7 +3602,7 @@ func botLoop(token string, adminIDstr string, wgDev wgDevice) {
 					setServerDNS(dnsValue)
 					saveDB()
 					dbMutex.Unlock()
-					promptMessageID = sendSettingsMenu(token, adminID, promptMessageID)
+					promptMessageID = sendLinksSettingsMenu(token, adminID, promptMessageID)
 					continue
 				case "limit":
 					limit, err := strconv.Atoi(cmd)
@@ -3426,7 +3625,7 @@ func botLoop(token string, adminIDstr string, wgDev wgDevice) {
 					if err != nil {
 						waitingForSetting = "default_ports"
 						promptMessageID = sendOrEditTelegram(token, adminID, promptMessageID, fmt.Sprintf("❌ %s.\n\nФормат: `56000,56001,9000`.", err.Error()), inlineKeyboard(
-							[]map[string]interface{}{inlineButton("◀️ Назад", "settings")},
+							[]map[string]interface{}{inlineButton("◀️ Назад", "settings_links")},
 						))
 						continue
 					}
@@ -3435,7 +3634,7 @@ func botLoop(token string, adminIDstr string, wgDev wgDevice) {
 					setServerDefaultPorts(ports)
 					saveDB()
 					dbMutex.Unlock()
-					promptMessageID = sendSettingsMenu(token, adminID, promptMessageID)
+					promptMessageID = sendLinksSettingsMenu(token, adminID, promptMessageID)
 					continue
 				case "public_ip":
 					ip, err := normalizePublicAddressInput(cmd)
@@ -3443,7 +3642,7 @@ func botLoop(token string, adminIDstr string, wgDev wgDevice) {
 						waitingForSetting = "public_ip"
 						promptMessageID = sendOrEditTelegram(token, adminID, promptMessageID, fmt.Sprintf("❌ %s.", err.Error()), inlineKeyboard(
 							[]map[string]interface{}{inlineButton("Определять автоматически", "set_public_ip_auto")},
-							[]map[string]interface{}{inlineButton("◀️ Назад", "settings")},
+							[]map[string]interface{}{inlineButton("◀️ Назад", "settings_links")},
 						))
 						continue
 					}
@@ -3453,7 +3652,7 @@ func botLoop(token string, adminIDstr string, wgDev wgDevice) {
 					publicIP = ""
 					saveDB()
 					dbMutex.Unlock()
-					promptMessageID = sendSettingsMenu(token, adminID, promptMessageID)
+					promptMessageID = sendLinksSettingsMenu(token, adminID, promptMessageID)
 					continue
 				case "owner_hash":
 					hash, err := normalizeVKHashesInput(cmd)
@@ -3719,8 +3918,7 @@ func botLoop(token string, adminIDstr string, wgDev wgDevice) {
 					dbMutex.Unlock()
 					link := fmt.Sprintf("wdtt://%s:%s:%s:%s:%s:%s", srvIP, pts[0], pts[1], pts[2], mainPassword, hash)
 					promptMessageID = sendOrEditTelegram(token, adminID, promptMessageID, fmt.Sprintf("🔗 *Ссылка для главного пароля:*\n`%s`", mdCode(link)), inlineKeyboard(
-						[]map[string]interface{}{inlineButton("👤 Профиль владельца", "settings_owner_profile")},
-						[]map[string]interface{}{inlineButton("◀️ Главное меню", "mainmenu")},
+						[]map[string]interface{}{inlineButton("◀️ Назад", "settings_owner_profile")},
 					))
 					continue
 				}
@@ -3734,6 +3932,10 @@ func botLoop(token string, adminIDstr string, wgDev wgDevice) {
 }
 
 func sendPasswordList(token string, adminID int64, wgDev wgDevice, messageID int) int {
+	return sendPasswordListPage(token, adminID, wgDev, messageID, 0)
+}
+
+func sendPasswordListPage(token string, adminID int64, wgDev wgDevice, messageID int, page int) int {
 	dbMutex.Lock()
 	defer dbMutex.Unlock()
 
@@ -3743,17 +3945,28 @@ func sendPasswordList(token string, adminID int64, wgDev wgDevice, messageID int
 	}
 
 	txt := "🔐 *Клиентские доступы:*\n\n"
+	items := sortedBotPasswordItems(db.Passwords)
 
-	var inlineKb []map[string]interface{}
-
-	if len(db.Passwords) == 0 {
+	if len(items) == 0 {
 		txt += "_Нет сгенерированных паролей._\n"
 	} else {
-		txt += fmt.Sprintf("_Активно: %d/%d_\n\n", len(db.Passwords), maxGeneratedPasswords)
-		for p, entry := range db.Passwords {
+		page = clampBotPasswordPage(page, len(items))
+		pages := (len(items) + botPasswordPageSize - 1) / botPasswordPageSize
+		start := page * botPasswordPageSize
+		end := start + botPasswordPageSize
+		if end > len(items) {
+			end = len(items)
+		}
+		txt += fmt.Sprintf("_Клиентов: %d/%d · страница %d/%d_\n\n", len(items), maxGeneratedPasswords, page+1, pages)
+		for _, item := range items[start:end] {
+			p := item.Password
+			entry := item.Entry
 			status := "🟢"
 			if entry.DeviceID != "" {
 				status = "🔗"
+			}
+			if entry.IsDeactivated {
+				status = "⏸"
 			}
 			expiry := "♾"
 			if entry.ExpiresAt > 0 {
@@ -3769,28 +3982,38 @@ func sendPasswordList(token string, adminID int64, wgDev wgDevice, messageID int
 				label = fmt.Sprintf("%s — %s", entry.Label, p)
 			}
 			txt += fmt.Sprintf("%s `%s` (%s)\n", status, mdCode(label), expiry)
-			buttonText := "🔍 " + p
-			if entry.Label != "" {
-				buttonText = "🔍 " + entry.Label
-			}
-			inlineKb = append(inlineKb, map[string]interface{}{
-				"text":          buttonText,
-				"callback_data": "viewpass_" + p,
-			})
 		}
 	}
 
-	txt += "\n🟢 = свободен | 🔗 = привязан"
+	txt += "\n🟢 = свободен | 🔗 = привязан | ⏸ = отключён"
 
 	var keyboard [][]map[string]interface{}
-	if len(inlineKb) > 0 {
-		for _, btn := range inlineKb {
-			keyboard = append(keyboard, []map[string]interface{}{btn})
+	if len(items) > 0 {
+		page = clampBotPasswordPage(page, len(items))
+		start := page * botPasswordPageSize
+		end := start + botPasswordPageSize
+		if end > len(items) {
+			end = len(items)
+		}
+		for _, item := range items[start:end] {
+			buttonText := "🔍 " + item.Password
+			if item.Entry.Label != "" {
+				buttonText = "🔍 " + item.Entry.Label
+			}
+			keyboard = append(keyboard, []map[string]interface{}{{
+				"text":          buttonText,
+				"callback_data": "viewpass_" + item.Password,
+			}})
+		}
+		if navRow := botPasswordPaginationRow(page, len(items)); len(navRow) > 0 {
+			keyboard = append(keyboard, navRow)
 		}
 	}
-	keyboard = append(keyboard, []map[string]interface{}{inlineButton("➕ Новый пароль", "menu_new")})
-	keyboard = append(keyboard, []map[string]interface{}{inlineButton("📥 Импорт клиента", "import_client")})
-	keyboard = append(keyboard, []map[string]interface{}{inlineButton("◀️ Главное меню", "mainmenu")})
+	keyboard = append(keyboard, []map[string]interface{}{
+		inlineButton("➕ Новый", "menu_new"),
+		inlineButton("📥 Импорт", "import_client"),
+	})
+	keyboard = append(keyboard, []map[string]interface{}{inlineButton("◀️ Назад", "mainmenu")})
 	replyMarkup := map[string]interface{}{"inline_keyboard": keyboard}
 	return sendOrEditTelegram(token, adminID, messageID, txt, replyMarkup)
 }

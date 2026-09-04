@@ -1,13 +1,18 @@
 package com.wdtt.plus.ui
 
 import android.content.Context
+import android.content.Intent
+import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
+import android.content.pm.ResolveInfo
 import android.net.Uri
+import android.os.Build
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.focusGroup
 import androidx.compose.foundation.gestures.Orientation
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.rememberScrollableState
@@ -95,6 +100,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.DialogProperties
 import androidx.core.graphics.drawable.toBitmap
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.compose.LifecycleResumeEffect
@@ -284,22 +290,17 @@ fun ExceptionsTab(
             val visibleInstalledApps = if (showSystemAppsOpt == true) {
                 appsList
             } else {
-                appsList.filter {
-                    !it.isSystem ||
-                        it.packageName in selectedPackages ||
-                        it.packageName == "com.google.android.youtube" ||
-                        it.packageName == "com.android.vending"
-                }
+                visibleAppsWithSystemSelected(appsList, selectedPackages)
             }
-            val visibleApps = unavailableSelectedApps + visibleInstalledApps
-            if (appSearchQuery.isBlank()) {
-                visibleApps
+            val queryFilteredApps = if (appSearchQuery.isBlank()) {
+                unavailableSelectedApps + visibleInstalledApps
             } else {
-                visibleApps.filter {
+                (unavailableSelectedApps + visibleInstalledApps).filter {
                     it.name.contains(appSearchQuery, ignoreCase = true) ||
                         it.packageName.contains(appSearchQuery, ignoreCase = true)
                 }
             }
+            sortAppsForRoutingList(queryFilteredApps, selectedPackages)
         }
     }
     val filteredAddresses = remember(addressRules, addressSearchQuery, addressFilter) {
@@ -404,6 +405,7 @@ fun ExceptionsTab(
     Column(
         modifier = Modifier
             .fillMaxSize()
+            .focusGroup()
             .nestedScroll(collapsingHeaderConnection)
             .padding(horizontal = 16.dp),
     ) {
@@ -744,7 +746,7 @@ private fun RoutingModeCard(
                     Text("Режим списка", fontWeight = FontWeight.SemiBold)
                     IconButton(
                         onClick = onHelp,
-                        modifier = Modifier.size(30.dp),
+                        modifier = Modifier.size(30.dp).remoteHelpFocus(),
                     ) {
                         Icon(
                             Icons.AutoMirrored.Filled.HelpOutline,
@@ -788,6 +790,11 @@ private fun AppsRoutingHeader(
         CompactControlSurface(
             modifier = Modifier
                 .fillMaxWidth()
+                .remoteToggleableRow(
+                    value = showSystemApps ?: false,
+                    enabled = showSystemApps != null,
+                    onValueChange = onShowSystemChanged,
+                )
                 .then(sectionSwipeModifier),
         ) {
             Text(
@@ -798,7 +805,7 @@ private fun AppsRoutingHeader(
             )
             Switch(
                 checked = showSystemApps ?: false,
-                onCheckedChange = onShowSystemChanged,
+                onCheckedChange = null,
                 enabled = showSystemApps != null,
                 modifier = Modifier.heightIn(max = 42.dp),
             )
@@ -838,7 +845,10 @@ private fun AppsRoutingHeader(
                     }
                 }
             }
-            IconButton(onClick = onQuickHelp, modifier = Modifier.size(38.dp)) {
+            IconButton(
+                onClick = onQuickHelp,
+                modifier = Modifier.size(38.dp).remoteHelpFocus(),
+            ) {
                 Icon(
                     Icons.AutoMirrored.Filled.HelpOutline,
                     contentDescription = "Инструкция по быстрым исключениям",
@@ -957,6 +967,7 @@ private fun AddressesRoutingHeader(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(RoutingControlHeight)
+                .remoteFocusOutline(RoundedCornerShape(16.dp))
                 .then(sectionSwipeModifier),
             shape = RoundedCornerShape(16.dp),
             color = MaterialTheme.colorScheme.surfaceContainerHighest,
@@ -989,7 +1000,10 @@ private fun AddressesRoutingHeader(
                         maxLines = 2,
                     )
                 }
-                IconButton(onClick = onHelp) {
+                IconButton(
+                    onClick = onHelp,
+                    modifier = Modifier.remoteHelpFocus(),
+                ) {
                     Icon(
                         Icons.AutoMirrored.Filled.HelpOutline,
                         contentDescription = "Инструкция по адресам",
@@ -1038,9 +1052,11 @@ private fun AddAddressDialog(
 ) {
     var value by rememberSaveable { mutableStateOf("") }
     var error by rememberSaveable { mutableStateOf("") }
-    val previewRules = remember(value) {
-        if (value.isBlank()) null else runCatching { normalizeVpnAddressRules(value) }.getOrNull()
+    val previewResult = remember(value) {
+        if (value.isBlank()) null else runCatching { normalizeVpnAddressRules(value) }
     }
+    val previewRules = previewResult?.getOrNull()
+    val validationError = previewResult?.exceptionOrNull()?.message.orEmpty()
     AlertDialog(
         onDismissRequest = onDismiss,
         title = {
@@ -1052,7 +1068,10 @@ private fun AddAddressDialog(
                     "Добавить адрес",
                     modifier = Modifier.weight(1f),
                 )
-                IconButton(onClick = onDismiss) {
+                IconButton(
+                    onClick = onDismiss,
+                    modifier = Modifier.remoteIconButtonFocus(),
+                ) {
                     Icon(
                         Icons.Default.Close,
                         contentDescription = "Закрыть добавление адреса",
@@ -1063,7 +1082,8 @@ private fun AddAddressDialog(
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(
-                    "Введите домен, ссылку сайта, IPv4, подсеть CIDR или диапазон IPv4. " +
+                    "Введите точный домен, ссылку сайта, IPv4, подсеть CIDR или диапазон IPv4. " +
+                        "Доменные зоны (.ru) и маски (*.ru) не поддерживаются. " +
                         "Несколько значений добавляйте с новой строки.",
                     style = MaterialTheme.typography.bodyMedium,
                 )
@@ -1080,10 +1100,11 @@ private fun AddAddressDialog(
                     singleLine = false,
                     minLines = 3,
                     maxLines = 6,
-                    isError = error.isNotBlank(),
+                    isError = error.isNotBlank() || validationError.isNotBlank(),
                     supportingText = {
                         when {
                             error.isNotBlank() -> Text(error)
+                            validationError.isNotBlank() -> Text(validationError)
                             previewRules?.size == 1 -> Text(
                                 "Будет добавлено как: ${previewRules.single().type.label}"
                             )
@@ -1101,6 +1122,8 @@ private fun AddAddressDialog(
                 onClick = {
                     if (value.isBlank()) {
                         error = "Введите адрес."
+                    } else if (validationError.isNotBlank()) {
+                        error = validationError
                     } else {
                         onAdd(value) { message -> error = message }
                     }
@@ -1112,6 +1135,8 @@ private fun AddAddressDialog(
 
 @Composable
 private fun RoutingHelpDialog(help: RoutingHelp, onDismiss: () -> Unit) {
+    val television = isTelevisionDevice()
+    val scrollState = rememberScrollState()
     val title: String
     val body: String
     when (help) {
@@ -1129,11 +1154,12 @@ private fun RoutingHelpDialog(help: RoutingHelp, onDismiss: () -> Unit) {
 
         RoutingHelp.ADDRESSES -> {
             title = "Маршрутизация адресов"
-            body = "В ЧС выбранные адреса идут напрямую, в БС — только выбранные адреса идут через VPN. Можно вставить несколько строк: точные домены, ссылки, домены или IPv4 с портом, отдельные IPv4, подсети CIDR и диапазоны IPv4. Порт удаляется, а диапазон преобразуется в минимальный набор подсетей. Домен при запуске VPN преобразуется в его текущие IPv4-адреса, поэтому после смены DNS-адресов перезапустите VPN. Маска *.example.org не равна DNS-имени и требует отдельного DNS-перехватчика; обычный WireGuard принимает только IP-маршруты, поэтому такие маски и IPv6 сейчас не применяются. Если в БС заполнены приложения и адреса, через VPN пойдёт трафик выбранных приложений к выбранным адресам."
+            body = "В ЧС выбранные адреса идут напрямую, в БС — только выбранные адреса идут через VPN. Можно вставить несколько строк: точные домены, ссылки, домены или IPv4 с портом, отдельные IPv4, подсети CIDR и диапазоны IPv4. Порт удаляется, а диапазон преобразуется в минимальный набор подсетей. Домен при запуске VPN преобразуется в его текущие IPv4-адреса, поэтому после смены DNS-адресов перезапустите VPN. Значение ru обозначает доменную зону, а не все сайты .ru. Доменные зоны и маски *.example.org требуют отдельного DNS-перехватчика; обычный WireGuard принимает только IP-маршруты, поэтому такие правила и IPv6 сейчас не применяются. Если в БС заполнены приложения и адреса, через VPN пойдёт трафик выбранных приложений к выбранным адресам."
         }
     }
     AlertDialog(
         onDismissRequest = onDismiss,
+        modifier = Modifier.televisionDialogWidth(television),
         title = {
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -1143,7 +1169,10 @@ private fun RoutingHelpDialog(help: RoutingHelp, onDismiss: () -> Unit) {
                     title,
                     modifier = Modifier.weight(1f),
                 )
-                IconButton(onClick = onDismiss) {
+                IconButton(
+                    onClick = onDismiss,
+                    modifier = Modifier.remoteIconButtonFocus(),
+                ) {
                     Icon(
                         Icons.Default.Close,
                         contentDescription = "Закрыть инструкцию",
@@ -1155,11 +1184,13 @@ private fun RoutingHelpDialog(help: RoutingHelp, onDismiss: () -> Unit) {
             Text(
                 body,
                 modifier = Modifier
-                    .heightIn(max = 360.dp)
-                    .verticalScroll(rememberScrollState()),
+                    .heightIn(max = if (television) 520.dp else 360.dp)
+                    .verticalScroll(scrollState)
+                    .tvDpadScrollable(scrollState, television),
             )
         },
         confirmButton = { TextButton(onClick = onDismiss) { Text("Понятно") } },
+        properties = DialogProperties(usePlatformDefaultWidth = !television),
     )
 }
 
@@ -1282,7 +1313,9 @@ private fun AddressRow(rule: VpnAddressRule, onRemove: () -> Unit) {
         VpnAddressType.SUBNET -> Icons.Default.Hub
     }
     Surface(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .remoteFocusOutline(RoundedCornerShape(14.dp)),
         shape = RoundedCornerShape(14.dp),
         color = MaterialTheme.colorScheme.surfaceContainerHighest,
         contentColor = MaterialTheme.colorScheme.onSurface,
@@ -1336,7 +1369,9 @@ private fun EmptyListMessage(text: String) {
 fun AppRow(app: AppItem, isSelected: Boolean, onClick: () -> Unit) {
     Surface(
         onClick = onClick,
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .remoteFocusOutline(RoundedCornerShape(14.dp)),
         shape = RoundedCornerShape(14.dp),
         color = MaterialTheme.colorScheme.surfaceContainerHighest,
         contentColor = MaterialTheme.colorScheme.onSurface,
@@ -1403,20 +1438,97 @@ private fun String.toVpnPackageSet(): Set<String> =
 
 private fun loadInstalledApps(context: Context): List<AppItem> {
     val packageManager = context.packageManager
-    return packageManager.getInstalledApplications(PackageManager.GET_META_DATA)
+    val appsByPackage = linkedMapOf<String, ApplicationInfo>()
+
+    fun addApp(app: ApplicationInfo?) {
+        if (app == null) return
+        if (isAlwaysBypassedVpnPackage(app.packageName, context.packageName)) return
+        appsByPackage.putIfAbsent(app.packageName, app)
+    }
+
+    packageManager.getInstalledApplicationsCompat()
+        .forEach(::addApp)
+
+    val launcherIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+    packageManager.queryIntentActivitiesCompat(launcherIntent)
+        .forEach { resolveInfo ->
+            val app = resolveInfo.activityInfo?.applicationInfo
+            if (app != null) {
+                addApp(app)
+            }
+        }
+
+    QuickExclusionExactPackages
+        .forEach { packageName -> addApp(packageManager.getApplicationInfoCompat(packageName)) }
+
+    return appsByPackage.values
         .asSequence()
-        .filterNot { isAlwaysBypassedVpnPackage(it.packageName, context.packageName) }
         .map { app ->
             AppItem(
                 name = app.loadLabel(packageManager).toString(),
                 packageName = app.packageName,
                 icon = runCatching { app.loadIcon(packageManager).toBitmap().asImageBitmap() }.getOrNull(),
-                isSystem = app.flags and android.content.pm.ApplicationInfo.FLAG_SYSTEM != 0,
+                isSystem = isVpnRoutingSystemApp(app.packageName, app.flags),
             )
         }
         .sortedBy { it.name.lowercase() }
         .toList()
 }
+
+internal fun isVpnRoutingSystemApp(packageName: String, flags: Int): Boolean {
+    val systemFlags = ApplicationInfo.FLAG_SYSTEM or ApplicationInfo.FLAG_UPDATED_SYSTEM_APP
+    if (flags and systemFlags == 0) return false
+    return packageName !in QuickExclusionExactPackages
+}
+
+internal fun visibleAppsWithSystemSelected(
+    apps: List<AppItem>,
+    selectedPackages: Set<String>,
+): List<AppItem> = apps.filter {
+    !it.isSystem || it.packageName in selectedPackages
+}
+
+internal fun sortAppsForRoutingList(
+    apps: List<AppItem>,
+    selectedPackages: Set<String>,
+): List<AppItem> = apps.sortedWith(
+    compareBy<AppItem>(
+        { it.packageName !in selectedPackages },
+        { it.name.lowercase() },
+        { it.packageName.lowercase() },
+    ),
+)
+
+private fun PackageManager.getInstalledApplicationsCompat(): List<ApplicationInfo> =
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        getInstalledApplications(
+            PackageManager.ApplicationInfoFlags.of(PackageManager.GET_META_DATA.toLong()),
+        )
+    } else {
+        @Suppress("DEPRECATION")
+        getInstalledApplications(PackageManager.GET_META_DATA)
+    }
+
+private fun PackageManager.getApplicationInfoCompat(packageName: String): ApplicationInfo? =
+    runCatching {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            getApplicationInfo(
+                packageName,
+                PackageManager.ApplicationInfoFlags.of(PackageManager.GET_META_DATA.toLong()),
+            )
+        } else {
+            @Suppress("DEPRECATION")
+            getApplicationInfo(packageName, PackageManager.GET_META_DATA)
+        }
+    }.getOrNull()
+
+private fun PackageManager.queryIntentActivitiesCompat(intent: Intent): List<ResolveInfo> =
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        queryIntentActivities(intent, PackageManager.ResolveInfoFlags.of(0L))
+    } else {
+        @Suppress("DEPRECATION")
+        queryIntentActivities(intent, 0)
+    }
 
 private suspend fun writeRoutingFile(context: Context, uri: Uri, text: String) =
     withContext(Dispatchers.IO) {

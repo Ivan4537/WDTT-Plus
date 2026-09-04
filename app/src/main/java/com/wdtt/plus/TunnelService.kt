@@ -47,7 +47,8 @@ private const val TUNNEL_ALERT_NOTIFICATION_ID = 2
 private const val NETWORK_CHANGE_SETTLE_MS = 90_000L
 private const val NETWORK_RETURN_SETTLE_MS = 45_000L
 private const val NETWORK_LOSS_GRACE_MS = 2 * 60_000L
-private const val WAKE_RESCUE_GRACE_MS = 60_000L
+private const val WAKE_RESCUE_FIRST_CHECK_MS = 20_000L
+private const val WAKE_RESCUE_FINAL_CHECK_DELAY_MS = 25_000L
 private const val TIMER_RESUME_TRANSPORT_CONFIRM_MS = 75_000L
 private const val TIMER_RESUME_TRANSPORT_WAKE_LOCK_TIMEOUT_MS =
     TIMER_RESUME_TRANSPORT_CONFIRM_MS + 15_000L
@@ -495,8 +496,8 @@ class TunnelService : Service() {
                     customVkClientId = intent.getStringExtra("custom_vk_client_id") ?: "",
                     customVkClientSecret = intent.getStringExtra("custom_vk_client_secret") ?: "",
                     profileMaxWorkers = intent.getIntExtra("profile_max_workers", 0),
-                    managedConfigFirstStart =
-                        intent.getBooleanExtra(MANAGED_CONFIG_FIRST_START_EXTRA, false),
+                    configFirstStart =
+                        intent.getBooleanExtra(CONFIG_FIRST_START_EXTRA, true),
                     profileIndex = intent.getIntExtra(TUNNEL_PROFILE_INDEX_EXTRA, 0).coerceIn(0, 2),
                 )
                 requestTunnelStart(params)
@@ -1701,33 +1702,47 @@ class TunnelService : Service() {
 
     private fun scheduleWakeRescueCheck() {
         if (!AMNEZIA_STYLE_RECOVERY || !TunnelManager.running.value || isTunnelPaused || TunnelManager.isCaptchaInProgress()) return
-        val wakeStartedAt = System.currentTimeMillis()
+        val wakeStartedAt = TunnelManager.wakeRecoveryReferenceAt()
         wakeRescueJob?.cancel()
         wakeRescueJob = TunnelManager.scope.launch(Dispatchers.Main) {
-            delay(WAKE_RESCUE_GRACE_MS)
-            if (!TunnelManager.running.value || isTunnelPaused || TunnelManager.isCaptchaInProgress()) return@launch
-            val confirmedNetworkFailure = TunnelManager.hasConfirmedNetworkFailureSince(wakeStartedAt)
-            val shouldReconnect = shouldReconnectTunnelAfterWake(
-                activeWorkers = TunnelManager.activeWorkers.value,
-                confirmedNetworkFailure = confirmedNetworkFailure,
-            )
-            if (TunnelManager.hasFreshTunnelActivitySince(wakeStartedAt)) {
-                TunnelManager.noteWakeRescueHealthy()
-            } else if (shouldReconnect) {
-                TunnelManager.noteWakeRescueReconnect()
-                updateNotification("Восстановление транспорта после сна...")
-                TunnelManager.restartTransport(
-                    reason = "[СОН] После пробуждения нет рабочих каналов или ответа на пользовательский трафик. Мягко переподключаем транспорт без пересоздания VPN.",
-                    minIntervalMs = WAKE_RESCUE_GRACE_MS,
-                    force = true,
+            delay(WAKE_RESCUE_FIRST_CHECK_MS)
+            var finalCheck = false
+            while (isActive) {
+                if (!TunnelManager.running.value || isTunnelPaused || TunnelManager.isCaptchaInProgress()) return@launch
+                val action = decideWakeRescueAction(
+                    freshTransportPath = TunnelManager.hasFreshTransportPathSince(wakeStartedAt),
+                    activeWorkers = TunnelManager.activeWorkers.value,
+                    confirmedNetworkFailure = TunnelManager.hasConfirmedNetworkFailureSince(wakeStartedAt),
+                    finalCheck = finalCheck,
                 )
-            } else {
-                // Выход из сна сам по себе не является доказательством поломки:
-                // Android и оператор могут на короткое время задержать вывод статистики.
-                // Не перезапускаем ни native-транспорт, ни системный VPN-интерфейс.
-                TunnelManager.noteWakeRescueDeferred()
+                when (action) {
+                    WakeRescueAction.HEALTHY -> {
+                        TunnelManager.noteWakeRescueHealthy()
+                        updateNotification(buildTunnelNotificationText())
+                        return@launch
+                    }
+                    WakeRescueAction.WAIT_FOR_PROBE -> {
+                        // Положительное число воркеров после Doze может быть
+                        // устаревшим. Даём немедленному native keepalive ещё одно
+                        // короткое окно, но больше не откладываем решение навсегда.
+                        TunnelManager.noteWakeRescueDeferred()
+                        updateNotification(buildTunnelNotificationText())
+                        finalCheck = true
+                        delay(WAKE_RESCUE_FINAL_CHECK_DELAY_MS)
+                    }
+                    WakeRescueAction.RECONNECT -> {
+                        TunnelManager.noteWakeRescueReconnect()
+                        updateNotification("Восстановление транспорта после сна...")
+                        TunnelManager.restartTransport(
+                            reason = "[СОН] После пробуждения сервер не подтвердил свежий двусторонний канал. Мягко переподключаем транспорт без пересоздания VPN.",
+                            minIntervalMs = WAKE_RESCUE_FIRST_CHECK_MS + WAKE_RESCUE_FINAL_CHECK_DELAY_MS,
+                            force = true,
+                        )
+                        updateNotification(buildTunnelNotificationText())
+                        return@launch
+                    }
+                }
             }
-            updateNotification(buildTunnelNotificationText())
         }
     }
 
@@ -2070,19 +2085,6 @@ class TunnelService : Service() {
                 scheduleTrustedWifiResumeRetry()
                 return
             }
-            if (android.net.VpnService.prepare(applicationContext) != null) {
-                val status = "VPN-разрешение недоступно. Откройте WDTT Plus для восстановления."
-                releaseTrustedWifiTransitionWakeLock()
-                TunnelManager.noteTrustedWifiEvent(
-                    "resume_permission",
-                    "Android не дал повторно занять VPN-слот; требуется открыть приложение.",
-                    warning = true
-                )
-                TrustedWifiManager.setStatus(status)
-                withContext(Dispatchers.Main) { updateNotification(status) }
-                return
-            }
-
             val params = lastStartParams ?: buildTunnelParamsFromSettings(applicationContext)
             if (params == null) {
                 val status = "Не удалось прочитать профиль VPN. Откройте WDTT Plus."
@@ -2337,7 +2339,7 @@ class TunnelService : Service() {
                 TunnelManager.noteUnderlyingNetworkChanged(
                     "Android подтвердил рабочую сеть",
                     graceMs = transportRecoveryPolicy(
-                        lastStartParams?.managedConfigFirstStart == true
+                        lastStartParams?.configFirstStart == true
                     ).networkSettleDelayMs,
                     replaceGrace = false
                 )
@@ -2365,7 +2367,7 @@ class TunnelService : Service() {
             return
         }
         val recoveryPolicy = transportRecoveryPolicy(
-            lastStartParams?.managedConfigFirstStart == true
+            lastStartParams?.configFirstStart == true
         )
         if (!shouldStartUnderlyingNetworkCheck(
                 checkPending = stableNetworkReconnectPending,
@@ -2764,11 +2766,6 @@ class TunnelService : Service() {
                     val helper = WireGuardHelper(applicationContext)
                     val startupWindow = System.currentTimeMillis() - TunnelManager.processStartedAtMs < INITIAL_VPN_START_GRACE_MS
                     val captchaActive = TunnelManager.isCaptchaInProgress()
-                    if (!startupWindow && !captchaActive && android.net.VpnService.prepare(applicationContext) != null) {
-                        Log.w("TunnelService", "VPN-разрешение WDTT Plus отозвано или слот передан другому VPN. Выключаем WDTT Plus.")
-                        stopTunnel(TunnelStopReason.VpnSlotTransferred)
-                        break
-                    }
                     // Не полагаемся только на broadcast: после глубокого сна первая
                     // итерация службы иногда выполняется раньше ACTION_SCREEN_ON.
                     observeDeviceInteractiveState(deviceInteractive)

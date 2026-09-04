@@ -1,6 +1,7 @@
 package com.wdtt.plus.ui
 
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.rememberScrollState
@@ -12,6 +13,7 @@ import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
@@ -45,6 +47,11 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.ProgressBarRangeInfo
@@ -70,6 +77,9 @@ import kotlin.math.sin
 
 internal fun adjustSleepTimerHours(totalMinutes: Int, hoursDelta: Int): Int =
     normalizeSleepPauseDelayMinutes(totalMinutes + hoursDelta * 60)
+
+internal fun adjustSleepTimerMinutes(totalMinutes: Int, direction: Int): Int =
+    normalizeSleepPauseDelayMinutes(totalMinutes + direction.coerceIn(-1, 1) * 5)
 
 internal fun replaceSleepTimerMinuteComponent(totalMinutes: Int, minute: Int): Int {
     val normalized = normalizeSleepPauseDelayMinutes(totalMinutes)
@@ -104,6 +114,7 @@ internal fun SleepTimerDialog(
     onApply: (SleepBatteryMode, Int, Int) -> Unit,
     onDismiss: () -> Unit,
 ) {
+    val television = isTelevisionDevice()
     var selectedModeName by rememberSaveable(initialMode) { mutableStateOf(initialMode.name) }
     var pauseDelayMinutes by rememberSaveable(initialPauseDelayMinutes) {
         mutableIntStateOf(normalizeSleepPauseDelayMinutes(initialPauseDelayMinutes))
@@ -127,132 +138,141 @@ internal fun SleepTimerDialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false),
     ) {
-        Surface(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 20.dp),
-            shape = RoundedCornerShape(28.dp),
-            tonalElevation = 8.dp,
-            shadowElevation = 12.dp,
+        Box(
+            modifier = Modifier.fillMaxSize(),
+            contentAlignment = Alignment.Center,
         ) {
-            Column(
-                modifier = Modifier
-                    .padding(horizontal = 22.dp, vertical = 20.dp)
-                    .verticalScroll(rememberScrollState()),
-                horizontalAlignment = Alignment.CenterHorizontally,
+            Surface(
+                modifier = if (television) {
+                    Modifier.televisionDialogWidth(television, fraction = 0.72f, maxWidth = 820.dp)
+                } else {
+                    Modifier.fillMaxWidth().padding(horizontal = 20.dp)
+                },
+                shape = RoundedCornerShape(28.dp),
+                tonalElevation = 8.dp,
+                shadowElevation = 12.dp,
             ) {
-                Box(
-                    modifier = Modifier.fillMaxWidth(),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Text(
-                        text = "Таймер сна",
-                        style = MaterialTheme.typography.titleLarge,
-                        fontWeight = FontWeight.Bold,
-                    )
-                    IconButton(
-                        onClick = onDismiss,
-                        modifier = Modifier.align(Alignment.CenterEnd),
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Close,
-                            contentDescription = "Закрыть таймер сна",
-                        )
-                    }
-                }
-                Spacer(Modifier.height(4.dp))
-                Box(
+                Column(
                     modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(min = 80.dp),
-                    contentAlignment = Alignment.Center,
+                        .padding(horizontal = 22.dp, vertical = 20.dp)
+                        .verticalScroll(rememberScrollState()),
+                    horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
-                    Text(
-                        text = when (selectedMode) {
-                            SleepBatteryMode.DELAYED_PAUSE -> if (totalMinutes == 0) {
-                                "VPN отключится сразу после выключения экрана. Интернет будет работать напрямую до включения экрана"
-                            } else {
-                                "VPN отключится через выбранное время. После отключения интернет будет работать напрямую до включения экрана"
-                            }
-                            SleepBatteryMode.TIMED_PAUSE -> if (totalMinutes == 0) {
-                                "При значении 0 мин VPN останется активным после выключения экрана"
-                            } else {
-                                "VPN отключится сразу и включится примерно через выбранное время. Во время паузы интернет работает напрямую"
-                            }
-                        },
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        textAlign = TextAlign.Center,
-                    )
-                }
-                Spacer(Modifier.height(12.dp))
-
-                SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
-                    SleepBatteryMode.entries.forEachIndexed { index, mode ->
-                        SegmentedButton(
-                            selected = selectedMode == mode,
-                            onClick = { selectedModeName = mode.name },
-                            shape = SegmentedButtonDefaults.itemShape(
-                                index = index,
-                                count = SleepBatteryMode.entries.size,
-                            ),
-                            icon = {
-                                StableSegmentedButtonIcon(selected = selectedMode == mode)
+                    Box(
+                        modifier = Modifier.fillMaxWidth(),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            text = "Таймер сна",
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.Bold,
+                        )
+                        IconButton(
+                            onClick = onDismiss,
+                            modifier = Modifier
+                                .align(Alignment.CenterEnd)
+                                .remoteIconButtonFocus(),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Close,
+                                contentDescription = "Закрыть таймер сна",
+                            )
+                        }
+                    }
+                    Spacer(Modifier.height(4.dp))
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 80.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            text = when (selectedMode) {
+                                SleepBatteryMode.DELAYED_PAUSE -> if (totalMinutes == 0) {
+                                    "VPN отключится сразу после выключения экрана. Интернет будет работать напрямую до включения экрана"
+                                } else {
+                                    "VPN отключится через выбранное время. После отключения интернет будет работать напрямую до включения экрана"
+                                }
+                                SleepBatteryMode.TIMED_PAUSE -> if (totalMinutes == 0) {
+                                    "При значении 0 мин VPN останется активным после выключения экрана"
+                                } else {
+                                    "VPN отключится сразу и включится примерно через выбранное время. Во время паузы интернет работает напрямую"
+                                }
                             },
-                            label = {
-                                Text(
-                                    text = when (mode) {
-                                        SleepBatteryMode.DELAYED_PAUSE -> "Отключить позже"
-                                        SleepBatteryMode.TIMED_PAUSE -> "Включить позже"
-                                    },
-                                    modifier = Modifier.width(IntrinsicSize.Min),
-                                    maxLines = 2,
-                                    textAlign = TextAlign.Center,
-                                )
-                            },
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            textAlign = TextAlign.Center,
                         )
                     }
-                }
-                Spacer(Modifier.height(16.dp))
+                    Spacer(Modifier.height(12.dp))
 
-                SleepTimerDial(
-                    totalMinutes = totalMinutes,
-                    mode = selectedMode,
-                    onTotalMinutesChange = onTotalMinutesChange,
-                )
-
-                Spacer(Modifier.height(14.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.Center,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    OutlinedButton(
-                        onClick = { onTotalMinutesChange(adjustSleepTimerHours(totalMinutes, -1)) },
-                        enabled = totalMinutes > 0,
-                        shape = RoundedCornerShape(14.dp),
-                    ) {
-                        Text("−1 ч", fontWeight = FontWeight.SemiBold)
+                    SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                        SleepBatteryMode.entries.forEachIndexed { index, mode ->
+                            SegmentedButton(
+                                selected = selectedMode == mode,
+                                onClick = { selectedModeName = mode.name },
+                                shape = SegmentedButtonDefaults.itemShape(
+                                    index = index,
+                                    count = SleepBatteryMode.entries.size,
+                                ),
+                                icon = {
+                                    StableSegmentedButtonIcon(selected = selectedMode == mode)
+                                },
+                                label = {
+                                    Text(
+                                        text = when (mode) {
+                                            SleepBatteryMode.DELAYED_PAUSE -> "Отключить позже"
+                                            SleepBatteryMode.TIMED_PAUSE -> "Включить позже"
+                                        },
+                                        modifier = Modifier.width(IntrinsicSize.Min),
+                                        maxLines = 2,
+                                        textAlign = TextAlign.Center,
+                                    )
+                                },
+                            )
+                        }
                     }
-                    Spacer(Modifier.width(12.dp))
-                    OutlinedButton(
-                        onClick = { onTotalMinutesChange(adjustSleepTimerHours(totalMinutes, 1)) },
-                        enabled = totalMinutes < MAX_SLEEP_PAUSE_DELAY_MINUTES,
-                        shape = RoundedCornerShape(14.dp),
+                    Spacer(Modifier.height(16.dp))
+
+                    SleepTimerDial(
+                        totalMinutes = totalMinutes,
+                        mode = selectedMode,
+                        onTotalMinutesChange = onTotalMinutesChange,
+                    )
+
+                    Spacer(Modifier.height(14.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.Center,
+                        verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        Text("+1 ч", fontWeight = FontWeight.SemiBold)
+                        OutlinedButton(
+                            onClick = { onTotalMinutesChange(adjustSleepTimerHours(totalMinutes, -1)) },
+                            enabled = totalMinutes > 0,
+                            shape = RoundedCornerShape(14.dp),
+                        ) {
+                            Text("−1 ч", fontWeight = FontWeight.SemiBold)
+                        }
+                        Spacer(Modifier.width(12.dp))
+                        OutlinedButton(
+                            onClick = { onTotalMinutesChange(adjustSleepTimerHours(totalMinutes, 1)) },
+                            enabled = totalMinutes < MAX_SLEEP_PAUSE_DELAY_MINUTES,
+                            shape = RoundedCornerShape(14.dp),
+                        ) {
+                            Text("+1 ч", fontWeight = FontWeight.SemiBold)
+                        }
                     }
-                }
 
-                Spacer(Modifier.height(18.dp))
+                    Spacer(Modifier.height(18.dp))
 
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.End,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Button(onClick = { onApply(selectedMode, pauseDelayMinutes, resumeDelayMinutes) }) {
-                        Text("Применить")
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Button(onClick = { onApply(selectedMode, pauseDelayMinutes, resumeDelayMinutes) }) {
+                            Text("Применить")
+                        }
                     }
                 }
             }
@@ -285,6 +305,22 @@ private fun SleepTimerDial(
     Box(
         modifier = Modifier
             .size(238.dp)
+            .remoteFocusOutline(CircleShape)
+            .onPreviewKeyEvent { event ->
+                if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                when (event.key) {
+                    Key.DirectionLeft -> {
+                        currentOnTotalMinutesChange(adjustSleepTimerMinutes(currentTotalMinutes, -1))
+                        true
+                    }
+                    Key.DirectionRight -> {
+                        currentOnTotalMinutesChange(adjustSleepTimerMinutes(currentTotalMinutes, 1))
+                        true
+                    }
+                    else -> false
+                }
+            }
+            .focusable()
             .semantics {
                 contentDescription = when (mode) {
                     SleepBatteryMode.DELAYED_PAUSE -> "Круговой таймер до отключения VPN"

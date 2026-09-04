@@ -311,9 +311,207 @@ class OutboundWireGuardTest {
     }
 
     @Test
+    fun standaloneOwnershipProbe_requiresBothOwnedMarkersAndHasSafeShellSyntax() {
+        val script = standaloneInstallerOwnershipProbeScript()
+
+        assertTrue("/var/lib/wdtt-server-installer/ownership" in script)
+        assertTrue("/etc/systemd/system/wdtt.service" in script)
+        assertTrue("Managed by WDTT Plus standalone server installer" in script)
+        assertTrue("WDTT_STANDALONE_MANAGED=1" in script)
+        assertTrue("WDTT_STANDALONE_MANAGED=0" in script)
+        assertTrue("WDTT_ANDROID_DEPLOY_MANAGED=1" in script)
+        assertTrue("Managed by WDTT Plus Android deploy" in script)
+        assertTrue("WDTT_LEGACY_ANDROID_DEPLOY_CANDIDATE=1" in script)
+        assertTrue("WDTT_INSTALL_TRACE=1" in script)
+        assertTrue("-config-dir[[:space:]]+/etc/wdtt" in script)
+        assertTrue("grep -Fq 'wdtt0'" in script)
+        assertTrue("[ ! -L" in script)
+        assertShellSyntax(script)
+
+        val process = ProcessBuilder("bash", "-c", script)
+            .redirectErrorStream(true)
+            .start()
+        val output = process.inputStream.bufferedReader().use { it.readText() }
+        assertEquals(0, process.waitFor())
+        assertFalse("probe must print real lines, not literal \\n sequences", "\\n" in output)
+        assertEquals(1, Regex("(?m)^WDTT_STANDALONE_MANAGED=[01]$").findAll(output).count())
+        assertEquals(1, Regex("(?m)^WDTT_ANDROID_DEPLOY_MANAGED=[01]$").findAll(output).count())
+        assertEquals(1, Regex("(?m)^WDTT_LEGACY_ANDROID_DEPLOY_CANDIDATE=[01]$").findAll(output).count())
+        assertEquals(1, Regex("(?m)^WDTT_INSTALL_TRACE=[01]$").findAll(output).count())
+        deploymentOwnershipFromProbe(output)
+    }
+
+    @Test
+    fun existingInstallActions_failClosedForUnknownOrFailedOwnershipCheck() {
+        val unknown = existingInstallOwnershipFromFlags(
+            standaloneManaged = false,
+            androidDeployManaged = false,
+            legacyAndroidDeployCandidate = false
+        )
+        assertFalse(
+            existingInstallAllowsPreservingUpdate(
+                ownership = unknown,
+                checkSucceeded = true
+            )
+        )
+        assertFalse(existingInstallAllowsReset(ownership = unknown, checkSucceeded = true))
+
+        val standalone = existingInstallOwnershipFromFlags(
+            standaloneManaged = true,
+            androidDeployManaged = false,
+            legacyAndroidDeployCandidate = false
+        )
+        assertFalse(
+            existingInstallAllowsPreservingUpdate(
+                ownership = standalone,
+                checkSucceeded = true
+            )
+        )
+        assertFalse(existingInstallAllowsReset(ownership = standalone, checkSucceeded = true))
+
+        val legacy = existingInstallOwnershipFromFlags(
+            standaloneManaged = false,
+            androidDeployManaged = false,
+            legacyAndroidDeployCandidate = true
+        )
+        assertTrue(
+            existingInstallAllowsPreservingUpdate(
+                ownership = legacy,
+                checkSucceeded = true
+            )
+        )
+        assertFalse(existingInstallAllowsReset(ownership = legacy, checkSucceeded = true))
+
+        val android = existingInstallOwnershipFromFlags(
+            standaloneManaged = false,
+            androidDeployManaged = true,
+            legacyAndroidDeployCandidate = true
+        )
+        assertEquals(DeploymentOwnership.AndroidDeploy, android)
+        assertTrue(existingInstallAllowsReset(ownership = android, checkSucceeded = true))
+        assertFalse(existingInstallAllowsReset(ownership = android, checkSucceeded = false))
+    }
+
+    @Test
+    fun ownershipProbe_recognizesRealLegacyV14AndroidUnitForPreservingUpdate() {
+        val root = Files.createTempDirectory("wdtt-v14-owner-probe").toFile()
+        try {
+            val binary = File(root, "usr/local/bin/wdtt-server")
+            val config = File(root, "etc/wdtt")
+            val unit = File(root, "etc/systemd/system/wdtt.service")
+            requireNotNull(binary.parentFile).mkdirs()
+            config.mkdirs()
+            requireNotNull(unit.parentFile).mkdirs()
+            binary.writeText("#!/bin/sh\nexit 0\n")
+            binary.setExecutable(true)
+            File(config, "passwords.json").writeText("{}\n")
+            File(config, "wg-keys.dat").writeText("test-only\n")
+            unit.writeText(
+                """
+                [Service]
+                ExecStartPre=-/usr/bin/env bash -c "ip link show wdtt0 >/dev/null 2>&1 && ip link del wdtt0 || true"
+                ExecStart=/usr/local/bin/wdtt-server -listen 0.0.0.0:56000 -wg-port 56001 -config-dir /etc/wdtt -max-passwords 50
+                """.trimIndent()
+            )
+
+            val process = ProcessBuilder(
+                "bash",
+                "-c",
+                standaloneInstallerOwnershipProbeScript(root.absolutePath)
+            ).redirectErrorStream(true).start()
+            val output = process.inputStream.bufferedReader().use { it.readText() }
+            assertEquals(0, process.waitFor())
+            val ownership = deploymentOwnershipFromProbe(output)
+            assertEquals(DeploymentOwnership.LegacyAndroidDeploy, ownership)
+            assertTrue(existingInstallAllowsPreservingUpdate(ownership, checkSucceeded = true))
+            assertFalse(existingInstallAllowsReset(ownership, checkSucceeded = true))
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun deploymentOwnership_allowsOnlyStrictLegacyAndroidShapeForPreserveMigration() {
+        assertEquals(
+            DeploymentOwnership.LegacyAndroidDeploy,
+            deploymentOwnershipFromProbe(
+                """
+                WDTT_STANDALONE_MANAGED=0
+                WDTT_ANDROID_DEPLOY_MANAGED=0
+                WDTT_LEGACY_ANDROID_DEPLOY_CANDIDATE=1
+                WDTT_INSTALL_TRACE=1
+                """.trimIndent()
+            )
+        )
+        assertEquals(
+            DeploymentOwnership.UnknownExisting,
+            deploymentOwnershipFromProbe(
+                """
+                WDTT_STANDALONE_MANAGED=0
+                WDTT_ANDROID_DEPLOY_MANAGED=0
+                WDTT_LEGACY_ANDROID_DEPLOY_CANDIDATE=0
+                WDTT_INSTALL_TRACE=1
+                """.trimIndent()
+            )
+        )
+        assertEquals(
+            DeploymentOwnership.NoInstall,
+            deploymentOwnershipFromProbe(
+                """
+                WDTT_STANDALONE_MANAGED=0
+                WDTT_ANDROID_DEPLOY_MANAGED=0
+                WDTT_LEGACY_ANDROID_DEPLOY_CANDIDATE=0
+                WDTT_INSTALL_TRACE=0
+                """.trimIndent()
+            )
+        )
+    }
+
+    @Test
+    fun ownershipProbe_doesNotTreatSudoDiscoveryAsSudoInvocation() {
+        val command = rootCommand("printf 'probe\\n'")
+
+        assertTrue("command -v sudo >/dev/null 2>&1" in command)
+        assertTrue("sudo -S -p '' bash -c" in command)
+        assertShellSyntax(command)
+    }
+
+    @Test
+    fun connectWithoutInstall_usesStandaloneDatabaseNotInstallerOwnership() {
+        val connection = selectExistingServerConnection(
+            dbJson = """
+                {
+                  "main_password":"SafeOwnerPassword42",
+                  "admin_id":"",
+                  "bot_token":"",
+                  "dns":"1.1.1.1,1.0.0.1",
+                  "max_passwords":50,
+                  "default_ports":"56000,56001,9000",
+                  "public_ip":"203.0.113.10",
+                  "passwords":{},
+                  "devices":{}
+                }
+            """.trimIndent(),
+            fallbackHost = "198.51.100.10",
+            adminMainPassword = "SafeOwnerPassword42"
+        )
+
+        assertEquals("203.0.113.10", connection.host)
+        assertEquals("SafeOwnerPassword42", connection.password)
+        assertEquals(56000, connection.ports.first)
+        assertEquals(56001, connection.ports.second)
+        assertEquals(9000, connection.ports.third)
+        assertEquals("1.1.1.1", connection.dns1)
+        assertEquals("1.0.0.1", connection.dns2)
+    }
+
+    @Test
     fun externalProxyTransparentCheck_doesNotCaptureRootXrayTraffic() {
         val script = outboundShellPrelude()
 
+        assertTrue("umask 077" in script)
+        assertTrue("install -d -m 0700 /etc/wdtt /etc/wdtt/outbound" in script)
+        assertTrue("chmod 0600 /etc/wdtt/outbound.json" in script)
         assertTrue("WDTT_PROXY_TEST_SOURCE=\"${'$'}test_source\"" in script)
         assertTrue("iptables -t nat -I OUTPUT -s \"${'$'}test_source\" -p tcp -j WDTT_PROXY_TEST" in script)
         assertTrue("curl --interface \"${'$'}test_source\"" in script)

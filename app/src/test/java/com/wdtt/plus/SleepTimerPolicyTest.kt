@@ -1,6 +1,7 @@
 package com.wdtt.plus
 
 import com.wdtt.plus.ui.adjustSleepTimerHours
+import com.wdtt.plus.ui.adjustSleepTimerMinutes
 import com.wdtt.plus.ui.formatSleepTimerDuration
 import com.wdtt.plus.ui.replaceSleepTimerMinuteComponent
 import com.wdtt.plus.ui.sleepBatteryModeDiagnosticText
@@ -39,6 +40,15 @@ class SleepTimerPolicyTest {
         assertEquals(0, adjustSleepTimerHours(totalMinutes = 30, hoursDelta = -1))
         assertEquals(0, adjustSleepTimerHours(totalMinutes = 60, hoursDelta = -1))
         assertEquals(24 * 60, adjustSleepTimerHours(totalMinutes = 23 * 60 + 30, hoursDelta = 1))
+    }
+
+    @Test
+    fun tvDpadAdjustsSleepTimerInFiveMinuteStepsWithinBounds() {
+        assertEquals(40, adjustSleepTimerMinutes(totalMinutes = 35, direction = 1))
+        assertEquals(30, adjustSleepTimerMinutes(totalMinutes = 35, direction = -1))
+        assertEquals(0, adjustSleepTimerMinutes(totalMinutes = 0, direction = -1))
+        assertEquals(24 * 60, adjustSleepTimerMinutes(totalMinutes = 24 * 60, direction = 1))
+        assertEquals(35, adjustSleepTimerMinutes(totalMinutes = 35, direction = 0))
     }
 
     @Test

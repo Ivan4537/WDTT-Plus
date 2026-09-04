@@ -64,6 +64,7 @@ internal fun VpnDnsSettingsCard(
     AppSectionCard(
         modifier = Modifier
             .fillMaxWidth()
+            .remoteFocusOutline(RoundedCornerShape(16.dp))
             .clickable(onClick = onClick),
         contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
     ) {
@@ -309,6 +310,7 @@ private fun VpnDnsOptionRow(
     Surface(
         modifier = Modifier
             .fillMaxWidth()
+            .remoteFocusOutline(RoundedCornerShape(8.dp))
             .clickable(onClick = onClick),
         color = if (selected) {
             MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.55f)

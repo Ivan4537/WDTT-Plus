@@ -118,13 +118,19 @@ internal fun RtNetworkSettingsDialog(
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.Bold,
                         )
-                        IconButton(onClick = onShowRtHelp) {
+                        IconButton(
+                            onClick = onShowRtHelp,
+                            modifier = Modifier.remoteHelpFocus(),
+                        ) {
                             Icon(
                                 Icons.AutoMirrored.Filled.HelpOutline,
                                 contentDescription = "Инструкция по режиму Сеть РТ",
                             )
                         }
-                        IconButton(onClick = onDismiss) {
+                        IconButton(
+                            onClick = onDismiss,
+                            modifier = Modifier.remoteIconButtonFocus(),
+                        ) {
                             Icon(Icons.Default.Close, contentDescription = "Закрыть")
                         }
                     }
@@ -196,7 +202,7 @@ internal fun RtNetworkSettingsDialog(
                                 Text("MASQUE", fontWeight = FontWeight.SemiBold)
                                 IconButton(
                                     onClick = onShowMasqueHelp,
-                                    modifier = Modifier.size(32.dp),
+                                    modifier = Modifier.size(32.dp).remoteHelpFocus(),
                                 ) {
                                     Icon(
                                         Icons.AutoMirrored.Filled.HelpOutline,
@@ -215,6 +221,7 @@ internal fun RtNetworkSettingsDialog(
                             checked = rtMasque,
                             enabled = controlsEnabled,
                             onCheckedChange = onRtMasqueChange,
+                            modifier = Modifier.remoteSwitchFocus(enabled = controlsEnabled),
                         )
                     }
 
@@ -230,7 +237,7 @@ internal fun RtNetworkSettingsDialog(
                                 Text("Через сервер", fontWeight = FontWeight.SemiBold)
                                 IconButton(
                                     onClick = onShowServerHelp,
-                                    modifier = Modifier.size(32.dp),
+                                    modifier = Modifier.size(32.dp).remoteHelpFocus(),
                                 ) {
                                     Icon(
                                         Icons.AutoMirrored.Filled.HelpOutline,
@@ -253,6 +260,9 @@ internal fun RtNetworkSettingsDialog(
                             checked = rtMasqueServerBootstrap,
                             enabled = controlsEnabled && rtMasque && serverAccess.available,
                             onCheckedChange = onServerBootstrapChange,
+                            modifier = Modifier.remoteSwitchFocus(
+                                enabled = controlsEnabled && rtMasque && serverAccess.available,
+                            ),
                         )
                     }
 

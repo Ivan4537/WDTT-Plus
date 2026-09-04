@@ -244,7 +244,10 @@ fun TrustedWifiSettingsDialog(
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
-                        IconButton(onClick = onDismiss) {
+                        IconButton(
+                            onClick = onDismiss,
+                            modifier = Modifier.remoteIconButtonFocus(),
+                        ) {
                             Icon(Icons.Default.Close, contentDescription = "Закрыть")
                         }
                     }
@@ -330,12 +333,15 @@ fun TrustedWifiSettingsDialog(
                                     ) {
                                         Icon(Icons.Default.Wifi, contentDescription = null, modifier = Modifier.size(19.dp))
                                         Text(ssid, modifier = Modifier.weight(1f).padding(horizontal = 10.dp))
-                                        IconButton(onClick = {
-                                            scope.launch {
-                                                settingsStore.removeTrustedWifiSsid(ssid)
-                                                recheckService()
-                                            }
-                                        }) {
+                                        IconButton(
+                                            onClick = {
+                                                scope.launch {
+                                                    settingsStore.removeTrustedWifiSsid(ssid)
+                                                    recheckService()
+                                                }
+                                            },
+                                            modifier = Modifier.remoteIconButtonFocus(),
+                                        ) {
                                             Icon(Icons.Default.DeleteOutline, contentDescription = "Удалить сеть")
                                         }
                                     }
@@ -395,7 +401,10 @@ fun TrustedWifiSettingsDialog(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text("Добавить сеть")
-                    IconButton(onClick = { showManualInput = false }) {
+                    IconButton(
+                        onClick = { showManualInput = false },
+                        modifier = Modifier.remoteIconButtonFocus(),
+                    ) {
                         Icon(Icons.Default.Close, contentDescription = "Закрыть")
                     }
                 }

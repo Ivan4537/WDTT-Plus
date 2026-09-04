@@ -31,16 +31,24 @@ func TestVKCallsUsesVkMeAPIWithCompatibilityFallback(t *testing.T) {
 	}
 }
 
-func TestStableVKCallsUUID(t *testing.T) {
-	setVKCallsPreflight(true, "device-a")
-	first := stableVKCallsUUID("vk")
-	second := stableVKCallsUUID("vk")
-	otherScope := stableVKCallsUUID("ok")
-	if first != second {
-		t.Fatalf("stable ID changed: %q != %q", first, second)
+func TestVKCallsPreflightRetryClassification(t *testing.T) {
+	for _, err := range []error{
+		&VkCaptchaError{ErrorCode: 14},
+		errors.New("temporary network failure"),
+	} {
+		if !shouldRetryVKCallsPreflight(err) {
+			t.Fatalf("transient preflight error was not retried: %v", err)
+		}
 	}
-	if first == otherScope {
-		t.Fatal("VK and OK scopes must use different IDs")
+	for _, err := range []error{
+		fmt.Errorf("%w: rate limited", errVKCallsFlood),
+		errors.New("INVALID_JOIN_LINK"),
+		errors.New("ANON_BLOCKED"),
+		errors.New("CALL_FULL"),
+	} {
+		if shouldRetryVKCallsPreflight(err) {
+			t.Fatalf("non-retryable preflight error was retried: %v", err)
+		}
 	}
 }
 
@@ -147,13 +155,29 @@ func TestParseVKCallsTURNLifetime(t *testing.T) {
 func TestVKCallsFloodPause(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	startVKCallsFloodPause(now)
-	if got := vkCallsFloodPauseRemaining(now.Add(10 * time.Second)); got != 50*time.Second {
+	if got := vkCallsPreflightPauseRemaining("first-link", now.Add(10*time.Second)); got != 50*time.Second {
 		t.Fatalf("pause remaining = %v, want 50s", got)
 	}
-	if got := vkCallsFloodPauseRemaining(now.Add(vkCallsFloodPause)); got != 0 {
+	if got := vkCallsPreflightPauseRemaining("first-link", now.Add(vkCallsFloodPause)); got != 0 {
 		t.Fatalf("expired pause remaining = %v, want 0", got)
 	}
 	vkCallsFloodUntil.Store(0)
+}
+
+func TestVKCallsCaptchaPauseIsScopedToOneLink(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	vkCallsFloodUntil.Store(0)
+	vkCallsLinkPauses.Lock()
+	vkCallsLinkPauses.until = make(map[string]int64)
+	vkCallsLinkPauses.Unlock()
+
+	startVKCallsLinkPause("first-link", now, vkCallsCaptchaPause)
+	if got := vkCallsPreflightPauseRemaining("first-link", now.Add(time.Second)); got <= 0 {
+		t.Fatal("the failed link did not retain its CAPTCHA pause")
+	}
+	if got := vkCallsPreflightPauseRemaining("second-link", now.Add(time.Second)); got != 0 {
+		t.Fatalf("independent link inherited another link pause: %v", got)
+	}
 }
 
 func TestVKCallsPreflightPauseForError(t *testing.T) {

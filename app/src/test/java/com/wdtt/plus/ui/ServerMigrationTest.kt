@@ -1,6 +1,8 @@
 package com.wdtt.plus.ui
 
 import com.wdtt.plus.ServerAdminProfileInfo
+import com.wdtt.plus.ServerStoredBackupDocument
+import com.wdtt.plus.ServerStoredBackupFile
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
@@ -414,7 +416,7 @@ class ServerMigrationTest {
     }
 
     @Test
-    fun versionTwoBackupRoundTripVerifiesIntegrity() {
+    fun currentBackupRoundTripVerifiesIntegrity() {
         val source = database("client-a", "Телефон")
         val keys = List(4) { "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" }.joinToString("\n")
         val encoded = backupToJson(
@@ -428,10 +430,128 @@ class ServerMigrationTest {
 
         val decoded = parseBackupFile(encoded)
 
-        assertEquals(2, decoded.formatVersion)
+        assertEquals(4, decoded.formatVersion)
         assertTrue(decoded.integrityVerified)
         assertTrue(decoded.hasWgKeys)
         assertEquals(source.toString(), decoded.passwordsJson)
+    }
+
+    @Test
+    fun currentBackupPreservesAndVerifiesOutboundProfile() {
+        val profile = "VERSION=1\nIMPORTED_WG_CONFIG_B64=YWJj\nUPDATED_AT=2026-09-02T12:00:00Z\n"
+        val backup = parseBackup(
+            passwordsJson = database("client-a", "Телефон").toString(),
+            wgKeysDat = List(4) { "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" }.joinToString("\n"),
+            createdAt = "02.09.2026 12:00",
+            sourceHost = "old.example.org",
+            outboundProfileEnv = profile,
+            backupPolicyJson = "{\"enabled\":true,\"interval_hours\":12,\"retention_count\":7}"
+        )
+
+        val decoded = parseBackupFile(backupToJson(backup))
+
+        assertEquals(profile, decoded.outboundProfileEnv)
+        assertEquals(true, JSONObject(decoded.backupPolicyJson.orEmpty()).getBoolean("enabled"))
+        assertEquals(12, JSONObject(decoded.backupPolicyJson.orEmpty()).getInt("interval_hours"))
+        assertEquals(4, decoded.formatVersion)
+        assertTrue(decoded.integrityVerified)
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun currentBackupRejectsChangedOutboundProfile() {
+        val encoded = JSONObject(
+            backupToJson(
+                parseBackup(
+                    passwordsJson = database("client-a", "Телефон").toString(),
+                    wgKeysDat = null,
+                    createdAt = "02.09.2026 12:00",
+                    sourceHost = "old.example.org",
+                    outboundProfileEnv = "VERSION=1\n"
+                )
+            )
+        )
+        encoded.put(
+            "outbound_profile_env_b64",
+            Base64.getEncoder().encodeToString("VERSION=2\n".toByteArray())
+        )
+
+        parseBackupFile(encoded.toString())
+    }
+
+    @Test
+    fun serverManagedSnapshotBecomesPortableFullBackup() {
+        val database = database("client-a", "Телефон").toString()
+        val keys = List(4) { "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" }.joinToString("\n")
+        val outbound = "VERSION=1\n"
+        val policy = "{\"enabled\":true,\"interval_hours\":12,\"retention_count\":7}"
+        fun stored(path: String, value: String) = ServerStoredBackupFile(
+            path = path,
+            mode = 384,
+            size = value.toByteArray().size.toLong(),
+            sha256 = "",
+            data = value.toByteArray()
+        )
+        val snapshot = ServerStoredBackupDocument(
+            id = "20260902T120000Z-abcdef123456",
+            createdAt = 1_778_000_000L,
+            reason = "scheduled",
+            serverVersion = "16",
+            passwordCount = 1,
+            deviceCount = 0,
+            files = listOf(
+                stored("passwords.json", database),
+                stored("wg-keys.dat", keys),
+                stored("outbound-profile.env", outbound),
+                stored("backup-policy.json", policy)
+            )
+        )
+
+        val portable = portableBackupFromServerSnapshot(snapshot, "new.example.org")
+
+        assertTrue(portable.hasWgKeys)
+        assertEquals(outbound, portable.outboundProfileEnv)
+        assertEquals(policy, portable.backupPolicyJson)
+        assertEquals("new.example.org", portable.sourceHost)
+        assertEquals(1, portable.passwordCount)
+    }
+
+    @Test
+    fun sameServerSnapshotRestoreKeepsItsExactServerSettings() {
+        val source = database("client-a", "Телефон")
+            .put("main_password", "backup-owner")
+            .put("dns", "9.9.9.9")
+            .put("default_ports", "57000,57001,9100")
+            .put("public_ip", "saved.example.org")
+        val backup = parseBackup(
+            passwordsJson = source.toString(),
+            wgKeysDat = null,
+            createdAt = "02.09.2026 12:00",
+            sourceHost = "saved.example.org"
+        ).copy(serverManagedSnapshot = true)
+        val request = DeployRequest(
+            host = "ssh.example.org",
+            user = "root",
+            pass = "ssh-password",
+            privateKey = "",
+            keyPassphrase = "",
+            allowPasswordAuthentication = true,
+            sshPort = 22,
+            mainPass = "current-owner",
+            adminId = "current-admin",
+            botToken = "current-token",
+            dtlsPort = 56000,
+            wgPort = 56001,
+            localPort = 9000,
+            dns1 = "1.1.1.1",
+            dns2 = "1.0.0.1"
+        )
+
+        val restored = JSONObject(normalizeDbForTarget(backup, null, ServerImportMode.Replace, request))
+
+        assertEquals("backup-owner", restored.getString("main_password"))
+        assertEquals("9.9.9.9", restored.getString("dns"))
+        assertEquals("57000,57001,9100", restored.getString("default_ports"))
+        assertEquals("saved.example.org", restored.getString("public_ip"))
     }
 
     @Test

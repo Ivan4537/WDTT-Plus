@@ -34,10 +34,10 @@ class TunnelRecoveryPolicyTest {
     }
 
     @Test
-    fun vkCallsPreflightFailuresKeepTheirCooldownAcrossNativeRestarts() {
+    fun onlyConfirmedVkCallsFloodKeepsCooldownAcrossNativeRestarts() {
         assertEquals(60_000L, vkCallsPreflightCooldownForLog("[VKCalls] VK временно ограничил анонимный вход"))
-        assertEquals(120_000L, vkCallsPreflightCooldownForLog("[VKCalls] VKCalls запросил CAPTCHA; временно не повторяем preflight"))
-        assertEquals(45_000L, vkCallsPreflightCooldownForLog("[VKCalls] preflight не сработал: timeout; временно не повторяем его"))
+        assertEquals(0L, vkCallsPreflightCooldownForLog("[VKCalls] две современные анонимные сессии запросили CAPTCHA"))
+        assertEquals(0L, vkCallsPreflightCooldownForLog("[VKCalls] preflight не сработал после безопасного повтора: timeout"))
         assertEquals(0L, vkCallsPreflightCooldownForLog("[VKCalls] TURN credentials получены"))
     }
 
@@ -119,6 +119,53 @@ class TunnelRecoveryPolicyTest {
                 lastKeepaliveResponseAtMs = 0L,
                 sinceMs = 100_000L,
                 nowMs = 175_000L,
+            ),
+        )
+    }
+
+    @Test
+    fun firstStatsSampleOnlyInitializesBaselineAndDoesNotFakeInboundTraffic() {
+        assertEquals(
+            TrafficSignatureDelta(
+                initializeBaseline = true,
+                downstreamChanged = false,
+                upstreamChanged = false,
+            ),
+            classifyTrafficSignatureDelta(
+                previousDownstream = "",
+                previousUpstream = "",
+                currentDownstream = "0.08",
+                currentUpstream = "0.04",
+            ),
+        )
+    }
+
+    @Test
+    fun onlyARealCounterChangeBecomesFreshTrafficEvidence() {
+        assertEquals(
+            TrafficSignatureDelta(
+                initializeBaseline = false,
+                downstreamChanged = true,
+                upstreamChanged = false,
+            ),
+            classifyTrafficSignatureDelta(
+                previousDownstream = "0.08",
+                previousUpstream = "0.04",
+                currentDownstream = "0.09",
+                currentUpstream = "0.04",
+            ),
+        )
+        assertEquals(
+            TrafficSignatureDelta(
+                initializeBaseline = false,
+                downstreamChanged = false,
+                upstreamChanged = false,
+            ),
+            classifyTrafficSignatureDelta(
+                previousDownstream = "0.08",
+                previousUpstream = "0.04",
+                currentDownstream = "0.08",
+                currentUpstream = "0.04",
             ),
         )
     }
@@ -634,6 +681,38 @@ class TunnelRecoveryPolicyTest {
     }
 
     @Test
+    fun repeatedTransportTimeoutsEnterRecoveryInsteadOfImmediateCriticalStop() {
+        assertEquals(
+            true,
+            shouldDeferRepeatedTransportErrorStop(
+                line = "TURN UDP подключение 91.231.135.175:19302: dial udp: connect: network is unreachable",
+                refusedCount = 400,
+            ),
+        )
+        assertEquals(
+            true,
+            shouldDeferRepeatedTransportErrorStop(
+                line = "read udp timeout",
+                refusedCount = 400,
+            ),
+        )
+        assertEquals(
+            false,
+            shouldDeferRepeatedTransportErrorStop(
+                line = "read udp timeout",
+                refusedCount = 399,
+            ),
+        )
+        assertEquals(
+            false,
+            shouldDeferRepeatedTransportErrorStop(
+                line = "FATAL_AUTH неверный пароль",
+                refusedCount = 400,
+            ),
+        )
+    }
+
+    @Test
     fun confirmedFailureTimestampMustExistAndMatchRequestedWindow() {
         assertEquals(false, hasConfirmedNetworkFailureAtOrAfter(true, 0L, 0L))
         assertEquals(false, hasConfirmedNetworkFailureAtOrAfter(false, 120_000L, 100_000L))
@@ -685,6 +764,64 @@ class TunnelRecoveryPolicyTest {
         assertEquals(
             false,
             shouldReconnectTunnelAfterWake(activeWorkers = 9, confirmedNetworkFailure = false),
+        )
+    }
+
+    @Test
+    fun wakeRecoveryRequiresFreshServerPathAndHasBoundedFinalDecision() {
+        assertEquals(
+            WakeRescueAction.HEALTHY,
+            decideWakeRescueAction(
+                freshTransportPath = true,
+                activeWorkers = 9,
+                confirmedNetworkFailure = false,
+                finalCheck = false,
+            ),
+        )
+        assertEquals(
+            WakeRescueAction.RECONNECT,
+            decideWakeRescueAction(
+                freshTransportPath = false,
+                activeWorkers = 0,
+                confirmedNetworkFailure = false,
+                finalCheck = false,
+            ),
+        )
+        assertEquals(
+            WakeRescueAction.WAIT_FOR_PROBE,
+            decideWakeRescueAction(
+                freshTransportPath = false,
+                activeWorkers = 9,
+                confirmedNetworkFailure = false,
+                finalCheck = false,
+            ),
+        )
+        assertEquals(
+            WakeRescueAction.RECONNECT,
+            decideWakeRescueAction(
+                freshTransportPath = false,
+                activeWorkers = 9,
+                confirmedNetworkFailure = false,
+                finalCheck = true,
+            ),
+        )
+    }
+
+    @Test
+    fun wakeRecoveryIncludesPongThatArrivedBeforeRescueJobStarted() {
+        assertEquals(
+            10_000L,
+            wakeRecoveryReferenceAt(
+                lastDeviceWakeAtMs = 10_000L,
+                nowMs = 10_250L,
+            ),
+        )
+        assertEquals(
+            80_001L,
+            wakeRecoveryReferenceAt(
+                lastDeviceWakeAtMs = 10_000L,
+                nowMs = 80_001L,
+            ),
         )
     }
 

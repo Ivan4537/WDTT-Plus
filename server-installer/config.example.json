@@ -1,0 +1,10 @@
+{
+  "main_password": "CHANGE_ME_USE_A_UNIQUE_PASSWORD",
+  "admin_id": "",
+  "bot_token": "",
+  "dns": "1.1.1.1",
+  "max_passwords": 50,
+  "default_ports": "56000,56001,9000",
+  "passwords": {},
+  "devices": {}
+}

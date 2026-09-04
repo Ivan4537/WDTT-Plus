@@ -620,6 +620,7 @@ fun ServerClientsSection(
             modifier = Modifier
                 .fillMaxWidth()
                 .clip(RoundedCornerShape(24.dp))
+                .remoteFocusOutline(RoundedCornerShape(24.dp))
                 .clickable {
                     val willExpand = !expanded
                     onExpandedChange(willExpand)
@@ -766,6 +767,7 @@ fun ServerClientsSection(
                             modifier = Modifier
                                 .width(if (activeFilterCount > 0) 72.dp else 56.dp)
                                 .requiredHeight(56.dp)
+                                .remoteFocusOutline(RoundedCornerShape(18.dp))
                         ) {
                             Row(
                                 modifier = Modifier.fillMaxSize(),
@@ -2246,7 +2248,9 @@ private fun StatusChip(status: String) {
             "expired" -> MaterialTheme.colorScheme.onErrorContainer
             else -> MaterialTheme.colorScheme.onSurfaceVariant
         },
-        modifier = Modifier.size(30.dp)
+        modifier = Modifier
+            .size(30.dp)
+            .remoteFocusOutline(CircleShape)
     ) {
         Box(contentAlignment = Alignment.Center) {
             Icon(
@@ -2507,6 +2511,8 @@ private fun ClientImportConfirmDialog(
     onDismiss: () -> Unit,
     onConfirm: () -> Unit
 ) {
+    val television = isTelevisionDevice()
+    val scrollState = rememberScrollState()
     val expired = payload.expiresAt > 0 && payload.expiresAt <= System.currentTimeMillis() / 1000L
     val errors = buildList {
         if (passwordConflict) add("На новом сервере уже есть клиент с таким паролем.")
@@ -2521,7 +2527,9 @@ private fun ClientImportConfirmDialog(
         title = { DialogTitle("Проверка импорта", onDismiss) },
         text = {
             Column(
-                modifier = Modifier.verticalScroll(rememberScrollState()),
+                modifier = Modifier
+                    .verticalScroll(scrollState)
+                    .tvDpadScrollable(scrollState, television),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 InfoLine("Клиент", payload.label.ifBlank { "Без имени" })

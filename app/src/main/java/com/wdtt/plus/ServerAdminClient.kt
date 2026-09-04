@@ -4,7 +4,9 @@ import com.jcraft.jsch.ChannelExec
 import com.jcraft.jsch.Session
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
 import org.json.JSONObject
+import java.util.Base64
 
 data class ServerAdminTarget(
     val host: String,
@@ -158,9 +160,65 @@ data class ServerAdminActionResult(
     val createdClient: ServerClientInfo?
 )
 
+data class ServerBackupPolicyInfo(
+    val enabled: Boolean,
+    val intervalHours: Int,
+    val retentionCount: Int
+)
+
+data class ServerStoredBackupInfo(
+    val id: String,
+    val createdAt: Long,
+    val reason: String,
+    val serverVersion: String,
+    val passwordCount: Int,
+    val deviceCount: Int,
+    val sizeBytes: Long,
+    val sha256: String,
+    val valid: Boolean,
+    val error: String,
+    val contentMetadataAvailable: Boolean,
+    val hasWireGuardKeys: Boolean,
+    val hasBackupPolicy: Boolean,
+    val outboundProfileMode: String
+)
+
+data class ServerBackupManagerInfo(
+    val policy: ServerBackupPolicyInfo,
+    val lastAttemptAt: Long,
+    val lastSuccessAt: Long,
+    val lastBackupId: String,
+    val lastError: String,
+    val nextRunAt: Long,
+    val totalBytes: Long,
+    val validCount: Int,
+    val brokenCount: Int,
+    val backups: List<ServerStoredBackupInfo>
+)
+
+data class ServerStoredBackupFile(
+    val path: String,
+    val mode: Int,
+    val size: Long,
+    val sha256: String,
+    val data: ByteArray
+)
+
+data class ServerStoredBackupDocument(
+    val id: String,
+    val createdAt: Long,
+    val reason: String,
+    val serverVersion: String,
+    val passwordCount: Int,
+    val deviceCount: Int,
+    val files: List<ServerStoredBackupFile>
+)
+
 object ServerAdminClient {
     private const val ADMIN_TIMEOUT = 45_000L
     private const val RESTART_TIMEOUT = 70_000L
+    private const val BACKUP_TIMEOUT = 120_000L
+    private const val MAX_BACKUP_DOCUMENT_BYTES = 8 * 1024 * 1024
 
     suspend fun list(target: ServerAdminTarget): ServerAdminState = withContext(Dispatchers.IO) {
         withSession(target) { ssh ->
@@ -333,6 +391,81 @@ object ServerAdminClient {
     suspend fun resetTraffic(target: ServerAdminTarget): ServerAdminActionResult =
         runArgsAction(target, listOf("reset-traffic"))
 
+    suspend fun backupStatus(target: ServerAdminTarget): ServerBackupManagerInfo = withContext(Dispatchers.IO) {
+        withSession(target) { ssh -> parseBackupStatus(callAdmin(ssh, target, listOf("backup-status"), BACKUP_TIMEOUT)) }
+    }
+
+    suspend fun configureBackups(
+        target: ServerAdminTarget,
+        enabled: Boolean,
+        intervalHours: Int,
+        retentionCount: Int
+    ): ServerBackupManagerInfo = withContext(Dispatchers.IO) {
+        require(intervalHours in 6..168) { "Интервал должен быть от 6 до 168 часов" }
+        require(retentionCount in 2..90) { "Количество копий должно быть от 2 до 90" }
+        withSession(target) { ssh ->
+            parseBackupStatus(
+                callAdmin(
+                    ssh,
+                    target,
+                    listOf(
+                        "backup-configure",
+                        "--enabled", enabled.toString(),
+                        "--interval-hours", intervalHours.toString(),
+                        "--retention", retentionCount.toString()
+                    ),
+                    BACKUP_TIMEOUT
+                )
+            )
+        }
+    }
+
+    suspend fun createBackup(
+        target: ServerAdminTarget,
+        reason: String = "manual"
+    ): ServerBackupManagerInfo = withContext(Dispatchers.IO) {
+        require(reason in setOf("manual", "pre_deploy", "pre_restore")) { "Некорректная причина резервной копии" }
+        withSession(target) {
+            ssh -> parseBackupStatus(
+                callAdmin(ssh, target, listOf("backup-create", "--reason", reason), BACKUP_TIMEOUT)
+            )
+        }
+    }
+
+    suspend fun verifyBackup(target: ServerAdminTarget, id: String): ServerStoredBackupInfo = withContext(Dispatchers.IO) {
+        requireBackupId(id)
+        withSession(target) { ssh ->
+            parseBackupInfo(
+                callAdmin(ssh, target, listOf("backup-verify", "--id", id), BACKUP_TIMEOUT)
+                    .getJSONObject("backup")
+            )
+        }
+    }
+
+    suspend fun exportBackup(target: ServerAdminTarget, id: String): ServerStoredBackupDocument = withContext(Dispatchers.IO) {
+        requireBackupId(id)
+        withSession(target) { ssh ->
+            parseBackupDocument(
+                callAdmin(ssh, target, listOf("backup-export", "--id", id), BACKUP_TIMEOUT)
+                    .getJSONObject("backup_document")
+            )
+        }
+    }
+
+    suspend fun deleteBackup(target: ServerAdminTarget, id: String): ServerBackupManagerInfo = withContext(Dispatchers.IO) {
+        requireBackupId(id)
+        withSession(target) { ssh ->
+            parseBackupStatus(
+                callAdmin(
+                    ssh,
+                    target,
+                    listOf("backup-delete", "--id", id, "--confirm", "УДАЛИТЬ"),
+                    BACKUP_TIMEOUT
+                )
+            )
+        }
+    }
+
     suspend fun restart(target: ServerAdminTarget): ServerAdminActionResult =
         withContext(Dispatchers.IO) {
             withSession(target) { ssh ->
@@ -368,23 +501,145 @@ object ServerAdminClient {
         }
     }
 
-    private fun callAdmin(ssh: AdminSshClient, target: ServerAdminTarget, args: List<String>): JSONObject {
-        val command = buildString {
-            append("/usr/local/bin/wdtt-server admin")
-            append(" --config-dir /etc/wdtt")
-            append(" --main-password ")
-            append(shellQuote(target.mainPassword))
-            args.forEach {
-                append(' ')
-                append(shellQuote(it))
-            }
-        }
-        val output = ssh.exec(rootCommand(command), ADMIN_TIMEOUT)
+    private fun callAdmin(
+        ssh: AdminSshClient,
+        target: ServerAdminTarget,
+        args: List<String>,
+        timeout: Long = ADMIN_TIMEOUT
+    ): JSONObject {
+        val request = JSONObject()
+            .put("main_password", target.mainPassword)
+            .put("args", JSONArray(args))
+            .toString()
+        val output = ssh.execRootWithStdin(
+            command = "/usr/local/bin/wdtt-server admin --config-dir /etc/wdtt --request-stdin",
+            stdinPayload = "$request\n",
+            timeout = timeout
+        )
         val json = extractJson(output)
         if (!json.optBoolean("ok", false)) {
             throw IllegalStateException(friendlyAdminError(json.optString("message", output)))
         }
         return json
+    }
+
+    private fun requireBackupId(id: String) {
+        require(Regex("^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$").matches(id)) {
+            "Некорректный идентификатор резервной копии"
+        }
+    }
+
+    private fun parseBackupStatus(response: JSONObject): ServerBackupManagerInfo {
+        val status = response.optJSONObject("backup_status")
+            ?: throw IllegalStateException("сервер не вернул состояние резервного копирования")
+        val policy = status.optJSONObject("policy") ?: JSONObject()
+        val state = status.optJSONObject("state") ?: JSONObject()
+        val backups = buildList {
+            val array = status.optJSONArray("backups") ?: return@buildList
+            for (index in 0 until array.length()) {
+                array.optJSONObject(index)?.let { add(parseBackupInfo(it)) }
+            }
+        }
+        return ServerBackupManagerInfo(
+            policy = ServerBackupPolicyInfo(
+                enabled = policy.optBoolean("enabled", false),
+                intervalHours = policy.optInt("interval_hours", 24).coerceIn(6, 168),
+                retentionCount = policy.optInt("retention_count", 14).coerceIn(2, 90)
+            ),
+            lastAttemptAt = state.optLong("last_attempt_at", 0L),
+            lastSuccessAt = state.optLong("last_success_at", 0L),
+            lastBackupId = state.optString("last_backup_id", ""),
+            lastError = state.optString("last_error", "").take(240),
+            nextRunAt = status.optLong("next_run_at", 0L),
+            totalBytes = status.optLong("total_bytes", 0L).coerceAtLeast(0L),
+            validCount = status.optInt("valid_count", 0).coerceAtLeast(0),
+            brokenCount = status.optInt("broken_count", 0).coerceAtLeast(0),
+            backups = backups
+        )
+    }
+
+    private fun parseBackupInfo(json: JSONObject): ServerStoredBackupInfo = ServerStoredBackupInfo(
+        id = json.optString("id", ""),
+        createdAt = json.optLong("created_at", 0L),
+        reason = json.optString("reason", "").take(40),
+        serverVersion = json.optString("server_version", "").take(32),
+        passwordCount = json.optInt("password_count", 0).coerceIn(0, 500),
+        deviceCount = json.optInt("device_count", 0).coerceIn(0, 2048),
+        sizeBytes = json.optLong("size_bytes", 0L).coerceAtLeast(0L),
+        sha256 = json.optString("sha256", "").lowercase(),
+        valid = json.optBoolean("valid", false),
+        error = json.optString("error", "").take(240),
+        contentMetadataAvailable = json.optBoolean("content_metadata", false),
+        hasWireGuardKeys = json.optBoolean("has_wireguard_keys", false),
+        hasBackupPolicy = json.optBoolean("has_backup_policy", false),
+        outboundProfileMode = json.optString("outbound_profile_mode", "").takeIf {
+            it in setOf("direct", "external_proxy", "tun_interface", "warp_free", "imported_wg", "wireguard_vps", "configured")
+        }.orEmpty()
+    )
+
+    internal fun parseBackupDocument(json: JSONObject): ServerStoredBackupDocument {
+        require(json.optString("format") == "wdtt-server-snapshot") { "неподдерживаемый формат серверной копии" }
+        val version = json.optInt("version", 0)
+        require(version in 1..3) { "неподдерживаемая версия серверной копии" }
+        val id = json.optString("id")
+        requireBackupId(id)
+        var total = 0L
+        val seen = mutableSetOf<String>()
+        val files = buildList {
+            val array = json.optJSONArray("files") ?: throw IllegalArgumentException("в серверной копии нет файлов")
+            require(array.length() in 2..4) { "некорректное число файлов в серверной копии" }
+            for (index in 0 until array.length()) {
+                val item = array.getJSONObject(index)
+                val path = item.getString("path")
+                require(path in setOf("passwords.json", "wg-keys.dat", "outbound-profile.env", "backup-policy.json") && seen.add(path)) {
+                    "недопустимый файл в серверной копии"
+                }
+                val size = item.getLong("size")
+                val limit = when (path) {
+                    "passwords.json" -> 5_000_000L
+                    "wg-keys.dat" -> 4096L
+                    "outbound-profile.env" -> 2L * 1024 * 1024
+                    else -> 64L * 1024
+                }
+                require(item.optInt("mode", 0) == 384) { "небезопасные права файла $path" }
+                require(size in 1..limit) { "некорректный размер файла $path" }
+                val encoded = item.getString("data_b64")
+                require(encoded.length <= (limit * 4 / 3 + 8).toInt()) { "файл $path слишком большой" }
+                val data = Base64.getDecoder().decode(encoded)
+                require(data.size.toLong() == size) { "размер файла $path не совпал" }
+                val expected = item.getString("sha256").lowercase()
+                require(Regex("^[0-9a-f]{64}$").matches(expected)) { "нет контрольной суммы файла $path" }
+                require(java.security.MessageDigest.getInstance("SHA-256").digest(data).joinToString("") { "%02x".format(it) } == expected) {
+                    "контрольная сумма файла $path не совпала"
+                }
+                total += size
+                require(total <= MAX_BACKUP_DOCUMENT_BYTES) { "серверная копия слишком большая" }
+                add(
+                    ServerStoredBackupFile(
+                        path = path,
+                        mode = item.optInt("mode", 0),
+                        size = size,
+                        sha256 = expected,
+                        data = data
+                    )
+                )
+            }
+        }
+        require(files.any { it.path == "passwords.json" } && files.any { it.path == "wg-keys.dat" }) {
+            "в серверной копии нет базы или WireGuard-ключей"
+        }
+        require(version < 3 || files.any { it.path == "backup-policy.json" }) {
+            "в серверной копии нет настроек резервного копирования"
+        }
+        return ServerStoredBackupDocument(
+            id = id,
+            createdAt = json.optLong("created_at", 0L),
+            reason = json.optString("reason", ""),
+            serverVersion = json.optString("server_version", ""),
+            passwordCount = json.optInt("password_count", 0),
+            deviceCount = json.optInt("device_count", 0),
+            files = files
+        )
     }
 
     private fun actionFromResponse(json: JSONObject): ServerAdminActionResult {
@@ -643,10 +898,31 @@ internal fun buildAdminProfilePatchArgs(
 }
 
 private class AdminSshClient(private val session: Session, private val sudoPassword: String) {
-    fun exec(command: String, timeout: Long): String {
+    companion object {
+        private const val MAX_COMMAND_OUTPUT_CHARS = 16_000_000
+    }
+
+    fun execRootWithStdin(command: String, stdinPayload: String, timeout: Long): String {
+        val isRoot = session.userName == "root"
+        if (!isRoot) {
+            exec("sudo -S -p '' -v", 20_000L, sudoPassword + "\n")
+        }
+        val quoted = "'" + command.replace("'", "'\"'\"'") + "'"
+        val rootCommand = if (isRoot) {
+            "bash -c $quoted"
+        } else {
+            "sudo -n bash -c $quoted"
+        }
+        return exec(rootCommand, timeout, stdinPayload)
+    }
+
+    fun exec(command: String, timeout: Long): String = exec(command, timeout, null)
+
+    private fun exec(command: String, timeout: Long, stdinPayload: String?): String {
         if (!session.isConnected) throw IllegalStateException("SSH-сессия разорвана")
         var channel: ChannelExec? = null
-        val result = StringBuilder()
+        val stdout = StringBuilder()
+        val stderr = StringBuilder()
         try {
             channel = session.openChannel("exec") as ChannelExec
             channel.setCommand(command)
@@ -654,12 +930,17 @@ private class AdminSshClient(private val session: Session, private val sudoPassw
             val input = channel.inputStream
             val err = channel.errStream
             channel.connect(15_000)
-            if (command.contains("sudo -S")) {
-                outStream.write("$sudoPassword\n".toByteArray())
+            if (stdinPayload != null) {
+                outStream.write(stdinPayload.toByteArray(Charsets.UTF_8))
+                outStream.flush()
+            } else if (command.contains("sudo -S")) {
+                outStream.write("$sudoPassword\n".toByteArray(Charsets.UTF_8))
                 outStream.flush()
             }
             val reader = input.bufferedReader()
             val errReader = err.bufferedReader()
+            val stdoutBuffer = CharArray(8 * 1024)
+            val stderrBuffer = CharArray(4 * 1024)
             val started = System.currentTimeMillis()
             while (!channel.isClosed || reader.ready() || errReader.ready()) {
                 if (System.currentTimeMillis() - started > timeout) {
@@ -667,16 +948,34 @@ private class AdminSshClient(private val session: Session, private val sudoPassw
                     throw IllegalStateException("timeout")
                 }
                 if (reader.ready()) {
-                    reader.readLine()?.let { result.appendLine(cleanShellLine(it)) }
+                    val read = reader.read(stdoutBuffer)
+                    if (read > 0) {
+                        require(stdout.length + stderr.length + read <= MAX_COMMAND_OUTPUT_CHARS) {
+                            "ответ сервера превышает безопасный размер"
+                        }
+                        stdout.append(stdoutBuffer, 0, read)
+                    }
                 }
                 if (errReader.ready()) {
-                    errReader.readLine()
-                        ?.takeIf { !it.contains("password for", ignoreCase = true) }
-                        ?.let { result.appendLine(cleanShellLine(it)) }
+                    val read = errReader.read(stderrBuffer)
+                    if (read > 0) {
+                        require(stdout.length + stderr.length + read <= MAX_COMMAND_OUTPUT_CHARS) {
+                            "ответ сервера превышает безопасный размер"
+                        }
+                        stderr.append(stderrBuffer, 0, read)
+                    }
                 }
                 if (!reader.ready() && !errReader.ready()) Thread.sleep(80)
             }
-            val output = result.toString().trim()
+            val cleanStdout = cleanShellOutput(stdout.toString()).trim()
+            val cleanStderr = cleanShellOutput(stderr.toString())
+                .lineSequence()
+                .filterNot { it.contains("password for", ignoreCase = true) }
+                .joinToString("\n")
+                .trim()
+            val output = listOf(cleanStdout, cleanStderr)
+                .filter(String::isNotBlank)
+                .joinToString("\n")
             if (channel.exitStatus != 0) {
                 if (output.startsWith("{") && output.endsWith("}")) return output
                 throw IllegalStateException(output.ifBlank { "команда завершилась с кодом ${channel.exitStatus}" })
@@ -690,8 +989,8 @@ private class AdminSshClient(private val session: Session, private val sudoPassw
         }
     }
 
-    private fun cleanShellLine(line: String): String =
-        line.replace(Regex("\u001B\\[[;\\d]*m"), "")
+    private fun cleanShellOutput(value: String): String =
+        value.replace(Regex("\u001B\\[[;\\d]*m"), "")
 }
 
 private fun String.thirdPortOrDefault(default: Int): Int =

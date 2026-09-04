@@ -1,9 +1,11 @@
 package com.wdtt.plus
 
-internal val ALWAYS_BYPASSED_VPN_PACKAGES = setOf(
+internal val LEGACY_DEFAULT_BYPASSED_VPN_PACKAGES = setOf(
     "com.vkontakte.android",
-    "com.vk.calls"
+    "com.vk.calls",
 )
+
+internal val ALWAYS_BYPASSED_VPN_PACKAGES: Set<String> = emptySet()
 
 internal fun isAlwaysBypassedVpnPackage(packageName: String, ownPackageName: String): Boolean {
     return packageName == ownPackageName || packageName in ALWAYS_BYPASSED_VPN_PACKAGES

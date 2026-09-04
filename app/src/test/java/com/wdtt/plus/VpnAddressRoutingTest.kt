@@ -83,6 +83,39 @@ class VpnAddressRoutingTest {
     }
 
     @Test
+    fun rejectsDomainZonesAndIncompleteSingleLabelNamesWithClearReason() {
+        listOf("ru", "su", "рф", "xn--p1ai", "https://ru/").forEach { value ->
+            val error = assertThrows(IllegalArgumentException::class.java) {
+                normalizeVpnAddressRules(value)
+            }
+            assertTrue(error.message.orEmpty().contains("доменная зона"))
+            assertTrue(error.message.orEmpty().contains("точный домен"))
+        }
+    }
+
+    @Test
+    fun legacySingleLabelRuleCanStillBeDecodedWithoutSilentDataLoss() {
+        val encoded = encodeVpnAddressRules(
+            listOf(VpnAddressRule(VpnAddressType.DOMAIN, "ru"))
+        )
+
+        assertEquals(
+            listOf(VpnAddressRule(VpnAddressType.DOMAIN, "ru")),
+            decodeVpnAddressRules(encoded),
+        )
+    }
+
+    @Test
+    fun multilineAddressValidationReportsBadLine() {
+        val error = assertThrows(IllegalArgumentException::class.java) {
+            normalizeVpnAddressRules("example.org\nru\n192.0.2.1")
+        }
+
+        assertTrue(error.message.orEmpty().startsWith("Строка 2:"))
+        assertTrue(error.message.orEmpty().contains("доменная зона"))
+    }
+
+    @Test
     fun codecPreservesValidatedRules() {
         val rules = listOf(
             normalizeVpnAddressRule("example.org"),
@@ -104,6 +137,78 @@ class VpnAddressRoutingTest {
         )
 
         assertEquals(document, decodeVpnRoutingDocument(encodeVpnRoutingDocument(document)))
+    }
+
+    @Test
+    fun routingDocumentExportNormalizesDataAndRemainsImportable() {
+        val encoded = encodeVpnRoutingDocument(
+            VpnRoutingDocument(
+                isWhitelist = false,
+                blacklistApps = listOf(" app.black ", "app.black"),
+                whitelistApps = emptyList(),
+                blacklistAddresses = listOf(
+                    VpnAddressRule(VpnAddressType.SUBNET, "192.168.1.77/24"),
+                    VpnAddressRule(VpnAddressType.SUBNET, "192.168.1.0/24"),
+                ),
+                whitelistAddresses = emptyList(),
+            ),
+        )
+
+        assertEquals(
+            VpnRoutingDocument(
+                isWhitelist = false,
+                blacklistApps = listOf("app.black"),
+                whitelistApps = emptyList(),
+                blacklistAddresses = listOf(VpnAddressRule(VpnAddressType.SUBNET, "192.168.1.0/24")),
+                whitelistAddresses = emptyList(),
+            ),
+            decodeVpnRoutingDocument(encoded),
+        )
+    }
+
+    @Test
+    fun routingDocumentExportNeverSilentlyDropsOversizedAddressLists() {
+        val addresses = (0..128).map { index ->
+            VpnAddressRule(
+                VpnAddressType.IP,
+                "192.0.${index / 256}.${index % 256}",
+            )
+        }
+
+        val error = assertThrows(IllegalArgumentException::class.java) {
+            encodeVpnRoutingDocument(
+                VpnRoutingDocument(false, emptyList(), emptyList(), addresses, emptyList())
+            )
+        }
+
+        assertTrue(error.message.orEmpty().contains("не больше 128"))
+    }
+
+    @Test
+    fun routingDocumentExportNeverCreatesAnUnimportableApplicationList() {
+        val packages = (0..5_000).map { index -> "app.exported.p$index" }
+
+        val error = assertThrows(IllegalArgumentException::class.java) {
+            encodeVpnRoutingDocument(
+                VpnRoutingDocument(false, packages, emptyList(), emptyList(), emptyList())
+            )
+        }
+
+        assertTrue(error.message.orEmpty().contains("слишком большой"))
+    }
+
+    @Test
+    fun routingDocumentExportNeverExceedsItsOwnImportByteLimit() {
+        val longSegment = "a".repeat(235)
+        val packages = (0 until 5_000).map { index -> "app.${longSegment}p$index" }
+
+        val error = assertThrows(IllegalArgumentException::class.java) {
+            encodeVpnRoutingDocument(
+                VpnRoutingDocument(false, packages, emptyList(), emptyList(), emptyList())
+            )
+        }
+
+        assertTrue(error.message.orEmpty().contains("слишком большая для экспорта"))
     }
 
     @Test

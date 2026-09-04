@@ -46,7 +46,7 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
-val appVersionName = "15"
+val appVersionName = "16"
 val releaseApkBaseName = "WDTT-Plus"
 
 val localProperties = Properties()
@@ -90,9 +90,9 @@ android {
         applicationId = "com.wdtt.plus"
         minSdk = 28
         targetSdk = 35
-        versionCode = 15
+        versionCode = 16
         versionName = appVersionName
-        buildConfigField("String", "MOD_RELEASE_DATE", "\"21.08.2026\"")
+        buildConfigField("String", "MOD_RELEASE_DATE", "\"04.09.2026\"")
         buildConfigField("String", "WDTT_PLUS_DOMAIN", buildConfigString(wdttPlusDomain))
         manifestPlaceholders["wdttPlusDomain"] = wdttPlusDomain
         manifestPlaceholders["appLabel"] = "WDTT Plus"
@@ -368,9 +368,8 @@ tasks.matching {
     dependsOn("buildServerAsset")
 }
 
-// Lint reads the source asset/native folders directly. During assembleRelease
-// the generators are in the same task graph, so make their order explicit
-// without forcing public source-only lint runs to build private local artifacts.
+// Native artifacts remain ordered only, so ordinary source-only lint does not
+// build them. The standalone installer is intentionally never an Android asset.
 tasks.matching { it.name.contains("Lint", ignoreCase = true) }.configureEach {
     mustRunAfter("buildServerAsset", "buildNativeClient")
 }
@@ -409,6 +408,32 @@ val nameReleaseApks = tasks.register<Exec>("nameReleaseApks") {
     )
 }
 
+val serverInstallerReleaseScript = rootProject.file("server-installer/release_bundle.sh")
+
+val invalidateGithubReleaseArtifacts = tasks.register<Exec>("invalidateGithubReleaseArtifacts") {
+    group = "distribution"
+    description = "Removes any previous GitHub-ready set before a new release build starts."
+    workingDir(rootProject.layout.projectDirectory.asFile)
+    commandLine(serverInstallerReleaseScript.absolutePath, "invalidate")
+}
+
+val prepareGithubReleaseArtifacts = tasks.register<Exec>("prepareGithubReleaseArtifacts") {
+    group = "distribution"
+    description = "After a successful audited release build, creates one verified GitHub upload set."
+    dependsOn(invalidateGithubReleaseArtifacts, "assembleRelease", "auditReleaseApks")
+    workingDir(rootProject.layout.projectDirectory.asFile)
+    commandLine(serverInstallerReleaseScript.absolutePath, "prepare")
+    mustRunAfter("auditReleaseApks")
+}
+
+val verifyGithubReleaseArtifacts = tasks.register<Exec>("verifyGithubReleaseArtifacts") {
+    group = "verification"
+    description = "Read-only verification of every APK, standalone server archive, and WARP archive."
+    workingDir(rootProject.layout.projectDirectory.asFile)
+    commandLine(serverInstallerReleaseScript.absolutePath, "verify")
+    mustRunAfter(prepareGithubReleaseArtifacts)
+}
+
 val auditReleaseApks = tasks.register<Exec>("auditReleaseApks") {
     group = "verification"
     description = "Runs the configured local source and APK publication audit."
@@ -430,7 +455,21 @@ val auditReleaseApks = tasks.register<Exec>("auditReleaseApks") {
 }
 
 tasks.matching { it.name == "assembleRelease" }.configureEach {
+    mustRunAfter(invalidateGithubReleaseArtifacts)
     finalizedBy(auditReleaseApks)
+}
+
+nameReleaseApks.configure {
+    mustRunAfter(invalidateGithubReleaseArtifacts)
+}
+
+// During GitHub bundle preparation the invalidation task is part of the graph.
+// Make it the first task unconditionally: Gradle may otherwise schedule shared
+// pre-build tasks before tasks whose names explicitly contain "Release".
+tasks.configureEach {
+    if (name != "invalidateGithubReleaseArtifacts") {
+        mustRunAfter(invalidateGithubReleaseArtifacts)
+    }
 }
 
 dependencies {
@@ -450,8 +489,8 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
     implementation("androidx.datastore:datastore-preferences:1.1.1")
     implementation("com.wireguard.android:tunnel:1.0.20260102")
-    implementation("com.github.mwiede:jsch:0.2.16")
-    implementation("org.bouncycastle:bcprov-jdk18on:1.79")
+    implementation("com.github.mwiede:jsch:2.28.7")
+    implementation("org.bouncycastle:bcprov-jdk18on:1.85.2")
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
     implementation("com.google.zxing:core:3.5.4")
     testImplementation("junit:junit:4.13.2")

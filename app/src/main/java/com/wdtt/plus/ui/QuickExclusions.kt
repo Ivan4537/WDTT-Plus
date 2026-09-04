@@ -29,6 +29,7 @@ internal val QuickExclusionExactPackages = setOf(
 
     // Соцсети, связь и магазины приложений
     "com.vkontakte.android",
+    "com.vk.calls",
     "com.vk.im",
     "com.vk.vkvideo",
     "ru.vk.music",

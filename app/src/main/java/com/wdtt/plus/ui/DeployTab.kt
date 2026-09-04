@@ -4,12 +4,21 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
+import android.view.ViewTreeObserver
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandVertically
@@ -17,8 +26,14 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.focusGroup
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
@@ -27,6 +42,8 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.HelpOutline
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.ChevronLeft
+import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
@@ -41,6 +58,8 @@ import com.wdtt.plus.TunnelService
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
@@ -53,13 +72,18 @@ import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.jcraft.jsch.ChannelExec
 import com.jcraft.jsch.ChannelSftp
 import com.jcraft.jsch.Session
@@ -71,6 +95,9 @@ import com.wdtt.plus.DeviceCompatibilityReport
 import com.wdtt.plus.ServerAdminClient
 import com.wdtt.plus.ServerAdminProfileInfo
 import com.wdtt.plus.ServerAdminTarget
+import com.wdtt.plus.ServerBackupManagerInfo
+import com.wdtt.plus.ServerStoredBackupDocument
+import com.wdtt.plus.ServerStoredBackupInfo
 import com.wdtt.plus.SettingsStore
 import com.wdtt.plus.SshCredentials
 import com.wdtt.plus.TunnelManager
@@ -114,11 +141,13 @@ import org.json.JSONObject
 
 private const val CMD_TIMEOUT = 900000L // 15 minutes
 private const val DEPLOY_READY_HOLD_MS = 800L
+internal const val DANGEROUS_SERVER_HOLD_MS = 3_000L
 private const val TUN_STATE_POLL_INTERVAL_MS = 10_000L
-private const val SERVER_BACKUP_FORMAT_VERSION = 2
-private const val MAX_SERVER_BACKUP_FILE_CHARS = 8_000_000
+private const val SERVER_BACKUP_FORMAT_VERSION = 4
+private const val MAX_SERVER_BACKUP_FILE_CHARS = 16_000_000
 private const val MAX_SERVER_DATABASE_CHARS = 5_000_000
 private const val MAX_SERVER_WG_KEYS_CHARS = 4_096
+private const val MAX_SERVER_OUTBOUND_PROFILE_CHARS = 2_000_000
 internal const val WGCF_VERSION = "2.2.32"
 private const val WGCF_LINUX_AMD64_SHA256 = "2ff97f2201972ce582a424455d50a3719a380eef0cd1f3144f7779348e122a2c"
 private const val WGCF_LINUX_AMD64_URL =
@@ -135,7 +164,82 @@ private enum class DeployMode {
     ResetAll
 }
 
-private enum class ServerImportMode {
+internal data class DangerousServerHoldState(
+    val startedAtElapsedMs: Long? = null,
+    val completedForCurrentPress: Boolean = false
+)
+
+internal data class DangerousServerHoldUpdate(
+    val state: DangerousServerHoldState,
+    val remainingMs: Long,
+    val confirmed: Boolean
+)
+
+internal fun advanceDangerousServerHold(
+    current: DangerousServerHoldState,
+    pressed: Boolean,
+    safetyReady: Boolean,
+    nowElapsedMs: Long,
+    durationMs: Long = DANGEROUS_SERVER_HOLD_MS
+): DangerousServerHoldUpdate {
+    val safeDurationMs = durationMs.coerceAtLeast(1L)
+    if (!pressed || !safetyReady) {
+        return DangerousServerHoldUpdate(
+            state = DangerousServerHoldState(),
+            remainingMs = safeDurationMs,
+            confirmed = false
+        )
+    }
+    if (current.completedForCurrentPress) {
+        return DangerousServerHoldUpdate(current, remainingMs = 0L, confirmed = false)
+    }
+
+    val startedAt = current.startedAtElapsedMs ?: nowElapsedMs
+    val elapsedMs = (nowElapsedMs - startedAt).coerceAtLeast(0L)
+    val remainingMs = (safeDurationMs - elapsedMs).coerceAtLeast(0L)
+    val completed = remainingMs == 0L
+    return DangerousServerHoldUpdate(
+        state = DangerousServerHoldState(
+            startedAtElapsedMs = startedAt,
+            completedForCurrentPress = completed
+        ),
+        remainingMs = remainingMs,
+        confirmed = completed
+    )
+}
+
+internal fun hasUnsavedServerBackupSettings(
+    savedEnabled: Boolean?,
+    savedIntervalHours: Int?,
+    savedRetentionCount: Int?,
+    enabledInput: Boolean,
+    intervalInput: String,
+    retentionInput: String
+): Boolean {
+    if (savedEnabled == null || savedIntervalHours == null || savedRetentionCount == null) return false
+    return enabledInput != savedEnabled ||
+        intervalInput.toIntOrNull() != savedIntervalHours ||
+        retentionInput.toIntOrNull() != savedRetentionCount
+}
+
+internal fun serverBackupSettingsAreValid(intervalInput: String, retentionInput: String): Boolean {
+    val intervalHours = intervalInput.toIntOrNull()
+    val retentionCount = retentionInput.toIntOrNull()
+    return intervalHours != null && intervalHours in 6..168 &&
+        retentionCount != null && retentionCount in 2..90
+}
+
+internal fun restoreSectionScrollTarget(
+    currentScroll: Int,
+    titleTopInWindow: Float,
+    viewportTopInWindow: Float,
+    revealOffsetPx: Float,
+    maxScroll: Int
+): Int = (
+    currentScroll + titleTopInWindow - viewportTopInWindow - revealOffsetPx
+).toInt().coerceIn(0, maxScroll.coerceAtLeast(0))
+
+internal enum class ServerImportMode {
     Replace,
     Merge
 }
@@ -303,7 +407,10 @@ internal data class ServerBackup(
     val formatVersion: Int = SERVER_BACKUP_FORMAT_VERSION,
     val integrityVerified: Boolean = true,
     val ownerProfileFromApp: Boolean = false,
-    val passwordProtected: Boolean = false
+    val passwordProtected: Boolean = false,
+    val outboundProfileEnv: String? = null,
+    val backupPolicyJson: String? = null,
+    val serverManagedSnapshot: Boolean = false
 ) {
     val hasWgKeys: Boolean
         get() = !wgKeysDat.isNullOrBlank()
@@ -319,7 +426,7 @@ private data class ServerImportPlan(
     val mode: ServerImportMode
 )
 
-private data class ExistingServerConnection(
+internal data class ExistingServerConnection(
     val host: String,
     val password: String,
     val ports: Triple<Int, Int, Int>,
@@ -344,7 +451,7 @@ private data class DeployServerComparison(
     val checkError: String? = null
 )
 
-private data class DeployRequest(
+internal data class DeployRequest(
     val host: String,
     val user: String,
     val pass: String,
@@ -369,12 +476,47 @@ private data class ExistingInstallInfo(
     val accessDbExists: Boolean,
     val wgKeysExist: Boolean,
     val active: Boolean,
+    val standaloneManaged: Boolean = false,
+    val androidDeployManaged: Boolean = false,
+    val legacyAndroidDeployCandidate: Boolean = false,
     val checkError: String? = null,
     val comparison: DeployServerComparison? = null
 ) {
     val hasAnyTrace: Boolean
         get() = serviceExists || binaryExists || configDirExists || accessDbExists || wgKeysExist
 }
+
+internal enum class DeploymentOwnership {
+    NoInstall,
+    StandaloneInstaller,
+    AndroidDeploy,
+    LegacyAndroidDeploy,
+    UnknownExisting
+}
+
+internal fun existingInstallOwnershipFromFlags(
+    standaloneManaged: Boolean,
+    androidDeployManaged: Boolean,
+    legacyAndroidDeployCandidate: Boolean
+): DeploymentOwnership = when {
+    standaloneManaged -> DeploymentOwnership.StandaloneInstaller
+    androidDeployManaged -> DeploymentOwnership.AndroidDeploy
+    legacyAndroidDeployCandidate -> DeploymentOwnership.LegacyAndroidDeploy
+    else -> DeploymentOwnership.UnknownExisting
+}
+
+internal fun existingInstallAllowsPreservingUpdate(
+    ownership: DeploymentOwnership,
+    checkSucceeded: Boolean
+): Boolean = checkSucceeded && ownership in setOf(
+    DeploymentOwnership.AndroidDeploy,
+    DeploymentOwnership.LegacyAndroidDeploy
+)
+
+internal fun existingInstallAllowsReset(
+    ownership: DeploymentOwnership,
+    checkSucceeded: Boolean
+): Boolean = checkSucceeded && ownership == DeploymentOwnership.AndroidDeploy
 
 internal data class OutboundProfileForms(
     val localProxyPort: String,
@@ -412,6 +554,7 @@ internal data class OutboundServerSnapshot(
     val externalProxyPort: String,
     val externalProxyLogin: String,
     val externalProxyPassword: String,
+    val externalProxyProfileSaved: Boolean = false,
     val wireGuardPresent: Boolean,
     val wireGuardActive: Boolean,
     val wireGuardExitHost: String,
@@ -438,6 +581,7 @@ internal data class OutboundServerSnapshot(
     val externalProxyServiceEnabled: Boolean = externalProxyServiceActive,
     val wireGuardServiceEnabled: Boolean = wireGuardServiceActive,
     val tunInterface: String = "",
+    val tunProfileSaved: Boolean = false,
     val tunPresent: Boolean = false,
     val tunInterfaceActive: Boolean = false,
     val tunServiceActive: Boolean = false,
@@ -492,7 +636,7 @@ internal data class OutboundServerSnapshot(
         get() = tunServiceActive || tunPolicyRuleActive || tunDefaultRouteActive || tunForwardRulesActive
 
     val tunHealthy: Boolean
-        get() = tunInterfaceActive && tunServiceActive && tunServiceEnabled &&
+        get() = tunPresent && tunInterfaceActive && tunServiceActive && tunServiceEnabled &&
             tunPolicyRuleActive && tunDefaultRouteActive && tunForwardRulesActive && tunIpForwardActive
 
     val hasRouteConflict: Boolean
@@ -593,6 +737,7 @@ internal fun outboundModeIndicator(
             snapshot.mode == "external_proxy" -> OutboundModeIndicator(OutboundModeVisualState.Error, "не запущен")
             snapshot.externalProxyRoutingPresent -> OutboundModeIndicator(OutboundModeVisualState.Warning, "остались правила")
             snapshot.externalProxyPresent -> OutboundModeIndicator(OutboundModeVisualState.Warning, "настроен")
+            snapshot.externalProxyProfileSaved -> OutboundModeIndicator(OutboundModeVisualState.Warning, "поля сохранены")
             else -> OutboundModeIndicator(OutboundModeVisualState.Off, "выключен")
         }
     }
@@ -607,6 +752,8 @@ internal fun outboundModeIndicator(
                 OutboundModeIndicator(OutboundModeVisualState.Error, "запущен частично")
             snapshot.mode == "tun_interface" && snapshot.tunPresent ->
                 OutboundModeIndicator(OutboundModeVisualState.Error, "не запущен")
+            snapshot.mode == "tun_interface" ->
+                OutboundModeIndicator(OutboundModeVisualState.Error, "не настроен")
             snapshot.tunRoutingPresent ->
                 OutboundModeIndicator(OutboundModeVisualState.Warning, "остались правила")
             snapshot.tunPresent -> OutboundModeIndicator(OutboundModeVisualState.Warning, "настроен")
@@ -807,10 +954,10 @@ private fun canDeleteImportedWireGuard(snapshot: OutboundServerSnapshot?): Boole
         )
 
 private fun canDeleteExternalProxy(snapshot: OutboundServerSnapshot?): Boolean =
-    snapshot?.externalProxyPresent == true
+    snapshot?.externalProxyPresent == true || snapshot?.externalProxyProfileSaved == true
 
 private fun canDeleteTunInterface(snapshot: OutboundServerSnapshot?): Boolean =
-    snapshot?.tunPresent == true
+    snapshot?.tunPresent == true || snapshot?.tunProfileSaved == true
 
 private fun canDeleteWireGuardVps(snapshot: OutboundServerSnapshot?): Boolean =
     snapshot != null && (
@@ -853,6 +1000,8 @@ private fun outboundDialogServerStateSummary(snapshot: OutboundServerSnapshot, d
             snapshot.externalProxyRoutingPresent -> parts +=
                 "Служба или правило внешнего прокси запущены не полностью. Нажмите «Отключить» для очистки либо включите режим заново."
             snapshot.externalProxyPresent -> parts += "Настройки внешнего прокси найдены, но маршрутизация сейчас не активна."
+            snapshot.externalProxyProfileSaved -> parts +=
+                "На сервере сохранены только поля внешнего прокси для повторного включения; его служба и маршрутизация WDTT не настроены."
             else -> parts += "Внешний TCP-прокси на сервере не настроен."
         }
         OutboundDialog.TunInterface -> when {
@@ -864,6 +1013,8 @@ private fun outboundDialogServerStateSummary(snapshot: OutboundServerSnapshot, d
                 "Служба или правила TUN-выхода запущены не полностью. Нажмите «Отключить» для очистки либо включите режим заново."
             snapshot.tunPresent -> parts +=
                 "Настройка TUN-интерфейса сохранена, но маршрутизация сейчас не активна."
+            snapshot.tunProfileSaved -> parts +=
+                "На сервере сохранено только имя TUN-интерфейса для повторного включения; маршрутизация WDTT через него не настроена."
             else -> parts += "TUN-интерфейс для выхода WDTT на сервере не настроен."
         }
         OutboundDialog.WireGuardVps -> when {
@@ -954,6 +1105,29 @@ fun DeployTab(
     var clientsSectionY by remember { mutableStateOf(0f) }
     var outboundSectionY by remember { mutableStateOf(0f) }
     var migrationSectionY by remember { mutableStateOf(0f) }
+    var deployViewportTopInWindow by remember { mutableStateOf<Float?>(null) }
+    var migrationImportTopInWindow by remember { mutableStateOf<Float?>(null) }
+    var restoreScrollRequestId by remember { mutableIntStateOf(0) }
+
+    LaunchedEffect(restoreScrollRequestId) {
+        if (restoreScrollRequestId == 0) return@LaunchedEffect
+        repeat(30) {
+            withFrameNanos { }
+            val titleTop = migrationImportTopInWindow
+            val viewportTop = deployViewportTopInWindow
+            if (titleTop != null && viewportTop != null) {
+                val target = restoreSectionScrollTarget(
+                    currentScroll = deployScrollState.value,
+                    titleTopInWindow = titleTop,
+                    viewportTopInWindow = viewportTop,
+                    revealOffsetPx = topRevealOffsetPx,
+                    maxScroll = deployScrollState.maxValue
+                )
+                deployScrollState.animateScrollTo(target)
+                return@LaunchedEffect
+            }
+        }
+    }
 
     LaunchedEffect(Unit) { DeployManager.init(context) }
 
@@ -1037,6 +1211,13 @@ fun DeployTab(
     var selectedImportModeName by rememberSaveable { mutableStateOf(ServerImportMode.Replace.name) }
     var migrationBusy by remember { mutableStateOf(false) }
     var migrationStatus by rememberSaveable { mutableStateOf("") }
+    var backupManagerInfo by remember { mutableStateOf<ServerBackupManagerInfo?>(null) }
+    var backupBusy by remember { mutableStateOf(false) }
+    var backupStatusMessage by rememberSaveable { mutableStateOf("") }
+    var backupEnabledInput by rememberSaveable { mutableStateOf(false) }
+    var backupIntervalInput by rememberSaveable { mutableStateOf("24") }
+    var backupRetentionInput by rememberSaveable { mutableStateOf("14") }
+    var pendingBackupDelete by remember { mutableStateOf<ServerStoredBackupInfo?>(null) }
     var existingConnectBusy by remember { mutableStateOf(false) }
     var existingConnectStatus by rememberSaveable { mutableStateOf("") }
     var pendingExistingConnectionApply by remember { mutableStateOf<PendingExistingConnectionApply?>(null) }
@@ -1191,6 +1372,51 @@ fun DeployTab(
         )
     }
     val primarySshAccessReady = primarySshAccessIssue == null
+    val backupAdminTarget = remember(
+        ip,
+        login,
+        password,
+        savedSshPrivateKey,
+        savedSshKeyPassphrase,
+        selectedSshAuthMode,
+        primarySshPort,
+        savedMainPass,
+        primarySshAccessReady
+    ) {
+        if (!primarySshAccessReady || savedMainPass.isBlank()) {
+            null
+        } else {
+            ServerAdminTarget(
+                host = ip.trim(),
+                user = login.ifBlank { "root" },
+                sshPassword = password,
+                sshPrivateKey = sshCredentials.privateKey,
+                sshKeyPassphrase = sshCredentials.privateKeyPassphrase,
+                allowPasswordAuthentication = sshCredentials.allowPasswordAuthentication,
+                sshPort = primarySshPort,
+                mainPassword = savedMainPass
+            )
+        }
+    }
+
+    LaunchedEffect(migrationSectionExpanded, backupAdminTarget) {
+        if (migrationSectionExpanded != true || backupAdminTarget == null || backupBusy) return@LaunchedEffect
+        backupBusy = true
+        backupStatusMessage = "Проверяю резервные копии на сервере..."
+        runCatching { ServerAdminClient.backupStatus(backupAdminTarget) }
+            .onSuccess { state ->
+                backupManagerInfo = state
+                backupEnabledInput = state.policy.enabled
+                backupIntervalInput = state.policy.intervalHours.toString()
+                backupRetentionInput = state.policy.retentionCount.toString()
+                backupStatusMessage = "Состояние резервных копий обновлено."
+            }
+            .onFailure { error ->
+                backupManagerInfo = null
+                backupStatusMessage = "Управление резервными копиями недоступно: ${friendlyDeployError(error, "проверка")}"
+            }
+        backupBusy = false
+    }
 
     LaunchedEffect(selectedSshAuthMode) {
         if (existingConnectStatus.contains("SSH-ключ", ignoreCase = true) ||
@@ -1309,7 +1535,7 @@ fun DeployTab(
             try {
                 writeServerBackupDocumentToUri(context, uri, document)
                 migrationStatus = buildString {
-                    append("${if (backup.hasWgKeys) "Полный" else "Частичный"} защищённый экспорт готов и перечитан: клиентов ${backup.passwordCount}, устройств ${backup.deviceCount}.")
+                    append("${if (backup.hasWgKeys) "Полный" else "Частичный"} защищённый экспорт готов и перечитан: ${backupClientCountLabel(backup.passwordCount)}, ${backupDeviceCountLabel(backup.deviceCount)}.")
                     if (backup.ownerProfileFromApp) append(" Актуальные поля профиля владельца взяты из вкладки «Туннель».")
                 }
             } catch (e: Exception) {
@@ -1399,6 +1625,106 @@ fun DeployTab(
         importedWireGuardConfig = importedWgConfigText,
         tunInterface = tunInterfaceInput
     )
+
+    fun applyBackupManagerState(state: ServerBackupManagerInfo, message: String) {
+        backupManagerInfo = state
+        backupEnabledInput = state.policy.enabled
+        backupIntervalInput = state.policy.intervalHours.toString()
+        backupRetentionInput = state.policy.retentionCount.toString()
+        backupStatusMessage = message
+    }
+
+    fun runBackupStateOperation(
+        progressMessage: String,
+        successMessage: String,
+        action: suspend (ServerAdminTarget) -> ServerBackupManagerInfo
+    ) {
+        val target = backupAdminTarget
+        if (target == null) {
+            backupStatusMessage = if (savedMainPass.isBlank()) {
+                "Укажите главный пароль в разделе «Секреты»."
+            } else {
+                primarySshAccessIssue ?: "Проверьте SSH-доступ к серверу."
+            }
+            return
+        }
+        backupBusy = true
+        backupStatusMessage = progressMessage
+        scope.launch {
+            runCatching { action(target) }
+                .onSuccess { applyBackupManagerState(it, successMessage) }
+                .onFailure { error ->
+                    backupStatusMessage = "Ошибка резервного копирования: ${friendlyDeployError(error, "операция")}"
+                    DeployManager.writeError("Server backup action error: ${error.message}")
+                }
+            backupBusy = false
+        }
+    }
+
+    fun loadStoredBackup(backup: ServerStoredBackupInfo, restore: Boolean) {
+        val target = backupAdminTarget
+        if (target == null) {
+            backupStatusMessage = primarySshAccessIssue ?: "Укажите главный пароль и проверьте SSH-доступ."
+            return
+        }
+        backupBusy = true
+        backupStatusMessage = if (restore) "Проверяю копию для восстановления..." else "Готовлю копию для скачивания..."
+        scope.launch {
+            runCatching {
+                val snapshot = ServerAdminClient.exportBackup(target, backup.id)
+                portableBackupFromServerSnapshot(snapshot, ip.trim())
+            }.onSuccess { portable ->
+                if (restore) {
+                    migrationImportTopInWindow = null
+                    selectedImportBackup = portable.copy(serverManagedSnapshot = true)
+                    selectedImportModeName = ServerImportMode.Replace.name
+                    migrationStatus = ""
+                    backupStatusMessage = "Копия подготовлена для восстановления. Текущий сервер пока не изменён."
+                    restoreScrollRequestId += 1
+                } else {
+                    exportPasswordBackup = portable
+                    migrationBusy = true
+                    backupStatusMessage = "Копия подготовлена. Задайте пароль для файла на устройстве."
+                }
+            }.onFailure { error ->
+                backupStatusMessage = "Не удалось подготовить копию: ${friendlyDeployError(error, "резервная копия")}"
+                DeployManager.writeError("Stored backup export error: ${error.message}")
+            }
+            backupBusy = false
+        }
+    }
+
+    fun prepareSelectedBackupApply(backup: ServerBackup) {
+        if (!primarySshAccessReady) {
+            val issue = primarySshAccessIssue ?: "Для применения проверьте доступ к серверу."
+            if (backup.serverManagedSnapshot) backupStatusMessage = issue else migrationStatus = issue
+            return
+        }
+        val effectiveLogin = if (login.isBlank()) "root" else login
+        val effectiveDtlsPort = if (savedManualPorts) savedServerDtlsPort.coerceIn(1, 65535) else 56000
+        val effectiveWgPort = if (savedManualPorts) savedServerWgPort.coerceIn(1, 65535) else 56001
+        val effectiveLocalPort = if (savedManualPorts) savedListenPort.coerceIn(1, 65535) else 9000
+        val effectiveMainPass = savedMainPass.ifBlank {
+            if (selectedImportMode == ServerImportMode.Replace) backup.mainPassword else ""
+        }
+        pendingDirectImportRequest = DeployRequest(
+            host = ip.trim(),
+            user = effectiveLogin,
+            pass = password,
+            privateKey = sshCredentials.privateKey,
+            keyPassphrase = sshCredentials.privateKeyPassphrase,
+            allowPasswordAuthentication = sshCredentials.allowPasswordAuthentication,
+            sshPort = primarySshPort,
+            mainPass = effectiveMainPass,
+            adminId = savedAdminId,
+            botToken = savedBotToken,
+            dtlsPort = effectiveDtlsPort,
+            wgPort = effectiveWgPort,
+            localPort = effectiveLocalPort,
+            dns1 = dns1,
+            dns2 = dns2
+        )
+    }
 
     suspend fun syncOwnerProfileToServer(
         requestHost: String,
@@ -2038,7 +2364,11 @@ fun DeployTab(
     Column(
         modifier = modifier
             .fillMaxSize()
+            .focusGroup()
             .padding(16.dp)
+            .onGloballyPositioned {
+                deployViewportTopInWindow = it.boundsInWindow().top
+            }
             .verticalScroll(deployScrollState),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
@@ -2179,7 +2509,10 @@ fun DeployTab(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text("Способ входа на сервер", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
-                IconButton(onClick = { showSshAuthHelp = true }, modifier = Modifier.size(32.dp)) {
+                IconButton(
+                    onClick = { showSshAuthHelp = true },
+                    modifier = Modifier.size(32.dp).remoteHelpFocus(),
+                ) {
                     Icon(Icons.AutoMirrored.Filled.HelpOutline, contentDescription = "Как работает вход по SSH", modifier = Modifier.size(20.dp))
                 }
             }
@@ -2505,7 +2838,17 @@ fun DeployTab(
                         existingConnectStatus = "Подключение без установки отменено: локальные данные не изменены. Сервер также не изменялся."
                     }
                 },
-                title = { Text("Данные отличаются") },
+                title = {
+                    DialogTitleWithClose(
+                        title = "Данные отличаются",
+                        onDismiss = {
+                            pendingExistingConnectionApply = null
+                            existingConnectStatus = "Подключение без установки отменено: локальные данные и сервер не изменены."
+                        },
+                        enabled = !existingConnectBusy,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                },
                 text = {
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Text(
@@ -2555,15 +2898,6 @@ fun DeployTab(
                         },
                         enabled = !existingConnectBusy
                     ) { Text("Применить с сервера") }
-                },
-                dismissButton = {
-                    TextButton(
-                        onClick = {
-                            pendingExistingConnectionApply = null
-                            existingConnectStatus = "Подключение без установки отменено: локальные данные и сервер не изменены."
-                        },
-                        enabled = !existingConnectBusy
-                    ) { Text("Отмена") }
                 }
             )
         }
@@ -3064,6 +3398,7 @@ fun DeployTab(
                     modifier = Modifier
                         .fillMaxWidth()
                         .clip(RoundedCornerShape(24.dp))
+                        .remoteFocusOutline(RoundedCornerShape(24.dp))
                         .clickable {
                             val willExpand = !migrationExpanded
                             scope.launch { settingsStore.saveDeployMigrationSectionExpanded(willExpand) }
@@ -3089,7 +3424,7 @@ fun DeployTab(
                         }
                     }
                     Text(
-                        "Перенос сервера",
+                        "Резервные копии и перенос",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold,
                         color = MaterialTheme.colorScheme.onSurface,
@@ -3115,49 +3450,139 @@ fun DeployTab(
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.30f))
+                    Text(
+                        "Резервное копирование",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold
+                    )
+                    ServerBackupManagementCard(
+                        state = backupManagerInfo,
+                        busy = backupBusy || migrationBusy || isDeploying,
+                        statusMessage = backupStatusMessage,
+                        accessIssue = when {
+                            !primarySshAccessReady -> primarySshAccessIssue
+                            savedMainPass.isBlank() -> "Укажите главный пароль в разделе «Секреты»."
+                            else -> null
+                        },
+                        enabledInput = backupEnabledInput,
+                        intervalInput = backupIntervalInput,
+                        retentionInput = backupRetentionInput,
+                        onEnabledChanged = { backupEnabledInput = it },
+                        onIntervalChanged = { backupIntervalInput = it },
+                        onRetentionChanged = { backupRetentionInput = it },
+                        onRefresh = {
+                            runBackupStateOperation(
+                                progressMessage = "Обновляю состояние резервных копий...",
+                                successMessage = "Состояние резервных копий обновлено."
+                            ) { ServerAdminClient.backupStatus(it) }
+                        },
+                        onSave = {
+                            val interval = backupIntervalInput.toIntOrNull()
+                            val retention = backupRetentionInput.toIntOrNull()
+                            if (interval == null || interval !in 6..168 || retention == null || retention !in 2..90) {
+                                backupStatusMessage = "Интервал должен быть 6–168 часов, количество копий — 2–90."
+                            } else {
+                                runBackupStateOperation(
+                                    progressMessage = "Сохраняю настройки и проверяю первую копию...",
+                                    successMessage = if (backupEnabledInput) {
+                                        "Автоматическое резервное копирование включено."
+                                    } else {
+                                        "Автоматическое резервное копирование выключено; существующие копии сохранены."
+                                    }
+                                ) {
+                                    ServerAdminClient.configureBackups(
+                                        target = it,
+                                        enabled = backupEnabledInput,
+                                        intervalHours = interval ?: 24,
+                                        retentionCount = retention ?: 14
+                                    )
+                                }
+                            }
+                        },
+                        onCreate = {
+                            runBackupStateOperation(
+                                progressMessage = "Создаю и проверяю резервную копию...",
+                                successMessage = "Новая резервная копия создана и проверена."
+                            ) { ServerAdminClient.createBackup(it) }
+                        },
+                        onVerify = { backup ->
+                            val target = backupAdminTarget
+                            if (target == null) {
+                                backupStatusMessage = "Укажите главный пароль и проверьте SSH-доступ."
+                            } else {
+                                backupBusy = true
+                                backupStatusMessage = "Повторно проверяю копию..."
+                                scope.launch {
+                                    runCatching { ServerAdminClient.verifyBackup(target, backup.id) }
+                                        .onSuccess {
+                                            backupStatusMessage = "Копия ${formatServerBackupTime(it.createdAt)} исправна; SHA-256 и содержимое совпали."
+                                        }
+                                        .onFailure { error ->
+                                            backupStatusMessage = "Проверка не пройдена: ${friendlyDeployError(error, "копия")}"
+                                        }
+                                    backupBusy = false
+                                }
+                            }
+                        },
+                        onDownload = { loadStoredBackup(it, restore = false) },
+                        onRestore = { loadStoredBackup(it, restore = true) },
+                        onDelete = { pendingBackupDelete = it }
+                    )
+            selectedImportBackup?.takeIf { it.serverManagedSnapshot }?.let { backup ->
+                SelectedBackupApplyCard(
+                    title = "Восстановление выбранной копии",
+                    subtitle = "Продолжение восстановления с текущего VPS. Оно отделено от переноса файлов на другой сервер.",
+                    backup = backup,
+                    selectedMode = selectedImportMode,
+                    busy = migrationBusy || isDeploying,
+                    onModeSelected = { selectedImportModeName = it.name },
+                    onRemove = {
+                        selectedImportBackup = null
+                        migrationImportTopInWindow = null
+                        backupStatusMessage = "Восстановление отменено; сервер не изменён."
+                    },
+                    onApply = { prepareSelectedBackupApply(backup) },
+                    titleModifier = Modifier.onGloballyPositioned {
+                        migrationImportTopInWindow = it.boundsInWindow().top
+                    }
+                )
+            }
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.30f))
             Text(
-                "Экспорт сохраняет базу WDTT Plus: профиль и устройства владельца, настройки Telegram-бота, клиентов, сроки хранения записей, привязки устройств, статистику и историю. Полный экспорт дополнительно сохраняет WireGuard-ключи сервера.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
+                "Перенос сервера",
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.Bold
             )
             Text(
-                "Старые ссылки останутся рабочими, если в них был домен, DNS указывает на новый сервер и при импорте сохранены прежние порты. Для ссылок с IP или при смене портов создайте и отправьте новые. Пароли, привязки и история входят в оба вида экспорта; серверные WireGuard-ключи — только в полный.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            Text(
-                "Настройки выходного IP, прокси, WARP и VPN/WireGuard-файлы этим экспортом не переносятся. После переезда включите нужный режим выхода на новом сервере заново.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            Text(
-                "Новый экспорт шифруется отдельным паролем. Пароль не сохраняется — храните и передавайте его отдельно от файла.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            Text(
-                "Перед импортом приложение проверяет пароль, подлинность, целостность базы и WireGuard-ключей. Старые незашифрованные файлы остаются совместимыми, но требуют особенно осторожного хранения.",
+                "Создайте защищённый файл текущего состояния или загрузите ранее сохранённый файл. " +
+                    "Загрузка только подготавливает данные: сервер изменится после выбора режима и подтверждения.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
 
             Row(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .remoteToggleableRow(
+                        value = exportIncludeWgKeys,
+                        enabled = !migrationBusy && !isDeploying,
+                    ) { exportIncludeWgKeys = it }
+                    .padding(horizontal = 8.dp, vertical = 6.dp),
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
                     Text(
-                        if (exportIncludeWgKeys) "Полный экспорт" else "Частичный экспорт",
+                        if (exportIncludeWgKeys) "С ключами WireGuard" else "Без ключей WireGuard",
                         style = MaterialTheme.typography.bodyMedium,
                         fontWeight = FontWeight.SemiBold,
                         color = MaterialTheme.colorScheme.onSurface
                     )
                     Text(
                         if (exportIncludeWgKeys) {
-                            "База WDTT Plus и WireGuard-ключи сервера. Для полного переезда с сохранением серверной WG-идентичности."
+                            "В файл войдут база, ключи WireGuard и сохранённый профиль выхода. Это переносит серверную WireGuard-идентичность."
                         } else {
-                            "Только база WDTT Plus без серверных WG-ключей. На целевом сервере сохранятся его ключи, а при их отсутствии создадутся новые."
+                            "В файл войдут база и сохранённый профиль выхода без ключей WireGuard. Целевой сервер сохранит свои ключи либо создаст новые."
                         },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -3166,61 +3591,63 @@ fun DeployTab(
                 Switch(
                     checked = exportIncludeWgKeys,
                     enabled = !migrationBusy && !isDeploying,
-                    onCheckedChange = { exportIncludeWgKeys = it }
+                    onCheckedChange = null,
                 )
             }
 
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            Text(
+                "Файл сохраняет профиль выхода, но не переносит сами внешние прокси, отдельные VPN-серверы и TUN-интерфейсы — после импорта проверьте выходной IP. " +
+                    "Старые ссылки сохранятся только при прежних адресе и портах; иначе создайте новые.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            OutlinedButton(
+                onClick = {
+                    if (!primarySshAccessReady) {
+                        migrationStatus = primarySshAccessIssue
+                            ?: "Для экспорта проверьте доступ к серверу."
+                        return@OutlinedButton
+                    }
+                    val effectiveLogin = if (login.isBlank()) "root" else login
+                    val sshPort = primarySshPort
+                    val includeKeys = exportIncludeWgKeys
+                    migrationBusy = true
+                    migrationStatus = "Проверяю сервер и готовлю экспорт..."
+                    scope.launch {
+                        try {
+                            val backup = readServerBackup(
+                                host = ip.trim(),
+                                user = effectiveLogin,
+                                credentials = sshCredentials,
+                                port = sshPort,
+                                includeWgKeys = includeKeys,
+                                localOwnerProfile = currentOwnerProfile(),
+                                localPeer = savedPeer
+                            )
+                            exportPasswordBackup = backup
+                            migrationStatus = "Бэкап подготовлен: ${backupClientCountLabel(backup.passwordCount)}, ${backupDeviceCountLabel(backup.deviceCount)}. Задайте пароль файла."
+                        } catch (e: Exception) {
+                            exportPasswordBackup = null
+                            migrationStatus = "Ошибка экспорта: ${friendlyDeployError(e, "экспорт")}"
+                            DeployManager.writeError("Server export prepare error: ${e.message}")
+                            migrationBusy = false
+                        }
+                    }
+                },
+                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                shape = RoundedCornerShape(16.dp),
+                enabled = !migrationBusy && !isDeploying
             ) {
-                OutlinedButton(
-                    onClick = {
-                        if (!primarySshAccessReady) {
-                            migrationStatus = primarySshAccessIssue
-                                ?: "Для экспорта проверьте доступ к серверу."
-                            return@OutlinedButton
-                        }
-                        val effectiveLogin = if (login.isBlank()) "root" else login
-                        val sshPort = primarySshPort
-                        val includeKeys = exportIncludeWgKeys
-                        migrationBusy = true
-                        migrationStatus = "Проверяю сервер и готовлю экспорт..."
-                        scope.launch {
-                            try {
-                                val backup = readServerBackup(
-                                    host = ip.trim(),
-                                    user = effectiveLogin,
-                                    credentials = sshCredentials,
-                                    port = sshPort,
-                                    includeWgKeys = includeKeys,
-                                    localOwnerProfile = currentOwnerProfile(),
-                                    localPeer = savedPeer
-                                )
-                                exportPasswordBackup = backup
-                                migrationStatus = "Бэкап подготовлен: клиентов ${backup.passwordCount}, устройств ${backup.deviceCount}. Задайте пароль файла."
-                            } catch (e: Exception) {
-                                exportPasswordBackup = null
-                                migrationStatus = "Ошибка экспорта: ${friendlyDeployError(e, "экспорт")}"
-                                DeployManager.writeError("Server export prepare error: ${e.message}")
-                                migrationBusy = false
-                            }
-                        }
-                    },
-                    modifier = Modifier.weight(1f).heightIn(min = 48.dp),
-                    shape = RoundedCornerShape(16.dp),
-                    enabled = !migrationBusy && !isDeploying
-                ) {
-                    Text("Экспорт", fontWeight = FontWeight.SemiBold)
-                }
-                Button(
-                    onClick = { importLauncher.launch("*/*") },
-                    modifier = Modifier.weight(1f).heightIn(min = 48.dp),
-                    shape = RoundedCornerShape(16.dp),
-                    enabled = !migrationBusy && !isDeploying
-                ) {
-                    Text("Импорт", fontWeight = FontWeight.SemiBold)
-                }
+                Text("Создать файл", fontWeight = FontWeight.SemiBold, maxLines = 1)
+            }
+            Button(
+                onClick = { importLauncher.launch("*/*") },
+                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                shape = RoundedCornerShape(16.dp),
+                enabled = !migrationBusy && !isDeploying
+            ) {
+                Text("Загрузить файл", fontWeight = FontWeight.SemiBold, maxLines = 1)
             }
 
             if (migrationBusy || migrationStatus.isNotBlank()) {
@@ -3229,110 +3656,20 @@ fun DeployTab(
                 InlineActionMessage("Экспорт и применение импорта пока недоступны: $primarySshAccessIssue")
             }
 
-            selectedImportBackup?.let { backup ->
-                Surface(
-                    shape = RoundedCornerShape(16.dp),
-                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
-                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.25f))
-                ) {
-                    Column(
-                        modifier = Modifier.fillMaxWidth().padding(12.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Text(
-                            "Выбран ${if (backup.hasWgKeys) "полный" else "частичный"} бэкап: ${backup.passwordCount} клиентов, ${backup.deviceCount} устройств${if (backup.hasWgKeys) ", WG-ключи сервера включены" else ", без WG-ключей сервера"}.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurface
-                        )
-                        Text(
-                            if (backup.passwordProtected) {
-                                "Файл защищён паролем; подлинность и целостность подтверждены."
-                            } else if (backup.integrityVerified) {
-                                "Целостность подтверждена, но старый файл не зашифрован."
-                            } else {
-                                "Старый незашифрованный формат: контрольной суммы в файле нет."
-                            },
-                            style = MaterialTheme.typography.bodySmall,
-                            color = if (backup.passwordProtected) {
-                                MaterialTheme.colorScheme.primary
-                            } else {
-                                MaterialTheme.colorScheme.error
-                            }
-                        )
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                            FilterChip(
-                                selected = selectedImportMode == ServerImportMode.Replace,
-                                onClick = { selectedImportModeName = ServerImportMode.Replace.name },
-                                label = { Text("Заменить") },
-                                enabled = !isDeploying,
-                                modifier = Modifier.weight(1f)
-                            )
-                            FilterChip(
-                                selected = selectedImportMode == ServerImportMode.Merge,
-                                onClick = { selectedImportModeName = ServerImportMode.Merge.name },
-                                label = { Text("Добавить") },
-                                enabled = !isDeploying,
-                                modifier = Modifier.weight(1f)
-                            )
-                        }
-                        Text(
-                            if (selectedImportMode == ServerImportMode.Replace) {
-                                "Заменить: база сервера будет перезаписана бэкапом. Это режим для переезда на новый сервер."
-                            } else {
-                                "Добавить: текущие настройки сервера сохранятся, отсутствующие клиенты и устройства будут добавлены без перезаписи конфликтов."
-                            },
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                        TextButton(
-                            onClick = {
-                                selectedImportBackup = null
-                                migrationStatus = ""
-                            },
-                            enabled = !isDeploying
-                        ) {
-                            Text("Убрать импорт")
-                        }
-                        Button(
-                            onClick = {
-                                if (!primarySshAccessReady) {
-                                    migrationStatus = primarySshAccessIssue
-                                        ?: "Для импорта проверьте доступ к серверу."
-                                    return@Button
-                                }
-                                val effectiveLogin = if (login.isBlank()) "root" else login
-                                val effectiveDtlsPort = if (savedManualPorts) savedServerDtlsPort.coerceIn(1, 65535) else 56000
-                                val effectiveWgPort = if (savedManualPorts) savedServerWgPort.coerceIn(1, 65535) else 56001
-                                val effectiveLocalPort = if (savedManualPorts) savedListenPort.coerceIn(1, 65535) else 9000
-                                val effectiveMainPass = savedMainPass.ifBlank {
-                                    if (selectedImportMode == ServerImportMode.Replace) backup.mainPassword else ""
-                                }
-                                pendingDirectImportRequest = DeployRequest(
-                                    host = ip.trim(),
-                                    user = effectiveLogin,
-	                                    pass = password,
-	                                    privateKey = sshCredentials.privateKey,
-	                                    keyPassphrase = sshCredentials.privateKeyPassphrase,
-	                                    allowPasswordAuthentication = sshCredentials.allowPasswordAuthentication,
-	                                    sshPort = primarySshPort,
-                                    mainPass = effectiveMainPass,
-                                    adminId = savedAdminId,
-                                    botToken = savedBotToken,
-                                    dtlsPort = effectiveDtlsPort,
-                                    wgPort = effectiveWgPort,
-                                    localPort = effectiveLocalPort,
-                                    dns1 = dns1,
-                                    dns2 = dns2
-                                )
-                            },
-                            enabled = !migrationBusy && !isDeploying,
-                            modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
-                            shape = RoundedCornerShape(16.dp)
-                        ) {
-                            Text("Импортировать сейчас", fontWeight = FontWeight.Bold)
-                        }
-                    }
-                }
+            selectedImportBackup?.takeUnless { it.serverManagedSnapshot }?.let { backup ->
+                SelectedBackupApplyCard(
+                    title = "Применение файла переноса",
+                    subtitle = "Продолжение работы с файлом, выбранным на устройстве. Серверные копии выше управляются отдельно.",
+                    backup = backup,
+                    selectedMode = selectedImportMode,
+                    busy = migrationBusy || isDeploying,
+                    onModeSelected = { selectedImportModeName = it.name },
+                    onRemove = {
+                        selectedImportBackup = null
+                        migrationStatus = ""
+                    },
+                    onApply = { prepareSelectedBackupApply(backup) }
+                )
             }
 
             if (migrationBusy && isDeploying) {
@@ -3346,6 +3683,20 @@ fun DeployTab(
                 }
             }
         }
+        }
+
+        pendingBackupDelete?.let { backup ->
+            ServerBackupDeleteConfirmDialog(
+                backup = backup,
+                onDismiss = { pendingBackupDelete = null },
+                onConfirm = {
+                    pendingBackupDelete = null
+                    runBackupStateOperation(
+                        progressMessage = "Удаляю выбранную резервную копию...",
+                        successMessage = "Резервная копия удалена. Последняя исправная копия всегда сохраняется."
+                    ) { ServerAdminClient.deleteBackup(it, backup.id) }
+                }
+            )
         }
 
         exportPasswordBackup?.let { backup ->
@@ -3362,8 +3713,7 @@ fun DeployTab(
                     pendingExportDocument = document
                     migrationStatus = "Защищённый бэкап подготовлен. Выберите место сохранения."
                     val stamp = SimpleDateFormat("yyyyMMdd-HHmm", Locale.US).format(Date())
-                    val safeHost = ip.replace(Regex("[^A-Za-z0-9_.-]"), "_").ifBlank { "server" }
-                    exportLauncher.launch("wdtt-backup-$safeHost-$stamp.wdtt-backup")
+                    exportLauncher.launch("WDTT-Backup-$stamp.wdtt-backup")
                 },
                 onError = { message ->
                     migrationStatus = "Ошибка защиты экспорта: $message"
@@ -3734,6 +4084,7 @@ private fun OutboundRoutingSection(
             modifier = Modifier
                 .fillMaxWidth()
                 .clip(RoundedCornerShape(24.dp))
+                .remoteFocusOutline(RoundedCornerShape(24.dp))
                 .clickable(onClick = onToggleExpanded)
                 .padding(vertical = 2.dp),
             horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -4494,7 +4845,10 @@ private fun WireGuardExitVpsDialog(
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text("Вход на дополнительный VPS", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
-            IconButton(onClick = onSshHelp, modifier = Modifier.size(32.dp)) {
+            IconButton(
+                onClick = onSshHelp,
+                modifier = Modifier.size(32.dp).remoteHelpFocus(),
+            ) {
                 Icon(Icons.AutoMirrored.Filled.HelpOutline, contentDescription = "Как работает вход по SSH", modifier = Modifier.size(20.dp))
             }
         }
@@ -4743,6 +5097,7 @@ private fun FreeWarpDialog(
             modifier = Modifier
                 .fillMaxWidth()
                 .clip(RoundedCornerShape(16.dp))
+                .remoteFocusOutline(RoundedCornerShape(16.dp), enabled = !busy)
                 .clickable(enabled = !busy) { termsAccepted = !termsAccepted },
             shape = RoundedCornerShape(16.dp),
             color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)
@@ -4941,7 +5296,7 @@ private fun TunInterfaceDialog(
             IconButton(
                 onClick = { showSetupHelp = true },
                 enabled = !busy,
-                modifier = Modifier.size(32.dp)
+                modifier = Modifier.size(32.dp).remoteHelpFocus(enabled = !busy)
             ) {
                 Icon(
                     Icons.AutoMirrored.Filled.HelpOutline,
@@ -4983,6 +5338,10 @@ private fun TunInterfaceDialog(
                         modifier = Modifier
                             .fillMaxWidth()
                             .clip(RoundedCornerShape(8.dp))
+                            .remoteFocusOutline(
+                                RoundedCornerShape(8.dp),
+                                enabled = !busy && !candidatesBusy,
+                            )
                             .clickable(enabled = !busy && !candidatesBusy) {
                                 onInterfaceChanged(candidate.name)
                             },
@@ -5061,9 +5420,16 @@ private fun TunInterfaceDialog(
     }
     if (showSetupHelp) {
         val configuration = LocalConfiguration.current
-        val helpMaxHeight = (configuration.screenHeightDp.dp * 0.56f).coerceAtMost(460.dp)
+        val television = isTelevisionDevice()
+        val helpScrollState = rememberScrollState()
+        val helpMaxHeight = if (television) {
+            (configuration.screenHeightDp.dp * 0.72f).coerceAtMost(620.dp)
+        } else {
+            (configuration.screenHeightDp.dp * 0.56f).coerceAtMost(460.dp)
+        }
         AlertDialog(
             onDismissRequest = { showSetupHelp = false },
+            modifier = Modifier.televisionDialogWidth(television),
             title = {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -5075,7 +5441,7 @@ private fun TunInterfaceDialog(
                     )
                     IconButton(
                         onClick = { showSetupHelp = false },
-                        modifier = Modifier.size(36.dp)
+                        modifier = Modifier.size(36.dp).remoteIconButtonFocus()
                     ) {
                         Icon(
                             Icons.Default.Close,
@@ -5089,7 +5455,8 @@ private fun TunInterfaceDialog(
                 Column(
                     modifier = Modifier
                         .heightIn(max = helpMaxHeight)
-                        .verticalScroll(rememberScrollState()),
+                        .verticalScroll(helpScrollState)
+                        .tvDpadScrollable(helpScrollState, television),
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     Text("1. Создайте и запустите TUN-интерфейс в Xray, sing-box или другом приложении на этом сервере.")
@@ -5101,7 +5468,8 @@ private fun TunInterfaceDialog(
             },
             confirmButton = {
                 TextButton(onClick = { showSetupHelp = false }) { Text("Понятно") }
-            }
+            },
+            properties = DialogProperties(usePlatformDefaultWidth = !television),
         )
     }
     if (confirmDelete) {
@@ -5422,7 +5790,10 @@ private fun OutboundDialogFrame(
                             style = MaterialTheme.typography.titleLarge,
                             fontWeight = FontWeight.Bold
                         )
-                        IconButton(onClick = onDismiss) {
+                        IconButton(
+                            onClick = onDismiss,
+                            modifier = Modifier.remoteIconButtonFocus(),
+                        ) {
                             Icon(Icons.Default.Close, contentDescription = "Закрыть")
                         }
                     }
@@ -6463,9 +6834,10 @@ private class SSHClient(private val session: Session, private val pass: String) 
 
         return try {
             channel = session.openChannel("exec") as ChannelExec
-            val cmd = if (command.contains("sudo") && !command.contains("sudo -S")) {
-                command.replace("sudo ", "sudo -S ")
-            } else command
+            // Root-команды сами явно выбирают sudo -S. Нельзя переписывать
+            // произвольный текст: строка `command -v sudo` — это проверка
+            // наличия программы, а не её запуск.
+            val cmd = command
 
             channel.setCommand(cmd)
             val outStream = channel.outputStream
@@ -6556,17 +6928,17 @@ private fun shellQuote(value: String): String {
     return "'" + value.replace("'", "'\"'\"'") + "'"
 }
 
-private fun rootCommand(command: String): String {
+internal fun rootCommand(command: String): String {
     val quoted = shellQuote(command)
-    return "if command -v sudo >/dev/null 2>&1; then sudo bash -c $quoted; " +
-        "elif [ \"\$(id -u)\" = \"0\" ]; then bash -c $quoted; " +
+    return "if [ \"\$(id -u)\" = \"0\" ]; then bash -c $quoted; " +
+        "elif command -v sudo >/dev/null 2>&1; then sudo -S -p '' bash -c $quoted; " +
         "else echo 'error: root privileges required and sudo not found'; exit 1; fi"
 }
 
 private fun rootShCommand(command: String): String {
     val quoted = shellQuote(command)
-    return "if command -v sudo >/dev/null 2>&1; then sudo -S sh -c $quoted; " +
-        "elif [ \"\$(id -u)\" = \"0\" ]; then sh -c $quoted; " +
+    return "if [ \"\$(id -u)\" = \"0\" ]; then sh -c $quoted; " +
+        "elif command -v sudo >/dev/null 2>&1; then sudo -S -p '' sh -c $quoted; " +
         "else echo 'error: root privileges required and sudo not found'; exit 1; fi"
 }
 
@@ -6642,6 +7014,7 @@ private suspend fun runCheckedRootScript(
 
 internal fun outboundShellPrelude(): String = """
     set -e
+    umask 077
     WDTT_SUBNET="${'$'}(ip -4 route show dev wdtt0 scope link 2>/dev/null | awk '{print ${'$'}1; exit}')"
     [ -n "${'$'}WDTT_SUBNET" ] || WDTT_SUBNET="10.66.66.0/24"
     WDTT_IFACE="wdtt0"
@@ -6653,7 +7026,7 @@ internal fun outboundShellPrelude(): String = """
     WDTT_TUN_PRIORITY="90"
     WDTT_TUN_CONFIG_FILE="/etc/wdtt-plus/tun-exit/interface"
     WDTT_TUN_OWNER_FILE="/etc/wdtt-plus/tun-exit/owner"
-    mkdir -p /etc/wdtt /etc/wdtt/outbound /etc/wdtt-plus/wg-exit /etc/wdtt-plus/tun-exit
+    install -d -m 0700 /etc/wdtt /etc/wdtt/outbound /etc/wdtt-plus /etc/wdtt-plus/wg-exit /etc/wdtt-plus/tun-exit
     wdtt_ext_iface() {
       ip -o route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if (${'$'}i=="dev") {print ${'$'}(i+1); exit}}'
     }
@@ -6856,6 +7229,7 @@ internal fun outboundShellPrelude(): String = """
       "updatedAt": "$(date -Is)"
     }
     EOF
+      chmod 0600 /etc/wdtt/outbound.json
     }
 """.trimIndent()
 
@@ -7263,8 +7637,10 @@ internal fun outboundSnapshotScript(): String = shellScript(
         *) EXTERNAL_KIND="${'$'}REDSOCKS_KIND";;
       esac
     fi
+    EXTERNAL_PROXY_PROFILE_SAVED=0
     if wdtt_profile_has_key EXTERNAL_PROXY_HOST_B64; then
       EXTERNAL_HOST_B64="${'$'}(wdtt_profile_value EXTERNAL_PROXY_HOST_B64)"
+      [ -n "${'$'}EXTERNAL_HOST_B64" ] && EXTERNAL_PROXY_PROFILE_SAVED=1
     else
       EXTERNAL_HOST="${'$'}DETAIL_HOST"
       [ -n "${'$'}EXTERNAL_HOST" ] || EXTERNAL_HOST="${'$'}(wdtt_redsocks_value ip)"
@@ -7287,7 +7663,7 @@ internal fun outboundSnapshotScript(): String = shellScript(
       EXTERNAL_PASSWORD_B64="${'$'}(wdtt_b64 "$(wdtt_redsocks_value password)")"
     fi
     EXTERNAL_PRESENT=0
-    if [ -f /etc/wdtt/redsocks.conf ] || [ "${'$'}MODE" = "external_proxy" ] || [ -n "${'$'}EXTERNAL_HOST_B64" ]; then
+    if [ -f /etc/wdtt/redsocks.conf ]; then
       EXTERNAL_PRESENT=1
     fi
     if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet wdtt-redsocks 2>/dev/null; then
@@ -7431,22 +7807,24 @@ internal fun outboundSnapshotScript(): String = shellScript(
       WG_MATCHES_WARP=1
     fi
 
-    TUN_INTERFACE="${'$'}(cat "${'$'}WDTT_TUN_CONFIG_FILE" 2>/dev/null | head -n 1)"
+    TUN_CONFIG_INTERFACE="${'$'}(cat "${'$'}WDTT_TUN_CONFIG_FILE" 2>/dev/null | head -n 1)"
+    TUN_INTERFACE="${'$'}TUN_CONFIG_INTERFACE"
+    TUN_PROFILE_SAVED=0
     if wdtt_profile_has_key TUN_INTERFACE_B64; then
       TUN_INTERFACE_B64="${'$'}(wdtt_profile_value TUN_INTERFACE_B64)"
+      [ -n "${'$'}TUN_INTERFACE_B64" ] && TUN_PROFILE_SAVED=1
       if [ -z "${'$'}TUN_INTERFACE" ] && [ -n "${'$'}TUN_INTERFACE_B64" ] && command -v base64 >/dev/null 2>&1; then
         TUN_INTERFACE="${'$'}(printf '%s' "${'$'}TUN_INTERFACE_B64" | base64 -d 2>/dev/null || true)"
       fi
     else
       TUN_INTERFACE_B64="${'$'}(wdtt_b64 "${'$'}TUN_INTERFACE")"
     fi
+    TUN_OWNED=0
+    [ "${'$'}(cat "${'$'}WDTT_TUN_OWNER_FILE" 2>/dev/null | head -n 1)" = WDTT_TUN_EXIT_V1 ] && TUN_OWNED=1
     TUN_PRESENT=0
-    if [ "${'$'}MODE" = "tun_interface" ] || [ -n "${'$'}TUN_INTERFACE" ] ||
-       [ -n "${'$'}TUN_INTERFACE_B64" ] || [ -e "${'$'}WDTT_TUN_OWNER_FILE" ] ||
-       [ -e "${'$'}WDTT_TUN_CONFIG_FILE" ] ||
-       [ -f /etc/systemd/system/wdtt-tun-exit.service ] ||
-       [ -x /usr/local/lib/wdtt/tun-exit-route ] ||
-       [ -x /usr/local/lib/wdtt/tun-exit-watch ]; then
+    # Сохранённое поле имени нужно лишь для повторного включения. Оно не
+    # означает, что WDTT уже настроил маршрутизацию через внешний TUN.
+    if [ "${'$'}TUN_OWNED" = 1 ]; then
       TUN_PRESENT=1
     fi
     TUN_INTERFACE_ACTIVE=0
@@ -7456,7 +7834,6 @@ internal fun outboundSnapshotScript(): String = shellScript(
     fi
     if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet wdtt-tun-exit.service 2>/dev/null; then
       TUN_SERVICE_ACTIVE=1
-      TUN_PRESENT=1
     else
       TUN_SERVICE_ACTIVE=0
     fi
@@ -7507,6 +7884,7 @@ internal fun outboundSnapshotScript(): String = shellScript(
     printf 'WDTT_EXTERNAL_PROXY_PORT=%s\n' "${'$'}EXTERNAL_PORT"
     printf 'WDTT_EXTERNAL_PROXY_LOGIN_B64=%s\n' "${'$'}EXTERNAL_LOGIN_B64"
     printf 'WDTT_EXTERNAL_PROXY_PASSWORD_B64=%s\n' "${'$'}EXTERNAL_PASSWORD_B64"
+    printf 'WDTT_EXTERNAL_PROXY_PROFILE_SAVED=%s\n' "${'$'}EXTERNAL_PROXY_PROFILE_SAVED"
     printf 'WDTT_WG_PRESENT=%s\n' "${'$'}WG_PRESENT"
     printf 'WDTT_WG_ACTIVE=%s\n' "${'$'}WG_ACTIVE"
     printf 'WDTT_WG_INTERFACE_ACTIVE=%s\n' "${'$'}WG_INTERFACE_ACTIVE"
@@ -7528,6 +7906,7 @@ internal fun outboundSnapshotScript(): String = shellScript(
     printf 'WDTT_WARP_MTU=%s\n' "${'$'}WG_MTU"
     printf 'WDTT_IMPORTED_WG_CONFIG_B64=%s\n' "${'$'}IMPORTED_WG_CONFIG_B64"
     printf 'WDTT_TUN_INTERFACE_B64=%s\n' "${'$'}TUN_INTERFACE_B64"
+    printf 'WDTT_TUN_PROFILE_SAVED=%s\n' "${'$'}TUN_PROFILE_SAVED"
     printf 'WDTT_TUN_PRESENT=%s\n' "${'$'}TUN_PRESENT"
     printf 'WDTT_TUN_INTERFACE_ACTIVE=%s\n' "${'$'}TUN_INTERFACE_ACTIVE"
     printf 'WDTT_TUN_SERVICE_ACTIVE=%s\n' "${'$'}TUN_SERVICE_ACTIVE"
@@ -7555,7 +7934,7 @@ private suspend fun readOutboundServerSnapshot(
     return parseOutboundServerSnapshot(output)
 }
 
-private fun parseOutboundServerSnapshot(output: String): OutboundServerSnapshot {
+internal fun parseOutboundServerSnapshot(output: String): OutboundServerSnapshot {
     fun value(name: String): String = markerValue(output, name).orEmpty()
     fun decoded(name: String): String {
         val raw = value(name)
@@ -7580,6 +7959,7 @@ private fun parseOutboundServerSnapshot(output: String): OutboundServerSnapshot 
         externalProxyPort = value("WDTT_EXTERNAL_PROXY_PORT"),
         externalProxyLogin = decoded("WDTT_EXTERNAL_PROXY_LOGIN_B64"),
         externalProxyPassword = decoded("WDTT_EXTERNAL_PROXY_PASSWORD_B64"),
+        externalProxyProfileSaved = flag("WDTT_EXTERNAL_PROXY_PROFILE_SAVED"),
         wireGuardPresent = flag("WDTT_WG_PRESENT"),
         wireGuardActive = flag("WDTT_WG_ACTIVE"),
         wireGuardExitHost = decoded("WDTT_WG_VPS_HOST_B64"),
@@ -7605,6 +7985,7 @@ private fun parseOutboundServerSnapshot(output: String): OutboundServerSnapshot 
         externalProxyServiceEnabled = flag("WDTT_EXTERNAL_PROXY_SERVICE_ENABLED"),
         wireGuardServiceEnabled = flag("WDTT_WG_SERVICE_ENABLED"),
         tunInterface = decoded("WDTT_TUN_INTERFACE_B64"),
+        tunProfileSaved = flag("WDTT_TUN_PROFILE_SAVED"),
         tunPresent = flag("WDTT_TUN_PRESENT"),
         tunInterfaceActive = flag("WDTT_TUN_INTERFACE_ACTIVE"),
         tunServiceActive = flag("WDTT_TUN_SERVICE_ACTIVE"),
@@ -7627,6 +8008,8 @@ private fun outboundRestoreSummary(snapshot: OutboundServerSnapshot): String {
     }
     if (snapshot.externalProxyPresent) {
         parts += if (snapshot.externalProxyActive) "Внешний TCP-прокси включён." else "Поля внешнего TCP-прокси заполнены."
+    } else if (snapshot.externalProxyProfileSaved) {
+        parts += "Сохранены только поля внешнего TCP-прокси; служба и маршрутизация WDTT не настроены."
     }
     if (snapshot.wireGuardPresent) {
         parts += if (snapshot.wireGuardActive) "WireGuard-выход найден и запущен." else "Поля WireGuard-выхода заполнены."
@@ -7637,6 +8020,8 @@ private fun outboundRestoreSummary(snapshot: OutboundServerSnapshot): String {
         } else {
             "Настройка TUN-интерфейса ${snapshot.tunInterface.ifBlank { "без имени" }} найдена, но маршрут сейчас не активен."
         }
+    } else if (snapshot.tunProfileSaved) {
+        parts += "Сохранено только имя TUN-интерфейса для повторного включения; маршрутизация WDTT через него не настроена."
     }
     if (snapshot.mode == "warp_free") {
         parts += if (snapshot.wireGuardActive) {
@@ -10334,7 +10719,8 @@ private suspend fun checkExistingInstall(
 					"printf 'CONFIG_DIR=%s\\n' \"$([ -d /etc/wdtt ] && echo 1 || echo 0)\"; " +
 					"printf 'ACCESS_DB=%s\\n' \"$([ -f /etc/wdtt/passwords.json ] && echo 1 || echo 0)\"; " +
 					"printf 'WG_KEYS=%s\\n' \"$([ -f /etc/wdtt/wg-keys.dat ] && echo 1 || echo 0)\"; " +
-					"printf 'ACTIVE=%s\\n' \"$(systemctl is-active wdtt 2>/dev/null || true)\""
+					"printf 'ACTIVE=%s\\n' \"$(systemctl is-active wdtt 2>/dev/null || true)\"; " +
+                    standaloneInstallerOwnershipProbeScript()
 			),
 			timeout = 15000L
 		)
@@ -10348,7 +10734,10 @@ private suspend fun checkExistingInstall(
 			configDirExists = flag("CONFIG_DIR"),
 			accessDbExists = flag("ACCESS_DB"),
 			wgKeysExist = flag("WG_KEYS"),
-			active = Regex("^ACTIVE=active$", RegexOption.MULTILINE).containsMatchIn(output)
+			active = Regex("^ACTIVE=active$", RegexOption.MULTILINE).containsMatchIn(output),
+			standaloneManaged = markerValue(output, "WDTT_STANDALONE_MANAGED") == "1",
+            androidDeployManaged = markerValue(output, "WDTT_ANDROID_DEPLOY_MANAGED") == "1",
+            legacyAndroidDeployCandidate = markerValue(output, "WDTT_LEGACY_ANDROID_DEPLOY_CANDIDATE") == "1"
 		)
 	} finally {
 		try { session?.disconnect() } catch (_: Exception) {}
@@ -10357,6 +10746,106 @@ private suspend fun checkExistingInstall(
 
 private fun markerValue(output: String, name: String): String? =
     Regex("^$name=(.*)$", setOf(RegexOption.MULTILINE)).find(output)?.groupValues?.getOrNull(1)?.trim()
+
+internal fun standaloneInstallerOwnershipProbeScript(pathPrefix: String = ""): String {
+    val normalizedPrefix = pathPrefix.trimEnd('/')
+    return """
+    root_prefix=${shellQuote(normalizedPrefix)}
+    ownership="${'$'}root_prefix/var/lib/wdtt-server-installer/ownership"
+    unit="${'$'}root_prefix/etc/systemd/system/wdtt.service"
+    binary="${'$'}root_prefix/usr/local/bin/wdtt-server"
+    config="${'$'}root_prefix/etc/wdtt"
+    passwords="${'$'}root_prefix/etc/wdtt/passwords.json"
+    wg_keys="${'$'}root_prefix/etc/wdtt/wg-keys.dat"
+    marker='Managed by WDTT Plus standalone server installer'
+    if [ -f "${'$'}ownership" ] && [ ! -L "${'$'}ownership" ] &&
+       [ -f "${'$'}unit" ] && [ ! -L "${'$'}unit" ] &&
+       grep -Fqx "${'$'}marker" "${'$'}ownership" &&
+       grep -Fqx "# ${'$'}marker" "${'$'}unit"; then
+      printf 'WDTT_STANDALONE_MANAGED=1\n'
+    else
+      printf 'WDTT_STANDALONE_MANAGED=0\n'
+    fi
+    if [ -f "${'$'}unit" ] && [ ! -L "${'$'}unit" ] &&
+       grep -Fqx '# Managed by WDTT Plus Android deploy' "${'$'}unit"; then
+      printf 'WDTT_ANDROID_DEPLOY_MANAGED=1\n'
+    else
+      printf 'WDTT_ANDROID_DEPLOY_MANAGED=0\n'
+    fi
+    if [ -f "${'$'}unit" ] && [ ! -L "${'$'}unit" ] &&
+       [ -f "${'$'}binary" ] && [ ! -L "${'$'}binary" ] && [ -x "${'$'}binary" ] &&
+       [ -d "${'$'}config" ] && [ ! -L "${'$'}config" ] &&
+       [ -f "${'$'}passwords" ] && [ ! -L "${'$'}passwords" ] &&
+       [ -f "${'$'}wg_keys" ] && [ ! -L "${'$'}wg_keys" ] &&
+       grep -Eq '^ExecStart=/usr/local/bin/wdtt-server([[:space:]]|${'$'})' "${'$'}unit" &&
+       grep -Eq '(^|[[:space:]])-config-dir[[:space:]]+/etc/wdtt([[:space:]]|${'$'})' "${'$'}unit" &&
+       grep -Fq 'wdtt0' "${'$'}unit"; then
+      printf 'WDTT_LEGACY_ANDROID_DEPLOY_CANDIDATE=1\n'
+    else
+      printf 'WDTT_LEGACY_ANDROID_DEPLOY_CANDIDATE=0\n'
+    fi
+    if [ -f "${'$'}unit" ] || [ -f "${'$'}binary" ] || [ -d "${'$'}config" ] ||
+       [ -f "${'$'}passwords" ] || [ -f "${'$'}wg_keys" ]; then
+      printf 'WDTT_INSTALL_TRACE=1\n'
+    else
+      printf 'WDTT_INSTALL_TRACE=0\n'
+    fi
+""".trimIndent()
+}
+
+internal fun deploymentOwnershipFromProbe(output: String): DeploymentOwnership {
+    return when {
+        markerValue(output, "WDTT_STANDALONE_MANAGED") != "0" &&
+            markerValue(output, "WDTT_STANDALONE_MANAGED") != "1" ->
+            throw IllegalStateException("не удалось безопасно проверить владельца установки. Изменяющая операция остановлена.")
+        markerValue(output, "WDTT_STANDALONE_MANAGED") == "1" -> DeploymentOwnership.StandaloneInstaller
+        markerValue(output, "WDTT_ANDROID_DEPLOY_MANAGED") == "1" -> DeploymentOwnership.AndroidDeploy
+        markerValue(output, "WDTT_LEGACY_ANDROID_DEPLOY_CANDIDATE") == "1" -> DeploymentOwnership.LegacyAndroidDeploy
+        markerValue(output, "WDTT_INSTALL_TRACE") == "0" -> DeploymentOwnership.NoInstall
+        markerValue(output, "WDTT_INSTALL_TRACE") == "1" -> DeploymentOwnership.UnknownExisting
+        else -> throw IllegalStateException("не удалось безопасно проверить владельца установки. Изменяющая операция остановлена.")
+    }
+}
+
+private fun deploymentOwnership(ssh: SSHClient): DeploymentOwnership {
+    val output = ssh.exec(rootCommand(standaloneInstallerOwnershipProbeScript()), timeout = 15_000L)
+    return deploymentOwnershipFromProbe(output)
+}
+
+private fun assertDeploymentMayBeUpdated(ownership: DeploymentOwnership, mode: DeployMode) {
+    when (ownership) {
+        DeploymentOwnership.StandaloneInstaller -> throw IllegalStateException(
+            "сервер управляется отдельным standalone-инсталлером. Android-приложение не обновляет " +
+                "и не перезаписывает такую установку; используйте server-installer/install.sh на VPS."
+        )
+        DeploymentOwnership.AndroidDeploy, DeploymentOwnership.NoInstall -> Unit
+        DeploymentOwnership.LegacyAndroidDeploy -> if (mode == DeployMode.ResetAll) {
+            throw IllegalStateException(
+                "старая Android-установка без метки допускает только обновление с сохранением. " +
+                    "После успешного обновления появится метка, а сброс по-прежнему потребует отдельного подтверждения."
+            )
+        }
+        DeploymentOwnership.UnknownExisting -> throw IllegalStateException(
+            "на сервере есть неизвестная установка WDTT без безопасных признаков Android-деплоя. " +
+                "Изменяющая операция остановлена."
+        )
+    }
+}
+
+private fun assertAndroidDeployMayManageServer(ssh: SSHClient, operation: String) {
+    when (deploymentOwnership(ssh)) {
+        DeploymentOwnership.AndroidDeploy -> Unit
+        DeploymentOwnership.StandaloneInstaller -> throw IllegalStateException(
+            "сервер управляется standalone-инсталлером. Для $operation используйте server-installer/install.sh на VPS; Android-деплой не будет менять эту установку."
+        )
+        DeploymentOwnership.LegacyAndroidDeploy -> throw IllegalStateException(
+            "старая Android-установка без метки не допускает $operation. Сначала выполните обновление с сохранением."
+        )
+        DeploymentOwnership.NoInstall, DeploymentOwnership.UnknownExisting -> throw IllegalStateException(
+            "не удалось безопасно подтвердить, что установка принадлежит Android-деплою. $operation остановлено."
+        )
+    }
+}
 
 private val remoteMachineMarkerRegex = Regex("^[A-Z][A-Z0-9_]*=.*$")
 
@@ -10870,6 +11359,37 @@ internal fun validatePasswordsDbForPreserving(
     return true
 }
 
+internal fun prepareDeployDatabaseJson(
+    currentJson: String?,
+    mainPassword: String,
+    adminId: String,
+    botToken: String,
+    dns: String,
+    ports: String
+): String {
+    val normalizedDns = normalizedDeployDns(dns)
+    val database = if (currentJson == null) {
+        JSONObject()
+            .put("main_password", mainPassword)
+            .put("admin_id", adminId)
+            .put("bot_token", botToken)
+            .put("passwords", JSONObject())
+            .put("devices", JSONObject())
+    } else {
+        JSONObject(currentJson)
+    }
+    if (mainPassword.isNotBlank()) database.put("main_password", mainPassword)
+    if (adminId.isNotBlank()) database.put("admin_id", adminId)
+    if (botToken.isNotBlank()) database.put("bot_token", botToken)
+    database.put("dns", normalizedDns)
+    database.put("default_ports", ports)
+    if (!database.has("max_passwords") || database.optInt("max_passwords", 0) <= 0) {
+        database.put("max_passwords", 50)
+    }
+    validatePasswordsDbStructure(database)
+    return database.toString(2)
+}
+
 private fun validateWgKeysDat(value: String) {
     val lines = value.trim().lines().map { it.trim() }.filter { it.isNotBlank() }
     require(lines.size == 4) { "wg-keys.dat должен содержать ровно 4 ключа" }
@@ -10885,7 +11405,9 @@ internal fun parseBackup(
     sourceHost: String,
     formatVersion: Int = SERVER_BACKUP_FORMAT_VERSION,
     integrityVerified: Boolean = true,
-    ownerProfileFromApp: Boolean = false
+    ownerProfileFromApp: Boolean = false,
+    outboundProfileEnv: String? = null,
+    backupPolicyJson: String? = null
 ): ServerBackup {
     require(passwordsJson.length <= MAX_SERVER_DATABASE_CHARS) { "база в бэкапе слишком большая" }
     require(wgKeysDat == null || wgKeysDat.length <= MAX_SERVER_WG_KEYS_CHARS) {
@@ -10898,23 +11420,46 @@ internal fun parseBackup(
     if (!wgKeysDat.isNullOrBlank()) {
         validateWgKeysDat(wgKeysDat)
     }
+    if (outboundProfileEnv != null) validateOutboundProfileBackup(outboundProfileEnv)
+    if (backupPolicyJson != null) validateBackupPolicyJson(backupPolicyJson)
     val passwords = db.optJSONObject("passwords") ?: JSONObject()
-    val devices = db.optJSONObject("devices") ?: JSONObject()
     return ServerBackup(
         passwordsJson = passwordsJson,
         wgKeysDat = wgKeysDat,
         createdAt = createdAt,
         sourceHost = sourceHost,
         passwordCount = passwords.length(),
-        deviceCount = devices.length(),
+        deviceCount = clientDeviceCountForBackup(db),
         mainPassword = db.optString("main_password"),
         adminId = db.optString("admin_id"),
         botToken = db.optString("bot_token"),
         dns = db.optString("dns"),
         formatVersion = formatVersion,
         integrityVerified = integrityVerified,
-        ownerProfileFromApp = ownerProfileFromApp
+        ownerProfileFromApp = ownerProfileFromApp,
+        outboundProfileEnv = outboundProfileEnv,
+        backupPolicyJson = backupPolicyJson
     )
+}
+
+internal fun clientDeviceCountForBackup(database: JSONObject): Int {
+    val result = linkedSetOf<String>()
+    val passwords = database.optJSONObject("passwords") ?: return 0
+    passwords.keys().forEach { password ->
+        val entry = passwords.optJSONObject(password) ?: return@forEach
+        entry.optString("device_id").trim().takeIf(String::isNotEmpty)?.let(result::add)
+        val history = entry.optJSONArray("bind_history") ?: return@forEach
+        for (index in 0 until history.length()) {
+            val event = history.optJSONObject(index) ?: continue
+            val deviceId = event.optString("device_id").trim()
+            val status = event.optString("status")
+            if (deviceId.isEmpty() || status == "denied_mismatch") continue
+            if (event.optLong("bound_at", 0L) > 0L || status == "active" || status == "unbound") {
+                result += deviceId
+            }
+        }
+    }
+    return result.size
 }
 
 internal fun backupToJson(backup: ServerBackup): String {
@@ -10933,6 +11478,18 @@ internal fun backupToJson(backup: ServerBackup): String {
             .put("wg_keys_dat_b64", encodeBase64Text(backup.wgKeysDat))
             .put("wg_keys_dat_sha256", sha256Text(backup.wgKeysDat))
     }
+    if (backup.outboundProfileEnv != null) {
+        validateOutboundProfileBackup(backup.outboundProfileEnv)
+        obj
+            .put("outbound_profile_env_b64", encodeBase64Text(backup.outboundProfileEnv))
+            .put("outbound_profile_env_sha256", sha256Text(backup.outboundProfileEnv))
+    }
+    if (backup.backupPolicyJson != null) {
+        validateBackupPolicyJson(backup.backupPolicyJson)
+        obj
+            .put("backup_policy_json_b64", encodeBase64Text(backup.backupPolicyJson))
+            .put("backup_policy_json_sha256", sha256Text(backup.backupPolicyJson))
+    }
     return obj.toString(2)
 }
 
@@ -10950,6 +11507,12 @@ internal fun parseBackupFile(raw: String): ServerBackup {
     val wgKeysB64 = obj.optString("wg_keys_dat_b64")
     require(wgKeysB64.length <= 5_500) { "wg-keys.dat в бэкапе слишком большой" }
     val wgKeys = if (wgKeysB64.isNotBlank()) decodeBase64Text(wgKeysB64) else null
+    val outboundB64 = obj.optString("outbound_profile_env_b64")
+    require(outboundB64.length <= 2_700_000) { "профиль выходного IP в бэкапе слишком большой" }
+    val outboundProfile = if (outboundB64.isNotBlank()) decodeBase64Text(outboundB64) else null
+    val policyB64 = obj.optString("backup_policy_json_b64")
+    require(policyB64.length <= 88_000) { "настройки резервного копирования слишком большие" }
+    val backupPolicy = if (policyB64.isNotBlank()) decodeBase64Text(policyB64) else null
     if (version >= 2) {
         val passwordsSha256 = obj.optString("passwords_json_sha256").lowercase()
         require(Regex("^[0-9a-f]{64}$").matches(passwordsSha256)) {
@@ -10967,6 +11530,24 @@ internal fun parseBackupFile(raw: String): ServerBackup {
                 "контрольная сумма WireGuard-ключей не совпала"
             }
         }
+        if (version >= 3 && outboundProfile != null) {
+            val outboundSha256 = obj.optString("outbound_profile_env_sha256").lowercase()
+            require(Regex("^[0-9a-f]{64}$").matches(outboundSha256)) {
+                "в бэкапе нет контрольной суммы профиля выходного IP"
+            }
+            require(sha256Text(outboundProfile) == outboundSha256) {
+                "контрольная сумма профиля выходного IP не совпала"
+            }
+        }
+        if (version >= 4 && backupPolicy != null) {
+            val policySha256 = obj.optString("backup_policy_json_sha256").lowercase()
+            require(Regex("^[0-9a-f]{64}$").matches(policySha256)) {
+                "в бэкапе нет контрольной суммы настроек резервного копирования"
+            }
+            require(sha256Text(backupPolicy) == policySha256) {
+                "контрольная сумма настроек резервного копирования не совпала"
+            }
+        }
     }
     return parseBackup(
         passwordsJson = passwordsJson,
@@ -10975,7 +11556,60 @@ internal fun parseBackupFile(raw: String): ServerBackup {
         sourceHost = obj.optString("source_host", "неизвестно"),
         formatVersion = version,
         integrityVerified = version >= 2,
-        ownerProfileFromApp = obj.optString("owner_profile_source") == "app"
+        ownerProfileFromApp = obj.optString("owner_profile_source") == "app",
+        outboundProfileEnv = outboundProfile,
+        backupPolicyJson = backupPolicy
+    )
+}
+
+private fun validateOutboundProfileBackup(value: String) {
+    require(value.length in 1..MAX_SERVER_OUTBOUND_PROFILE_CHARS) {
+        "профиль выходного IP в бэкапе имеет недопустимый размер"
+    }
+    require('\u0000' !in value) { "профиль выходного IP содержит недопустимые данные" }
+    value.lineSequence().filter(String::isNotBlank).forEach { line ->
+        val key = line.substringBefore('=', "")
+        require(Regex("^[A-Z][A-Z0-9_]{0,63}$").matches(key)) {
+            "профиль выходного IP содержит неизвестную строку"
+        }
+    }
+}
+
+private fun validateBackupPolicyJson(value: String) {
+    require(value.length in 1..65_536) { "настройки резервного копирования имеют недопустимый размер" }
+    val policy = JSONObject(value)
+    require(policy.has("enabled") && policy.get("enabled") is Boolean) {
+        "в настройках резервного копирования некорректно задано включение расписания"
+    }
+    require(policy.optInt("interval_hours", 0) in 6..168) {
+        "в настройках резервного копирования некорректно задан интервал"
+    }
+    require(policy.optInt("retention_count", 0) in 2..90) {
+        "в настройках резервного копирования некорректно задано число копий"
+    }
+    require(policy.optLong("updated_at", 0L) >= 0L) {
+        "в настройках резервного копирования некорректно задано время изменения"
+    }
+}
+
+internal fun portableBackupFromServerSnapshot(
+    snapshot: ServerStoredBackupDocument,
+    sourceHost: String
+): ServerBackup {
+    val files = snapshot.files.associateBy { it.path }
+    val passwords = files["passwords.json"]?.data?.toString(Charsets.UTF_8)
+        ?: throw IllegalArgumentException("в серверной копии нет passwords.json")
+    val wgKeys = files["wg-keys.dat"]?.data?.toString(Charsets.UTF_8)
+        ?: throw IllegalArgumentException("в серверной копии нет wg-keys.dat")
+    val outbound = files["outbound-profile.env"]?.data?.toString(Charsets.UTF_8)
+    val backupPolicy = files["backup-policy.json"]?.data?.toString(Charsets.UTF_8)
+    return parseBackup(
+        passwordsJson = passwords,
+        wgKeysDat = wgKeys,
+        createdAt = java.time.Instant.ofEpochSecond(snapshot.createdAt).toString(),
+        sourceHost = sourceHost,
+        outboundProfileEnv = outbound,
+        backupPolicyJson = backupPolicy
     )
 }
 
@@ -11008,9 +11642,56 @@ private suspend fun writeServerBackupDocumentToUri(context: Context, outputUri: 
 }
 
 private fun serverBackupSelectionStatus(backup: ServerBackup, encrypted: Boolean): String = buildString {
-    append("Выбран ${if (backup.hasWgKeys) "полный" else "частичный"} бэкап: клиентов ${backup.passwordCount}, устройств ${backup.deviceCount}.")
+    append("Выбран ${if (backup.hasWgKeys) "полный" else "частичный"} бэкап: ${backupClientCountLabel(backup.passwordCount)}, ${backupDeviceCountLabel(backup.deviceCount)}.")
     append(if (encrypted) " Пароль и подлинность файла проверены." else if (backup.integrityVerified) " Целостность файла проверена, но файл не зашифрован." else " Это совместимый старый незашифрованный формат без контрольной суммы.")
     if (backup.ownerProfileFromApp) append(" Профиль владельца сохранён из вкладки «Туннель».")
+}
+
+private fun serverBackupReasonLabel(reason: String): String = when (reason) {
+    "manual" -> "вручную"
+    "scheduled" -> "по расписанию"
+    "enabled" -> "при включении"
+    "pre_deploy" -> "перед обновлением"
+    "pre_restore" -> "перед восстановлением"
+    else -> "сервером"
+}
+
+private fun serverBackupOutboundLabel(mode: String): String = when (mode) {
+    "direct" -> "прямой выход"
+    "external_proxy" -> "внешний TCP-прокси"
+    "tun_interface" -> "TUN-интерфейс"
+    "warp_free" -> "WARP"
+    "imported_wg" -> "VPN/WireGuard-файл"
+    "wireguard_vps" -> "другой сервер"
+    "configured" -> "настроенный профиль"
+    else -> ""
+}
+
+internal fun backupClientCountLabel(count: Int): String =
+    "$count ${russianPluralForm(count, "клиент", "клиента", "клиентов")}"
+
+internal fun backupDeviceCountLabel(count: Int): String =
+    "$count ${russianPluralForm(count, "устройство", "устройства", "устройств")}"
+
+private fun russianPluralForm(count: Int, one: String, few: String, many: String): String {
+    val mod100 = count % 100
+    if (mod100 in 11..14) return many
+    return when (count % 10) {
+        1 -> one
+        2, 3, 4 -> few
+        else -> many
+    }
+}
+
+private fun formatServerBackupTime(epochSeconds: Long): String {
+    if (epochSeconds <= 0L) return "нет"
+    return SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault()).format(Date(epochSeconds * 1000L))
+}
+
+private fun formatServerBackupBytes(bytes: Long): String = when {
+    bytes >= 1024L * 1024L -> String.format(Locale.getDefault(), "%.1f МиБ", bytes / (1024.0 * 1024.0))
+    bytes >= 1024L -> String.format(Locale.getDefault(), "%.1f КиБ", bytes / 1024.0)
+    else -> "$bytes Б"
 }
 
 private fun normalizedServerAddress(value: String): String =
@@ -11070,18 +11751,9 @@ private suspend fun readServerBackup(
     try {
         session = createSshSession(host, user, credentials, port)
         val ssh = SSHClient(session, credentials.password)
-        val command = buildString {
-            append("[ -f /etc/wdtt/passwords.json ] || { echo WDTT_ERROR=no_passwords_json; exit 2; }; ")
-            append("printf 'WDTT_DB_B64='; base64 /etc/wdtt/passwords.json | tr -d '\\n'; printf '\\n'; ")
-            if (includeWgKeys) {
-                append("if [ -f /etc/wdtt/wg-keys.dat ]; then printf 'WDTT_WG_KEYS_B64='; base64 /etc/wdtt/wg-keys.dat | tr -d '\\n'; printf '\\n'; fi; ")
-            }
-        }
-        val output = ssh.exec(rootCommand(command), timeout = 30000L)
-        markerValue(output, "WDTT_ERROR")?.let { throw IllegalStateException("сервер не отдал базу: $it") }
-        val dbB64 = markerValue(output, "WDTT_DB_B64") ?: throw IllegalStateException("сервер не отдал passwords.json")
-        val passwordsJson = decodeBase64Text(dbB64)
-        val wgKeys = markerValue(output, "WDTT_WG_KEYS_B64")?.takeIf { it.isNotBlank() }?.let { decodeBase64Text(it) }
+        val passwordsJson = readRemotePasswordsJson(ssh)
+            ?: throw IllegalStateException("сервер не отдал passwords.json")
+        val wgKeys = if (includeWgKeys) readRemoteWgKeysDat(ssh) else null
         if (includeWgKeys && wgKeys.isNullOrBlank()) {
             throw IllegalStateException("полный экспорт невозможен: на сервере не найден корректный /etc/wdtt/wg-keys.dat. Выполните установку сервера или выберите частичный экспорт")
         }
@@ -11096,27 +11768,83 @@ private suspend fun readServerBackup(
             wgKeysDat = wgKeys,
             createdAt = SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault()).format(Date()),
             sourceHost = host,
-            ownerProfileFromApp = prepared.ownerProfileFromApp
+            ownerProfileFromApp = prepared.ownerProfileFromApp,
+            outboundProfileEnv = readRemoteOutboundProfile(ssh),
+            backupPolicyJson = readRemoteBackupPolicy(ssh)
         )
     } finally {
         try { session?.disconnect() } catch (_: Exception) {}
     }
 }
 
+private fun readRemoteOutboundProfile(ssh: SSHClient): String? {
+    val output = ssh.exec(
+        rootCommand(
+            "path=/etc/wdtt/outbound-profile.env; " +
+                "if [ -e \"${'$'}path\" ]; then " +
+                "[ -f \"${'$'}path\" ] && [ ! -L \"${'$'}path\" ] || { echo WDTT_ERROR=unsafe_outbound_profile; exit 2; }; " +
+                "size=${'$'}(stat -c %s \"${'$'}path\" 2>/dev/null || echo 0); " +
+                "[ \"${'$'}size\" -gt 0 ] && [ \"${'$'}size\" -le $MAX_SERVER_OUTBOUND_PROFILE_CHARS ] || { echo WDTT_ERROR=bad_outbound_profile_size; exit 2; }; " +
+                "printf 'WDTT_OUTBOUND_PROFILE_B64='; base64 \"${'$'}path\" | tr -d '\\n'; printf '\\n'; fi"
+        ),
+        timeout = 20_000L
+    )
+    markerValue(output, "WDTT_ERROR")?.let { throw IllegalStateException("сервер отклонил профиль выходного IP: $it") }
+    val encoded = markerValue(output, "WDTT_OUTBOUND_PROFILE_B64") ?: return null
+    require(encoded.length <= 2_700_000) { "профиль выходного IP на сервере слишком большой" }
+    return decodeBase64Text(encoded).also(::validateOutboundProfileBackup)
+}
+
+private fun readRemoteBackupPolicy(ssh: SSHClient): String {
+    val output = ssh.exec(
+        rootCommand(
+            "path=/etc/wdtt/backup-policy.json; " +
+                "if [ -e \"${'$'}path\" ]; then " +
+                "[ -f \"${'$'}path\" ] && [ ! -L \"${'$'}path\" ] || { echo WDTT_ERROR=unsafe_backup_policy; exit 2; }; " +
+                "size=${'$'}(stat -c %s \"${'$'}path\" 2>/dev/null || echo 0); " +
+                "[ \"${'$'}size\" -gt 0 ] && [ \"${'$'}size\" -le 65536 ] || { echo WDTT_ERROR=bad_backup_policy_size; exit 2; }; " +
+                "printf 'WDTT_BACKUP_POLICY_B64='; base64 \"${'$'}path\" | tr -d '\\n'; printf '\\n'; " +
+                "else printf 'WDTT_BACKUP_POLICY_B64=eyJlbmFibGVkIjpmYWxzZSwiaW50ZXJ2YWxfaG91cnMiOjI0LCJyZXRlbnRpb25fY291bnQiOjE0fQ==\\n'; fi"
+        ),
+        timeout = 20_000L
+    )
+    markerValue(output, "WDTT_ERROR")?.let { throw IllegalStateException("сервер отклонил настройки резервного копирования: $it") }
+    val encoded = markerValue(output, "WDTT_BACKUP_POLICY_B64")
+        ?: throw IllegalStateException("сервер не вернул настройки резервного копирования")
+    require(encoded.length <= 88_000) { "настройки резервного копирования на сервере слишком большие" }
+    return decodeBase64Text(encoded).also(::validateBackupPolicyJson)
+}
+
 private fun readRemotePasswordsJson(ssh: SSHClient): String? {
     val output = ssh.exec(
-        rootCommand("if [ -f /etc/wdtt/passwords.json ]; then printf 'WDTT_DB_B64='; base64 /etc/wdtt/passwords.json | tr -d '\\n'; printf '\\n'; fi"),
+        rootCommand(
+            "path=/etc/wdtt/passwords.json; " +
+                "if [ -e \"${'$'}path\" ]; then " +
+                "[ -f \"${'$'}path\" ] && [ ! -L \"${'$'}path\" ] || { echo WDTT_ERROR=unsafe_passwords_json; exit 2; }; " +
+                "size=${'$'}(stat -c %s \"${'$'}path\" 2>/dev/null || echo 0); " +
+                "[ \"${'$'}size\" -gt 0 ] && [ \"${'$'}size\" -le 5000000 ] || { echo WDTT_ERROR=bad_passwords_json_size; exit 2; }; " +
+                "printf 'WDTT_DB_B64='; base64 \"${'$'}path\" | tr -d '\\n'; printf '\\n'; fi"
+        ),
         timeout = 20000L
     )
+    markerValue(output, "WDTT_ERROR")?.let { throw IllegalStateException("сервер отклонил passwords.json: $it") }
     val dbB64 = markerValue(output, "WDTT_DB_B64") ?: return null
     return decodeBase64Text(dbB64)
 }
 
 private fun readRemoteWgKeysDat(ssh: SSHClient): String? {
     val output = ssh.exec(
-        rootCommand("if [ -f /etc/wdtt/wg-keys.dat ]; then printf 'WDTT_WG_KEYS_B64='; base64 /etc/wdtt/wg-keys.dat | tr -d '\\n'; printf '\\n'; fi"),
+        rootCommand(
+            "path=/etc/wdtt/wg-keys.dat; " +
+                "if [ -e \"${'$'}path\" ]; then " +
+                "[ -f \"${'$'}path\" ] && [ ! -L \"${'$'}path\" ] || { echo WDTT_ERROR=unsafe_wg_keys; exit 2; }; " +
+                "size=${'$'}(stat -c %s \"${'$'}path\" 2>/dev/null || echo 0); " +
+                "[ \"${'$'}size\" -gt 0 ] && [ \"${'$'}size\" -le 4096 ] || { echo WDTT_ERROR=bad_wg_keys_size; exit 2; }; " +
+                "printf 'WDTT_WG_KEYS_B64='; base64 \"${'$'}path\" | tr -d '\\n'; printf '\\n'; fi"
+        ),
         timeout = 20_000L
     )
+    markerValue(output, "WDTT_ERROR")?.let { throw IllegalStateException("сервер отклонил wg-keys.dat: $it") }
     val encoded = markerValue(output, "WDTT_WG_KEYS_B64") ?: return null
     require(encoded.length <= 5_500) { "wg-keys.dat на сервере слишком большой" }
     return decodeBase64Text(encoded).also(::validateWgKeysDat)
@@ -11391,12 +12119,33 @@ private fun existingConnectionDiffLines(
     }
 }
 
-private fun normalizeDnsValues(first: String, second: String = ""): String =
+internal fun normalizeDnsValues(first: String, second: String = ""): String =
     listOf(first, second)
         .flatMap { it.split(',') }
         .map { it.trim() }
         .filter { it.isNotBlank() }
         .joinToString(",")
+
+internal fun normalizedDeployDns(first: String, second: String = ""): String {
+    val values = listOf(first, second)
+        .flatMap { it.split(',') }
+        .map { it.trim() }
+        .filter { it.isNotBlank() }
+    require(values.isNotEmpty()) { "Укажите хотя бы один DNS" }
+    require(values.size <= 4) { "Можно указать не больше четырёх DNS" }
+    values.forEach { value ->
+        require(value.length <= 64) { "DNS слишком длинный" }
+        require(value.all { char ->
+            char == '.' || char == ':' || char == '-' || char == '_' ||
+                char in '0'..'9' || char in 'a'..'z' || char in 'A'..'Z'
+        }) { "DNS содержит недопустимые символы" }
+    }
+    return values.joinToString(",")
+}
+
+internal fun isLegacyDefaultDnsUpgrade(serverDns: String, localDns: String): Boolean =
+    normalizeDnsValues(serverDns) == "1.1.1.1" &&
+        normalizeDnsValues(localDns) == "1.1.1.1,1.0.0.1"
 
 internal fun outboundProfilesDiffer(
     server: OutboundServerSnapshot,
@@ -11499,7 +12248,9 @@ private suspend fun compareDeployWithServer(
                         request.dns1.ifBlank { "1.1.1.1" },
                         request.dns2
                     )
-                    if (serverDns != localDns) {
+                    if (isLegacyDefaultDnsUpgrade(serverDns, localDns)) {
+                        notes += "На сервере осталось прежнее стандартное значение DNS 1.1.1.1; обновление безопасно добавит резервный 1.0.0.1."
+                    } else if (serverDns != localDns) {
                         overwriteLines += "DNS: сервер — ${serverDns.ifBlank { "не задан" }}, приложение — $localDns"
                     }
 
@@ -11563,7 +12314,7 @@ private fun secretPresenceLabel(value: String): String {
     return if (count == 0) "не заданы" else "заданы ($count)"
 }
 
-private fun selectExistingServerConnection(
+internal fun selectExistingServerConnection(
     dbJson: String,
     fallbackHost: String,
     adminMainPassword: String
@@ -11710,7 +12461,7 @@ internal fun prepareServerDatabaseForTarget(
     if (mainPasswordOverride.isNotBlank()) target.put("main_password", mainPasswordOverride)
     if (adminIdOverride.isNotBlank()) target.put("admin_id", adminIdOverride)
     if (botTokenOverride.isNotBlank()) target.put("bot_token", botTokenOverride)
-    target.put("dns", dnsValue)
+    target.put("dns", normalizedDeployDns(dnsValue))
     target.put("default_ports", portsSpec)
     target.put("public_ip", publicHost)
     if (!target.has("passwords")) target.put("passwords", JSONObject())
@@ -11720,12 +12471,17 @@ internal fun prepareServerDatabaseForTarget(
     return target.toString(2)
 }
 
-private fun normalizeDbForTarget(
+internal fun normalizeDbForTarget(
     backup: ServerBackup,
     currentDbJson: String?,
     mode: ServerImportMode,
     request: DeployRequest
 ): String {
+    if (backup.serverManagedSnapshot && mode == ServerImportMode.Replace) {
+        val exact = JSONObject(backup.passwordsJson)
+        validatePasswordsDbStructure(exact)
+        return exact.toString(2)
+    }
     val portsSpec = "${request.dtlsPort},${request.wgPort},${request.localPort}"
     val dnsValue = listOf(request.dns1, request.dns2)
         .filter { it.isNotBlank() }
@@ -11768,14 +12524,26 @@ private fun applyServerImport(
     request: DeployRequest,
     backup: ServerBackup,
     mode: ServerImportMode,
-    restartService: Boolean
+    restartService: Boolean,
+    standaloneManaged: Boolean = false
 ) {
     val currentDb = if (mode == ServerImportMode.Merge) readRemotePasswordsJson(ssh) else null
     val preparedDb = normalizeDbForTarget(backup, currentDb, mode, request)
-    val dbFile = File(context.cacheDir, "wdtt-import-passwords.json")
-    val wgFile = File(context.cacheDir, "wdtt-import-wg-keys.dat")
+    val dbFile = File.createTempFile("wdtt-import-passwords-", ".json", context.cacheDir)
+    val wgFile = File.createTempFile("wdtt-import-wg-keys-", ".dat", context.cacheDir)
+    val outboundFile = File.createTempFile("wdtt-import-outbound-", ".env", context.cacheDir)
+    val policyFile = File.createTempFile("wdtt-import-backup-policy-", ".json", context.cacheDir)
     val remoteDbFile = "/tmp/wdtt-import-passwords.json"
     val remoteWgFile = "/tmp/wdtt-import-wg-keys.dat"
+    val remoteOutboundFile = "/tmp/wdtt-import-outbound.env"
+    val remotePolicyFile = "/tmp/wdtt-import-backup-policy.json"
+    listOf(dbFile, wgFile, outboundFile, policyFile).forEach { file ->
+        file.setReadable(false, false)
+        file.setWritable(false, false)
+        file.setExecutable(false, false)
+        file.setReadable(true, true)
+        file.setWritable(true, true)
+    }
     dbFile.writeText(preparedDb)
     try {
         ssh.upload(dbFile, remoteDbFile, permissions = 0b110000000)
@@ -11784,23 +12552,64 @@ private fun applyServerImport(
             wgFile.writeText(backup.wgKeysDat.orEmpty())
             ssh.upload(wgFile, remoteWgFile, permissions = 0b110000000)
         }
+        val replaceOutboundProfile = mode == ServerImportMode.Replace && backup.outboundProfileEnv != null
+        val removeOutboundProfile = mode == ServerImportMode.Replace &&
+            backup.outboundProfileEnv == null &&
+            backup.formatVersion >= 3
+        if (replaceOutboundProfile) {
+            val outbound = backup.outboundProfileEnv.orEmpty()
+            validateOutboundProfileBackup(outbound)
+            outboundFile.writeText(outbound)
+            ssh.upload(outboundFile, remoteOutboundFile, permissions = 0b110000000)
+        }
+        val replaceBackupPolicy = mode == ServerImportMode.Replace && backup.backupPolicyJson != null
+        val removeBackupPolicy = mode == ServerImportMode.Replace &&
+            backup.backupPolicyJson == null &&
+            backup.formatVersion >= 4
+        if (replaceBackupPolicy) {
+            val policy = backup.backupPolicyJson.orEmpty()
+            validateBackupPolicyJson(policy)
+            policyFile.writeText(policy)
+            ssh.upload(policyFile, remotePolicyFile, permissions = 0b110000000)
+        }
         val command = buildString {
             append("set -e; ")
             append("systemctl stop wdtt 2>/dev/null || true; ")
-            append("mkdir -p /etc/wdtt; ")
-            append("install -m 600 ${shellQuote(remoteDbFile)} /etc/wdtt/passwords.json; ")
+            append("mkdir -p -m 700 /etc/wdtt; [ -d /etc/wdtt ] && [ ! -L /etc/wdtt ]; ")
+            append("install -m 600 ${shellQuote(remoteDbFile)} /etc/wdtt/.passwords.json.import; ")
+            append("mv -f /etc/wdtt/.passwords.json.import /etc/wdtt/passwords.json; ")
             append("rm -f ${shellQuote(remoteDbFile)}; ")
             if (replaceWgKeys) {
-                append("install -m 600 ${shellQuote(remoteWgFile)} /etc/wdtt/wg-keys.dat; rm -f ${shellQuote(remoteWgFile)}; ")
+                append("install -m 600 ${shellQuote(remoteWgFile)} /etc/wdtt/.wg-keys.dat.import; ")
+                append("mv -f /etc/wdtt/.wg-keys.dat.import /etc/wdtt/wg-keys.dat; rm -f ${shellQuote(remoteWgFile)}; ")
+            }
+            if (replaceOutboundProfile) {
+                append("install -m 600 ${shellQuote(remoteOutboundFile)} /etc/wdtt/.outbound-profile.env.import; ")
+                append("mv -f /etc/wdtt/.outbound-profile.env.import /etc/wdtt/outbound-profile.env; rm -f ${shellQuote(remoteOutboundFile)}; ")
+            } else if (removeOutboundProfile) {
+                append("rm -f /etc/wdtt/outbound-profile.env; ")
+            }
+            if (replaceBackupPolicy) {
+                append("install -m 600 ${shellQuote(remotePolicyFile)} /etc/wdtt/.backup-policy.json.import; ")
+                append("mv -f /etc/wdtt/.backup-policy.json.import /etc/wdtt/backup-policy.json; rm -f ${shellQuote(remotePolicyFile)}; ")
+            } else if (removeBackupPolicy) {
+                append("rm -f /etc/wdtt/backup-policy.json; ")
             }
             append("echo WDTT_IMPORT_FILES=1; ")
             if (restartService) {
                 append("systemctl restart wdtt; ")
                 append("systemctl is-active --quiet wdtt; ")
+                append("for attempt in 1 2 3 4 5 6 7 8 9 10; do [ -S /run/wdtt/admin.sock ] && break; sleep 1; done; ")
+                append("[ -S /run/wdtt/admin.sock ]; ")
                 append("echo WDTT_IMPORT_SERVICE=active; ")
             }
         }
-        val output = ssh.exec(rootCommand(command), timeout = 60000L)
+        val serializedCommand = if (standaloneManaged) {
+            "flock -n /var/lib/wdtt-server-installer/installer.lock bash -c ${shellQuote(command)}"
+        } else {
+            command
+        }
+        val output = ssh.exec(rootCommand(serializedCommand), timeout = 60000L)
         if (markerValue(output, "WDTT_IMPORT_FILES") != "1") {
             throw IllegalStateException(
                 compactRemoteTail(output).ifBlank { "сервер не подтвердил запись импортируемых файлов" }
@@ -11813,18 +12622,70 @@ private fun applyServerImport(
                 "WireGuard-ключи на сервере не совпали с бэкапом"
             }
         }
+        if (replaceOutboundProfile) {
+            val installedOutbound = readRemoteOutboundProfile(ssh)
+                ?: throw IllegalStateException("после восстановления не найден профиль выходного IP")
+            require(installedOutbound == backup.outboundProfileEnv) {
+                "профиль выходного IP на сервере не совпал с бэкапом"
+            }
+        }
+        if (replaceBackupPolicy) {
+            val installedPolicy = readRemoteBackupPolicy(ssh)
+            require(JSONObject(installedPolicy).toString() == JSONObject(backup.backupPolicyJson.orEmpty()).toString()) {
+                "настройки резервного копирования на сервере не совпали с бэкапом"
+            }
+        }
         if (restartService && markerValue(output, "WDTT_IMPORT_SERVICE") != "active") {
             throw IllegalStateException("wdtt.service не стал active после импорта")
         }
     } finally {
         runCatching {
             ssh.exec(
-                rootCommand("rm -f ${shellQuote(remoteDbFile)} ${shellQuote(remoteWgFile)}"),
+                rootCommand("rm -f ${shellQuote(remoteDbFile)} ${shellQuote(remoteWgFile)} ${shellQuote(remoteOutboundFile)} ${shellQuote(remotePolicyFile)}"),
                 timeout = 10_000L
             )
         }
         dbFile.delete()
         wgFile.delete()
+        outboundFile.delete()
+        policyFile.delete()
+    }
+}
+
+private fun isBackupFeatureUnavailable(error: Throwable): Boolean {
+    val message = error.message.orEmpty().lowercase(Locale.ROOT)
+    return "не поддерживает" in message ||
+        "неизвестная admin-команда" in message ||
+        "admin_socket_unavailable" in message ||
+        "старый wdtt-server" in message
+}
+
+private suspend fun createPersistentSafetyBackup(
+    request: DeployRequest,
+    reason: String
+): Boolean {
+    return try {
+        ServerAdminClient.createBackup(
+            target = ServerAdminTarget(
+                host = request.host,
+                user = request.user.ifBlank { "root" },
+                sshPassword = request.pass,
+                sshPrivateKey = request.privateKey,
+                sshKeyPassphrase = request.keyPassphrase,
+                allowPasswordAuthentication = request.allowPasswordAuthentication,
+                sshPort = request.sshPort,
+                mainPassword = request.mainPass
+            ),
+            reason = reason
+        )
+        true
+    } catch (error: Throwable) {
+        if (isBackupFeatureUnavailable(error)) {
+            DeployManager.writeError("Persistent backup is unavailable on the previous server version; transactional rollback remains active.")
+            false
+        } else {
+            throw IllegalStateException("не удалось создать обязательную серверную копию перед изменением: ${error.message}", error)
+        }
     }
 }
 
@@ -11854,6 +12715,17 @@ private suspend fun performServerImportNow(
         DeployManager.activeSession = session
         val ssh = SSHClient(session, request.pass)
         sshClient = ssh
+        onProgress(0.10f, "Проверяю владельца установки...")
+        val ownership = deploymentOwnership(ssh)
+        if (ownership != DeploymentOwnership.AndroidDeploy && ownership != DeploymentOwnership.StandaloneInstaller) {
+            throw IllegalStateException(
+                "импорт доступен только для подтверждённой Android- или standalone-установки. " +
+                    "Для старой Android-установки без метки сначала выполните «Обновить с сохранением»."
+            )
+        }
+        val standaloneManaged = ownership == DeploymentOwnership.StandaloneInstaller
+        onProgress(0.12f, "Создаю постоянную копию перед восстановлением...")
+        createPersistentSafetyBackup(request, "pre_restore")
         onProgress(0.15f, "Проверяю текущую базу и создаю страховочную копию...")
         val beforeJson = readRemotePasswordsJson(ssh)?.also {
             validatePasswordsDbStructure(JSONObject(it))
@@ -11861,7 +12733,11 @@ private suspend fun performServerImportNow(
         prepareServerUpdateRollback(ssh)
         rollbackPrepared = true
         onProgress(0.35f, "Подготовка импорта...")
-        applyServerImport(context, ssh, request, backup, mode, restartService = true)
+        applyServerImport(
+            context, ssh, request, backup, mode,
+            restartService = true,
+            standaloneManaged = standaloneManaged
+        )
         onProgress(0.85f, "Проверяю импортированные данные и службу...")
         val afterJson = readRemotePasswordsJson(ssh)
             ?: throw IllegalStateException("после импорта не найдена база passwords.json")
@@ -11913,22 +12789,62 @@ private fun prepareServerUpdateRollback(ssh: SSHClient) {
     val command = """
         set -e
         BACKUP=${shellQuote(SERVER_UPDATE_BACKUP_DIR)}
-        rm -rf "${'$'}BACKUP"
+        [ ! -e "${'$'}BACKUP" ] || { echo WDTT_UPDATE_BACKUP=stale; exit 3; }
+        if [ -d /etc/wdtt ]; then
+            [ ! -L /etc/wdtt ] || { echo WDTT_UPDATE_BACKUP=unsafe_config; exit 4; }
+            unsafe=${'$'}(find /etc/wdtt -mindepth 1 \( -type l -o ! \( -type f -o -type d \) \) -print -quit 2>/dev/null || true)
+            [ -z "${'$'}unsafe" ] || { echo WDTT_UPDATE_BACKUP=unsafe_config; exit 4; }
+        fi
         install -d -m 700 "${'$'}BACKUP"
-        if [ -d /etc/wdtt ]; then cp -a /etc/wdtt "${'$'}BACKUP/config"; touch "${'$'}BACKUP/had_config"; fi
-        if [ -f /usr/local/bin/wdtt-server ]; then cp -a /usr/local/bin/wdtt-server "${'$'}BACKUP/wdtt-server"; touch "${'$'}BACKUP/had_binary"; fi
-        if [ -f /etc/systemd/system/wdtt.service ]; then cp -a /etc/systemd/system/wdtt.service "${'$'}BACKUP/wdtt.service"; touch "${'$'}BACKUP/had_service"; fi
+        if [ -d /etc/wdtt ]; then
+            cp -a /etc/wdtt "${'$'}BACKUP/config"
+            while IFS= read -r -d '' source; do
+                relative=${'$'}{source#/etc/wdtt/}
+                cmp -s "${'$'}source" "${'$'}BACKUP/config/${'$'}relative" || exit 5
+            done < <(find /etc/wdtt -type f -print0)
+            touch "${'$'}BACKUP/had_config"
+        fi
+        if [ -f /usr/local/bin/wdtt-server ] && [ ! -L /usr/local/bin/wdtt-server ]; then
+            cp -a /usr/local/bin/wdtt-server "${'$'}BACKUP/wdtt-server"
+            cmp -s /usr/local/bin/wdtt-server "${'$'}BACKUP/wdtt-server" || exit 5
+            touch "${'$'}BACKUP/had_binary"
+        fi
+        if [ -f /etc/systemd/system/wdtt.service ] && [ ! -L /etc/systemd/system/wdtt.service ]; then
+            cp -a /etc/systemd/system/wdtt.service "${'$'}BACKUP/wdtt.service"
+            cmp -s /etc/systemd/system/wdtt.service "${'$'}BACKUP/wdtt.service" || exit 5
+            touch "${'$'}BACKUP/had_service"
+        fi
         if systemctl is-active --quiet wdtt; then touch "${'$'}BACKUP/was_active"; fi
+        if systemctl is-enabled --quiet wdtt; then touch "${'$'}BACKUP/was_enabled"; fi
+        printf 'prepared\n' > "${'$'}BACKUP/state"
+        chmod 600 "${'$'}BACKUP/state"
         echo WDTT_UPDATE_BACKUP=ready
     """.trimIndent()
     val output = ssh.exec(rootCommand(command), timeout = 30000L)
+    markerValue(output, "WDTT_UPDATE_BACKUP")?.takeIf { it != "ready" }?.let { state ->
+        throw IllegalStateException(
+            if (state == "stale") {
+                "найдена незавершённая страховочная копия прошлого обновления; " +
+                    "новая установка заблокирована до проверки или отката"
+            } else {
+                "страховочная копия отклонена: $state"
+            }
+        )
+    }
     require(Regex("^WDTT_UPDATE_BACKUP=ready$", RegexOption.MULTILINE).containsMatchIn(output)) {
         "не удалось подготовить страховочную копию обновления"
     }
 }
 
 private fun cleanupServerUpdateRollback(ssh: SSHClient) {
-    ssh.exec(rootCommand("rm -rf ${shellQuote(SERVER_UPDATE_BACKUP_DIR)}"), timeout = 10000L)
+    val command = """
+        set -e
+        BACKUP=${shellQuote(SERVER_UPDATE_BACKUP_DIR)}
+        [ -f "${'$'}BACKUP/state" ] && [ "${'$'}(cat "${'$'}BACKUP/state")" = prepared ] || exit 2
+        printf 'committed\n' > "${'$'}BACKUP/state"
+        rm -rf "${'$'}BACKUP"
+    """.trimIndent()
+    ssh.exec(rootCommand(command), timeout = 10000L)
 }
 
 private fun rollbackServerUpdate(ssh: SSHClient) {
@@ -11936,11 +12852,16 @@ private fun rollbackServerUpdate(ssh: SSHClient) {
         set -e
         BACKUP=${shellQuote(SERVER_UPDATE_BACKUP_DIR)}
         [ -d "${'$'}BACKUP" ] || { echo WDTT_ROLLBACK=missing; exit 2; }
+        [ -f "${'$'}BACKUP/state" ] && [ "${'$'}(cat "${'$'}BACKUP/state")" = prepared ] || { echo WDTT_ROLLBACK=unsafe_state; exit 2; }
+        [ ! -e "${'$'}BACKUP/had_config" ] || [ -d "${'$'}BACKUP/config" ] || { echo WDTT_ROLLBACK=incomplete_config; exit 2; }
+        [ ! -e "${'$'}BACKUP/had_binary" ] || [ -f "${'$'}BACKUP/wdtt-server" ] || { echo WDTT_ROLLBACK=incomplete_binary; exit 2; }
+        [ ! -e "${'$'}BACKUP/had_service" ] || [ -f "${'$'}BACKUP/wdtt.service" ] || { echo WDTT_ROLLBACK=incomplete_service; exit 2; }
         systemctl stop wdtt 2>/dev/null || true
         if [ -f "${'$'}BACKUP/had_binary" ]; then install -m 755 "${'$'}BACKUP/wdtt-server" /usr/local/bin/wdtt-server; else rm -f /usr/local/bin/wdtt-server; fi
         if [ -f "${'$'}BACKUP/had_service" ]; then install -m 644 "${'$'}BACKUP/wdtt.service" /etc/systemd/system/wdtt.service; else rm -f /etc/systemd/system/wdtt.service; fi
         if [ -f "${'$'}BACKUP/had_config" ]; then rm -rf /etc/wdtt; cp -a "${'$'}BACKUP/config" /etc/wdtt; else rm -rf /etc/wdtt; fi
         systemctl daemon-reload
+        if [ -f "${'$'}BACKUP/was_enabled" ]; then systemctl enable wdtt >/dev/null 2>&1; else systemctl disable wdtt >/dev/null 2>&1 || true; fi
         if [ -f "${'$'}BACKUP/was_active" ]; then systemctl restart wdtt; sleep 2; systemctl is-active --quiet wdtt; fi
         rm -rf "${'$'}BACKUP"
         echo WDTT_ROLLBACK=ok
@@ -12392,6 +13313,7 @@ private suspend fun performDeploy(
     var rollbackPrepared = false
     var preservedDbJson: String? = null
     var preImportDbJson: String? = null
+    var stagedDatabaseFile: File? = null
     try {
         onProgress(0.02f, "Подключение...")
 	        session = createSshSession(
@@ -12404,12 +13326,44 @@ private suspend fun performDeploy(
         val ssh = SSHClient(session, pass)
         sshClient = ssh
 
+        onProgress(0.04f, "Проверяю владельца установки...")
+        val ownership = deploymentOwnership(ssh)
+        assertDeploymentMayBeUpdated(ownership, mode)
+        if (ownership == DeploymentOwnership.LegacyAndroidDeploy && importPlan != null) {
+            throw IllegalStateException(
+                "старая Android-установка без метки допускает только обновление с сохранением без импорта. " +
+                    "После успешного обновления можно повторить импорт."
+            )
+        }
+        if (ownership == DeploymentOwnership.AndroidDeploy) {
+            onProgress(0.045f, "Создаю постоянную копию перед деплоем...")
+            createPersistentSafetyBackup(
+                request = DeployRequest(
+                    host = host,
+                    user = user,
+                    pass = pass,
+                    privateKey = privateKey,
+                    keyPassphrase = keyPassphrase,
+                    allowPasswordAuthentication = allowPasswordAuthentication,
+                    sshPort = port,
+                    mainPass = mainPass,
+                    adminId = adminId,
+                    botToken = botToken,
+                    dtlsPort = dtlsPort,
+                    wgPort = wgPort,
+                    localPort = localPort,
+                    dns1 = dns1,
+                    dns2 = dns2
+                ),
+                reason = "pre_deploy"
+            )
+        }
+
         onProgress(0.05f, "Подготовка файлов...")
-        val passArg = if (mainPass.isNotBlank()) "-password $mainPass " else ""
-        val adminArg = if (adminId.isNotBlank()) "-admin $adminId " else ""
-        val botArg = if (botToken.isNotBlank()) "-bot-token $botToken " else ""
-        val dnsArg = "-dns ${if(dns1.isNotBlank()) dns1 else "1.1.1.1"}${if(dns2.isNotBlank()) ",$dns2" else ""} "
-        val args = "$passArg$adminArg$botArg$dnsArg".trim()
+        val desiredDns = normalizedDeployDns(
+            first = dns1.ifBlank { "1.1.1.1" },
+            second = dns2
+        )
 
         val scriptFile = File(context.cacheDir, "deploy.sh")
         val serverFile = File(context.cacheDir, "server")
@@ -12429,11 +13383,23 @@ private suspend fun performDeploy(
             return@withContext false
         }
         val expectedServerSha256 = sha256File(serverFile)
-        if (mode == DeployMode.PreserveData || importPlan != null) {
+        var currentDbJsonForDeploy: String? = null
+		if (
+			mode == DeployMode.PreserveData ||
+			importPlan != null ||
+			(mode == DeployMode.ResetAll && ownership == DeploymentOwnership.AndroidDeploy)
+		) {
             onProgress(0.055f, "Проверка сохранённых данных...")
             val currentDbJson = readRemotePasswordsJson(ssh)?.also {
                 validatePasswordsDbForPreserving(JSONObject(it), mainPass)
             }
+            if (mode == DeployMode.PreserveData && currentDbJson == null) {
+                throw IllegalStateException(
+                    "обновление с сохранением остановлено: на сервере нет passwords.json; " +
+                        "создание пустой базы вместо неизвестного состояния запрещено"
+                )
+            }
+            currentDbJsonForDeploy = currentDbJson
             if (mode == DeployMode.PreserveData) {
                 if (importPlan == null) preservedDbJson = currentDbJson
                 if (importPlan?.mode == ServerImportMode.Merge) preImportDbJson = currentDbJson
@@ -12442,9 +13408,29 @@ private suspend fun performDeploy(
             rollbackPrepared = true
         }
 
+        if (importPlan == null) {
+            val preparedDatabase = prepareDeployDatabaseJson(
+                currentJson = if (mode == DeployMode.PreserveData) currentDbJsonForDeploy else null,
+                mainPassword = mainPass,
+                adminId = adminId,
+                botToken = botToken,
+                dns = desiredDns,
+                ports = "$dtlsPort,$wgPort,$localPort"
+            )
+            stagedDatabaseFile = File.createTempFile("wdtt-passwords-", ".json", context.cacheDir).apply {
+                setReadable(false, false)
+                setWritable(false, false)
+                setExecutable(false, false)
+                setReadable(true, true)
+                setWritable(true, true)
+                writeText(preparedDatabase, Charsets.UTF_8)
+            }
+        }
+
         onProgress(0.06f, "Загрузка на сервер...")
         ssh.upload(scriptFile, "/tmp/deploy.sh")
         ssh.upload(serverFile, "/tmp/wdtt-server")
+        stagedDatabaseFile?.let { ssh.upload(it, "/tmp/wdtt-passwords.json.new", permissions = 0b110000000) }
         scriptFile.delete()
         serverFile.delete()
 
@@ -12490,7 +13476,12 @@ private suspend fun performDeploy(
             )
         }
 		val output = ssh.exec(
-			rootCommand("env WDTT_ARGS=${shellQuote(args)} WDTT_DTLS_PORT=$dtlsPort WDTT_WG_PORT=$wgPort WDTT_SSH_PORT=$port WDTT_PRESERVE_DATA=${if (mode == DeployMode.PreserveData) 1 else 0} bash /tmp/deploy.sh"),
+			rootCommand(
+                "env WDTT_DTLS_PORT=$dtlsPort WDTT_WG_PORT=$wgPort WDTT_SSH_PORT=$port " +
+                    "WDTT_PRESERVE_DATA=${if (mode == DeployMode.PreserveData) 1 else 0} " +
+                    "${if (stagedDatabaseFile != null) "WDTT_STAGED_DB=/tmp/wdtt-passwords.json.new " else ""}" +
+                    "bash /tmp/deploy.sh"
+            ),
 			timeout = CMD_TIMEOUT
         )
 
@@ -12563,6 +13554,13 @@ private suspend fun performDeploy(
         DeployManager.failDeploy(friendlyDeployError(e, "установка сервера"))
         return@withContext false
     } finally {
+        stagedDatabaseFile?.delete()
+        runCatching {
+            sshClient?.exec(
+                rootCommand("rm -f /tmp/wdtt-server /tmp/wdtt-passwords.json.new"),
+                timeout = 10_000L
+            )
+        }
         try { session?.disconnect() } catch (_: Exception) {}
         DeployManager.activeSession = null
     }
@@ -12582,6 +13580,9 @@ private suspend fun performUninstall(
         session = createSshSession(host, user, credentials, port)
         DeployManager.activeSession = session
         val ssh = SSHClient(session, credentials.password)
+
+        onProgress(0.10f, "Проверяю владельца установки...")
+        assertAndroidDeployMayManageServer(ssh, "удаления")
 
         onProgress(0.15f, "Остановка сервиса...")
         ssh.exec(
@@ -12675,7 +13676,14 @@ private fun ServerBackupExportPasswordDialog(
 
     AlertDialog(
         onDismissRequest = { if (!busy) onDismiss() },
-        title = { Text("Защитить бэкап") },
+        title = {
+            DialogTitleWithClose(
+                title = "Защитить бэкап",
+                onDismiss = onDismiss,
+                enabled = !busy,
+                color = MaterialTheme.colorScheme.primary
+            )
+        },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text(
@@ -12732,9 +13740,6 @@ private fun ServerBackupExportPasswordDialog(
                     }
                 }
             ) { Text("Продолжить") }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss, enabled = !busy) { Text("Отмена") }
         }
     )
 }
@@ -12752,7 +13757,14 @@ private fun ServerBackupImportPasswordDialog(
 
     AlertDialog(
         onDismissRequest = { if (!busy) onDismiss() },
-        title = { Text("Пароль бэкапа") },
+        title = {
+            DialogTitleWithClose(
+                title = "Пароль бэкапа",
+                onDismiss = onDismiss,
+                enabled = !busy,
+                color = MaterialTheme.colorScheme.primary
+            )
+        },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text("Введите пароль, заданный при экспорте. Проверка не изменяет сервер.")
@@ -12795,11 +13807,223 @@ private fun ServerBackupImportPasswordDialog(
                     }
                 }
             ) { Text("Проверить") }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss, enabled = !busy) { Text("Отмена") }
         }
     )
+}
+
+@Composable
+private fun rememberServerActionNetworkAvailable(): Boolean {
+    val context = LocalContext.current.applicationContext
+    var available by remember(context) { mutableStateOf(false) }
+    DisposableEffect(context) {
+        val connectivity = context.getSystemService(ConnectivityManager::class.java)
+        val mainHandler = Handler(Looper.getMainLooper())
+        if (connectivity == null) {
+            available = false
+            onDispose { }
+        } else {
+            val matchingNetworks = mutableSetOf<Network>()
+            fun update(network: Network, present: Boolean) {
+                mainHandler.post {
+                    if (present) matchingNetworks += network else matchingNetworks -= network
+                    available = matchingNetworks.isNotEmpty()
+                }
+            }
+            val callback = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) = update(network, present = true)
+                override fun onLost(network: Network) = update(network, present = false)
+                override fun onCapabilitiesChanged(
+                    network: Network,
+                    networkCapabilities: NetworkCapabilities
+                ) = update(network, present = true)
+            }
+            val registered = runCatching {
+                connectivity.registerNetworkCallback(
+                    NetworkRequest.Builder()
+                        .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                        .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                        .build(),
+                    callback
+                )
+            }.isSuccess
+            if (!registered) available = false
+            onDispose {
+                if (registered) runCatching { connectivity.unregisterNetworkCallback(callback) }
+            }
+        }
+    }
+    return available
+}
+
+@Composable
+private fun DangerousServerHoldButton(
+    actionLabel: String,
+    enabled: Boolean,
+    modifier: Modifier = Modifier,
+    guardKey: Any? = Unit,
+    onConfirmed: () -> Unit
+) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val pressed by interactionSource.collectIsPressedAsState()
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val view = LocalView.current
+    val networkAvailable = rememberServerActionNetworkAvailable()
+    var lifecycleResumed by remember(lifecycleOwner) {
+        mutableStateOf(lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
+    }
+    var windowFocused by remember(view) { mutableStateOf(view.hasWindowFocus()) }
+    var holdState by remember(guardKey) { mutableStateOf(DangerousServerHoldState()) }
+    var remainingMs by remember(guardKey) { mutableLongStateOf(DANGEROUS_SERVER_HOLD_MS) }
+    val currentOnConfirmed by rememberUpdatedState(onConfirmed)
+
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, _ ->
+            lifecycleResumed = lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+    DisposableEffect(view) {
+        val listener = ViewTreeObserver.OnWindowFocusChangeListener { hasFocus ->
+            windowFocused = hasFocus
+        }
+        view.viewTreeObserver.addOnWindowFocusChangeListener(listener)
+        onDispose {
+            val observer = view.viewTreeObserver
+            if (observer.isAlive) observer.removeOnWindowFocusChangeListener(listener)
+        }
+    }
+
+    val safetyReady = enabled && networkAvailable && lifecycleResumed && windowFocused
+    LaunchedEffect(pressed, safetyReady, guardKey) {
+        if (!pressed || !safetyReady) {
+            holdState = DangerousServerHoldState()
+            remainingMs = DANGEROUS_SERVER_HOLD_MS
+            return@LaunchedEffect
+        }
+        while (true) {
+            val update = advanceDangerousServerHold(
+                current = holdState,
+                pressed = true,
+                safetyReady = safetyReady,
+                nowElapsedMs = SystemClock.elapsedRealtime()
+            )
+            holdState = update.state
+            remainingMs = update.remainingMs
+            if (update.confirmed) {
+                currentOnConfirmed()
+                return@LaunchedEffect
+            }
+            kotlinx.coroutines.delay(25L)
+        }
+    }
+
+    val secondsRemaining = ((remainingMs + 999L) / 1_000L).coerceAtLeast(1L)
+    val progress = if (holdState.completedForCurrentPress) {
+        1f
+    } else {
+        ((DANGEROUS_SERVER_HOLD_MS - remainingMs).toFloat() / DANGEROUS_SERVER_HOLD_MS)
+            .coerceIn(0f, 1f)
+    }
+    val statusText = when {
+        !networkAvailable -> "Нет подключения к сети"
+        holdState.completedForCurrentPress -> "Подтверждение принято"
+        pressed -> "Осталось $secondsRemaining с · отпустите, чтобы отменить"
+        else -> "Удерживайте кнопку 3 секунды"
+    }
+
+    Column(
+        modifier = modifier,
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        Text(
+            text = statusText,
+            modifier = Modifier.fillMaxWidth(),
+            style = MaterialTheme.typography.bodySmall,
+            color = if (!networkAvailable) {
+                MaterialTheme.colorScheme.error
+            } else {
+                MaterialTheme.colorScheme.onSurfaceVariant
+            },
+            fontWeight = if (pressed) FontWeight.SemiBold else FontWeight.Normal,
+            textAlign = TextAlign.Center,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(6.dp)
+                .clip(CircleShape)
+                .background(MaterialTheme.colorScheme.surfaceVariant)
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth(progress)
+                    .fillMaxHeight()
+                    .background(MaterialTheme.colorScheme.error)
+            )
+        }
+        Box(
+            modifier = Modifier.fillMaxWidth(),
+            contentAlignment = Alignment.Center
+        ) {
+            Button(
+                onClick = {},
+                enabled = safetyReady,
+                interactionSource = interactionSource,
+                modifier = Modifier
+                    .fillMaxWidth(0.82f)
+                    .heightIn(min = 52.dp),
+                shape = RoundedCornerShape(16.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.error,
+                    contentColor = MaterialTheme.colorScheme.onError
+                )
+            ) {
+                Text(
+                    actionLabel,
+                    fontWeight = FontWeight.Bold,
+                    textAlign = TextAlign.Center,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun DialogTitleWithClose(
+    title: String,
+    onDismiss: () -> Unit,
+    enabled: Boolean = true,
+    color: Color = MaterialTheme.colorScheme.error
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Text(
+            text = title,
+            modifier = Modifier.weight(1f),
+            style = MaterialTheme.typography.titleLarge,
+            fontWeight = FontWeight.Bold,
+            color = color
+        )
+        IconButton(
+            onClick = onDismiss,
+            enabled = enabled,
+            modifier = Modifier.size(40.dp)
+        ) {
+            Icon(
+                imageVector = Icons.Default.Close,
+                contentDescription = "Закрыть"
+            )
+        }
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -12813,6 +14037,8 @@ private fun ServerImportConfirmDialog(
     onDismiss: () -> Unit,
     onConfirm: () -> Unit
 ) {
+    val television = isTelevisionDevice()
+    val scrollState = rememberScrollState()
     val portsSpec = "${request.dtlsPort},${request.wgPort},${request.localPort}"
     val dnsValue = listOf(request.dns1, request.dns2).filter { it.isNotBlank() }.joinToString(",")
     val modeText = if (mode == ServerImportMode.Replace) "Заменить базу сервера бэкапом" else "Добавить отсутствующих клиентов и устройства"
@@ -12849,13 +14075,13 @@ private fun ServerImportConfirmDialog(
                     modifier = Modifier
                         .padding(24.dp)
                         .fillMaxWidth()
-                        .verticalScroll(rememberScrollState()),
+                        .verticalScroll(scrollState)
+                        .tvDpadScrollable(scrollState, television),
                     verticalArrangement = Arrangement.spacedBy(14.dp)
                 ) {
-                Text(
-                    title,
-                    style = MaterialTheme.typography.titleLarge,
-                    fontWeight = FontWeight.Bold,
+                DialogTitleWithClose(
+                    title = title,
+                    onDismiss = onDismiss,
                     color = MaterialTheme.colorScheme.primary
                 )
                 Text(
@@ -12878,7 +14104,7 @@ private fun ServerImportConfirmDialog(
                     ) {
                         ConfirmLine("Режим", modeText)
                         ConfirmLine("Бэкап", "${backup.sourceHost}, ${backup.createdAt}")
-                        ConfirmLine("Данные", "${backup.passwordCount} клиентов, ${backup.deviceCount} устройств")
+                        ConfirmLine("Данные", "${backupClientCountLabel(backup.passwordCount)}, ${backupDeviceCountLabel(backup.deviceCount)}")
                         ConfirmLine("Адрес сервера для ссылок", request.host)
                         ConfirmLine("Порты быстрых ссылок", portsSpec)
                         ConfirmLine("Главный пароль", mainPasswordText)
@@ -12896,26 +14122,41 @@ private fun ServerImportConfirmDialog(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    OutlinedButton(
-                        onClick = onDismiss,
-                        modifier = Modifier.weight(1f).heightIn(min = 48.dp),
-                        shape = RoundedCornerShape(16.dp)
-                    ) {
-                        Text("Назад")
-                    }
-                    Button(
-                        onClick = onConfirm,
-                        modifier = Modifier.weight(1f).heightIn(min = 48.dp),
-                        shape = RoundedCornerShape(16.dp)
-                    ) {
-                        Text(if (isDeploy) "Продолжить" else "Импорт", fontWeight = FontWeight.Bold)
-                    }
-                    Spacer(Modifier.height(4.dp))
+                if (mode == ServerImportMode.Replace) {
+                    Text(
+                        "Для запуска замены непрерывно удерживайте опасную кнопку 3 секунды. " +
+                            "Перед изменением будет создана постоянная и транзакционная копия текущего состояния.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
                 }
+                if (mode == ServerImportMode.Replace) {
+                    DangerousServerHoldButton(
+                        actionLabel = if (isDeploy) "Продолжить" else "Заменить",
+                        enabled = true,
+                        guardKey = listOf(backup.sourceHost, backup.createdAt, request.host, mode.name),
+                        onConfirmed = onConfirm,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                } else {
+                    Box(
+                        modifier = Modifier.fillMaxWidth(),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Button(
+                            onClick = onConfirm,
+                            modifier = Modifier.fillMaxWidth(0.82f).heightIn(min = 52.dp),
+                            shape = RoundedCornerShape(16.dp)
+                        ) {
+                            Text(
+                                if (isDeploy) "Продолжить" else "Импорт",
+                                fontWeight = FontWeight.Bold,
+                                textAlign = TextAlign.Center
+                            )
+                        }
+                    }
+                }
+                Spacer(Modifier.height(4.dp))
             }
         }
     }
@@ -12950,48 +14191,71 @@ private fun SshAuthenticationHelpDialog(
     additionalServer: Boolean = false,
     onDismiss: () -> Unit
 ) {
-    androidx.compose.ui.window.Dialog(onDismissRequest = onDismiss) {
-        Surface(
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(24.dp),
-            color = MaterialTheme.colorScheme.surface,
-            tonalElevation = 8.dp
+    val television = isTelevisionDevice()
+    val scrollState = rememberScrollState()
+    androidx.compose.ui.window.Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = !television),
+    ) {
+        BoxWithConstraints(
+            modifier = Modifier.fillMaxSize().padding(8.dp),
+            contentAlignment = Alignment.Center,
         ) {
-            Column(modifier = Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
+            Surface(
+                modifier = (if (television) {
+                    Modifier.televisionDialogWidth(television)
+                } else {
+                    Modifier.fillMaxWidth()
+                }).heightIn(max = maxHeight * 0.92f),
+                shape = RoundedCornerShape(24.dp),
+                color = MaterialTheme.colorScheme.surface,
+                tonalElevation = 8.dp
+            ) {
+                Column(
+                    modifier = Modifier
+                        .padding(20.dp)
+                        .verticalScroll(scrollState)
+                        .tvDpadScrollable(scrollState, television),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
-                    Text("Вход по SSH", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                    IconButton(onClick = onDismiss) {
-                        Icon(Icons.Default.Close, contentDescription = "Закрыть")
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("Вход по SSH", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                        IconButton(
+                            onClick = onDismiss,
+                            modifier = Modifier.remoteIconButtonFocus(),
+                        ) {
+                            Icon(Icons.Default.Close, contentDescription = "Закрыть")
+                        }
                     }
-                }
-                Text(
-                    if (additionalServer) {
-                        "Выберите, как текущий WDTT-сервер войдёт на дополнительный VPS во время настройки WireGuard-выхода."
-                    } else {
-                        "Выбранный способ используется для установки, подключения без установки и всех инструментов управления этим WDTT-сервером."
-                    },
-                    style = MaterialTheme.typography.bodyMedium
-                )
-                Text("• «Пароль» — обычный вход по логину и SSH-паролю.", style = MaterialTheme.typography.bodySmall)
-                Text(
-                    "• «SSH-ключ» — вход по приватному ключу; соответствующий публичный ключ должен находиться на сервере в authorized_keys.",
-                    style = MaterialTheme.typography.bodySmall
-                )
-                Text(
-                    "В режиме ключа пароль необязателен для root или passwordless sudo. Если sudo требует пароль, укажите его в поле «Пароль sudo».",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                if (!additionalServer) {
                     Text(
-                        "«Пароль туннеля» требуется отдельно: SSH открывает доступ к системе, а пароль туннеля подтверждает владельца WDTT.",
+                        if (additionalServer) {
+                            "Выберите, как текущий WDTT-сервер войдёт на дополнительный VPS во время настройки WireGuard-выхода."
+                        } else {
+                            "Выбранный способ используется для установки, подключения без установки и всех инструментов управления этим WDTT-сервером."
+                        },
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                    Text("• «Пароль» — обычный вход по логину и SSH-паролю.", style = MaterialTheme.typography.bodySmall)
+                    Text(
+                        "• «SSH-ключ» — вход по приватному ключу; соответствующий публичный ключ должен находиться на сервере в authorized_keys.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    Text(
+                        "В режиме ключа пароль необязателен для root или passwordless sudo. Если sudo требует пароль, укажите его в поле «Пароль sudo».",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
+                    if (!additionalServer) {
+                        Text(
+                            "«Пароль туннеля» требуется отдельно: SSH открывает доступ к системе, а пароль туннеля подтверждает владельца WDTT.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                 }
             }
         }
@@ -13319,7 +14583,10 @@ fun DeploySecretsDialog(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text("Секреты Деплоя", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                    IconButton(onClick = onDismiss) {
+                    IconButton(
+                        onClick = onDismiss,
+                        modifier = Modifier.remoteIconButtonFocus(),
+                    ) {
                         Icon(Icons.Default.Close, contentDescription = "Закрыть")
                     }
                 }
@@ -13327,6 +14594,12 @@ fun DeploySecretsDialog(
                 Spacer(Modifier.height(16.dp))
 
                 val isPasswordValid = passInput.isNotEmpty() && passInput.matches(Regex("^[a-zA-Z0-9_.!?:#/-]+$"))
+                val dnsInputIssue = if (manualDnsInput) {
+                    runCatching { normalizedDeployDns(dns1Input, dns2Input) }
+                        .exceptionOrNull()?.message
+                } else {
+                    null
+                }
 
                 OutlinedTextField(
                     value = passInput,
@@ -13373,7 +14646,7 @@ fun DeploySecretsDialog(
                     )
                     IconButton(
                         onClick = { showTelegramBotHelp = true },
-                        modifier = Modifier.size(36.dp)
+                        modifier = Modifier.size(36.dp).remoteHelpFocus()
                     ) {
                         Icon(
                             Icons.AutoMirrored.Filled.HelpOutline,
@@ -13422,7 +14695,10 @@ fun DeploySecretsDialog(
                 HorizontalDivider()
                 Spacer(Modifier.height(8.dp))
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .remoteToggleableRow(value = manualDnsInput) { manualDnsInput = it }
+                        .padding(horizontal = 8.dp, vertical = 6.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
@@ -13436,7 +14712,7 @@ fun DeploySecretsDialog(
                     }
                     Switch(
                         checked = manualDnsInput,
-                        onCheckedChange = { manualDnsInput = it }
+                        onCheckedChange = null,
                     )
                 }
 
@@ -13465,13 +14741,24 @@ fun DeploySecretsDialog(
                             shape = RoundedCornerShape(16.dp)
                         )
                     }
+                    if (dnsInputIssue != null) {
+                        Text(
+                            text = dnsInputIssue,
+                            modifier = Modifier.padding(top = 4.dp),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error
+                        )
+                    }
                 }
 
                 Spacer(Modifier.height(16.dp))
                 HorizontalDivider()
                 Spacer(Modifier.height(8.dp))
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .remoteToggleableRow(value = manualSshInput) { manualSshInput = it }
+                        .padding(horizontal = 8.dp, vertical = 6.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
@@ -13485,7 +14772,7 @@ fun DeploySecretsDialog(
                     }
                     Switch(
                         checked = manualSshInput,
-                        onCheckedChange = { manualSshInput = it }
+                        onCheckedChange = null,
                     )
                 }
 
@@ -13509,7 +14796,10 @@ fun DeploySecretsDialog(
                 HorizontalDivider()
                 Spacer(Modifier.height(8.dp))
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .remoteToggleableRow(value = manualPortsInput) { manualPortsInput = it }
+                        .padding(horizontal = 8.dp, vertical = 6.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
@@ -13523,7 +14813,7 @@ fun DeploySecretsDialog(
                     }
                     Switch(
                         checked = manualPortsInput,
-                        onCheckedChange = { manualPortsInput = it }
+                        onCheckedChange = null,
                     )
                 }
 
@@ -13562,8 +14852,8 @@ fun DeploySecretsDialog(
                         val finalPort = if (manualSshInput) normalizePort(sshPortInput, "22") else "22"
                         val finalDtls = if (manualPortsInput) normalizePort(dtlsPortInput, "56000") else "56000"
                         val finalWg = if (manualPortsInput) normalizePort(wgPortInput, "56001") else "56001"
-                        val finalDns1 = if (manualDnsInput) dns1Input.ifBlank { "1.1.1.1" } else "1.1.1.1"
-                        val finalDns2 = if (manualDnsInput) dns2Input.ifBlank { "1.0.0.1" } else "1.0.0.1"
+                        val finalDns1 = if (manualDnsInput) dns1Input.trim().ifBlank { "1.1.1.1" } else "1.1.1.1"
+                        val finalDns2 = if (manualDnsInput) dns2Input.trim().ifBlank { "1.0.0.1" } else "1.0.0.1"
                         val effectiveManualPorts = manualPortsInput && (finalDtls != "56000" || finalWg != "56001")
                         scope.launch {
                             settingsStore.saveDeploySecrets(passInput, adminIdInput, botTokenInput, finalPort)
@@ -13576,7 +14866,7 @@ fun DeploySecretsDialog(
                     },
                     modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
                     shape = RoundedCornerShape(16.dp),
-                    enabled = isPasswordValid,
+                    enabled = isPasswordValid && dnsInputIssue == null,
                     colors = ButtonDefaults.buttonColors(contentColor = MaterialTheme.colorScheme.onPrimary)
                 ) { Text("Сохранить", fontWeight = FontWeight.SemiBold) }
                     Spacer(Modifier.height(4.dp))
@@ -13593,6 +14883,7 @@ fun DeploySecretsDialog(
 @Composable
 private fun TelegramBotHelpDialog(onDismiss: () -> Unit) {
     val context = LocalContext.current
+    val television = isTelevisionDevice()
 
     fun openTelegramBot(username: String, miniApp: Boolean = false) {
         val tgUri = if (miniApp) {
@@ -13625,13 +14916,18 @@ private fun TelegramBotHelpDialog(onDismiss: () -> Unit) {
         Toast.makeText(context, "$handle скопирован", Toast.LENGTH_SHORT).show()
     }
 
-    androidx.compose.ui.window.Dialog(onDismissRequest = onDismiss) {
+    androidx.compose.ui.window.Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = !television),
+    ) {
         BoxWithConstraints(
             modifier = Modifier.fillMaxSize().padding(8.dp),
             contentAlignment = Alignment.Center
         ) {
             Surface(
-                modifier = Modifier.heightIn(max = maxHeight * 0.92f),
+                modifier = Modifier
+                    .televisionDialogWidth(television)
+                    .heightIn(max = maxHeight * 0.92f),
                 shape = RoundedCornerShape(24.dp),
                 color = MaterialTheme.colorScheme.surface,
                 contentColor = MaterialTheme.colorScheme.onSurface,
@@ -13656,8 +14952,11 @@ private fun TelegramBotHelpDialog(onDismiss: () -> Unit) {
                             color = MaterialTheme.colorScheme.primary,
                             modifier = Modifier.weight(1f)
                         )
-                        IconButton(onClick = onDismiss) {
-                            Icon(Icons.Default.Close, contentDescription = "Закрыть")
+                    IconButton(
+                        onClick = onDismiss,
+                        modifier = Modifier.remoteIconButtonFocus(),
+                    ) {
+                        Icon(Icons.Default.Close, contentDescription = "Закрыть")
                         }
                     }
 
@@ -13791,6 +15090,603 @@ private fun TelegramBotActionRow(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
+private fun ServerBackupDeleteConfirmDialog(
+    backup: ServerStoredBackupInfo,
+    onDismiss: () -> Unit,
+    onConfirm: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            DialogTitleWithClose(
+                title = "Удалить резервную копию?",
+                onDismiss = onDismiss
+            )
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    "Копия от ${formatServerBackupTime(backup.createdAt)} будет удалена только с VPS. " +
+                        "Файлы, уже скачанные на устройство, не изменятся. Последнюю исправную копию сервер удалить не позволит."
+                )
+                Text(
+                    "Для удаления непрерывно удерживайте кнопку 3 секунды. Отпускание или потеря связи отменит отсчёт.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                DangerousServerHoldButton(
+                    actionLabel = "Удалить",
+                    enabled = true,
+                    modifier = Modifier.fillMaxWidth(),
+                    guardKey = backup.id,
+                    onConfirmed = onConfirm
+                )
+            }
+        },
+        confirmButton = {}
+    )
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ServerBackupManagementCard(
+    state: ServerBackupManagerInfo?,
+    busy: Boolean,
+    statusMessage: String,
+    accessIssue: String?,
+    enabledInput: Boolean,
+    intervalInput: String,
+    retentionInput: String,
+    onEnabledChanged: (Boolean) -> Unit,
+    onIntervalChanged: (String) -> Unit,
+    onRetentionChanged: (String) -> Unit,
+    onRefresh: () -> Unit,
+    onSave: () -> Unit,
+    onCreate: () -> Unit,
+    onVerify: (ServerStoredBackupInfo) -> Unit,
+    onDownload: (ServerStoredBackupInfo) -> Unit,
+    onRestore: (ServerStoredBackupInfo) -> Unit,
+    onDelete: (ServerStoredBackupInfo) -> Unit
+) {
+    val backups = state?.backups.orEmpty()
+    val settingsValid = serverBackupSettingsAreValid(intervalInput, retentionInput)
+    val hasUnsavedSettings = hasUnsavedServerBackupSettings(
+        savedEnabled = state?.policy?.enabled,
+        savedIntervalHours = state?.policy?.intervalHours,
+        savedRetentionCount = state?.policy?.retentionCount,
+        enabledInput = enabledInput,
+        intervalInput = intervalInput,
+        retentionInput = retentionInput
+    )
+    val unsavedSettingsAreaHeight by animateDpAsState(
+        targetValue = if (hasUnsavedSettings) 58.dp else 0.dp,
+        animationSpec = tween(durationMillis = 260),
+        label = "backupUnsavedSettingsHeight"
+    )
+    val unsavedSettingsAreaAlpha = (unsavedSettingsAreaHeight.value / 58f).coerceIn(0f, 1f)
+    var selectedBackupId by rememberSaveable { mutableStateOf<String?>(null) }
+    LaunchedEffect(backups.map(ServerStoredBackupInfo::id)) {
+        if (selectedBackupId !in backups.map(ServerStoredBackupInfo::id)) {
+            selectedBackupId = backups.firstOrNull()?.id
+        }
+    }
+    val selectedBackupIndex = backups.indexOfFirst { it.id == selectedBackupId }
+        .takeIf { it >= 0 }
+        ?: 0
+
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text(
+                "Копии хранятся на VPS, а расписание работает независимо от приложения.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.weight(1f)
+            )
+            if (busy) CircularProgressIndicator(modifier = Modifier.size(22.dp), strokeWidth = 2.dp)
+        }
+
+        if (state != null) {
+            Text(
+                "Исправных копий: ${state.validCount} · повреждённых: ${state.brokenCount} · ${formatServerBackupBytes(state.totalBytes)}",
+                style = MaterialTheme.typography.bodySmall
+            )
+            Text(
+                "Последняя успешная: ${formatServerBackupTime(state.lastSuccessAt)}" +
+                    if (state.policy.enabled) " · следующая: ${formatServerBackupTime(state.nextRunAt)}" else " · расписание выключено",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            if (state.lastError.isNotBlank()) {
+                Text(
+                    "Последняя ошибка: ${state.lastError}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error
+                )
+            }
+        }
+
+        ServerBackupPanel {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .remoteToggleableRow(
+                        value = enabledInput,
+                        enabled = !busy && accessIssue == null,
+                        onValueChange = onEnabledChanged
+                    )
+                    .padding(vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Автоматические копии", fontWeight = FontWeight.SemiBold)
+                    Text(
+                        if (enabledInput) "Будут создаваться по заданному расписанию" else "Создаются только вручную и перед опасными операциями",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Switch(checked = enabledInput, onCheckedChange = null, enabled = !busy && accessIssue == null)
+            }
+
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                OutlinedTextField(
+                    value = intervalInput,
+                    onValueChange = { onIntervalChanged(it.filter(Char::isDigit).take(3)) },
+                    label = { Text("Интервал (ч)") },
+                    supportingText = { Text("6–168") },
+                    singleLine = true,
+                    enabled = !busy,
+                    modifier = Modifier.weight(1f)
+                )
+                OutlinedTextField(
+                    value = retentionInput,
+                    onValueChange = { onRetentionChanged(it.filter(Char::isDigit).take(2)) },
+                    label = { Text("Количество") },
+                    supportingText = { Text("2–90") },
+                    singleLine = true,
+                    enabled = !busy,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+
+            Column(modifier = Modifier.fillMaxWidth()) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(unsavedSettingsAreaHeight)
+                        .clipToBounds()
+                ) {
+                    if (unsavedSettingsAreaHeight > 0.dp) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(48.dp)
+                                .graphicsLayer { alpha = unsavedSettingsAreaAlpha },
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(8.dp)
+                                    .background(MaterialTheme.colorScheme.primary, CircleShape)
+                            )
+                            Text(
+                                "Изменения не сохранены",
+                                style = MaterialTheme.typography.labelLarge,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.weight(1f)
+                            )
+                            TextButton(
+                                onClick = {
+                                    state?.policy?.let { policy ->
+                                        onEnabledChanged(policy.enabled)
+                                        onIntervalChanged(policy.intervalHours.toString())
+                                        onRetentionChanged(policy.retentionCount.toString())
+                                    }
+                                },
+                                enabled = hasUnsavedSettings && !busy
+                            ) { Text("Отменить") }
+                        }
+                    }
+                }
+                if (hasUnsavedSettings) {
+                    Button(
+                        onClick = onSave,
+                        enabled = !busy && accessIssue == null && settingsValid,
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
+                    ) { Text("Сохранить изменения", maxLines = 1, overflow = TextOverflow.Ellipsis) }
+                } else {
+                    OutlinedButton(
+                        onClick = {},
+                        enabled = false,
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
+                    ) { Text("Сохранить изменения", maxLines = 1, overflow = TextOverflow.Ellipsis) }
+                }
+                Spacer(Modifier.height(10.dp))
+                OutlinedButton(
+                    onClick = onCreate,
+                    enabled = !busy && accessIssue == null && !hasUnsavedSettings,
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("Создать резервную копию", maxLines = 1, overflow = TextOverflow.Ellipsis) }
+                Spacer(Modifier.height(10.dp))
+                TextButton(
+                    onClick = onRefresh,
+                    enabled = !busy && accessIssue == null && !hasUnsavedSettings,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Обновить состояние")
+                }
+            }
+        }
+
+        if (accessIssue != null) {
+            InlineActionMessage(accessIssue)
+        } else if (statusMessage.isNotBlank()) {
+            InlineActionMessage(statusMessage)
+        }
+
+        if (backups.isNotEmpty()) {
+            val selectedBackup = backups[selectedBackupIndex]
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.30f))
+            Text("История копий", fontWeight = FontWeight.SemiBold)
+            ServerBackupPanel(contentPadding = PaddingValues(vertical = 12.dp)) {
+                ServerBackupsPager(
+                    backups = backups,
+                    selectedIndex = selectedBackupIndex,
+                    onSelectedIndexChange = { index -> selectedBackupId = backups[index].id }
+                )
+                ServerBackupSwipeHint(
+                    selectedIndex = selectedBackupIndex,
+                    count = backups.size,
+                    modifier = Modifier.align(Alignment.CenterHorizontally)
+                )
+            }
+            ServerBackupPanel {
+                ServerBackupActions(
+                    backup = selectedBackup,
+                    busy = busy,
+                    allowStateChangingActions = !hasUnsavedSettings,
+                    onVerify = onVerify,
+                    onDownload = onDownload,
+                    onRestore = onRestore,
+                    onDelete = onDelete
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ServerBackupPanel(
+    modifier: Modifier = Modifier,
+    contentPadding: PaddingValues = PaddingValues(12.dp),
+    content: @Composable ColumnScope.() -> Unit
+) {
+    Surface(
+        modifier = modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(22.dp),
+        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.48f),
+        contentColor = MaterialTheme.colorScheme.onSurface,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.14f)),
+        tonalElevation = 0.dp,
+        shadowElevation = 0.dp
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(contentPadding),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+            content = content
+        )
+    }
+}
+
+@Composable
+private fun ServerBackupsPager(
+    backups: List<ServerStoredBackupInfo>,
+    selectedIndex: Int,
+    onSelectedIndexChange: (Int) -> Unit
+) {
+    val pagerState = rememberPagerState(
+        initialPage = selectedIndex.coerceIn(0, backups.lastIndex),
+        pageCount = { backups.size }
+    )
+    LaunchedEffect(selectedIndex, backups.size) {
+        val target = selectedIndex.coerceIn(0, backups.lastIndex)
+        if (pagerState.currentPage != target) pagerState.scrollToPage(target)
+    }
+    LaunchedEffect(pagerState, backups.size) {
+        snapshotFlow { pagerState.currentPage }.collect { page ->
+            if (page in backups.indices) onSelectedIndexChange(page)
+        }
+    }
+    HorizontalPager(
+        state = pagerState,
+        key = { index -> backups[index].id },
+        beyondViewportPageCount = 1,
+        contentPadding = PaddingValues(horizontal = 18.dp),
+        pageSpacing = 12.dp,
+        modifier = Modifier.fillMaxWidth()
+    ) { page ->
+        ServerBackupCard(
+            backup = backups[page],
+            modifier = Modifier.fillMaxWidth()
+        )
+    }
+}
+
+@Composable
+private fun ServerBackupCard(
+    backup: ServerStoredBackupInfo,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        modifier = modifier,
+        shape = RoundedCornerShape(18.dp),
+        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.55f),
+        border = BorderStroke(
+            1.dp,
+            if (backup.valid) MaterialTheme.colorScheme.outline.copy(alpha = 0.16f)
+            else MaterialTheme.colorScheme.error.copy(alpha = 0.55f)
+        )
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Text(
+                "${formatServerBackupTime(backup.createdAt)} · ${serverBackupReasonLabel(backup.reason)}",
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                if (backup.valid) {
+                    "${backupClientCountLabel(backup.passwordCount)} · ${backupDeviceCountLabel(backup.deviceCount)} · " +
+                        "${formatServerBackupBytes(backup.sizeBytes)} · сервер ${backup.serverVersion}"
+                } else {
+                    "Повреждена: ${backup.error.ifBlank { "проверка не пройдена" }}"
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = if (backup.valid) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.error,
+                maxLines = 3,
+                overflow = TextOverflow.Ellipsis
+            )
+            if (backup.valid && backup.contentMetadataAvailable) {
+                Text(
+                    buildString {
+                        append("Содержимое: база")
+                        if (backup.hasWireGuardKeys) append(", ключи WireGuard")
+                        if (backup.hasBackupPolicy) append(", расписание копий")
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+                serverBackupOutboundLabel(backup.outboundProfileMode).takeIf(String::isNotBlank)?.let { label ->
+                    Text(
+                        "Выходной маршрут: $label",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun ColumnScope.ServerBackupActions(
+    backup: ServerStoredBackupInfo,
+    busy: Boolean,
+    allowStateChangingActions: Boolean,
+    onVerify: (ServerStoredBackupInfo) -> Unit,
+    onDownload: (ServerStoredBackupInfo) -> Unit,
+    onRestore: (ServerStoredBackupInfo) -> Unit,
+    onDelete: (ServerStoredBackupInfo) -> Unit
+) {
+    Text(
+        "Действия для копии от ${formatServerBackupTime(backup.createdAt)}",
+        style = MaterialTheme.typography.labelLarge,
+        fontWeight = FontWeight.Bold,
+        textAlign = TextAlign.Center,
+        modifier = Modifier.align(Alignment.CenterHorizontally)
+    )
+    FlowRow(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Button(
+            onClick = { onRestore(backup) },
+            enabled = !busy && backup.valid
+        ) { Text("Восстановить", maxLines = 1) }
+        OutlinedButton(
+            onClick = { onDownload(backup) },
+            enabled = !busy && backup.valid
+        ) { Text("Скачать", maxLines = 1) }
+        OutlinedButton(
+            onClick = { onVerify(backup) },
+            enabled = !busy && backup.valid
+        ) { Text("Проверить", maxLines = 1) }
+        TextButton(
+            onClick = { onDelete(backup) },
+            enabled = !busy && allowStateChangingActions,
+            colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)
+        ) { Text("Удалить", maxLines = 1) }
+    }
+}
+
+@Composable
+private fun ServerBackupSwipeHint(
+    selectedIndex: Int,
+    count: Int,
+    modifier: Modifier = Modifier
+) {
+    Row(
+        modifier = modifier,
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Icon(
+            Icons.Default.ChevronLeft,
+            contentDescription = null,
+            modifier = Modifier.size(18.dp),
+            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = if (selectedIndex > 0) 0.9f else 0.28f)
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(5.dp), verticalAlignment = Alignment.CenterVertically) {
+            repeat(count.coerceAtMost(7)) { dot ->
+                val active = when {
+                    count <= 7 -> dot == selectedIndex
+                    selectedIndex <= 3 -> dot == selectedIndex
+                    selectedIndex >= count - 4 -> dot == 7 - (count - selectedIndex)
+                    else -> dot == 3
+                }
+                Box(
+                    modifier = Modifier
+                        .size(if (active) 8.dp else 6.dp)
+                        .background(
+                            color = if (active) MaterialTheme.colorScheme.primary
+                            else MaterialTheme.colorScheme.outline.copy(alpha = 0.42f),
+                            shape = CircleShape
+                        )
+                )
+            }
+        }
+        Text(
+            "${selectedIndex + 1}/$count",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Icon(
+            Icons.Default.ChevronRight,
+            contentDescription = null,
+            modifier = Modifier.size(18.dp),
+            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = if (selectedIndex < count - 1) 0.9f else 0.28f)
+        )
+    }
+}
+
+@Composable
+private fun SelectedBackupApplyCard(
+    title: String,
+    subtitle: String,
+    backup: ServerBackup,
+    selectedMode: ServerImportMode,
+    busy: Boolean,
+    onModeSelected: (ServerImportMode) -> Unit,
+    onRemove: () -> Unit,
+    onApply: () -> Unit,
+    modifier: Modifier = Modifier,
+    titleModifier: Modifier = Modifier
+) {
+    Surface(
+        modifier = modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(22.dp),
+        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.48f),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.18f)),
+        tonalElevation = 0.dp,
+        shadowElevation = 0.dp
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Text(
+                text = title,
+                modifier = titleModifier,
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.Bold
+            )
+            Text(
+                subtitle,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.30f))
+            Text(
+                "${if (backup.hasWgKeys) "Полная" else "Частичная"} копия: " +
+                    "${backupClientCountLabel(backup.passwordCount)}, ${backupDeviceCountLabel(backup.deviceCount)}" +
+                    if (backup.hasWgKeys) ", ключи WireGuard включены." else ", без ключей WireGuard.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface
+            )
+            Text(
+                when {
+                    backup.serverManagedSnapshot ->
+                        "Копия повторно проверена по SHA-256 и подготовлена для восстановления."
+                    backup.passwordProtected ->
+                        "Файл защищён паролем; подлинность и целостность подтверждены."
+                    backup.integrityVerified ->
+                        "Целостность подтверждена, но старый файл не зашифрован."
+                    else -> "Старый незашифрованный формат: контрольной суммы в файле нет."
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = if (backup.passwordProtected || backup.serverManagedSnapshot) {
+                    MaterialTheme.colorScheme.primary
+                } else {
+                    MaterialTheme.colorScheme.error
+                }
+            )
+            SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                listOf(
+                    ServerImportMode.Replace to "Заменить",
+                    ServerImportMode.Merge to "Добавить"
+                ).forEachIndexed { index, (mode, label) ->
+                    val selected = selectedMode == mode
+                    SegmentedButton(
+                        selected = selected,
+                        onClick = { onModeSelected(mode) },
+                        shape = SegmentedButtonDefaults.itemShape(index, 2),
+                        enabled = !busy,
+                        icon = { StableSegmentedButtonIcon(selected = selected) }
+                    ) {
+                        Text(label, maxLines = 1, textAlign = TextAlign.Center)
+                    }
+                }
+            }
+            Text(
+                if (selectedMode == ServerImportMode.Replace) {
+                    if (backup.serverManagedSnapshot) {
+                        "Текущее состояние сервера будет заменено выбранной копией. Перед изменением создаётся страховочная копия."
+                    } else {
+                        "База целевого сервера будет заменена данными из файла. Это основной режим полного переноса."
+                    }
+                } else {
+                    "Текущие настройки сохранятся, а отсутствующие клиенты и устройства будут добавлены без перезаписи конфликтов."
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Button(
+                onClick = onApply,
+                enabled = !busy,
+                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                shape = RoundedCornerShape(16.dp)
+            ) {
+                Text(
+                    if (backup.serverManagedSnapshot) "Продолжить восстановление" else "Применить файл на сервере",
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            TextButton(onClick = onRemove, enabled = !busy, modifier = Modifier.fillMaxWidth()) {
+                Text(if (backup.serverManagedSnapshot) "Отменить восстановление" else "Убрать файл")
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
 private fun ExistingInstallDialog(
 	info: ExistingInstallInfo,
 	importMode: ServerImportMode? = null,
@@ -13798,7 +15694,26 @@ private fun ExistingInstallDialog(
 	onPreserve: () -> Unit,
 	onReset: () -> Unit
 ) {
+	var showResetConfirmation by rememberSaveable { mutableStateOf(false) }
+	val television = isTelevisionDevice()
+	val scrollState = rememberScrollState()
 	val checkError = info.checkError
+	val ownership = existingInstallOwnershipFromFlags(
+		standaloneManaged = info.standaloneManaged,
+		androidDeployManaged = info.androidDeployManaged,
+		legacyAndroidDeployCandidate = info.legacyAndroidDeployCandidate
+	)
+	val preservingUpdateAllowed = existingInstallAllowsPreservingUpdate(
+		ownership = ownership,
+		checkSucceeded = checkError == null
+	)
+	val resetAllowed = existingInstallAllowsReset(
+		ownership = ownership,
+		checkSucceeded = checkError == null
+	)
+	LaunchedEffect(resetAllowed) {
+		if (!resetAllowed) showResetConfirmation = false
+	}
 	androidx.compose.ui.window.Dialog(onDismissRequest = onDismiss) {
 		BoxWithConstraints(
 			modifier = Modifier.fillMaxSize().padding(8.dp),
@@ -13815,20 +15730,20 @@ private fun ExistingInstallDialog(
 					modifier = Modifier
 						.padding(24.dp)
 						.fillMaxWidth()
-						.verticalScroll(rememberScrollState()),
+						.verticalScroll(scrollState)
+						.tvDpadScrollable(scrollState, television),
 					verticalArrangement = Arrangement.spacedBy(16.dp)
 				) {
-				Text(
-					if (checkError == null) "WDTT Plus уже найден на сервере" else "Проверка сервера не завершилась",
-					style = MaterialTheme.typography.titleLarge,
-					fontWeight = FontWeight.Bold,
-					color = MaterialTheme.colorScheme.primary
-				)
+                DialogTitleWithClose(
+                    title = if (checkError == null) "WDTT Plus уже найден на сервере" else "Проверка сервера не завершилась",
+                    onDismiss = onDismiss,
+                    color = MaterialTheme.colorScheme.primary
+                )
 				Text(
 					if (checkError == null) {
 						"На сервере есть следы установленного WDTT Plus. Выберите, как продолжить деплой."
 					} else {
-						"Не удалось надежно проверить, установлен ли WDTT Plus на сервере. Можно продолжить обновление с сохранением данных, но лучше сначала убедиться, что SSH-доступ работает стабильно."
+						"Не удалось надёжно проверить установку и её владельца. Все изменяющие действия заблокированы; проверьте SSH-доступ и повторите проверку."
 					},
 					style = MaterialTheme.typography.bodyMedium,
 					color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -13862,6 +15777,31 @@ private fun ExistingInstallDialog(
 						InstallTraceLine("База паролей", info.accessDbExists)
 						InstallTraceLine("WireGuard-ключи", info.wgKeysExist)
 						InstallTraceLine("Сервис активен", info.active)
+						if (ownership == DeploymentOwnership.StandaloneInstaller) {
+							Text(
+								"Управление: отдельный standalone-инсталлер. Приложение распознало установку, но не обновляет и не перезаписывает её. Для обновления используйте server-installer/install.sh на VPS.",
+								style = MaterialTheme.typography.bodySmall,
+								color = MaterialTheme.colorScheme.primary
+							)
+						} else if (ownership == DeploymentOwnership.AndroidDeploy) {
+							Text(
+								"Управление: Android-деплой. После обновления с сохранением можно при необходимости выполнить на VPS `install.sh adopt-android` — только с отдельным подтверждением и rollback.",
+								style = MaterialTheme.typography.bodySmall,
+								color = MaterialTheme.colorScheme.primary
+							)
+						} else if (ownership == DeploymentOwnership.LegacyAndroidDeploy) {
+							Text(
+								"Найдена старая Android-установка без метки. Доступно только обновление с сохранением: оно создаст страховочную копию, сохранит данные и добавит метку для следующих операций.",
+								style = MaterialTheme.typography.bodySmall,
+								color = MaterialTheme.colorScheme.primary
+							)
+						} else if (info.hasAnyTrace) {
+							Text(
+								"Установка без подтверждённых признаков Android-деплоя. Чтобы не изменить чужой сервер, обновление, импорт, удаление и сброс заблокированы.",
+								style = MaterialTheme.typography.bodySmall,
+								color = MaterialTheme.colorScheme.error
+							)
+						}
 					}
 				}
 				Surface(
@@ -13918,7 +15858,15 @@ private fun ExistingInstallDialog(
 					}
 				}
 				Text(
-					"С сохранением данных: обновится бинарник, серверные настройки будут взяты из приложения, а клиентские пароли, привязки устройств, история и ключи сохранятся. Перед изменением создаётся страховочная копия.\n\nС нуля: данные WDTT Plus на сервере будут удалены, все выданные ссылки и привязки пропадут; затем сервер получит текущие поля приложения.",
+					if (ownership == DeploymentOwnership.StandaloneInstaller) {
+						"Standalone-установка отделена от Android-деплоя. Обновление, повторный деплой, сброс и удаление здесь заблокированы, чтобы не обойти журнал и откат ручного установщика. Подключение, управление сервером и безопасное восстановление копий остаются доступны отдельно."
+					} else if (ownership == DeploymentOwnership.LegacyAndroidDeploy) {
+						"С сохранением данных: обновится бинарник, серверные настройки будут взяты из приложения, а клиентские пароли, привязки устройств, история и ключи сохранятся. Перед изменением создаётся страховочная копия.\n\nЭто одноразовый путь миграции старого Android-деплоя. Сброс, удаление и импорт будут доступны только после успешного обновления и появления метки."
+					} else if (ownership == DeploymentOwnership.AndroidDeploy) {
+						"С сохранением данных: обновится бинарник, серверные настройки будут взяты из приложения, а клиентские пароли, привязки устройств, история и ключи сохранятся. Перед изменением создаётся страховочная копия.\n\nС нуля: данные WDTT Plus на сервере будут удалены, все выданные ссылки и привязки пропадут; затем сервер получит текущие поля приложения."
+					} else {
+						"Владелец установки не подтверждён. Обновление, импорт, сброс и удаление заблокированы до успешной безопасной проверки."
+					},
 					style = MaterialTheme.typography.bodySmall,
 					color = MaterialTheme.colorScheme.onSurfaceVariant
 				)
@@ -13943,6 +15891,7 @@ private fun ExistingInstallDialog(
 				Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
 					Button(
 						onClick = onPreserve,
+						enabled = preservingUpdateAllowed,
 						modifier = Modifier.fillMaxWidth().heightIn(min = 50.dp),
 						shape = RoundedCornerShape(16.dp)
 					) {
@@ -13955,7 +15904,8 @@ private fun ExistingInstallDialog(
 						)
 					}
 					OutlinedButton(
-						onClick = onReset,
+						onClick = { showResetConfirmation = true },
+						enabled = resetAllowed,
 						modifier = Modifier.fillMaxWidth().heightIn(min = 50.dp),
 						shape = RoundedCornerShape(16.dp),
 						colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error),
@@ -13965,18 +15915,60 @@ private fun ExistingInstallDialog(
 						Spacer(Modifier.width(8.dp))
 						Text("Начать с нуля", fontWeight = FontWeight.Bold)
 					}
-					TextButton(
-						onClick = onDismiss,
-						modifier = Modifier.fillMaxWidth()
-					) {
-						Text("Отмена")
-					}
 					Spacer(Modifier.height(4.dp))
 				}
 			}
 		}
+		}
+	}
+	if (showResetConfirmation) {
+		ServerResetConfirmDialog(
+			onDismiss = { showResetConfirmation = false },
+			onConfirm = {
+				showResetConfirmation = false
+				onReset()
+			}
+		)
 	}
 }
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ServerResetConfirmDialog(
+	onDismiss: () -> Unit,
+	onConfirm: () -> Unit
+) {
+	AlertDialog(
+		onDismissRequest = onDismiss,
+		title = {
+			DialogTitleWithClose(
+				title = "Начать установку с нуля?",
+				onDismiss = onDismiss
+			)
+		},
+		text = {
+			Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+				Text(
+					"Текущая база WDTT Plus, все выданные ссылки и привязки устройств на сервере будут удалены. " +
+						"Затем сервер будет заново установлен из текущих полей приложения."
+				)
+				Text(
+					"Перед удалением приложение создаст проверенную страховочную копию. " +
+						"Для запуска непрерывно удерживайте кнопку 3 секунды.",
+					style = MaterialTheme.typography.bodySmall,
+					color = MaterialTheme.colorScheme.onSurfaceVariant
+				)
+				DangerousServerHoldButton(
+					actionLabel = "Начать с нуля",
+					enabled = true,
+					modifier = Modifier.fillMaxWidth(),
+					guardKey = "server-reset",
+					onConfirmed = onConfirm
+				)
+			}
+		},
+		confirmButton = {}
+	)
 }
 
 @Composable
@@ -14009,9 +16001,6 @@ private fun InstallTraceLine(label: String, present: Boolean) {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun UninstallConfirmDialog(onDismiss: () -> Unit, onConfirm: () -> Unit) {
-    var confirmText by remember { mutableStateOf("") }
-    val isConfirmed = confirmText.trim().lowercase() == "да"
-
     androidx.compose.ui.window.Dialog(onDismissRequest = onDismiss) {
         BoxWithConstraints(
             modifier = Modifier.fillMaxSize().padding(8.dp),
@@ -14031,49 +16020,24 @@ fun UninstallConfirmDialog(onDismiss: () -> Unit, onConfirm: () -> Unit) {
                         .verticalScroll(rememberScrollState()),
                     verticalArrangement = Arrangement.spacedBy(16.dp)
                 ) {
-                Text(
-                    "Удаление WDTT Plus с сервера",
-                    style = MaterialTheme.typography.titleLarge,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.error
+                DialogTitleWithClose(
+                    title = "Удаление WDTT Plus с сервера",
+                    onDismiss = onDismiss
                 )
                 Text(
-                    "Будут удалены: бинарник, systemd-сервис, бот, конфигурация WDTT Plus и только помеченные правила firewall/NAT для WDTT Plus.\n\nЭто действие необратимо.",
+                    "Будут удалены: бинарник, systemd-сервис, бот, конфигурация WDTT Plus и только помеченные правила firewall/NAT для WDTT Plus.\n\n" +
+                        "Это действие необратимо. Для запуска непрерывно удерживайте кнопку 3 секунды.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-                OutlinedTextField(
-                    value = confirmText,
-                    onValueChange = { confirmText = it },
-                    label = { Text("Введите «да» для подтверждения") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(16.dp),
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = MaterialTheme.colorScheme.error,
-                        unfocusedBorderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f)
-                    )
+                DangerousServerHoldButton(
+                    actionLabel = "Удалить",
+                    enabled = true,
+                    guardKey = "server-uninstall",
+                    onConfirmed = onConfirm,
+                    modifier = Modifier.fillMaxWidth()
                 )
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    OutlinedButton(
-                        onClick = onDismiss, modifier = Modifier.weight(1f).heightIn(min = 48.dp),
-                        shape = RoundedCornerShape(16.dp),
-                        colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.onSurface)
-                    ) { Text("Отмена") }
-                    Button(
-                        onClick = onConfirm, modifier = Modifier.weight(1f).heightIn(min = 48.dp),
-                        shape = RoundedCornerShape(16.dp), enabled = isConfirmed,
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = MaterialTheme.colorScheme.error,
-                            contentColor = MaterialTheme.colorScheme.onError
-                        )
-                    ) {
-                        Icon(Icons.Default.Delete, null, Modifier.size(18.dp))
-                        Spacer(Modifier.width(6.dp))
-                        Text("Удалить", fontWeight = FontWeight.Bold)
-                    }
-                    Spacer(Modifier.height(4.dp))
-                }
+                Spacer(Modifier.height(4.dp))
             }
         }
     }

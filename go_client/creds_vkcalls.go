@@ -11,6 +11,7 @@ import (
 	neturl "net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -30,8 +31,12 @@ const (
 )
 
 var (
-	errVKCallsFlood    = errors.New("VKCalls participant check flood")
-	vkCallsFloodUntil  atomic.Int64
+	errVKCallsFlood   = errors.New("VKCalls participant check flood")
+	vkCallsFloodUntil atomic.Int64
+	vkCallsLinkPauses = struct {
+		sync.Mutex
+		until map[string]int64
+	}{until: make(map[string]int64)}
 	vkCallsAPIBaseURLs = [...]string{
 		"https://api.vk.me",
 		"https://api.vk.ru",
@@ -56,15 +61,13 @@ func isVKCallsFloodError(err error) bool {
 }
 
 func startVKCallsFloodPause(now time.Time) {
-	startVKCallsPreflightPause(now, vkCallsFloodPause)
+	startVKCallsGlobalPause(now, vkCallsFloodPause)
 }
 
-// startVKCallsPreflightPause is a small circuit breaker for the optional
-// VKCalls path.  A fresh worker group must not repeat the same failed
-// anonymous flow while the legacy provider is already handling the session.
-// It deliberately affects only preflight: it never delays TURN handshakes or
-// workers that already have credentials.
-func startVKCallsPreflightPause(now time.Time, duration time.Duration) {
+// startVKCallsGlobalPause protects the shared public IP from a confirmed VK
+// flood response. CAPTCHA and transient failures are scoped to one join link:
+// a bad call must not force every independent worker group into legacy CAPTCHA.
+func startVKCallsGlobalPause(now time.Time, duration time.Duration) {
 	if duration <= 0 {
 		return
 	}
@@ -77,10 +80,43 @@ func startVKCallsPreflightPause(now time.Time, duration time.Duration) {
 	}
 }
 
-func vkCallsFloodPauseRemaining(now time.Time) time.Duration {
+func vkCallsGlobalPauseRemaining(now time.Time) time.Duration {
 	remaining := time.Unix(0, vkCallsFloodUntil.Load()).Sub(now)
 	if remaining <= 0 {
 		return 0
+	}
+	return remaining
+}
+
+func startVKCallsLinkPause(link string, now time.Time, duration time.Duration) {
+	link = strings.TrimSpace(link)
+	if link == "" || duration <= 0 {
+		return
+	}
+	target := now.Add(duration).UnixNano()
+	vkCallsLinkPauses.Lock()
+	if vkCallsLinkPauses.until[link] < target {
+		vkCallsLinkPauses.until[link] = target
+	}
+	vkCallsLinkPauses.Unlock()
+}
+
+func vkCallsPreflightPauseRemaining(link string, now time.Time) time.Duration {
+	remaining := vkCallsGlobalPauseRemaining(now)
+	link = strings.TrimSpace(link)
+	if link == "" {
+		return remaining
+	}
+	vkCallsLinkPauses.Lock()
+	linkUntil := vkCallsLinkPauses.until[link]
+	if linkUntil != 0 && !now.Before(time.Unix(0, linkUntil)) {
+		delete(vkCallsLinkPauses.until, link)
+		linkUntil = 0
+	}
+	vkCallsLinkPauses.Unlock()
+	linkRemaining := time.Unix(0, linkUntil).Sub(now)
+	if linkRemaining > remaining {
+		return linkRemaining
 	}
 	return remaining
 }
@@ -104,14 +140,24 @@ func vkCallsPreflightPauseForError(err error) time.Duration {
 	return vkCallsTransientFailurePause
 }
 
-func stableVKCallsUUID(scope string) string {
-	seed := getVKCallsDeviceID() + ":" + scope
-	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(seed)).String()
+func shouldRetryVKCallsPreflight(err error) bool {
+	if err == nil || isVKCallsFloodError(err) {
+		return false
+	}
+	message := strings.ToUpper(err.Error())
+	return !strings.Contains(message, "INVALID_JOIN_LINK") &&
+		!strings.Contains(message, "ANON_BLOCKED") &&
+		!strings.Contains(message, "CALL_FULL")
 }
 
 func getVKCredsViaVKCalls(ctx context.Context, link string, streamID int) (string, string, []string, time.Duration, error) {
-	deviceID := stableVKCallsUUID("vk")
-	okDeviceID := stableVKCallsUUID("ok")
+	// VKCalls device_id identifies an anonymous call participant. Reusing the
+	// Android installation ID for several calls makes independent worker groups
+	// look like repeated joins of one participant and can trigger participant
+	// flood control. One bounded preflight attempt therefore gets one fresh pair
+	// of anonymous participant IDs; retries are capped by fetchVkCreds.
+	deviceID := uuid.NewString()
+	okDeviceID := uuid.NewString()
 	name := generateName()
 	joinURL := vkCallsJoinURL(link)
 

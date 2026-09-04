@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -23,6 +25,36 @@ type CaptchaResult struct {
 	Value     string
 }
 
+const startupConfigPrefix = "START_CONFIG|"
+
+type nativeStartupSecrets struct {
+	VKHashes             string `json:"vk_hashes"`
+	ConnectionPassword   string `json:"connection_password"`
+	CustomVKClientID     string `json:"custom_vk_client_id"`
+	CustomVKClientSecret string `json:"custom_vk_client_secret"`
+}
+
+type nativeStartupConfigResult struct {
+	secrets nativeStartupSecrets
+	err     error
+}
+
+func decodeNativeStartupSecrets(payload string) (nativeStartupSecrets, error) {
+	const maxEncodedStartupConfig = 32 * 1024
+	if payload == "" || len(payload) > maxEncodedStartupConfig {
+		return nativeStartupSecrets{}, fmt.Errorf("invalid startup config size")
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(payload)
+	if err != nil {
+		return nativeStartupSecrets{}, fmt.Errorf("decode startup config: %w", err)
+	}
+	var secrets nativeStartupSecrets
+	if err := json.Unmarshal(raw, &secrets); err != nil {
+		return nativeStartupSecrets{}, fmt.Errorf("parse startup config: %w", err)
+	}
+	return secrets, nil
+}
+
 // CaptchaResultChan — канал для получения токена капчи из внешнего решателя (WebView)
 var CaptchaResultChan = make(chan CaptchaResult, 8)
 var captchaRequestSequence atomic.Uint64
@@ -35,12 +67,10 @@ var captchaResultWaiters = struct {
 
 var captchaModeValue atomic.Value
 var vkCallsPreflightEnabled atomic.Bool
-var vkCallsDeviceID atomic.Value
 
 func init() {
 	captchaModeValue.Store("auto")
 	vkCallsPreflightEnabled.Store(true)
-	vkCallsDeviceID.Store("unknown")
 }
 
 func normalizeCaptchaMode(mode string) string {
@@ -66,21 +96,8 @@ func getCaptchaMode() string {
 	return mode
 }
 
-func setVKCallsPreflight(enabled bool, deviceID string) {
+func setVKCallsPreflight(enabled bool) {
 	vkCallsPreflightEnabled.Store(enabled)
-	deviceID = strings.TrimSpace(deviceID)
-	if deviceID == "" {
-		deviceID = "unknown"
-	}
-	vkCallsDeviceID.Store(deviceID)
-}
-
-func getVKCallsDeviceID() string {
-	deviceID, _ := vkCallsDeviceID.Load().(string)
-	if deviceID == "" {
-		return "unknown"
-	}
-	return deviceID
 }
 
 func normalizeBooleanFlagArgs(args []string, flagName string) []string {
@@ -265,13 +282,24 @@ func main() {
 
 	var pauseFlag int32
 	var activeDispatcher atomic.Pointer[Dispatcher]
+	startupConfigCh := make(chan nativeStartupConfigResult, 1)
 
-	// STDIN для PAUSE/RESUME/STOP и CAPTCHA_RESULT
+	// STDIN для конфигурации запуска, PAUSE/RESUME/STOP и CAPTCHA_RESULT.
+	// Секреты запуска не передаются через argv/environment, где их может
+	// прочитать системная диагностика Android.
 	go func() {
 		scanner := bufio.NewScanner(os.Stdin)
+		scanner.Buffer(make([]byte, 4096), 40*1024)
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
 			switch {
+			case strings.HasPrefix(line, startupConfigPrefix):
+				secrets, err := decodeNativeStartupSecrets(strings.TrimPrefix(line, startupConfigPrefix))
+				select {
+				case startupConfigCh <- nativeStartupConfigResult{secrets: secrets, err: err}:
+				default:
+					log.Printf("[STDIN] Повторная конфигурация запуска проигнорирована")
+				}
 			case line == "PAUSE":
 				log.Printf("[STDIN] Команда PAUSE")
 				atomic.StoreInt32(&pauseFlag, 1)
@@ -280,14 +308,14 @@ func main() {
 				atomic.StoreInt32(&pauseFlag, 0)
 			case line == "DEVICE_SLEEP":
 				if dispatcher := activeDispatcher.Load(); dispatcher != nil {
-					dispatcher.resetUserTrafficHealth()
+					dispatcher.noteDeviceSleep()
 				}
-				log.Printf("[STDIN] Экран выключен, таймер пользовательского трафика сброшен")
+				log.Printf("[STDIN] Экран выключен, контроль сетевых тайм-аутов приостановлен")
 			case line == "DEVICE_WAKE":
 				if dispatcher := activeDispatcher.Load(); dispatcher != nil {
-					dispatcher.resetUserTrafficHealth()
+					dispatcher.noteDeviceWake(time.Now())
 				}
-				log.Printf("[STDIN] Экран включён, проверка пользовательского трафика начнётся заново")
+				log.Printf("[STDIN] Экран включён, отправлена немедленная проверка каналов")
 			case line == "STOP":
 				log.Printf("[STDIN] Команда STOP")
 				cancel()
@@ -368,14 +396,35 @@ func main() {
 	)
 	fingerprint := flag.String("fingerprint", "firefox", "браузерный фингерпринт (firefox, chrome, safari, ios, android)")
 	clientIdsFlag := flag.String("client-ids", "", "ID клиентов VK через запятую")
+	startupConfigStdin := flag.Bool(
+		"startup-config-stdin",
+		false,
+		"получить секретные параметры запуска из stdin",
+	)
 
 	flag.Parse()
+	var startupSecrets nativeStartupSecrets
+	if *startupConfigStdin {
+		select {
+		case result := <-startupConfigCh:
+			if result.err != nil {
+				log.Fatal("[КЛИЕНТ] Некорректная конфигурация запуска из stdin")
+			}
+			startupSecrets = result.secrets
+			*vkHash = startupSecrets.VKHashes
+			*connPassword = startupSecrets.ConnectionPassword
+		case <-time.After(10 * time.Second):
+			log.Fatal("[КЛИЕНТ] Конфигурация запуска из stdin не получена")
+		case <-ctx.Done():
+			return
+		}
+	}
 	transportSession := normalizeTransportSession(*transportSessionFlag)
 	if transportSession == "" {
 		transportSession = newTransportSession()
 	}
 	activeCaptchaMode := setCaptchaMode(*captchaMode)
-	setVKCallsPreflight(*vkCallsPreflight, *deviceID)
+	setVKCallsPreflight(*vkCallsPreflight)
 	var normalizedTurnSNI string
 	if *turnStreamFirst {
 		var turnSNIErr error
@@ -404,6 +453,10 @@ func main() {
 	customClientSecret := os.Getenv("WDTT_CUSTOM_VK_CLIENT_SECRET")
 	_ = os.Unsetenv("WDTT_CUSTOM_VK_CLIENT_ID")
 	_ = os.Unsetenv("WDTT_CUSTOM_VK_CLIENT_SECRET")
+	if *startupConfigStdin {
+		customClientID = startupSecrets.CustomVKClientID
+		customClientSecret = startupSecrets.CustomVKClientSecret
+	}
 	if *clientIdsFlag != "" {
 		SetActiveClientIds(*clientIdsFlag)
 	}

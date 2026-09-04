@@ -64,17 +64,22 @@ class QuickToggleTileService : TileService() {
     override fun onClick() {
         super.onClick()
         runCatching {
-            when (
+            val running = TunnelManager.running.value
+            val trustedWifiWaiting = TrustedWifiManager.state.value.waiting
+            val action = if (running || trustedWifiWaiting) {
+                TunnelToggleAction.STOP
+            } else {
                 tunnelToggleAction(
-                    running = TunnelManager.running.value,
-                    trustedWifiWaiting = TrustedWifiManager.state.value.waiting,
+                    running = false,
+                    trustedWifiWaiting = false,
                     vpnPermissionRequired = VpnService.prepare(this) != null,
                 )
-            ) {
+            }
+            when (action) {
                 TunnelToggleAction.STOP -> {
                     // Состояние плитки изменится после фактической остановки службы.
                     startService(
-                        Intent(this, TunnelService::class.java).apply { action = "STOP" }
+                        Intent(this, TunnelService::class.java).apply { this.action = "STOP" }
                     )
                 }
                 TunnelToggleAction.REQUEST_VPN_PERMISSION -> {

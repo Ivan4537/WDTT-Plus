@@ -1,0 +1,9 @@
+# Operator-created files can contain the owner password or other secrets.
+/initial.json
+/config.json
+/*.local.json
+/*.secret.json
+
+# Locally built distribution artifacts are attached to a release, not Git.
+/wdtt-server
+/SHA256SUMS

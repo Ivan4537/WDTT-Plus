@@ -85,3 +85,31 @@ func TestDeviceStateChangeClearsPendingAndReportedTrafficStall(t *testing.T) {
 		t.Fatal("a response after reset must not report recovery from an obsolete stall")
 	}
 }
+
+func TestDeviceSleepSuppressesHealthAndWakeNotifiesWorkers(t *testing.T) {
+	d := &Dispatcher{}
+	wakeCh := make(chan struct{}, 1)
+	workers := []*WorkerSlot{{ID: 1, WakeCh: wakeCh}}
+	d.workers.Store(&workers)
+	wakeAt := time.Unix(500, 0)
+
+	d.noteDeviceSleep()
+	if !d.shouldSuppressTransportHealth(wakeAt.Add(24 * time.Hour)) {
+		t.Fatal("transport timeouts must stay suppressed while the device sleeps")
+	}
+
+	if generation := d.noteDeviceWake(wakeAt); generation != 1 {
+		t.Fatalf("first wake generation = %d, want 1", generation)
+	}
+	select {
+	case <-wakeCh:
+	default:
+		t.Fatal("wake must request an immediate keepalive from every worker")
+	}
+	if !d.shouldSuppressTransportHealth(wakeAt.Add(deviceWakeHealthGrace - time.Nanosecond)) {
+		t.Fatal("transport timeouts must stay suppressed during wake grace")
+	}
+	if d.shouldSuppressTransportHealth(wakeAt.Add(deviceWakeHealthGrace)) {
+		t.Fatal("transport health checks must resume after wake grace")
+	}
+}

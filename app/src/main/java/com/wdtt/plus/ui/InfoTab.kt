@@ -9,7 +9,6 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
-import android.net.VpnService
 import android.os.Build
 import android.os.PowerManager
 import android.os.StatFs
@@ -32,6 +31,7 @@ import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.focusGroup
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -522,6 +522,7 @@ fun InfoTab(
         modifier = Modifier
             .fillMaxSize()
             .fillMaxWidth()
+            .focusGroup()
             .padding(start = 16.dp, end = 16.dp, top = 0.dp, bottom = 28.dp)
             .verticalScroll(infoScrollState),
         verticalArrangement = Arrangement.spacedBy(16.dp)
@@ -985,6 +986,7 @@ private fun QuestionDestinationDialog(
     onGitHubClick: () -> Unit,
     onRemoteActionClick: (RemoteUiAction) -> Unit,
 ) {
+    val television = isTelevisionDevice()
     Dialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false),
@@ -998,7 +1000,11 @@ private fun QuestionDestinationDialog(
                 color = MaterialTheme.colorScheme.surface,
                 tonalElevation = 8.dp,
                 shadowElevation = 18.dp,
-                modifier = Modifier.fillMaxWidth().heightIn(max = 560.dp),
+                modifier = (if (television) {
+                    Modifier.televisionDialogWidth(television)
+                } else {
+                    Modifier.fillMaxWidth()
+                }).heightIn(max = 560.dp),
             ) {
                 Column(
                     modifier = Modifier.fillMaxWidth().padding(20.dp),
@@ -1796,6 +1802,7 @@ private fun ExpandableSectionCard(
             modifier = Modifier
                 .fillMaxWidth()
                 .clip(RoundedCornerShape(24.dp))
+                .remoteFocusOutline(RoundedCornerShape(24.dp))
                 .clickable(onClick = onToggle)
                 .padding(vertical = 2.dp),
             horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -1873,6 +1880,7 @@ private fun InfoActionTile(
         contentColor = MaterialTheme.colorScheme.onSurface,
         modifier = modifier
             .clip(RoundedCornerShape(24.dp))
+            .remoteFocusOutline(RoundedCornerShape(24.dp))
             .clickable(onClick = onClick)
     ) {
         Column(
@@ -1918,6 +1926,7 @@ private fun WideActionTile(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(24.dp))
+            .remoteFocusOutline(RoundedCornerShape(24.dp))
             .clickable(onClick = onClick)
     ) {
         Row(
@@ -1970,6 +1979,7 @@ private fun ProjectLinkRow(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(24.dp))
+            .remoteFocusOutline(RoundedCornerShape(24.dp))
             .clickable(onClick = onClick)
     ) {
         Row(
@@ -2156,7 +2166,7 @@ private suspend fun buildSupportReportSummary(context: Context, settingsStore: S
     val updateInstallPermission = diagnosticText {
         context.packageManager.canRequestPackageInstalls()
     }
-    val vpnPermission = diagnosticText { VpnService.prepare(context) == null }
+    val vpnPermission = "проверяется только при явном подключении"
     val displayMetrics = context.resources.displayMetrics
     val screenSummary = diagnosticText {
         "${displayMetrics.widthPixels}×${displayMetrics.heightPixels}, " +

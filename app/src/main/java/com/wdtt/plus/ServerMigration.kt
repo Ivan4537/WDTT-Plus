@@ -1,7 +1,7 @@
 package com.wdtt.plus
 
 /** Версии приложения, для которых выпускалась новая обязательная серверная часть. */
-internal val SERVER_MIGRATION_LEVELS = intArrayOf(2, 3, 5, 6, 7, 12, 14, 15)
+internal val SERVER_MIGRATION_LEVELS = intArrayOf(2, 3, 5, 6, 7, 12, 14, 15, 16)
 
 data class ServerMigrationState(
     val pendingLevel: Int,
@@ -65,7 +65,6 @@ internal fun resolveServerMigrationInitialization(
             pendingLevel = maxOf(pendingLevel, currentRequiredLevel)
         }
     }
-
     return ServerMigrationInitialization(
         lastSeenAppVersionCode = maxOf(storedLastSeenAppVersionCode ?: 0, currentVersionCode),
         pendingLevel = pendingLevel,

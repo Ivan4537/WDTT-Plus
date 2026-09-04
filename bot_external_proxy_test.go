@@ -11,6 +11,9 @@ func TestExternalProxyTransparentCheckDoesNotCaptureRootXrayTraffic(t *testing.T
 	script := outboundBotPrelude()
 
 	for _, expected := range []string{
+		`umask 077`,
+		`install -d -m 0700 /etc/wdtt /etc/wdtt/outbound`,
+		`chmod 0600 /etc/wdtt/outbound.json`,
 		`WDTT_PROXY_TEST_SOURCE="$test_source"`,
 		`iptables -t nat -I OUTPUT -s "$test_source" -p tcp -j WDTT_PROXY_TEST`,
 		`curl --interface "$test_source"`,
@@ -85,6 +88,84 @@ func TestExternalProxyInputRejectsAmbiguousCredentials(t *testing.T) {
 	}
 	if _, _, _, _, _, err := parseExternalProxyInput(`socks5 proxy.example.com 1080 user pass\"word`); err == nil {
 		t.Fatal("credentials requiring config escaping must be entered from the app")
+	}
+}
+
+func TestBotPasswordListSortsByLabelThenPassword(t *testing.T) {
+	items := sortedBotPasswordItems(map[string]*PasswordEntry{
+		"z-pass": &PasswordEntry{Label: "Дом"},
+		"a-pass": &PasswordEntry{Label: "Дом"},
+		"b-pass": &PasswordEntry{Label: "Ноутбук"},
+		"c-pass": &PasswordEntry{},
+	})
+
+	got := make([]string, 0, len(items))
+	for _, item := range items {
+		got = append(got, item.Password)
+	}
+	want := []string{"c-pass", "a-pass", "z-pass", "b-pass"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("unexpected password order: got %v, want %v", got, want)
+	}
+}
+
+func TestBotPasswordPaginationRowShowsRemainingCounts(t *testing.T) {
+	first := botPasswordPaginationRow(0, 20)
+	if len(first) != 1 || first[0]["text"] != "Вперёд (12) ▶️" || first[0]["callback_data"] != "listpage_1" {
+		t.Fatalf("unexpected first page row: %#v", first)
+	}
+
+	middle := botPasswordPaginationRow(1, 20)
+	if len(middle) != 2 ||
+		middle[0]["text"] != "◀️ Назад (8)" ||
+		middle[0]["callback_data"] != "listpage_0" ||
+		middle[1]["text"] != "Вперёд (4) ▶️" ||
+		middle[1]["callback_data"] != "listpage_2" {
+		t.Fatalf("unexpected middle page row: %#v", middle)
+	}
+
+	last := botPasswordPaginationRow(2, 20)
+	if len(last) != 1 || last[0]["text"] != "◀️ Назад (16)" || last[0]["callback_data"] != "listpage_1" {
+		t.Fatalf("unexpected last page row: %#v", last)
+	}
+}
+
+func TestBotBackButtonsUseConsistentLabel(t *testing.T) {
+	source, err := os.ReadFile("bot.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	for _, forbidden := range []string{
+		"◀️ Главное меню",
+		"◀️ Сервер",
+		"◀️ Настройки",
+		"◀️ К списку",
+		"◀️ Профиль владельца",
+		"◀️ Отмена",
+		"◀️ Назад к",
+	} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("bot back button label %q must be renamed to ◀️ Назад or made a non-back shortcut", forbidden)
+		}
+	}
+}
+
+func TestBotTrafficBackTargetsMatchEntryPoint(t *testing.T) {
+	source, err := os.ReadFile("bot.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	for _, expected := range []string{
+		`inlineButton("📊 Трафик", "status_traffic")`,
+		`promptMessageID = sendTrafficMenu(token, adminID, menuMessageID, "status")`,
+		`inlineButton("📊 Трафик", "settings_traffic")`,
+		`promptMessageID = sendTrafficMenu(token, adminID, menuMessageID, "settings_maintenance")`,
+	} {
+		if !strings.Contains(text, expected) {
+			t.Fatalf("bot traffic navigation does not contain %q", expected)
+		}
 	}
 }
 

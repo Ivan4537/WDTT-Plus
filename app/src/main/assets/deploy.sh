@@ -2,14 +2,20 @@
 # ==============================================================================
 #  WDTT Plus Server — Универсальный установщик для VPS
 #  Поддержка: Debian 11+, Ubuntu 20.04+, CentOS/RHEL/Fedora/AlmaLinux/Rocky
-#  Версия: 3.5  |  Дата: 2026-07-30
+#  Версия: 3.9  |  Дата: 2026-09-02
 #  NAT:  MASQUERADE через iptables
 #  WG:   порт 56001 (не конфликтует с существующим WG на 51820)
 #  DTLS: порт 56000
 # ==============================================================================
-set -uo pipefail
+set -euo pipefail
 
-readonly SCRIPT_VERSION="3.5"
+readonly SCRIPT_VERSION="3.9"
+readonly WDTT_DEPLOY_CONTRACT_VERSION="1"
+readonly WDTT_SERVER_VERSION="16"
+readonly WDTT_SERVER_BINARY_PATH="/usr/local/bin/wdtt-server"
+readonly WDTT_SYSTEMD_UNIT_PATH="/etc/systemd/system/wdtt.service"
+readonly WDTT_ANDROID_DEPLOY_MARKER="Managed by WDTT Plus Android deploy"
+readonly WDTT_ANDROID_CONTRACT_MARKER="WDTT deploy compatibility: 1"
 readonly LOG_FILE="/var/log/wdtt-install.log"
 readonly WG_PORT="${WDTT_WG_PORT:-56001}"
 readonly DTLS_PORT="${WDTT_DTLS_PORT:-56000}"
@@ -20,12 +26,13 @@ readonly MAX_HANDSHAKES="${WDTT_MAX_HANDSHAKES:-32}"
 readonly HANDSHAKE_RATE="${WDTT_HANDSHAKE_RATE:-24}"
 readonly MAX_CLIENT_MBPS="${WDTT_MAX_CLIENT_MBPS:-0}"
 readonly WG_BACKEND="${WDTT_WG_BACKEND:-auto}"
-readonly WDTT_ARGS="${WDTT_ARGS:-}"
 readonly WDTT_PRESERVE_DATA="${WDTT_PRESERVE_DATA:-0}"
 readonly WDTT_IFACE="wdtt0"
 readonly WDTT_CONFIG_DIR="/etc/wdtt"
 readonly WDTT_ACCESS_DB="passwords.json"
+readonly WDTT_ACCESS_DB_PREVIOUS="passwords.json.previous"
 readonly WDTT_WG_KEYS="wg-keys.dat"
+readonly WDTT_STAGED_DB="${WDTT_STAGED_DB:-}"
 readonly IPT_COMMENT="WDTT_MANAGED"
 readonly IPT_MIRROR_COMMENT="WDTT_MIRRORED"
 
@@ -366,11 +373,34 @@ fw_cleanup_wdtt_rules() {
     fi
 }
 
-cleanup_config_dir_keep_access_db() {
+secure_preserved_config() {
     [ -d "$WDTT_CONFIG_DIR" ] || return 0
-    find "$WDTT_CONFIG_DIR" -mindepth 1 -maxdepth 1 ! -name "$WDTT_ACCESS_DB" ! -name "$WDTT_WG_KEYS" -exec rm -rf {} + 2>/dev/null || true
-    [ -f "$WDTT_CONFIG_DIR/$WDTT_ACCESS_DB" ] && chmod 600 "$WDTT_CONFIG_DIR/$WDTT_ACCESS_DB" 2>/dev/null || true
-    [ -f "$WDTT_CONFIG_DIR/$WDTT_WG_KEYS" ] && chmod 600 "$WDTT_CONFIG_DIR/$WDTT_WG_KEYS" 2>/dev/null || true
+    [ ! -L "$WDTT_CONFIG_DIR" ] || die "$WDTT_CONFIG_DIR не должен быть символической ссылкой"
+    local name path
+    for name in "$WDTT_ACCESS_DB" "$WDTT_ACCESS_DB_PREVIOUS" "$WDTT_WG_KEYS" "outbound-profile.env"; do
+        path="$WDTT_CONFIG_DIR/$name"
+        [ -e "$path" ] || continue
+        [ -f "$path" ] && [ ! -L "$path" ] || die "Небезопасный объект конфигурации: $path"
+        chmod 600 "$path" || die "Не удалось защитить $path"
+    done
+}
+
+validate_deploy_data_mode() {
+    local database="$WDTT_CONFIG_DIR/$WDTT_ACCESS_DB"
+    if [ -e "$database" ] && [ "$WDTT_PRESERVE_DATA" != "1" ]; then
+        die "Найдена существующая база WDTT. Обновление разрешено только в режиме сохранения; явный сброс должен заранее удалить старую базу после подтверждения в приложении."
+    fi
+    if [ "$WDTT_PRESERVE_DATA" = "1" ]; then
+        [ -f "$database" ] && [ ! -L "$database" ] && [ -s "$database" ] ||
+            die "Режим сохранения требует обычный непустой passwords.json"
+        secure_preserved_config
+    fi
+    if [ -n "$WDTT_STAGED_DB" ]; then
+        [ -f "$WDTT_STAGED_DB" ] && [ ! -L "$WDTT_STAGED_DB" ] && [ -s "$WDTT_STAGED_DB" ] ||
+            die "Подготовленная база WDTT отсутствует или небезопасна"
+        [ "$(stat -c '%a' "$WDTT_STAGED_DB")" = "600" ] ||
+            die "Подготовленная база WDTT должна иметь права 600"
+    fi
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -384,9 +414,6 @@ wdtt_cleanup() {
 
     systemctl unmask wdtt 2>/dev/null || true
     systemctl stop wdtt 2>/dev/null || true
-    systemctl disable wdtt 2>/dev/null || true
-    rm -f /etc/systemd/system/wdtt.service 2>/dev/null || true
-    systemctl daemon-reload 2>/dev/null || true
     pkill -x wdtt-server 2>/dev/null || killall wdtt-server 2>/dev/null || true
 
     # Удаляем только собственный интерфейс WDTT.
@@ -396,12 +423,13 @@ wdtt_cleanup() {
     fw_cleanup_wdtt_rules "$(detect_wan_interface)"
 
     if [ "$WDTT_PRESERVE_DATA" = "1" ]; then
-        [ -f "$WDTT_CONFIG_DIR/$WDTT_ACCESS_DB" ] && chmod 600 "$WDTT_CONFIG_DIR/$WDTT_ACCESS_DB" 2>/dev/null || true
-        [ -f "$WDTT_CONFIG_DIR/$WDTT_WG_KEYS" ] && chmod 600 "$WDTT_CONFIG_DIR/$WDTT_WG_KEYS" 2>/dev/null || true
-        echo "✓ Режим обновления: конфигурация и данные сохранены"
+        secure_preserved_config
+        echo "✓ Режим обновления: всё содержимое /etc/wdtt сохранено"
     else
+        systemctl disable wdtt 2>/dev/null || true
+        rm -f /etc/systemd/system/wdtt.service 2>/dev/null || true
+        systemctl daemon-reload 2>/dev/null || true
         rm -f /usr/local/bin/wdtt-server 2>/dev/null || true
-        cleanup_config_dir_keep_access_db
     fi
 
     echo "✓ Очистка завершена (база доступа сохранена)"
@@ -482,7 +510,12 @@ setup_wdtt_binary() {
     echo "📦 Установка wdtt-server..."
 
     if [ -f /tmp/wdtt-server ]; then
+        [ ! -L /tmp/wdtt-server ] && [ -s /tmp/wdtt-server ] || die "/tmp/wdtt-server отсутствует или небезопасен"
         chmod +x /tmp/wdtt-server
+        local staged_version
+        staged_version="$(/tmp/wdtt-server --version 2>/dev/null | head -n 1 || true)"
+        [ "$staged_version" = "$WDTT_SERVER_VERSION" ] ||
+            die "Загружен wdtt-server несовместимой версии: ожидается $WDTT_SERVER_VERSION, получено ${staged_version:-не определено}"
         rm -f /usr/local/bin/.wdtt-server.new
         install -m 0755 /tmp/wdtt-server /usr/local/bin/.wdtt-server.new || die "Не удалось подготовить новый wdtt-server"
         mv -f /usr/local/bin/.wdtt-server.new /usr/local/bin/wdtt-server || die "Не удалось атомарно заменить wdtt-server"
@@ -495,7 +528,23 @@ setup_wdtt_binary() {
         echo "  Загрузите бинарник вручную в /usr/local/bin/wdtt-server"
     fi
 
+    if [ -x "$WDTT_SERVER_BINARY_PATH" ]; then
+        local server_version
+        server_version="$("$WDTT_SERVER_BINARY_PATH" --version 2>/dev/null | head -n 1 || true)"
+        [ "$server_version" = "$WDTT_SERVER_VERSION" ] ||
+            die "wdtt-server несовместимой версии: ожидается $WDTT_SERVER_VERSION, получено ${server_version:-не определено}"
+    fi
+
     mkdir -p "$WDTT_CONFIG_DIR"
+    chmod 700 "$WDTT_CONFIG_DIR"
+    if [ -n "$WDTT_STAGED_DB" ]; then
+        install -m 0600 "$WDTT_STAGED_DB" "$WDTT_CONFIG_DIR/.passwords.json.new" ||
+            die "Не удалось подготовить passwords.json"
+        mv -f "$WDTT_CONFIG_DIR/.passwords.json.new" "$WDTT_CONFIG_DIR/$WDTT_ACCESS_DB" ||
+            die "Не удалось атомарно установить passwords.json"
+        rm -f "$WDTT_STAGED_DB"
+    fi
+    secure_preserved_config
 }
 
 # ─── Systemd-сервис WDTT ─────────────────────────────────────────────────────
@@ -503,7 +552,11 @@ setup_wdtt_service() {
     prog 0.75 "Сервис..."
     echo "🔧 Создание systemd-сервиса WDTT Plus..."
 
-    cat > /etc/systemd/system/wdtt.service << WDTTSVC
+local unit_tmp="/etc/systemd/system/.wdtt.service.new"
+rm -f "$unit_tmp"
+cat > "$unit_tmp" << WDTTSVC
+# ${WDTT_ANDROID_DEPLOY_MARKER}
+# ${WDTT_ANDROID_CONTRACT_MARKER}
 [Unit]
 Description=WDTT Plus Server
 After=network.target network-online.target
@@ -513,7 +566,7 @@ Wants=network-online.target
 Type=simple
 ExecStartPre=-/usr/bin/env bash -c "ip link show ${WDTT_IFACE} >/dev/null 2>&1 && ip link del ${WDTT_IFACE} 2>/dev/null || true"
 ExecStartPre=-/usr/bin/env bash -c "if command -v iptables >/dev/null 2>&1; then iptables -C INPUT -p udp --dport ${DTLS_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport ${DTLS_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT; iptables -C INPUT -p udp --dport ${WG_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport ${WG_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT; iptables -C INPUT -p tcp --dport ${SSH_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport ${SSH_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT; fi"
-ExecStart=/usr/local/bin/wdtt-server -listen 0.0.0.0:${DTLS_PORT} -wg-port ${WG_PORT} -config-dir ${WDTT_CONFIG_DIR} -max-passwords ${MAX_PASSWORDS} -max-workers-per-access ${MAX_WORKERS_PER_ACCESS} -max-handshakes ${MAX_HANDSHAKES} -handshake-rate ${HANDSHAKE_RATE} -max-client-mbps ${MAX_CLIENT_MBPS} -wg-backend ${WG_BACKEND} ${WDTT_ARGS}
+ExecStart=${WDTT_SERVER_BINARY_PATH} -listen 0.0.0.0:${DTLS_PORT} -wg-port ${WG_PORT} -config-dir ${WDTT_CONFIG_DIR} -max-passwords ${MAX_PASSWORDS} -max-workers-per-access ${MAX_WORKERS_PER_ACCESS} -max-handshakes ${MAX_HANDSHAKES} -handshake-rate ${HANDSHAKE_RATE} -max-client-mbps ${MAX_CLIENT_MBPS} -wg-backend ${WG_BACKEND}
 Restart=always
 RestartSec=5
 LimitNOFILE=65535
@@ -521,6 +574,9 @@ LimitNOFILE=65535
 [Install]
 WantedBy=multi-user.target
 WDTTSVC
+
+    chmod 644 "$unit_tmp"
+    mv -f "$unit_tmp" "$WDTT_SYSTEMD_UNIT_PATH" || die "Не удалось атомарно установить wdtt.service"
 
     systemctl daemon-reload
     systemctl unmask wdtt >/dev/null 2>&1 || true
@@ -559,6 +615,7 @@ start_wdtt() {
         echo "⚠️ Сервис wdtt не запустился. Статус: $status"
         echo "   Последние логи:"
         journalctl -u wdtt -n 7 --no-pager 2>/dev/null | sed 's/^/   >> /'
+        die "Сервис wdtt не прошёл проверку запуска"
     fi
 
     echo "   Логи:   journalctl -u wdtt -f"
@@ -582,7 +639,7 @@ do_uninstall() {
     fw_cleanup_wdtt_rules "$(detect_wan_interface)"
 
     rm -f /usr/local/bin/wdtt-server
-    cleanup_config_dir_keep_access_db
+    secure_preserved_config
     rm -f /etc/sysctl.d/99-wdtt.conf
     sysctl --system >/dev/null 2>&1 || true
 
@@ -629,15 +686,21 @@ main() {
     mkdir -p "$(dirname "$LOG_FILE")"
     echo "=== WDTT Plus Installer v${SCRIPT_VERSION} — $(date) ===" >> "$LOG_FILE"
 
-    detect_os
-    install_prerequisites
-    require_runtime_tools
-    detect_firewall
-
     case "$action" in
-        status|--status|-s)       do_status ;;
-        uninstall|--uninstall|-u) do_uninstall ;;
+        status|--status|-s)
+            do_status
+            ;;
+        uninstall|--uninstall|-u)
+            require_runtime_tools
+            secure_preserved_config
+            do_uninstall
+            ;;
         install|--install|-i|*)
+            validate_deploy_data_mode
+            detect_os
+            install_prerequisites
+            require_runtime_tools
+            detect_firewall
             wdtt_cleanup
             setup_sysctl
             setup_nat_and_firewall

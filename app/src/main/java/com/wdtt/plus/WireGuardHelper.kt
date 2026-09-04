@@ -2,9 +2,7 @@ package com.wdtt.plus
 
 import android.content.Context
 import android.content.Intent
-import android.net.VpnService
 import android.util.Log
-import com.wireguard.android.backend.GoBackend
 import com.wireguard.android.backend.Tunnel
 import com.wireguard.config.Config
 import com.wireguard.config.Interface
@@ -50,6 +48,7 @@ class WireGuardHelper(context: Context) {
             if (isCurrentTunnel) {
                 sharedTunnel = null
                 sharedConfigFingerprint = null
+                TunnelManager.noteVpnInterfaceState(false)
             }
             if (isCurrentTunnel && !suppressDownCallback) {
                 onExternalDown?.invoke()
@@ -63,10 +62,6 @@ class WireGuardHelper(context: Context) {
 
     private suspend fun startTunnelLocked(configString: String) = withContext(Dispatchers.IO) {
         try {
-            if (VpnService.prepare(appContext) != null) {
-                throw IllegalStateException("VPN-разрешение не выдано")
-            }
-
             val parsedConfig = Config.parse(ByteArrayInputStream(configString.toByteArray(Charsets.UTF_8)))
 
             val builder = Interface.Builder()
@@ -172,6 +167,21 @@ class WireGuardHelper(context: Context) {
                 allowedIps = effectiveAllowedIps,
             )
 
+            val routingMode = if (isWhitelist) "белый список" else "чёрный список"
+            val appRuleCount = selectedPackages.count {
+                !isAlwaysBypassedVpnPackage(it, appContext.packageName)
+            }
+            val fullIpv4Tunnel = routedAllowedIps.contains("0.0.0.0/0")
+            TunnelManager.noteVpnRoutingEvent(
+                key = "applied_${dnsSettings.profileIndex}_${isWhitelist}_${appRuleCount}_${addressRules.size}_${routedAllowedIps.size}",
+                message = buildString {
+                    append("«$profileLabel»: $routingMode; правил приложений: $appRuleCount, ")
+                    append("правил адресов: ${addressRules.size}, маршрутов VPN: ${routedAllowedIps.size}; ")
+                    append(if (fullIpv4Tunnel) "IPv4 идёт через VPN полностью" else "действует раздельная маршрутизация")
+                    if (routing.blocksAllApps) append("; пустой белый список блокирует пользовательский трафик")
+                },
+            )
+
             val newInterface = builder.build()
 
             val peerBuilder = Peer.Builder()
@@ -225,6 +235,7 @@ class WireGuardHelper(context: Context) {
                         updatedConfig = finalConfig,
                     )
                 ) {
+                    TunnelManager.noteVpnInterfaceState(true)
                     Log.d("WG", "WireGuard config unchanged; keeping the current VPN interface")
                     return@withContext
                 }
@@ -255,8 +266,13 @@ class WireGuardHelper(context: Context) {
             }
             sharedTunnel = nextTunnel
             sharedConfigFingerprint = wireGuardConfigFingerprint(finalConfig)
+            TunnelManager.noteVpnInterfaceState(true)
             Log.d("WG", "WireGuard tunnel started successfully")
         } catch (e: Exception) {
+            val stillUp = sharedTunnel?.let { tunnel ->
+                runCatching { backend.getState(tunnel) == Tunnel.State.UP }.getOrDefault(false)
+            } ?: false
+            TunnelManager.noteVpnInterfaceState(stillUp)
             val detailed = "WireGuard start failed: ${e.readableMessage()}; ${configString.describeWireGuardConfig()}"
             Log.e("WG", detailed)
             e.printStackTrace()
@@ -332,61 +348,27 @@ class WireGuardHelper(context: Context) {
                     sharedConfigFingerprint = null
                     Log.d("WG", "WireGuard tunnel stopped")
                 }
+                TunnelManager.noteVpnInterfaceState(false)
             } catch (e: Exception) {
+                val stillUp = sharedTunnel?.let { tunnel ->
+                    runCatching { backend.getState(tunnel) == Tunnel.State.UP }.getOrDefault(false)
+                } ?: false
+                TunnelManager.noteVpnInterfaceState(stillUp)
                 Log.e("WG", "Failed to stop WireGuard: ${e.readableMessage()}")
             }
         }
     }
 
     private fun notifyWireGuardInterfaceDropped() {
-        val slotTransferred = isVpnSlotTransferred()
-        TunnelManager.onWireGuardInterfaceDropped(slotTransferred)
-        if (slotTransferred) {
-            requestVpnSlotHandoverStop()
-            return
-        }
-
-        // При смене VPN Android может уничтожить старый VpnService чуть раньше,
-        // чем обновит владельца разрешения. Несколько коротких проверок закрывают
-        // эту гонку, не добавляя постоянного polling: ветка выполняется только
-        // после внешнего DOWN-сигнала от WireGuard.
-        TunnelManager.scope.launch {
-            repeat(20) {
-                delay(250L)
-                if (isVpnSlotTransferred()) {
-                    TunnelManager.onWireGuardInterfaceDropped(vpnSlotTransferred = true)
-                    requestVpnSlotHandoverStop()
-                    return@launch
-                }
-            }
-        }
+        // SafeGoBackend.onRevoke is the authoritative external-revocation
+        // signal. A bare DOWN can also be a transient loss after sleep.
+        TunnelManager.onWireGuardInterfaceDropped(vpnSlotTransferred = false)
     }
-
-    /**
-     * Не полагаемся только на StateFlow: callback WireGuard приходит в момент,
-     * когда Android уже передаёт единственный VPN-слот. Доставляем сигнал в
-     * работающую foreground-службу сразу, чтобы она закрыла нативный клиент и
-     * не смогла запустить WireGuard повторно в этой сессии.
-     */
-    private fun requestVpnSlotHandoverStop() {
-        runCatching {
-            appContext.startService(
-                Intent(appContext, TunnelService::class.java).apply {
-                    action = ACTION_VPN_SLOT_REVOKED
-                }
-            )
-        }.onFailure {
-            Log.w("WG", "Не удалось немедленно передать остановку VPN-службе: ${it.readableMessage()}")
-        }
-    }
-
-    private fun isVpnSlotTransferred(): Boolean =
-        runCatching { VpnService.prepare(appContext) != null }.getOrDefault(false)
 
     private suspend fun ensureGoBackendServiceStarted() {
         withContext(Dispatchers.Main) {
             runCatching {
-                val intent = Intent(appContext, GoBackend.VpnService::class.java)
+                val intent = Intent(appContext, SafeGoBackend.VpnService::class.java)
                 appContext.startService(intent)
             }.onFailure {
                 Log.w("WG", "GoBackend service warmup failed: ${it.readableMessage()}")
@@ -402,6 +384,10 @@ class WireGuardHelper(context: Context) {
                 backend.setState(nextTunnel, Tunnel.State.UP, finalConfig)
                 return
             } catch (e: Exception) {
+                if (shouldYieldVpnSlotAfterSafeEstablishFailure(e)) {
+                    notifyVpnSlotUnavailable()
+                    throw e
+                }
                 lastError = e
                 Log.w("WG", "WireGuard UP attempt ${attempt + 1}/3 failed: ${e.readableMessage()}")
                 runCatching { backend.setState(nextTunnel, Tunnel.State.DOWN, null) }
@@ -410,6 +396,19 @@ class WireGuardHelper(context: Context) {
             }
         }
         throw lastError ?: IllegalStateException("WireGuard UP failed")
+    }
+
+    private fun notifyVpnSlotUnavailable() {
+        TunnelManager.onWireGuardInterfaceDropped(vpnSlotTransferred = true)
+        runCatching {
+            appContext.startService(
+                Intent(appContext, TunnelService::class.java).apply {
+                    action = ACTION_VPN_SLOT_REVOKED
+                },
+            )
+        }.onFailure { error ->
+            Log.w("WG", "Не удалось остановить WDTT после безопасного отказа Android", error)
+        }
     }
 
     private fun Throwable.readableMessage(): String {
@@ -446,3 +445,7 @@ internal fun wireGuardConfigFingerprint(config: Config): String =
     MessageDigest.getInstance("SHA-256")
         .digest(config.toWgQuickString().toByteArray(Charsets.UTF_8))
         .joinToString(separator = "") { byte -> "%02x".format(byte.toInt() and 0xff) }
+
+internal fun shouldYieldVpnSlotAfterSafeEstablishFailure(error: Throwable): Boolean =
+    generateSequence(error) { it.cause }
+        .any { it is SafeGoBackend.VpnSlotUnavailableException }

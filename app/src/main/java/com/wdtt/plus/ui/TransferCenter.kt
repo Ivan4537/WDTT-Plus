@@ -86,6 +86,9 @@ fun TransferCenterDialog(
     onDismiss: () -> Unit
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
+    val cameraAvailable = remember(context) {
+        context.packageManager.hasSystemFeature(PackageManager.FEATURE_CAMERA_ANY)
+    }
     val scope = rememberCoroutineScope()
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
@@ -146,7 +149,11 @@ fun TransferCenterDialog(
                 }
                 Text("Получить профиль", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                 Text(
-                    "Добавьте профиль через камеру, изображение или файл. Через эти же кнопки можно получить защищённые настройки администратора: предварительно включать админ-режим не нужно. После ввода пароля приложение покажет подтверждение, импортирует настройки и активирует режим администратора.",
+                    if (cameraAvailable) {
+                        "Добавьте профиль через камеру, изображение или файл. Через эти же кнопки можно получить защищённые настройки администратора: предварительно включать админ-режим не нужно. После ввода пароля приложение покажет подтверждение, импортирует настройки и активирует режим администратора."
+                    } else {
+                        "На этом устройстве нет доступной камеры. Добавьте профиль из изображения или файла. Защищённые настройки администратора поддерживаются теми же способами."
+                    },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -155,15 +162,17 @@ fun TransferCenterDialog(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    TransferButton("Камера", Icons.Default.CameraAlt, busy) {
-                        cameraLauncher.launch(
-                            ScanOptions()
-                                .setDesiredBarcodeFormats(ScanOptions.QR_CODE)
-                                .setPrompt("Наведите камеру на QR-код WDTT Plus")
-                                .setBeepEnabled(false)
-                                .setCaptureActivity(QrCaptureActivity::class.java)
-                                .setOrientationLocked(false)
-                        )
+                    if (cameraAvailable) {
+                        TransferButton("Камера", Icons.Default.CameraAlt, busy) {
+                            cameraLauncher.launch(
+                                ScanOptions()
+                                    .setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                                    .setPrompt("Наведите камеру на QR-код WDTT Plus")
+                                    .setBeepEnabled(false)
+                                    .setCaptureActivity(QrCaptureActivity::class.java)
+                                    .setOrientationLocked(false)
+                            )
+                        }
                     }
                     TransferButton("Галерея", Icons.Default.Image, busy) { galleryLauncher.launch("image/*") }
                     TransferButton("Файл", Icons.Default.FileOpen, busy) {

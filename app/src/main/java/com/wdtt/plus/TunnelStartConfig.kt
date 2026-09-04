@@ -4,7 +4,7 @@ import android.content.Context
 import android.content.Intent
 
 internal const val TUNNEL_PROFILE_INDEX_EXTRA = "profile_index"
-internal const val MANAGED_CONFIG_FIRST_START_EXTRA = "managed_config_first_start"
+internal const val CONFIG_FIRST_START_EXTRA = "config_first_start"
 internal const val DEFAULT_RT_TURN_SNI = "ya.ru"
 
 internal fun normalizeRtTurnSni(value: String): String? {
@@ -41,9 +41,9 @@ internal data class TransportRecoveryPolicy(
 )
 
 internal fun transportRecoveryPolicy(
-    managedConfigFirstStart: Boolean,
+    configFirstStart: Boolean,
 ): TransportRecoveryPolicy {
-    val processRestartDelayMs = if (managedConfigFirstStart) 250L else 2_500L
+    val processRestartDelayMs = if (configFirstStart) 250L else 2_500L
     return TransportRecoveryPolicy(
         networkSettleDelayMs = 15_000L,
         reconnectMinIntervalMs = 2 * 60_000L,
@@ -79,12 +79,13 @@ internal fun displayedTunnelProfile(
     selectedProfile
 }.coerceIn(0, 2)
 
-internal fun shouldUseManagedConfigFirstStart(
-    remoteManaged: Boolean,
-    profileMaxWorkers: Int,
-): Boolean = remoteManaged &&
-    profileMaxWorkers in TUNNEL_WORKERS_PER_GROUP..APP_MAX_WORKERS &&
-    profileMaxWorkers % TUNNEL_WORKERS_PER_GROUP == 0
+/**
+ * WireGuard configuration is mandatory for every profile, not only for a
+ * remotely managed profile with a worker limit. Starting data workers before
+ * GETCONF succeeds can otherwise report an active transport while Android has
+ * no VPN interface and user traffic is still going directly over Wi-Fi.
+ */
+internal fun shouldUseConfigFirstStart(): Boolean = true
 
 suspend fun buildTunnelParamsFromSettings(
     context: Context,
@@ -101,10 +102,7 @@ internal fun buildTunnelParams(saved: TunnelProfileSnapshot): TunnelParams? {
         saved.workersPerHash,
         saved.profileMaxWorkers
     )
-    val managedConfigFirstStart = shouldUseManagedConfigFirstStart(
-        remoteManaged = saved.remoteManaged,
-        profileMaxWorkers = saved.profileMaxWorkers,
-    )
+    val configFirstStart = shouldUseConfigFirstStart()
     val linkParts = saved.link
         .takeIf { saved.linkMode }
         ?.let { WdttDeepLink.validate(it).parts }
@@ -133,7 +131,7 @@ internal fun buildTunnelParams(saved: TunnelProfileSnapshot): TunnelParams? {
             customVkClientId = saved.customVkClientId,
             customVkClientSecret = saved.customVkClientSecret,
             profileMaxWorkers = saved.profileMaxWorkers,
-            managedConfigFirstStart = managedConfigFirstStart,
+            configFirstStart = configFirstStart,
             profileIndex = saved.profileIndex,
         )
     } else {
@@ -169,7 +167,7 @@ internal fun buildTunnelParams(saved: TunnelProfileSnapshot): TunnelParams? {
             customVkClientId = saved.customVkClientId,
             customVkClientSecret = saved.customVkClientSecret,
             profileMaxWorkers = saved.profileMaxWorkers,
-            managedConfigFirstStart = managedConfigFirstStart,
+            configFirstStart = configFirstStart,
             profileIndex = saved.profileIndex,
         )
     }
@@ -200,7 +198,7 @@ suspend fun buildTunnelStartIntentFromSettings(context: Context): Intent? {
         putExtra("custom_vk_client_id", params.customVkClientId)
         putExtra("custom_vk_client_secret", params.customVkClientSecret)
         putExtra("profile_max_workers", params.profileMaxWorkers)
-        putExtra(MANAGED_CONFIG_FIRST_START_EXTRA, params.managedConfigFirstStart)
+        putExtra(CONFIG_FIRST_START_EXTRA, params.configFirstStart)
         putExtra(TUNNEL_PROFILE_INDEX_EXTRA, params.profileIndex)
     }
 }

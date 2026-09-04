@@ -57,7 +57,6 @@ func parseConfigResponse(resp string) (string, error) {
 			return "", fmt.Errorf("FATAL_AUTH: доступ запрещён (%s)", reason)
 		}
 	}
-
 	return resp, nil
 }
 

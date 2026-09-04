@@ -67,6 +67,20 @@ class OutboundProfileComparisonTest {
     }
 
     @Test
+    fun savedProxyFields_withoutProxyConfig_areNotReportedAsConfigured() {
+        val server = snapshot(
+            externalProxyHost = "proxy.example.org",
+            externalProxyProfileSaved = true,
+        )
+
+        assertEquals(
+            OutboundModeIndicator(OutboundModeVisualState.Warning, "поля сохранены"),
+            outboundModeIndicator(server, OutboundDialog.ExternalProxy)
+        )
+        assertFalse(server.externalProxyPresent)
+    }
+
+    @Test
     fun configuredTunInterfaceChange_isReported() {
         val server = snapshot(mode = "tun_interface", tunInterface = "xray0")
         val local = forms(tunInterface = "singtun0")
@@ -210,6 +224,7 @@ class OutboundProfileComparisonTest {
         externalProxyPort: String = "",
         externalProxyLogin: String = "",
         externalProxyPassword: String = "",
+        externalProxyProfileSaved: Boolean = false,
         wireGuardPresent: Boolean = false,
         wireGuardActive: Boolean = false,
         wireGuardExitHost: String = "",
@@ -241,6 +256,7 @@ class OutboundProfileComparisonTest {
         externalProxyPort = externalProxyPort,
         externalProxyLogin = externalProxyLogin,
         externalProxyPassword = externalProxyPassword,
+        externalProxyProfileSaved = externalProxyProfileSaved,
         wireGuardPresent = wireGuardPresent,
         wireGuardActive = wireGuardActive,
         wireGuardExitHost = wireGuardExitHost,

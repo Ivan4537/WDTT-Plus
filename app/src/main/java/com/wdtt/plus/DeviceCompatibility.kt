@@ -8,7 +8,6 @@ import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.Uri
-import android.net.VpnService
 import android.os.Build
 import android.os.PowerManager
 import android.os.StatFs
@@ -456,6 +455,7 @@ object DeviceCompatibility {
         workersPerHash: Int? = null
     ): DeviceCompatibilityReport {
         val appContext = context.applicationContext
+        val television = isTelevisionDevice(appContext)
         val items = buildList {
             add(androidVersionItem())
             add(abiItem())
@@ -468,10 +468,10 @@ object DeviceCompatibility {
 
             if (includeRuntimeChecks) {
                 add(networkItem(appContext))
-                add(vpnPermissionItem(appContext))
+                add(vpnPermissionItem())
                 add(tunnelStateItem())
-                add(notificationPermissionItem(appContext))
-                add(batteryItem(appContext))
+                add(notificationPermissionItem(appContext, television))
+                add(batteryItem(appContext, television))
                 add(updateInstallPermissionItem(appContext))
             }
         }
@@ -799,26 +799,14 @@ object DeviceCompatibility {
         }
     }
 
-    private fun vpnPermissionItem(context: Context): DeviceCheckItem {
-        val granted = runCatching { VpnService.prepare(context) == null }.getOrDefault(false)
-        return if (granted) {
-            DeviceCheckItem(
-                title = "VPN-разрешение",
-                status = "выдано",
-                details = "WDTT Plus уже может поднимать системный VPN-интерфейс.",
-                severity = DeviceCheckSeverity.Ok,
-                action = DeviceCheckAction.VpnSettings
-            )
-        } else {
-            DeviceCheckItem(
-                title = "VPN-разрешение",
-                status = "будет запрошено при подключении",
-                details = "Отсутствие VPN-разрешения сейчас не является ошибкой. Оно понадобится только при первом запуске туннеля.",
-                recommendation = "Если подключение не стартует после нажатия «Подключить», подтвердите системный запрос VPN.",
-                severity = DeviceCheckSeverity.Info,
-                action = DeviceCheckAction.VpnSettings
-            )
-        }
+    private fun vpnPermissionItem(): DeviceCheckItem {
+        return DeviceCheckItem(
+            title = "VPN-разрешение",
+            status = "проверяется только при подключении",
+            details = "Диагностика не запрашивает и не меняет владельца системного VPN. При нажатии «Подключить» Android сам покажет запрос, если он нужен.",
+            severity = DeviceCheckSeverity.Info,
+            action = DeviceCheckAction.VpnSettings
+        )
     }
 
     private fun tunnelStateItem(): DeviceCheckItem {
@@ -850,7 +838,18 @@ object DeviceCompatibility {
         }
     }
 
-    private fun notificationPermissionItem(context: Context): DeviceCheckItem {
+    private fun notificationPermissionItem(
+        context: Context,
+        television: Boolean,
+    ): DeviceCheckItem {
+        if (television) {
+            return DeviceCheckItem(
+                title = "Уведомления",
+                status = "телефонный запрос не требуется на TV",
+                details = "WDTT Plus не показывает стартовый запрос уведомлений на Android TV. Системная foreground-служба VPN продолжает работать без этого диалога.",
+                severity = DeviceCheckSeverity.Ok,
+            )
+        }
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
             return DeviceCheckItem(
                 title = "Уведомления",
@@ -881,7 +880,18 @@ object DeviceCompatibility {
         }
     }
 
-    private fun batteryItem(context: Context): DeviceCheckItem {
+    private fun batteryItem(
+        context: Context,
+        television: Boolean,
+    ): DeviceCheckItem {
+        if (television) {
+            return DeviceCheckItem(
+                title = "Фоновая работа",
+                status = "управляется Android TV",
+                details = "На TV приложение не открывает телефонный запрос исключения из оптимизации батареи при первом запуске. VPN работает как foreground-служба; состояние можно диагностировать отдельно при реальной проблеме со сном устройства.",
+                severity = DeviceCheckSeverity.Info,
+            )
+        }
         val powerManager = runCatching { context.getSystemService(PowerManager::class.java) }.getOrNull()
         val ignored = runCatching {
             powerManager?.isIgnoringBatteryOptimizations(context.packageName)

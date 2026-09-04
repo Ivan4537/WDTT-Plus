@@ -72,6 +72,21 @@ internal data class ClientDnsPathAssessment(
     val action: DeviceCheckAction?
 )
 
+internal data class AndroidPrivateDnsState(
+    val active: Boolean,
+    val serverName: String? = null,
+) {
+    val strict: Boolean
+        get() = active && !serverName.isNullOrBlank()
+
+    val display: String
+        get() = if (!active) {
+            "выключен"
+        } else {
+            serverName?.takeIf(String::isNotBlank)?.let { "включён ($it)" } ?: "включён"
+        }
+}
+
 private const val NETWORK_PROBE_TIMEOUT_MS = 4_500L
 private const val SOCKET_TIMEOUT_MS = 3_500
 private val directExecutor = Executor { command -> command.run() }
@@ -263,6 +278,14 @@ private suspend fun collectClientNetworkDiagnostics(
             .filter { it.success }
             .mapTo(linkedSetOf()) { it.label }
         val clientDnsAssessment = assessClientDnsPath(successfulClientDnsRoutes, systemPrimaryApiWorks)
+        val privateDnsState = androidPrivateDnsState(diagnosticNetwork.linkProperties)
+        val primaryDnsHasProblem = primaryDnsOk < primaryDnsResults.size
+        val primaryHttpsHasProblem = primaryHttpsOk < primaryHttpsResults.size
+        val privateDnsProblemItem = buildPrivateDnsProblemItem(
+            state = privateDnsState,
+            dnsProblem = primaryDnsHasProblem || clientDnsAssessment.severity == DeviceCheckSeverity.Error,
+            httpsProblem = primaryHttpsHasProblem,
+        )
 
         val dnsItem = DeviceCheckItem(
             title = "DNS основного VKCalls на телефоне",
@@ -270,10 +293,12 @@ private suspend fun collectClientNetworkDiagnostics(
             details = primaryDnsResults.joinToString(". ") { it.display() } + ". " +
                 "Резервные legacy- и совместимые узлы: " +
                 reserveDnsResults.joinToString(". ") { it.display() } + ".",
-            recommendation = if (primaryDnsOk == primaryDnsResults.size) "" else
-                "Быстрый VKCalls может быть недоступен. Проверьте системный или Private DNS и сеть оператора; приложение также попробует legacy-резерв.",
-            severity = if (primaryDnsOk == primaryDnsResults.size) DeviceCheckSeverity.Ok else DeviceCheckSeverity.Warning,
-            action = if (primaryDnsOk == primaryDnsResults.size) null else DeviceCheckAction.NetworkSettings
+            recommendation = if (!primaryDnsHasProblem) "" else
+                "Быстрый VKCalls может быть недоступен. Проверьте системный DNS, сеть оператора" +
+                    privateDnsRecommendationTail(privateDnsState) +
+                    "; приложение также попробует legacy-резерв.",
+            severity = if (primaryDnsHasProblem) DeviceCheckSeverity.Warning else DeviceCheckSeverity.Ok,
+            action = if (primaryDnsHasProblem) DeviceCheckAction.NetworkSettings else null
         )
 
         val clientDnsItem = DeviceCheckItem(
@@ -303,12 +328,14 @@ private suspend fun collectClientNetworkDiagnostics(
         ClientNetworkDiagnosticsReport(
             summaryLines = listOf(
                 "Физическая сеть диагностики: ${networkPathSummary(diagnosticNetwork)}",
+                "Android Private DNS: ${privateDnsState.display}",
                 "DNS основного VKCalls: $primaryDnsOk/${primaryDnsResults.size}",
                 "DNS клиента: ${clientDnsAssessment.status}; UDP $clientUdpOk/${clientUdp.size}, TCP $clientTcpOk/${clientTcp.size}",
                 "HTTPS основного VKCalls: $primaryHttpsOk/${primaryHttpsResults.size}"
             ),
             items = buildList {
                 add(networkItem)
+                privateDnsProblemItem?.let(::add)
                 add(dnsItem)
                 add(clientDnsItem)
                 add(httpsItem)
@@ -354,6 +381,45 @@ internal fun assessClientDnsPath(
             action = DeviceCheckAction.NetworkSettings
         )
     }
+}
+
+internal fun androidPrivateDnsState(properties: LinkProperties?): AndroidPrivateDnsState =
+    AndroidPrivateDnsState(
+        active = properties?.isPrivateDnsActive == true,
+        serverName = properties?.privateDnsServerName?.takeIf(String::isNotBlank),
+    )
+
+internal fun privateDnsRecommendationTail(state: AndroidPrivateDnsState): String =
+    if (state.active) {
+        ", а также Android Private DNS"
+    } else {
+        ""
+    }
+
+internal fun buildPrivateDnsProblemItem(
+    state: AndroidPrivateDnsState,
+    dnsProblem: Boolean,
+    httpsProblem: Boolean,
+): DeviceCheckItem? {
+    if (!state.active || (!dnsProblem && !httpsProblem)) return null
+    val problemText = when {
+        dnsProblem && httpsProblem -> "DNS/HTTPS-проверки до VKCalls нестабильны"
+        dnsProblem -> "DNS-проверки до VKCalls нестабильны"
+        else -> "HTTPS-проверки до VKCalls нестабильны"
+    }
+    val modeText = if (state.strict) {
+        "строгий режим с сервером ${state.serverName}"
+    } else {
+        "автоматический режим"
+    }
+    return DeviceCheckItem(
+        title = "Android Private DNS",
+        status = state.display,
+        details = "На активной физической сети включён Private DNS ($modeText). $problemText. Private DNS может быть не причиной, но при блокировке или сбоях DoT он влияет на системный DNS Android.",
+        recommendation = "Если подключение WDTT Plus или VKCalls нестабильно, откройте настройки сети Android и временно переключите «Частный DNS» в режим «Авто» или «Выкл», затем повторите диагностику.",
+        severity = DeviceCheckSeverity.Warning,
+        action = DeviceCheckAction.NetworkSettings,
+    )
 }
 
 private fun selectDiagnosticNetwork(context: Context, connectivityManager: ConnectivityManager): DiagnosticNetwork? {

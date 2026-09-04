@@ -34,10 +34,14 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.focusGroup
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.shape.GenericShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.selection.selectable
 import kotlinx.coroutines.launch
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.BatterySaver
@@ -57,7 +61,11 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.Brush
@@ -72,9 +80,13 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalInputModeManager
+import androidx.compose.ui.input.InputMode
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
 import androidx.compose.ui.window.DialogProperties
@@ -95,6 +107,10 @@ import com.wdtt.plus.ui.ExceptionsTab
 import com.wdtt.plus.ui.InfoTab
 import com.wdtt.plus.ui.AdminImportDialog
 import com.wdtt.plus.ui.TransferCenterDialog
+import com.wdtt.plus.ui.isTelevisionDevice
+import com.wdtt.plus.ui.remoteFocusOutline
+import com.wdtt.plus.ui.remoteHelpFocus
+import com.wdtt.plus.ui.televisionDialogWidth
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -1075,8 +1091,13 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 private fun RoleSelectionScreen(
+    television: Boolean,
     onRoleSelected: (String) -> Unit
 ) {
+    val initialFocusRequester = remember { FocusRequester() }
+    LaunchedEffect(television) {
+        if (television) initialFocusRequester.requestFocus()
+    }
     Box(modifier = Modifier.fillMaxSize()) {
         AppBackdrop(modifier = Modifier.matchParentSize())
         Column(
@@ -1117,7 +1138,8 @@ private fun RoleSelectionScreen(
                         title = "Я - юзер",
                         body = "Хочу подключаться бесплатно по ссылке WDTT или вручную, управлять VPN, исключениями и смотреть логи.",
                         icon = Icons.Filled.VpnKey,
-                        onClick = { onRoleSelected("user") }
+                        onClick = { onRoleSelected("user") },
+                        modifier = Modifier.focusRequester(initialFocusRequester),
                     )
                     RoleChoiceButton(
                         title = "Я - админ",
@@ -1136,14 +1158,17 @@ private fun RoleChoiceButton(
     title: String,
     body: String,
     icon: ImageVector,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     Surface(
         onClick = onClick,
         shape = RoundedCornerShape(18.dp),
         color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f)),
-        modifier = Modifier.fillMaxWidth()
+        modifier = modifier
+            .fillMaxWidth()
+            .remoteFocusOutline(RoundedCornerShape(18.dp))
     ) {
         Row(
             modifier = Modifier.padding(14.dp),
@@ -1408,6 +1433,7 @@ private fun MainScreen(
     val tunnelRunning by TunnelManager.running.collectAsStateWithLifecycle()
     val view = LocalView.current
     val context = LocalContext.current
+    val television = isTelevisionDevice()
     val density = LocalDensity.current
     val focusManager = LocalFocusManager.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -1557,6 +1583,7 @@ private fun MainScreen(
 
     if (interfaceRole.isBlank()) {
         RoleSelectionScreen(
+            television = television,
             onRoleSelected = { role ->
                 scope.launch { settingsStore.saveInterfaceRole(role) }
             }
@@ -1573,7 +1600,13 @@ private fun MainScreen(
         return
     }
 
-    if (!permissionOnboardingComplete) {
+    LaunchedEffect(permissionOnboardingComplete, television) {
+        if (!permissionOnboardingComplete && !shouldShowPhonePermissionOnboarding(television)) {
+            settingsStore.savePermissionOnboardingComplete(true)
+        }
+    }
+
+    if (!permissionOnboardingComplete && shouldShowPhonePermissionOnboarding(television)) {
         PermissionOnboardingScreen(
             onComplete = {
                 scope.launch { settingsStore.savePermissionOnboardingComplete(true) }
@@ -2163,16 +2196,12 @@ private fun MainScreen(
                     if (incomingProfileName.isNotBlank()) {
                         Text("Название из подключения: «$incomingProfileName».")
                     }
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        repeat(3) { profile ->
-                            FilterChip(
-                                selected = plan.targetProfile == profile,
-                                enabled = profile !in plan.blockedProfiles,
-                                onClick = { onSelectWdttDeepLinkOverwriteProfile(profile) },
-                                label = { Text(vpnProfileDisplayName(profile, profileNames)) }
-                            )
-                        }
-                    }
+                    ProfileReplacementChips(
+                        selectedProfile = plan.targetProfile,
+                        blockedProfiles = plan.blockedProfiles,
+                        profileNames = profileNames,
+                        onSelect = onSelectWdttDeepLinkOverwriteProfile,
+                    )
                     if (plan.blockedProfiles.size == 3) {
                         Text("Все профили защищены действующим удалённым доступом. Сначала освободите один из них.")
                     } else {
@@ -2197,6 +2226,37 @@ private fun MainScreen(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun ProfileReplacementChips(
+    selectedProfile: Int,
+    blockedProfiles: Set<Int>,
+    profileNames: List<String>,
+    onSelect: (Int) -> Unit,
+) {
+    FlowRow(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        repeat(3) { profile ->
+            FilterChip(
+                selected = selectedProfile == profile,
+                enabled = profile !in blockedProfiles,
+                onClick = { onSelect(profile) },
+                modifier = Modifier.widthIn(min = 108.dp, max = 220.dp),
+                label = {
+                    Text(
+                        text = vpnProfileDisplayName(profile, profileNames),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            )
+        }
+    }
+}
+
 @Composable
 private fun WdttConnectActivationDialog(
     flow: WdttConnectFlow,
@@ -2214,6 +2274,7 @@ private fun WdttConnectActivationDialog(
     onOpenFailureAction: (RemoteLaunchTarget) -> Unit,
     onDismiss: () -> Unit,
 ) {
+    val television = isTelevisionDevice()
     var manualHashes by rememberSaveable { mutableStateOf("") }
     var selectedHashMethod by rememberSaveable { mutableStateOf<String?>(null) }
     var helpMethod by rememberSaveable { mutableStateOf<String?>(null) }
@@ -2228,6 +2289,7 @@ private fun WdttConnectActivationDialog(
                 canDismiss -> onDismiss()
             }
         },
+        modifier = Modifier.televisionDialogWidth(television),
         title = { Text("Подключение WDTT Plus") },
         text = {
             AnimatedContent(
@@ -2301,16 +2363,12 @@ private fun WdttConnectActivationDialog(
                             if (incomingName.isNotBlank()) {
                                 Text("Новый доступ: «$incomingName».")
                             }
-                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                repeat(3) { profile ->
-                                    FilterChip(
-                                        selected = state.plan.targetProfile == profile,
-                                        enabled = profile !in state.plan.blockedProfiles,
-                                        onClick = { onSelectProfile(profile) },
-                                        label = { Text(vpnProfileDisplayName(profile, profileNames)) }
-                                    )
-                                }
-                            }
+                            ProfileReplacementChips(
+                                selectedProfile = state.plan.targetProfile,
+                                blockedProfiles = state.plan.blockedProfiles,
+                                profileNames = profileNames,
+                                onSelect = onSelectProfile,
+                            )
                             Text(
                                 if (state.plan.blockedProfiles.size == 3) {
                                     "Все профили защищены действующим готовым доступом. " +
@@ -2488,12 +2546,14 @@ private fun WdttConnectActivationDialog(
                 }
                 else -> Unit
             }
-        }
+        },
+        properties = DialogProperties(usePlatformDefaultWidth = !television),
     )
 
     helpMethod?.let { method ->
         AlertDialog(
             onDismissRequest = { helpMethod = null },
+            modifier = Modifier.televisionDialogWidth(television),
             title = {
                 Text(
                     when (method) {
@@ -2525,7 +2585,8 @@ private fun WdttConnectActivationDialog(
             },
             confirmButton = {
                 TextButton(onClick = { helpMethod = null }) { Text("Понятно") }
-            }
+            },
+            properties = DialogProperties(usePlatformDefaultWidth = !television),
         )
     }
 
@@ -2555,21 +2616,29 @@ private fun HashMethodRow(
     onClick: () -> Unit,
 ) {
     Surface(
-        onClick = onClick,
         shape = RoundedCornerShape(10.dp),
         color = MaterialTheme.colorScheme.surfaceVariant,
-        modifier = Modifier.fillMaxWidth()
+        modifier = Modifier.fillMaxWidth(),
     ) {
         Row(
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+            modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            Column(modifier = Modifier.weight(1f)) {
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .remoteFocusOutline(RoundedCornerShape(8.dp))
+                    .clickable(onClick = onClick)
+                    .padding(horizontal = 8.dp, vertical = 6.dp)
+            ) {
                 Text(title, fontWeight = FontWeight.SemiBold)
                 Text(body, style = MaterialTheme.typography.bodySmall)
             }
-            IconButton(onClick = onHelp) {
+            IconButton(
+                onClick = onHelp,
+                modifier = Modifier.remoteHelpFocus(),
+            ) {
                 Icon(Icons.Filled.Info, contentDescription = "Как это работает")
             }
         }
@@ -2611,6 +2680,7 @@ private fun SharedVkHashDialog(
     )
 }
 
+@OptIn(ExperimentalComposeUiApi::class)
 @Composable
 private fun ProxyNavigationBar(
     navItems: List<NavItem>,
@@ -2622,6 +2692,8 @@ private fun ProxyNavigationBar(
     onTabSelected: (Int) -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val television = isTelevisionDevice()
+    val inputModeManager = LocalInputModeManager.current
     val colors = MaterialTheme.colorScheme
     val isDark = colors.background.luminance() < 0.22f
     val selectedColor = colors.primary
@@ -2646,6 +2718,16 @@ private fun ProxyNavigationBar(
     }
     val indicatorIndex = remember { Animatable(selectedVisualIndex.toFloat()) }
     val dragVisualIndex = indicatorIndex.value
+    val focusRequesters = remember(navItems.map(NavItem::id)) {
+        List(navItems.size) { FocusRequester() }
+    }
+
+    LaunchedEffect(television, navItems.map(NavItem::id)) {
+        if (television && focusRequesters.isNotEmpty()) {
+            inputModeManager.requestInputMode(InputMode.Keyboard)
+            focusRequesters[selectedVisualIndex].requestFocus()
+        }
+    }
 
     LaunchedEffect(selectedVisualIndex) {
         if (dragTargetIndex !in navItems.indices) {
@@ -2702,6 +2784,7 @@ private fun ProxyNavigationBar(
                 Row(
                     modifier = Modifier
                         .fillMaxSize()
+                        .focusGroup()
                         .padding(horizontal = trackPadding, vertical = 6.dp)
                 ) {
                     navItems.forEachIndexed { index, item ->
@@ -2713,7 +2796,18 @@ private fun ProxyNavigationBar(
                                 .weight(1f)
                                 .fillMaxHeight()
                                 .clip(RoundedCornerShape(22.dp))
-                                .clickable { onTabSelected(item.id) },
+                                .focusRequester(focusRequesters[index])
+                                .onFocusChanged { state ->
+                                    if (television && state.isFocused && item.id != selectedTab) {
+                                        onTabSelected(item.id)
+                                    }
+                                }
+                                .remoteFocusOutline(RoundedCornerShape(22.dp))
+                                .selectable(
+                                    selected = item.id == selectedTab,
+                                    role = Role.Tab,
+                                    onClick = { onTabSelected(item.id) },
+                                ),
                             verticalArrangement = Arrangement.Center,
                             horizontalAlignment = Alignment.CenterHorizontally
                         ) {

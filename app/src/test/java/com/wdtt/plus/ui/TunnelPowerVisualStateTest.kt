@@ -31,7 +31,20 @@ class TunnelPowerVisualStateTest {
             state(
                 running = true,
                 activeWorkers = 1,
+                vpnInterfaceUp = true,
                 underlyingNetworkAvailable = true,
+            ),
+        )
+    }
+
+    @Test
+    fun workersWithoutWireguardInterfaceRemainConnecting() {
+        assertEquals(
+            TunnelPowerVisualState.Connecting,
+            state(
+                running = true,
+                activeWorkers = 18,
+                vpnInterfaceUp = false,
             ),
         )
     }
@@ -54,6 +67,7 @@ class TunnelPowerVisualStateTest {
         starting: Boolean = false,
         stopping: Boolean = false,
         activeWorkers: Int = 0,
+        vpnInterfaceUp: Boolean = false,
         underlyingNetworkAvailable: Boolean = true,
         hasConnectionError: Boolean = false,
         cooldownActive: Boolean = false,
@@ -63,6 +77,7 @@ class TunnelPowerVisualStateTest {
         starting = starting,
         stopping = stopping,
         activeWorkers = activeWorkers,
+        vpnInterfaceUp = vpnInterfaceUp,
         underlyingNetworkAvailable = underlyingNetworkAvailable,
         hasConnectionError = hasConnectionError,
         cooldownActive = cooldownActive,

@@ -43,7 +43,7 @@ import (
 )
 
 const (
-	wdttServerVersion     = "15"
+	wdttServerVersion     = "16"
 	wgIfaceName           = "wdtt0"
 	wgServerAddr          = "10.66.66.1"
 	wgServerCIDR          = wgServerAddr + "/24"
@@ -53,7 +53,152 @@ const (
 	keepalive             = 25
 	dtlsKeepaliveByte     = 0xFF
 	dtlsClientIdleTimeout = 90 * time.Second
+	multipathRelayHello   = "WDTT_MUX1"
+	multipathRelayChunk   = 16
 )
+
+// A WireGuard peer has one roaming UDP endpoint. Previously every DTLS worker
+// opened its own localhost UDP socket, so packets from one phone continuously
+// replaced that endpoint and replies were sent through an arbitrary worker.
+// A deviceWGRelay gives all workers of one device one stable source socket and
+// only multiplexes the already-encrypted WireGuard datagrams around it.
+type deviceWGAttachment struct {
+	downstream chan []byte
+}
+
+type deviceWGRelay struct {
+	key         string
+	conn        *net.UDPConn
+	mu          sync.Mutex
+	attachments map[*deviceWGAttachment]struct{}
+	order       []*deviceWGAttachment
+	rrIndex     int
+	rrCount     int
+	closed      bool
+}
+
+var deviceWGRelays = struct {
+	sync.Mutex
+	byKey map[string]*deviceWGRelay
+}{byKey: make(map[string]*deviceWGRelay)}
+
+func acquireDeviceWGRelay(deviceID, wgEndpoint string) (*deviceWGRelay, *deviceWGAttachment, error) {
+	key := deviceID + "\x00" + wgEndpoint
+	deviceWGRelays.Lock()
+	defer deviceWGRelays.Unlock()
+
+	relay := deviceWGRelays.byKey[key]
+	if relay == nil {
+		remote, err := net.ResolveUDPAddr("udp", wgEndpoint)
+		if err != nil {
+			return nil, nil, err
+		}
+		conn, err := net.DialUDP("udp", nil, remote)
+		if err != nil {
+			return nil, nil, err
+		}
+		_ = conn.SetReadBuffer(2 * 1024 * 1024)
+		_ = conn.SetWriteBuffer(2 * 1024 * 1024)
+		relay = &deviceWGRelay{
+			key:         key,
+			conn:        conn,
+			attachments: make(map[*deviceWGAttachment]struct{}),
+		}
+		deviceWGRelays.byKey[key] = relay
+		go relay.readLoop()
+	}
+	attachment := &deviceWGAttachment{downstream: make(chan []byte, 384)}
+	relay.attachments[attachment] = struct{}{}
+	relay.order = append(relay.order, attachment)
+	return relay, attachment, nil
+}
+
+func (relay *deviceWGRelay) release(attachment *deviceWGAttachment) {
+	if relay == nil || attachment == nil {
+		return
+	}
+	deviceWGRelays.Lock()
+	defer deviceWGRelays.Unlock()
+	relay.mu.Lock()
+	delete(relay.attachments, attachment)
+	for i, candidate := range relay.order {
+		if candidate == attachment {
+			relay.order = append(relay.order[:i], relay.order[i+1:]...)
+			break
+		}
+	}
+	if len(relay.order) == 0 {
+		relay.rrIndex = 0
+		relay.rrCount = 0
+	} else {
+		relay.rrIndex %= len(relay.order)
+	}
+	empty := len(relay.attachments) == 0
+	if empty && !relay.closed {
+		relay.closed = true
+		_ = relay.conn.Close()
+	}
+	relay.mu.Unlock()
+	if empty && deviceWGRelays.byKey[relay.key] == relay {
+		delete(deviceWGRelays.byKey, relay.key)
+	}
+}
+
+func (relay *deviceWGRelay) writeFrom(attachment *deviceWGAttachment, packet []byte) error {
+	relay.mu.Lock()
+	defer relay.mu.Unlock()
+	if relay.closed {
+		return net.ErrClosed
+	}
+	if _, ok := relay.attachments[attachment]; !ok {
+		return net.ErrClosed
+	}
+	_, err := relay.conn.Write(packet)
+	return err
+}
+
+func (relay *deviceWGRelay) nextAttachment() *deviceWGAttachment {
+	relay.mu.Lock()
+	defer relay.mu.Unlock()
+	if relay.closed || len(relay.order) == 0 {
+		return nil
+	}
+	for attempts := 0; attempts < len(relay.order); attempts++ {
+		index := relay.rrIndex % len(relay.order)
+		attachment := relay.order[index]
+		if _, attached := relay.attachments[attachment]; attached {
+			relay.rrCount++
+			if relay.rrCount >= multipathRelayChunk {
+				relay.rrIndex = (index + 1) % len(relay.order)
+				relay.rrCount = 0
+			}
+			return attachment
+		}
+		relay.rrIndex = (index + 1) % len(relay.order)
+		relay.rrCount = 0
+	}
+	return nil
+}
+
+func (relay *deviceWGRelay) readLoop() {
+	buf := make([]byte, 2048)
+	for {
+		n, err := relay.conn.Read(buf)
+		if err != nil {
+			return
+		}
+		packet := append([]byte(nil), buf[:n]...)
+		attachment := relay.nextAttachment()
+		if attachment == nil {
+			continue
+		}
+		select {
+		case attachment.downstream <- packet:
+		default:
+			// A blocked DTLS path must not stall the shared WireGuard reader.
+		}
+	}
+}
 
 func deviceLogRef(deviceID string) string {
 	clean := strings.TrimSpace(deviceID)
@@ -488,22 +633,27 @@ func adminDeviceIDSet(loaded *Database) map[string]struct{} {
 	return result
 }
 
-func initDB(dir, mainPass, adminID, botToken, dnsValue string) {
+func initDB(dir, mainPass, adminID, botToken, dnsValue string) error {
 	dbFile = filepath.Join(dir, "passwords.json")
-	db = &Database{
-		Passwords: make(map[string]*PasswordEntry),
-		Devices:   make(map[string]*ClientDevice),
+	loaded, err := loadDatabaseFile(dbFile)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("загрузка passwords.json: %w", err)
+		}
+		if _, previousErr := os.Lstat(dbFile + databasePreviousSuffix); previousErr == nil {
+			return fmt.Errorf("основная база отсутствует, но найдена предыдущая копия; автоматическое создание пустой базы запрещено")
+		} else if !os.IsNotExist(previousErr) {
+			return fmt.Errorf("проверка предыдущей копии базы: %w", previousErr)
+		}
+		if strings.TrimSpace(mainPass) == "" {
+			return errors.New("passwords.json отсутствует и главный пароль для первой установки не задан")
+		}
+		loaded = &Database{
+			Passwords: make(map[string]*PasswordEntry),
+			Devices:   make(map[string]*ClientDevice),
+		}
 	}
-	data, err := os.ReadFile(dbFile)
-	if err == nil {
-		json.Unmarshal(data, db)
-	}
-	if db.Passwords == nil {
-		db.Passwords = make(map[string]*PasswordEntry)
-	}
-	if db.Devices == nil {
-		db.Devices = make(map[string]*ClientDevice)
-	}
+	db = loaded
 	if mainPass != "" || db.MainPassword == "" {
 		db.MainPassword = mainPass
 	}
@@ -519,8 +669,12 @@ func initDB(dir, mainPass, adminID, botToken, dnsValue string) {
 	if dnsValue == "" {
 		dnsValue = defaultDNS
 	}
-	db.DNS = dnsValue
-	setServerDNS(dnsValue)
+	normalizedDNS, err := normalizeDNSInput(dnsValue)
+	if err != nil {
+		return fmt.Errorf("некорректный DNS в passwords.json или параметре -dns: %w", err)
+	}
+	db.DNS = normalizedDNS
+	setServerDNS(normalizedDNS)
 	if db.MaxPasswords > 0 && maxGeneratedPasswords == defaultMaxGeneratedPasswords {
 		if db.MaxPasswords > 500 {
 			maxGeneratedPasswords = 500
@@ -532,33 +686,27 @@ func initDB(dir, mainPass, adminID, botToken, dnsValue string) {
 	if strings.TrimSpace(db.DefaultPorts) == "" {
 		db.DefaultPorts = "56000,56001,9000"
 	}
+	if strings.TrimSpace(db.MainPassword) == "" {
+		return errors.New("main_password в passwords.json пуст; запуск без явного восстановления запрещён")
+	}
 	db.AdminProfile = normalizeAdminProfileForStorage(db.AdminProfile, db.DefaultPorts)
 	setServerDefaultPorts(db.DefaultPorts)
 	setServerPublicIPOverride(db.PublicIP)
-	saveDB()
-	if err := refreshWrapKeysFromDBLocked(); err != nil {
-		log.Fatalf("[WRAP] init keys: %v", err)
+	if err := saveDB(); err != nil {
+		return err
 	}
+	if err := refreshWrapKeysFromDBLocked(); err != nil {
+		return fmt.Errorf("инициализация ключей обёртки: %w", err)
+	}
+	return nil
 }
 
-func saveDB() {
-	data, err := json.MarshalIndent(db, "", "  ")
-	if err != nil {
-		log.Printf("[DB] marshal error: %v", err)
-		return
+func saveDB() error {
+	if err := persistDatabaseFile(dbFile, db); err != nil {
+		log.Printf("[DB] сохранение отклонено: %v", err)
+		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(dbFile), 0700); err != nil {
-		log.Printf("[DB] mkdir error: %v", err)
-		return
-	}
-	tmp := dbFile + ".tmp"
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
-		log.Printf("[DB] write error: %v", err)
-		return
-	}
-	if err := os.Rename(tmp, dbFile); err != nil {
-		log.Printf("[DB] rename error: %v", err)
-	}
+	return nil
 }
 
 func isPasswordExpired(entry *PasswordEntry) bool {
@@ -708,7 +856,9 @@ func cleanupExpiredPasswords(wgDev wgDevice) int {
 	defer dbMutex.Unlock()
 	removed := cleanupExpiredPasswordsLocked(wgDev)
 	if removed > 0 {
-		saveDB()
+		if err := saveDB(); err != nil {
+			log.Printf("[DB] не удалось сохранить очистку истёкших записей: %v", err)
+		}
 	}
 	return removed
 }
@@ -1026,7 +1176,9 @@ func statsLoop(ctx context.Context, configDir string) {
 		flushAccessTraffic()
 		dbMutex.Lock()
 		if atomic.SwapInt32(&dbTrafficDirty, 0) == 1 {
-			saveDB()
+			if err := saveDB(); err != nil {
+				atomic.StoreInt32(&dbTrafficDirty, 1)
+			}
 		}
 		dbMutex.Unlock()
 	}()
@@ -1053,7 +1205,9 @@ func statsLoop(ctx context.Context, configDir string) {
 			numPasswords := len(db.Passwords)
 			numDevices := len(db.Devices)
 			if atomic.SwapInt32(&dbTrafficDirty, 0) == 1 {
-				saveDB()
+				if err := saveDB(); err != nil {
+					atomic.StoreInt32(&dbTrafficDirty, 1)
+				}
 			}
 			dbMutex.Unlock()
 
@@ -1158,26 +1312,38 @@ func generateKeyPair() (privB64, pubB64 string, err error) {
 
 func loadOrGenerateKeys(dir string) (*wgKeys, error) {
 	f := filepath.Join(dir, "wg-keys.dat")
-	if data, err := os.ReadFile(f); err == nil {
-		lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-		if len(lines) >= 4 {
-			keys := &wgKeys{
-				serverPrivate: strings.TrimSpace(lines[0]),
-				serverPublic:  strings.TrimSpace(lines[1]),
-				clientPrivate: strings.TrimSpace(lines[2]),
-				clientPublic:  strings.TrimSpace(lines[3]),
-			}
-			for _, k := range []string{keys.serverPrivate, keys.serverPublic,
-				keys.clientPrivate, keys.clientPublic} {
-				if _, err := b64ToHex(k); err != nil {
-					goto generate
-				}
-			}
-			log.Printf("[WG] Ключи загружены из %s", f)
-			return keys, nil
+	if info, err := os.Lstat(f); err == nil {
+		if !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > 4096 {
+			return nil, errors.New("wg-keys.dat должен быть обычным непустым файлом допустимого размера")
 		}
+		data, err := os.ReadFile(f)
+		if err != nil {
+			return nil, fmt.Errorf("чтение wg-keys.dat: %w", err)
+		}
+		lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+		if len(lines) != 4 {
+			return nil, errors.New("wg-keys.dat должен содержать ровно четыре ключа")
+		}
+		keys := &wgKeys{
+			serverPrivate: strings.TrimSpace(lines[0]),
+			serverPublic:  strings.TrimSpace(lines[1]),
+			clientPrivate: strings.TrimSpace(lines[2]),
+			clientPublic:  strings.TrimSpace(lines[3]),
+		}
+		for _, k := range []string{keys.serverPrivate, keys.serverPublic,
+			keys.clientPrivate, keys.clientPublic} {
+			if _, err := b64ToHex(k); err != nil {
+				return nil, fmt.Errorf("wg-keys.dat содержит некорректный ключ: %w", err)
+			}
+		}
+		log.Printf("[WG] Ключи загружены из %s", f)
+		return keys, nil
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("проверка wg-keys.dat: %w", err)
 	}
-generate:
+	if len(db.Passwords) != 0 || len(db.Devices) != 0 || len(db.AdminProfile.DeviceIDs) != 0 {
+		return nil, errors.New("wg-keys.dat отсутствует при существующих доступах или устройствах; автоматическая замена ключей запрещена")
+	}
 	log.Println("[WG] Генерирую новые ключи...")
 	sPriv, sPub, err := generateKeyPair()
 	if err != nil {
@@ -1188,10 +1354,14 @@ generate:
 		return nil, err
 	}
 	keys := &wgKeys{sPriv, sPub, cPriv, cPub}
-	os.MkdirAll(dir, 0700)
-	os.WriteFile(f, []byte(fmt.Sprintf("%s\n%s\n%s\n%s\n",
+	if err := ensurePrivateDatabaseDirectory(dir); err != nil {
+		return nil, err
+	}
+	if err := writeSyncedFileAtomically(f, []byte(fmt.Sprintf("%s\n%s\n%s\n%s\n",
 		keys.serverPrivate, keys.serverPublic,
-		keys.clientPrivate, keys.clientPublic)), 0600)
+		keys.clientPrivate, keys.clientPublic)), 0600); err != nil {
+		return nil, fmt.Errorf("сохранение новых WireGuard-ключей: %w", err)
+	}
 	log.Printf("[WG] Ключи сохранены в %s", f)
 	return keys, nil
 }
@@ -1369,7 +1539,7 @@ func main() {
 	mainPass := flag.String("password", "", "пароль владельца")
 	adminID := flag.String("admin", "", "Telegram Admin ID")
 	botToken := flag.String("bot-token", "", "Telegram Bot Token")
-	dnsValue := flag.String("dns", defaultDNS, "DNS для WireGuard-клиентов, через запятую")
+	dnsValue := flag.String("dns", "", "DNS для WireGuard-клиентов, через запятую; пустое значение сохраняет DNS из базы")
 	maxPasswordsFlag := flag.Int("max-passwords", defaultMaxGeneratedPasswords, "максимум активных сгенерированных паролей")
 	maxWorkersFlag := flag.Int("max-workers-per-access", defaultMaxWorkersPerAccess, "максимум одновременных DTLS-воркеров одного доступа; 0 отключает лимит")
 	maxHandshakesFlag := flag.Int("max-handshakes", defaultMaxHandshakes, "максимум одновременных DTLS-рукопожатий")
@@ -1423,7 +1593,9 @@ func main() {
 		os.Exit(0)
 	}()
 
-	initDB(*configDir, *mainPass, *adminID, *botToken, *dnsValue)
+	if err := initDB(*configDir, *mainPass, *adminID, *botToken, *dnsValue); err != nil {
+		log.Fatalf("[DB] Безопасный запуск остановлен: %v", err)
+	}
 
 	keys, err := loadOrGenerateKeys(*configDir)
 	if err != nil {
@@ -1443,6 +1615,7 @@ func main() {
 	if err := startAdminSocket(ctx, *configDir, wgDev); err != nil {
 		log.Fatalf("[ADMIN] Локальное управление: %v", err)
 	}
+	startServerBackupScheduler(ctx, *configDir)
 	defer func() {
 		wgDev.Close()
 		runCmdSilent("ip", "link", "del", wgIfaceName)
@@ -1658,6 +1831,7 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 			)
 			dbMutex.Unlock()
 		} else if valid && isGenPass && entry.DeviceID != "" && entry.DeviceID != deviceID {
+			previousHistoryLength := len(entry.BindHistory)
 			appendBindHistory(entry, BindHistoryEntry{
 				DeviceID:   deviceID,
 				DeviceName: deviceDisplayNameFromInfo(deviceID, deviceInfo),
@@ -1667,7 +1841,9 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 				Status:     "denied_mismatch",
 				Note:       "пароль уже привязан к другому устройству",
 			})
-			saveDB()
+			if err := saveDB(); err != nil {
+				entry.BindHistory = entry.BindHistory[:previousHistoryLength]
+			}
 			// Пароль уже привязан к другому устройству
 			clientConn.Write([]byte("DENIED:device_mismatch"))
 			log.Printf(
@@ -1679,6 +1855,13 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 			dbMutex.Unlock()
 		} else if valid {
 			newlyBound := false
+			previousDeviceID := ""
+			previousHistoryLength := 0
+			previousAdminDeviceIDs := append([]string(nil), db.AdminProfile.DeviceIDs...)
+			if entry != nil {
+				previousDeviceID = entry.DeviceID
+				previousHistoryLength = len(entry.BindHistory)
+			}
 
 			// Привязываем пароль к устройству при первом использовании
 			if isGenPass && entry.DeviceID == "" {
@@ -1695,6 +1878,10 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 			}
 
 			dev, exists := db.Devices[deviceID]
+			var previousDevice ClientDevice
+			if exists && dev != nil {
+				previousDevice = *dev
+			}
 			if !exists {
 				dev = &ClientDevice{DeviceID: deviceID, IP: getNextIP()}
 				privB64, pubB64, keyErr := generateKeyPair()
@@ -1703,7 +1890,6 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 					dev.PubKey = pubB64
 					applyDeviceInfo(dev, deviceInfo, remoteIP, nowUnix)
 					db.Devices[deviceID] = dev
-					saveDB()
 					log.Printf("[WG] Новое устройство %s", deviceLogRef(deviceID))
 				} else {
 					dev = nil
@@ -1724,7 +1910,20 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 						Status:     "active",
 					})
 				}
-				saveDB()
+				if err := saveDB(); err != nil {
+					if exists {
+						*dev = previousDevice
+					} else {
+						delete(db.Devices, deviceID)
+					}
+					if entry != nil {
+						entry.DeviceID = previousDeviceID
+						entry.BindHistory = entry.BindHistory[:previousHistoryLength]
+					}
+					db.AdminProfile.DeviceIDs = previousAdminDeviceIDs
+					dev = nil
+					configResponse = "DENIED:server_storage"
+				}
 			}
 			if dev != nil {
 				connDevice = dev
@@ -1827,16 +2026,31 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 		firstPacket = buf[:n]
 	}
 
-	// WG прокси
-	wgConn, err := net.Dial("udp", wgEndpoint)
-	if err != nil {
-		return
-	}
-	defer wgConn.Close()
+	// WDTT_MUX1 is sent by current clients before their first WireGuard packet.
+	// Older clients retain the independent-socket path unchanged.
+	useMultipathRelay := firstStr == multipathRelayHello && connDevice != nil
+	var relay *deviceWGRelay
+	var relayAttachment *deviceWGAttachment
+	var wgConn net.Conn
+	if useMultipathRelay {
+		var relayErr error
+		relay, relayAttachment, relayErr = acquireDeviceWGRelay(connDevice.DeviceID, wgEndpoint)
+		if relayErr != nil {
+			return
+		}
+		defer relay.release(relayAttachment)
+		firstPacket = nil
+	} else {
+		wgConn, err = net.Dial("udp", wgEndpoint)
+		if err != nil {
+			return
+		}
+		defer wgConn.Close()
 
-	if uc, ok := wgConn.(*net.UDPConn); ok {
-		uc.SetReadBuffer(2 * 1024 * 1024)
-		uc.SetWriteBuffer(2 * 1024 * 1024)
+		if uc, ok := wgConn.(*net.UDPConn); ok {
+			_ = uc.SetReadBuffer(2 * 1024 * 1024)
+			_ = uc.SetWriteBuffer(2 * 1024 * 1024)
+		}
 	}
 
 	if !accessIdentityIsActive(identity) {
@@ -1846,14 +2060,23 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 		upsertPeerInWG(wgDev, connDevice)
 	}
 
-	if err := runtimeLease.upload.wait(ctx, len(firstPacket)); err != nil {
-		return
+	writeToWG := func(packet []byte) error {
+		if relay != nil {
+			return relay.writeFrom(relayAttachment, packet)
+		}
+		_, err := wgConn.Write(packet)
+		return err
 	}
-	if _, err := wgConn.Write(firstPacket); err != nil {
-		return
+	if len(firstPacket) > 0 {
+		if err := runtimeLease.upload.wait(ctx, len(firstPacket)); err != nil {
+			return
+		}
+		if err := writeToWG(firstPacket); err != nil {
+			return
+		}
+		atomic.AddInt64(&totalBytesFromClient, int64(len(firstPacket)))
+		recordAccessTraffic(runtimeLease, 0, int64(len(firstPacket)))
 	}
-	atomic.AddInt64(&totalBytesFromClient, int64(len(firstPacket)))
-	recordAccessTraffic(runtimeLease, 0, int64(len(firstPacket)))
 
 	pctx, pcancel := context.WithCancel(ctx)
 	defer pcancel()
@@ -1890,7 +2113,9 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 
 	context.AfterFunc(pctx, func() {
 		clientConn.SetDeadline(time.Now())
-		wgConn.SetDeadline(time.Now())
+		if wgConn != nil {
+			wgConn.SetDeadline(time.Now())
+		}
 	})
 
 	var proxyWg sync.WaitGroup
@@ -1933,7 +2158,7 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 			if err := runtimeLease.upload.wait(pctx, nn); err != nil {
 				return
 			}
-			if _, err := wgConn.Write((*b)[:nn]); err != nil {
+			if err := writeToWG((*b)[:nn]); err != nil {
 				return
 			}
 			atomic.AddInt64(&totalBytesFromClient, int64(nn))
@@ -1954,17 +2179,31 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 				return
 			default:
 			}
-			wgConn.SetReadDeadline(time.Now().Add(30 * time.Minute))
-			nn, err := wgConn.Read(*b)
-			if err != nil {
-				if isNetTimeout(err) {
-					if pctx.Err() != nil {
-						return
-					}
-					continue
+			var packet []byte
+			if relay != nil {
+				select {
+				case packet = <-relayAttachment.downstream:
+				case <-pctx.Done():
+					return
 				}
-				return
+				nn := len(packet)
+				copy(*b, packet)
+				_ = nn
+			} else {
+				wgConn.SetReadDeadline(time.Now().Add(30 * time.Minute))
+				nn, err := wgConn.Read(*b)
+				if err != nil {
+					if isNetTimeout(err) {
+						if pctx.Err() != nil {
+							return
+						}
+						continue
+					}
+					return
+				}
+				packet = append(packet, (*b)[:nn]...)
 			}
+			nn := len(packet)
 			if time.Since(lastAccessCheck) >= 5*time.Second {
 				if !accessIdentityIsActive(identity) {
 					return
@@ -1974,7 +2213,7 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 			if err := runtimeLease.download.wait(pctx, nn); err != nil {
 				return
 			}
-			if _, err := clientConn.Write((*b)[:nn]); err != nil {
+			if _, err := clientConn.Write(packet); err != nil {
 				return
 			}
 			atomic.AddInt64(&totalBytesToClient, int64(nn))
@@ -2295,7 +2534,7 @@ func (c *wrapPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 		c.obfsWrite = NewObfsState()
 	}
 	key := c.key
-	obfsCfg := c.obfsCfg
+	obfsCfg := *c.obfsCfg
 	obfsWrite := c.obfsWrite
 	c.activeOps++
 	c.stateMu.Unlock()
@@ -2303,7 +2542,7 @@ func (c *wrapPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 
 	buffer := wrapWireBufferPool.Get().(*[]byte)
 	defer wrapWireBufferPool.Put(buffer)
-	wrapped, wErr := obfsWrapPacketInto((*buffer)[:0], key, p, obfsCfg, obfsWrite)
+	wrapped, wErr := obfsWrapPacketInto((*buffer)[:0], key, p, &obfsCfg, obfsWrite)
 	if wErr != nil {
 		return 0, fmt.Errorf("obfs wrap: %w", wErr)
 	}

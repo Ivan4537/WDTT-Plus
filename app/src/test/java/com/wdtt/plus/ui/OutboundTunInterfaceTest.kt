@@ -192,12 +192,14 @@ class OutboundTunInterfaceTest {
         val diagnostics = serverDiagnosticsScript()
 
         assertTrue("WDTT_TUN_INTERFACE_B64" in snapshot)
+        assertTrue("WDTT_TUN_PROFILE_SAVED" in snapshot)
         assertTrue("WDTT_TUN_POLICY_RULE_ACTIVE" in snapshot)
         assertTrue("WDTT_TUN_FORWARD_RULES_ACTIVE" in snapshot)
         assertTrue("WDTT_TUN_IP_FORWARD_ACTIVE" in snapshot)
         assertTrue("WDTT_TUN_FAIL_CLOSED_ACTIVE" in snapshot)
-        assertTrue("[ -e \"${'$'}WDTT_TUN_OWNER_FILE\" ]" in snapshot)
-        assertTrue("[ -e \"${'$'}WDTT_TUN_CONFIG_FILE\" ]" in snapshot)
+        assertTrue("TUN_OWNED=0" in snapshot)
+        assertTrue("WDTT_TUN_EXIT_V1" in snapshot)
+        assertTrue("Сохранённое поле имени нужно лишь для повторного включения" in snapshot)
         assertTrue("Автозапуск TUN-выхода" in status)
         assertTrue("Пересылка IPv4-пакетов" in status)
         assertTrue("Аварийная блокировка прямого выхода" in status)
@@ -264,9 +266,53 @@ class OutboundTunInterfaceTest {
         )
     }
 
+    @Test
+    fun savedTunNameWithoutOwnedRouting_isNotReportedAsConfigured() {
+        val savedNameOnly = snapshot(
+            mode = "direct",
+            tunPresent = false,
+            tunProfileSaved = true,
+            tunInterfaceActive = false,
+            tunServiceActive = false,
+            tunServiceEnabled = false,
+            tunPolicyRuleActive = false,
+            tunDefaultRouteActive = false,
+            tunForwardRulesActive = false,
+            tunIpForwardActive = false,
+            tunFailClosedActive = false
+        )
+
+        assertEquals(
+            OutboundModeIndicator(OutboundModeVisualState.Off, "выключен"),
+            outboundModeIndicator(savedNameOnly, OutboundDialog.TunInterface)
+        )
+        assertFalse(savedNameOnly.tunHealthy)
+    }
+
+    @Test
+    fun snapshotParser_keepsSavedTunNameSeparateFromConfiguredRouting() {
+        val parsed = parseOutboundServerSnapshot(
+            """
+            WDTT_OUTBOUND_MODE=direct
+            WDTT_TUN_INTERFACE_B64=eHJheQ==
+            WDTT_TUN_PROFILE_SAVED=1
+            WDTT_TUN_PRESENT=0
+            """.trimIndent()
+        )
+
+        assertEquals("xray", parsed.tunInterface)
+        assertTrue(parsed.tunProfileSaved)
+        assertFalse(parsed.tunPresent)
+        assertEquals(
+            OutboundModeIndicator(OutboundModeVisualState.Off, "выключен"),
+            outboundModeIndicator(parsed, OutboundDialog.TunInterface)
+        )
+    }
+
     private fun snapshot(
         mode: String,
         tunPresent: Boolean,
+        tunProfileSaved: Boolean = false,
         tunInterfaceActive: Boolean,
         tunServiceActive: Boolean,
         tunServiceEnabled: Boolean,
@@ -304,6 +350,7 @@ class OutboundTunInterfaceTest {
         warpMtu = "",
         importedWireGuardConfig = "",
         tunInterface = "xray0",
+        tunProfileSaved = tunProfileSaved,
         tunPresent = tunPresent,
         tunInterfaceActive = tunInterfaceActive,
         tunServiceActive = tunServiceActive,

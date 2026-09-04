@@ -45,6 +45,31 @@ class LogSeverityTest {
     }
 
     @Test
+    fun vkCallsStreamPreflightLogs_arePresentedAsUserStatus() {
+        for (streamId in listOf(100, 200, 300, 400)) {
+            val start = classifyVkCallsLog("[STREAM $streamId] [VKCalls] preflight 1/2")
+            assertEquals("vkcalls_start", start?.key)
+            assertEquals("[VKCalls] Пробуем основной бескапчевый провайдер...", start?.message)
+            assertEquals(false, start?.warning)
+        }
+
+        val retry = classifyVkCallsLog(
+            "[STREAM 300] [VKCalls] первая анонимная сессия не принята; повторяем один раз с новой идентичностью"
+        )
+        val fallback = classifyVkCallsLog(
+            "[STREAM 400] [VKCalls] preflight не сработал после безопасного повтора: timeout; продолжаем резервную legacy-цепочку",
+            isError = true,
+        )
+
+        assertEquals("vkcalls_retry", retry?.key)
+        assertEquals("[VKCalls] Повторяем проверку с новой анонимной сессией...", retry?.message)
+        assertEquals(false, retry?.warning)
+        assertEquals("vkcalls_fallback", fallback?.key)
+        assertEquals("[VKCalls] Основной провайдер временно недоступен — пробуем совместимый резерв", fallback?.message)
+        assertEquals(false, fallback?.warning)
+    }
+
+    @Test
     fun warningDoesNotCountAsUnreadError() {
         val warning = LogEntry("warning", "Повторяем", severity = LogSeverity.Warning)
 

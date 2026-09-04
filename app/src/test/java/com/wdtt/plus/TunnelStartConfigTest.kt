@@ -5,6 +5,11 @@ import org.junit.Test
 
 class TunnelStartConfigTest {
     @Test
+    fun `wireguard config is required before workers for every profile`() {
+        assertEquals(true, shouldUseConfigFirstStart())
+    }
+
+    @Test
     fun `tile and widgets stop both active and trusted wifi waiting tunnel`() {
         assertEquals(
             TunnelToggleAction.STOP,
@@ -41,6 +46,26 @@ class TunnelStartConfigTest {
                 trustedWifiWaiting = false,
                 vpnPermissionRequired = false,
             )
+        )
+    }
+
+    @Test
+    fun `stop action is selected before any permission probe`() {
+        assertEquals(
+            TunnelToggleAction.STOP,
+            tunnelToggleAction(
+                running = true,
+                trustedWifiWaiting = false,
+                vpnPermissionRequired = true,
+            ),
+        )
+        assertEquals(
+            TunnelToggleAction.STOP,
+            tunnelToggleAction(
+                running = false,
+                trustedWifiWaiting = true,
+                vpnPermissionRequired = true,
+            ),
         )
     }
 

@@ -311,7 +311,10 @@ fun VkClientSettingsDialog(
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
-                        IconButton(onClick = onDismiss) {
+                        IconButton(
+                            onClick = onDismiss,
+                            modifier = Modifier.remoteIconButtonFocus(),
+                        ) {
                             Icon(Icons.Default.Close, contentDescription = "Закрыть")
                         }
                     }
@@ -346,7 +349,17 @@ fun VkClientSettingsDialog(
                             color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f)
                         ) {
                             Row(
-                                modifier = Modifier.fillMaxWidth().padding(14.dp),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .remoteToggleableRow(
+                                        value = enabled,
+                                        enabled = !tunnelRunning,
+                                    ) { checked ->
+                                        scope.launch {
+                                            settingsStore.saveCustomVkCredentialsEnabled(checked)
+                                        }
+                                    }
+                                    .padding(14.dp),
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(12.dp)
                             ) {
@@ -368,9 +381,7 @@ fun VkClientSettingsDialog(
                                 Switch(
                                     checked = enabled,
                                     enabled = !tunnelRunning,
-                                    onCheckedChange = { checked ->
-                                        scope.launch { settingsStore.saveCustomVkCredentialsEnabled(checked) }
-                                    }
+                                    onCheckedChange = null,
                                 )
                             }
                         }
@@ -389,7 +400,10 @@ fun VkClientSettingsDialog(
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
                                 }
-                                IconButton(onClick = { showHelp = true }) {
+                                IconButton(
+                                    onClick = { showHelp = true },
+                                    modifier = Modifier.remoteHelpFocus(),
+                                ) {
                                     Icon(
                                         Icons.AutoMirrored.Filled.HelpOutline,
                                         contentDescription = "Как получить Client ID и secret"
@@ -649,6 +663,7 @@ fun VkClientSettingsDialog(
 @Composable
 private fun VkClientCredentialsHelpDialog(onDismiss: () -> Unit) {
     val context = LocalContext.current
+    val television = isTelevisionDevice()
     val clipboard = LocalClipboardManager.current
     val configuration = LocalConfiguration.current
     val packageName = context.packageName
@@ -665,8 +680,11 @@ private fun VkClientCredentialsHelpDialog(onDismiss: () -> Unit) {
     ) {
         Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             Surface(
-                modifier = Modifier
-                    .fillMaxWidth(0.92f)
+                modifier = (if (television) {
+                    Modifier.televisionDialogWidth(television, fraction = 0.82f, maxWidth = 1_000.dp)
+                } else {
+                    Modifier.fillMaxWidth(0.92f)
+                })
                     .fillMaxHeight(0.9f)
                     .heightIn(max = (configuration.screenHeightDp.dp - 32.dp).coerceAtLeast(360.dp)),
                 shape = RoundedCornerShape(30.dp),
@@ -697,7 +715,10 @@ private fun VkClientCredentialsHelpDialog(onDismiss: () -> Unit) {
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
-                        IconButton(onClick = onDismiss) {
+                        IconButton(
+                            onClick = onDismiss,
+                            modifier = Modifier.remoteIconButtonFocus(),
+                        ) {
                             Icon(Icons.Default.Close, contentDescription = "Закрыть")
                         }
                     }

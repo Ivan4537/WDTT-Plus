@@ -29,7 +29,9 @@ const (
 	readBufSize                  = 1600
 	socketBufSize                = 625 * 1024
 	keepaliveByte                = 0xFF // DTLS-level keepalive marker
+	multipathRelayHello          = "WDTT_MUX1"
 	keepaliveInterval            = 15 * time.Second
+	healthMonitorSuspendGap      = 30 * time.Second
 	defaultHandshakeTimeout      = 20 * time.Second
 	wrapHandshakeTimeout         = 8 * time.Second
 )
@@ -385,6 +387,7 @@ func RunSession(
 	deviceID, password, deviceInfo, transportSession string,
 	stats *Stats,
 	preferTURNStream bool,
+	onTURNAllocated func(),
 ) (bool, error) {
 	configDelivered := false
 
@@ -472,13 +475,15 @@ func RunSession(
 
 	// Reset error count on successful allocation
 	getStreamCache(creds.CacheStreamID).errorCount.Store(0)
+	if onTURNAllocated != nil {
+		onTURNAllocated()
+	}
 
 	if selectedMasqueProtocol != "" {
 		log.Printf("[СЕССИЯ #%d] Relay: %s через TURN %s внутри MASQUE %s ✓", sessionID, relay.LocalAddr(), selectedEndpoint.label(), selectedMasqueProtocol)
 	} else {
 		log.Printf("[СЕССИЯ #%d] Relay: %s через TURN %s", sessionID, relay.LocalAddr(), selectedEndpoint.label())
 	}
-
 	// Pipe для DTLS ↔ TURN relay
 	pipeA, pipeB := connutil.AsyncPacketPipe()
 
@@ -687,10 +692,18 @@ func RunSession(
 
 	log.Printf("[ВОРКЕР #%d] [READY] Туннель готов к работе ✓", sessionID)
 
+	// New servers use this one-shot capability marker to bind every worker of
+	// a device to one stable WireGuard-side UDP source. An older server treats
+	// it as an invalid WireGuard datagram, then continues with the next packet.
+	if _, err := dtlsConn.Write([]byte(multipathRelayHello)); err != nil {
+		return false, fmt.Errorf("запуск multipath-реле: %w", err)
+	}
+
 	// Регистрация в диспетчере
 	slot := &WorkerSlot{
 		ID:     sessionID,
 		SendCh: make(chan []byte, workerSendBuf),
+		WakeCh: make(chan struct{}, 1),
 	}
 	d.Register(slot)
 	defer d.Unregister(slot)
@@ -699,6 +712,7 @@ func RunSession(
 	lastServerRxAt.Store(time.Now().UnixNano())
 	var keepalivePongSeen atomic.Int32
 	policyLimitCh := make(chan int, 1)
+	var dtlsWriteMu sync.Mutex
 
 	// Proxy DTLS ↔ Dispatcher
 	var proxyWg sync.WaitGroup
@@ -708,16 +722,31 @@ func RunSession(
 	go func() {
 		defer proxyWg.Done()
 		defer sessCancel()
+		writeKeepalive := func(now time.Time) bool {
+			ping := []byte{keepaliveByte}
+			_ = dtlsConn.SetWriteDeadline(now.Add(5 * time.Second))
+			dtlsWriteMu.Lock()
+			_, err := dtlsConn.Write(ping)
+			dtlsWriteMu.Unlock()
+			return err == nil
+		}
+		// Проверяем каждый новый канал сразу, чтобы Android получил раннее
+		// подтверждение, что новый процесс действительно видит сервер.
+		if !writeKeepalive(time.Now()) {
+			return
+		}
 		t := time.NewTicker(keepaliveInterval)
 		defer t.Stop()
-		ping := []byte{keepaliveByte}
 		for {
 			select {
 			case <-sessCtx.Done():
 				return
-			case <-t.C:
-				_ = dtlsConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-				if _, err := dtlsConn.Write(ping); err != nil {
+			case <-slot.WakeCh:
+				if !writeKeepalive(time.Now()) {
+					return
+				}
+			case now := <-t.C:
+				if !writeKeepalive(now) {
 					return
 				}
 			}
@@ -729,12 +758,24 @@ func RunSession(
 		defer proxyWg.Done()
 		t := time.NewTicker(10 * time.Second)
 		defer t.Stop()
+		lastHealthCheckAt := time.Now()
+		var schedulerResumeGraceUntil time.Time
 		for {
 			select {
 			case <-sessCtx.Done():
 				return
 			case <-t.C:
 				now := time.Now()
+				if now.Sub(lastHealthCheckAt) > healthMonitorSuspendGap {
+					// DEVICE_SLEEP/WAKE может быть доставлен с задержкой отдельными
+					// производителями Android. Большой разрыв самого Go-таймера —
+					// дополнительный признак приостановки процесса в Doze.
+					schedulerResumeGraceUntil = now.Add(deviceWakeHealthGrace)
+				}
+				lastHealthCheckAt = now
+				if d.shouldSuppressTransportHealth(now) || now.Before(schedulerResumeGraceUntil) {
+					continue
+				}
 				lastRxUnix := lastServerRxAt.Load()
 				lastRx := time.Unix(0, lastRxUnix)
 
@@ -767,7 +808,9 @@ func RunSession(
 				}
 				userTraffic := isWireGuardUserDataPacket(pkt)
 				_ = dtlsConn.SetWriteDeadline(time.Now().Add(sessionReadTimeout))
+				dtlsWriteMu.Lock()
 				_, writeErr := dtlsConn.Write(pkt)
+				dtlsWriteMu.Unlock()
 				putPktBuf(pkt)
 				if writeErr != nil {
 					log.Printf("[ВОРКЕР #%d] Ошибка Writer: %v", sessionID, writeErr)
@@ -784,6 +827,17 @@ func RunSession(
 	go func() {
 		defer proxyWg.Done()
 		defer sessCancel()
+		var reportedWakeGeneration uint64
+		noteKeepalivePong := func() {
+			generation := d.wakeGeneration.Load()
+			firstPong := keepalivePongSeen.CompareAndSwap(0, 1)
+			if firstPong || generation > reportedWakeGeneration {
+				reportedWakeGeneration = generation
+				// Android использует этот сигнал как доказательство свежего
+				// двустороннего пути, в том числе после каждого пробуждения.
+				log.Printf("[HEALTH] сервер ответил на keepalive")
+			}
+		}
 		for {
 			pkt := getPktBuf(2048)
 			_ = dtlsConn.SetReadDeadline(time.Now().Add(sessionReadTimeout))
@@ -815,11 +869,7 @@ func RunSession(
 
 			// Skip keepalive pong from server
 			if n == 1 && pkt[0] == keepaliveByte {
-				if keepalivePongSeen.CompareAndSwap(0, 1) {
-					// Один сигнал на нативный процесс: Android использует его для
-					// проверки таймерного возобновления, не засоряя лог каждым pong.
-					log.Printf("[HEALTH] сервер ответил на keepalive")
-				}
+				noteKeepalivePong()
 				putPktBuf(pkt)
 				continue
 			}

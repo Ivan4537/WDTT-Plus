@@ -461,31 +461,55 @@ func fetchVkCredsSerialized(ctx context.Context, link string, streamID int) (fet
 
 func fetchVkCreds(ctx context.Context, link string, streamID int) (fetchedTurnCredentials, error) {
 	if vkCallsPreflightEnabled.Load() {
-		if pause := vkCallsFloodPauseRemaining(time.Now()); pause > 0 {
-			log.Printf("[STREAM %d] [VKCalls] preflight временно пропущен после ограничения VK (%v); продолжаем резервную legacy-цепочку", streamID, pause.Truncate(time.Second))
+		if pause := vkCallsPreflightPauseRemaining(link, time.Now()); pause > 0 {
+			log.Printf("[STREAM %d] [VKCalls] preflight временно пропущен для этого хеша после предыдущего сбоя (%v); продолжаем резервную legacy-цепочку", streamID, pause.Truncate(time.Second))
 		} else {
-			log.Printf("[STREAM %d] [VKCalls] preflight", streamID)
-			if user, pass, addrs, lifetime, err := getVKCredsViaVKCalls(ctx, link, streamID); err == nil {
-				log.Printf("[STREAM %d] [VK Provider] modern-vkcalls: успешно", streamID)
-				return fetchedTurnCredentials{
-					Username:    user,
-					Password:    pass,
-					ServerAddrs: addrs,
-					Lifetime:    lifetime,
-					Provider:    "modern-vkcalls",
-				}, nil
-			} else {
-				pause := vkCallsPreflightPauseForError(err)
-				startVKCallsPreflightPause(time.Now(), pause)
+			var modernErr error
+			for attempt := 1; attempt <= 2; attempt++ {
+				log.Printf("[STREAM %d] [VKCalls] preflight %d/2", streamID, attempt)
+				user, pass, addrs, lifetime, err := getVKCredsViaVKCalls(ctx, link, streamID)
+				if err == nil {
+					log.Printf("[STREAM %d] [VK Provider] modern-vkcalls: успешно", streamID)
+					return fetchedTurnCredentials{
+						Username:    user,
+						Password:    pass,
+						ServerAddrs: addrs,
+						Lifetime:    lifetime,
+						Provider:    "modern-vkcalls",
+					}, nil
+				}
+				modernErr = err
+				if attempt == 2 || !shouldRetryVKCallsPreflight(err) {
+					break
+				}
+				log.Printf("[STREAM %d] [VKCalls] первая анонимная сессия не принята; повторяем один раз с новой идентичностью", streamID)
+				timer := time.NewTimer(time.Duration(350+rand.Intn(301)) * time.Millisecond)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return fetchedTurnCredentials{}, ctx.Err()
+				case <-timer.C:
+				}
+			}
+			if modernErr != nil {
+				pause := vkCallsPreflightPauseForError(modernErr)
+				if isVKCallsFloodError(modernErr) {
+					startVKCallsGlobalPause(time.Now(), pause)
+				} else {
+					startVKCallsLinkPause(link, time.Now(), pause)
+				}
+				if isHashFallbackCredentialError(modernErr) {
+					return fetchedTurnCredentials{}, modernErr
+				}
 				switch {
-				case isVKCallsFloodError(err):
+				case isVKCallsFloodError(modernErr):
 					log.Printf("[STREAM %d] [VKCalls] VK временно ограничил анонимный вход; продолжаем резервную legacy-цепочку", streamID)
 				case pause == vkCallsCaptchaPause:
-					log.Printf("[STREAM %d] [VKCalls] VKCalls запросил CAPTCHA; временно не повторяем preflight и продолжаем резервную legacy-цепочку", streamID)
+					log.Printf("[STREAM %d] [VKCalls] две современные анонимные сессии запросили CAPTCHA; продолжаем одной legacy-цепочкой", streamID)
 				case pause > 0:
-					log.Printf("[STREAM %d] [VKCalls] preflight не сработал: %v; временно не повторяем его и продолжаем резервную legacy-цепочку", streamID, err)
+					log.Printf("[STREAM %d] [VKCalls] preflight не сработал после безопасного повтора: %v; продолжаем резервную legacy-цепочку", streamID, modernErr)
 				default:
-					log.Printf("[STREAM %d] [VKCalls] preflight не сработал: %v; продолжаем резервную legacy-цепочку", streamID, err)
+					log.Printf("[STREAM %d] [VKCalls] preflight не сработал: %v; продолжаем резервную legacy-цепочку", streamID, modernErr)
 				}
 			}
 		}

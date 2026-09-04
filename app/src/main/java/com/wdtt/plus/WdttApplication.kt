@@ -3,7 +3,6 @@ package com.wdtt.plus
 import android.app.Application
 import android.content.Context
 import android.util.Log
-import com.wireguard.android.backend.GoBackend
 import com.wireguard.android.backend.Tunnel
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -17,9 +16,9 @@ internal fun shouldClearPhantomVpn(activeTunnelProfile: Int?): Boolean =
 
 class WdttApplication : Application() {
     @Volatile
-    private var backendInstance: GoBackend? = null
+    private var backendInstance: SafeGoBackend? = null
 
-    val backend: GoBackend
+    val backend: SafeGoBackend
         get() = getBackend(this)
 
     override fun onCreate() {
@@ -82,9 +81,24 @@ class WdttApplication : Application() {
         }
     }
 
-    fun getBackend(context: Context): GoBackend {
+    fun getBackend(context: Context): SafeGoBackend {
         return backendInstance ?: synchronized(this) {
-            backendInstance ?: GoBackend(context.applicationContext).also { backendInstance = it }
+            backendInstance ?: SafeGoBackend(context.applicationContext).also { backend ->
+                backend.setRevocationListener {
+                    TunnelManager.onWireGuardInterfaceDropped(vpnSlotTransferred = true)
+                    runCatching {
+                        startService(
+                            android.content.Intent(this@WdttApplication, TunnelService::class.java).apply {
+                                action = ACTION_VPN_SLOT_REVOKED
+                            },
+                        )
+                    }.onFailure { error ->
+                        Log.w("WdttApp", "Не удалось передать отзыв VPN foreground-службе", error)
+                    }
+                }
+                backendInstance = backend
+                backend
+            }
         }
     }
 }

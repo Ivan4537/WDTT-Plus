@@ -59,6 +59,8 @@ fun DeviceCompatibilityDialog(
     onCopy: (() -> Unit)? = null,
     onAction: ((DeviceCheckAction) -> Unit)? = null
 ) {
+    val television = isTelevisionDevice()
+    val scrollState = rememberScrollState()
     val visibleItems = remember(report) {
         report.items.ifEmpty {
             listOf(
@@ -96,7 +98,8 @@ fun DeviceCompatibilityDialog(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(20.dp)
-                        .verticalScroll(rememberScrollState()),
+                        .verticalScroll(scrollState)
+                        .tvDpadScrollable(scrollState, television),
                     verticalArrangement = Arrangement.spacedBy(14.dp)
                 ) {
                     Row(

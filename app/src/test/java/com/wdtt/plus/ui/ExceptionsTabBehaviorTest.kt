@@ -1,5 +1,6 @@
 package com.wdtt.plus.ui
 
+import android.content.pm.ApplicationInfo
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -52,6 +53,8 @@ class ExceptionsTabBehaviorTest {
             "com.octopod.russianpost.client.android",
             "ru.nspk.mirpay",
             "ru.nspk.sbpay",
+            "com.vkontakte.android",
+            "com.vk.calls",
             "logo.com.mbanking",
             "ru.rzd.pass",
             "ru.tutu.tutu_emp",
@@ -92,5 +95,61 @@ class ExceptionsTabBehaviorTest {
         assertTrue(matchesQuickExclusionApp("Вкусно — и точка", "store.variant"))
         assertTrue(matchesQuickExclusionApp("Сателлит Online", "store.variant"))
         assertFalse(matchesQuickExclusionApp("Калькулятор", "com.example.calculator"))
+    }
+
+    @Test
+    fun `known user apps stay visible when firmware marks them as system apps`() {
+        assertFalse(isVpnRoutingSystemApp("com.vkontakte.android", ApplicationInfo.FLAG_SYSTEM))
+        assertFalse(isVpnRoutingSystemApp("com.vk.calls", ApplicationInfo.FLAG_UPDATED_SYSTEM_APP))
+        assertTrue(isVpnRoutingSystemApp("com.android.settings", ApplicationInfo.FLAG_SYSTEM))
+    }
+
+    @Test
+    fun `selected system apps stay visible when the switch is off`() {
+        val visible = visibleAppsWithSystemSelected(
+            listOf(
+                AppItem(
+                    name = "VK",
+                    packageName = "com.vkontakte.android",
+                    icon = null,
+                    isSystem = false,
+                ),
+                AppItem(
+                    name = "Android Settings",
+                    packageName = "com.android.settings",
+                    icon = null,
+                    isSystem = true,
+                ),
+            ),
+            selectedPackages = setOf("com.android.settings"),
+        )
+
+        assertEquals(
+            listOf("com.vkontakte.android", "com.android.settings"),
+            visible.map(AppItem::packageName),
+        )
+    }
+
+    @Test
+    fun `selected apps are sorted first and each group stays alphabetical`() {
+        val sorted = sortAppsForRoutingList(
+            listOf(
+                AppItem(name = "Яндекс", packageName = "ru.yandex.searchplugin", icon = null, isSystem = false),
+                AppItem(name = "Банк", packageName = "ru.bank", icon = null, isSystem = false),
+                AppItem(name = "Авито", packageName = "com.avito.android", icon = null, isSystem = false),
+                AppItem(name = "Настройки", packageName = "com.android.settings", icon = null, isSystem = true),
+            ),
+            selectedPackages = setOf("ru.yandex.searchplugin", "com.android.settings"),
+        )
+
+        assertEquals(
+            listOf(
+                "com.android.settings",
+                "ru.yandex.searchplugin",
+                "com.avito.android",
+                "ru.bank",
+            ),
+            sorted.map(AppItem::packageName),
+        )
     }
 }

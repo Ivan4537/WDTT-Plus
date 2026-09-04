@@ -1,6 +1,7 @@
 package com.wdtt.plus
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -73,6 +74,45 @@ class ClientNetworkDiagnosticsTest {
         assertEquals("DNS до VK недоступен", result.status)
         assertEquals(DeviceCheckSeverity.Error, result.severity)
         assertEquals(DeviceCheckAction.NetworkSettings, result.action)
+    }
+
+    @Test
+    fun privateDnsWarningAppearsOnlyWhenPrivateDnsAndNetworkProblemMeet() {
+        assertNull(
+            buildPrivateDnsProblemItem(
+                state = AndroidPrivateDnsState(active = false),
+                dnsProblem = true,
+                httpsProblem = true,
+            )
+        )
+        assertNull(
+            buildPrivateDnsProblemItem(
+                state = AndroidPrivateDnsState(active = true, serverName = "dns.example"),
+                dnsProblem = false,
+                httpsProblem = false,
+            )
+        )
+
+        val item = buildPrivateDnsProblemItem(
+            state = AndroidPrivateDnsState(active = true, serverName = "dns.google"),
+            dnsProblem = true,
+            httpsProblem = false,
+        )
+
+        assertEquals("Android Private DNS", item?.title)
+        assertEquals("включён (dns.google)", item?.status)
+        assertEquals(DeviceCheckSeverity.Warning, item?.severity)
+        assertEquals(DeviceCheckAction.NetworkSettings, item?.action)
+        assertTrue(item?.recommendation?.contains("Частный DNS") == true)
+    }
+
+    @Test
+    fun privateDnsRecommendationTailIsConditional() {
+        assertEquals("", privateDnsRecommendationTail(AndroidPrivateDnsState(active = false)))
+        assertEquals(
+            ", а также Android Private DNS",
+            privateDnsRecommendationTail(AndroidPrivateDnsState(active = true, serverName = "dns.google")),
+        )
     }
 
     @Test

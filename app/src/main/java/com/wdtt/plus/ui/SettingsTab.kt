@@ -22,6 +22,8 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.focusGroup
+import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
@@ -64,6 +66,11 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
@@ -73,6 +80,10 @@ import androidx.compose.ui.text.TextLinkStyles
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.withLink
+import androidx.compose.ui.semantics.ProgressBarRangeInfo
+import androidx.compose.ui.semantics.progressBarRangeInfo
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.setProgress
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -101,7 +112,8 @@ import com.wdtt.plus.DEFAULT_VK_CLIENT_IDS
 import com.wdtt.plus.DEFAULT_RT_TURN_SNI
 import com.wdtt.plus.ManlCaptchaWebViewManager
 import com.wdtt.plus.MainActivity
-import com.wdtt.plus.MANAGED_CONFIG_FIRST_START_EXTRA
+import com.wdtt.plus.CONFIG_FIRST_START_EXTRA
+import com.wdtt.plus.NativeClientStartupSecrets
 import com.wdtt.plus.RemoteContinuation
 import com.wdtt.plus.RemoteContinuationLauncher
 import com.wdtt.plus.RemoteActionCatalogGateway
@@ -120,7 +132,8 @@ import com.wdtt.plus.TUNNEL_PROFILE_INDEX_EXTRA
 import com.wdtt.plus.VpnDnsSettingsSnapshot
 import com.wdtt.plus.normalizeTunnelWorkerCount
 import com.wdtt.plus.normalizeRtTurnSni
-import com.wdtt.plus.shouldUseManagedConfigFirstStart
+import com.wdtt.plus.nativeClientStartupConfigLine
+import com.wdtt.plus.shouldUseConfigFirstStart
 import com.wdtt.plus.TrustedWifiManager
 import com.wdtt.plus.VkJoinLink
 import com.wdtt.plus.WDTTColors
@@ -370,6 +383,7 @@ fun SettingsTabContent(
 
     val tunnelRunning by TunnelManager.running.collectAsStateWithLifecycle()
     val activeWorkers by TunnelManager.activeWorkers.collectAsStateWithLifecycle()
+    val vpnInterfaceUp by TunnelManager.vpnInterfaceUp.collectAsStateWithLifecycle()
     val warpResetBlockedMessage = "Для сброса отключите VPN"
     val tunnelTransition by TunnelManager.transition.collectAsStateWithLifecycle()
     val trustedWifiState by TrustedWifiManager.state.collectAsStateWithLifecycle()
@@ -660,11 +674,8 @@ fun SettingsTabContent(
             putExtra("custom_vk_client_secret", customVkClientSecret)
             putExtra("profile_max_workers", profileMaxWorkers)
             putExtra(
-                MANAGED_CONFIG_FIRST_START_EXTRA,
-                shouldUseManagedConfigFirstStart(
-                    remoteManaged = remoteManagedProfile,
-                    profileMaxWorkers = profileMaxWorkers,
-                ),
+                CONFIG_FIRST_START_EXTRA,
+                shouldUseConfigFirstStart(),
             )
             putExtra(TUNNEL_PROFILE_INDEX_EXTRA, activeProfile)
         }
@@ -1145,6 +1156,7 @@ fun SettingsTabContent(
     Column(
         modifier = Modifier
             .fillMaxSize()
+            .focusGroup()
             .verticalScroll(scrollState)
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
@@ -1324,6 +1336,7 @@ fun SettingsTabContent(
                 waiting = trustedWifiWaiting,
                 transition = tunnelTransition,
                 activeWorkers = activeWorkers,
+                vpnInterfaceUp = vpnInterfaceUp,
                 targetWorkers = currentWorkers.toInt(),
                 cooldownActive = cooldownActive,
                 underlyingNetworkAvailable = underlyingNetworkAvailable,
@@ -2244,7 +2257,10 @@ private fun TunnelLaunchParametersDialog(
                             fontWeight = FontWeight.Bold,
                             color = MaterialTheme.colorScheme.primary,
                         )
-                        IconButton(onClick = onDismiss) {
+                        IconButton(
+                            onClick = onDismiss,
+                            modifier = Modifier.remoteIconButtonFocus(),
+                        ) {
                             Icon(Icons.Default.Close, contentDescription = "Закрыть")
                         }
                     }
@@ -2287,7 +2303,7 @@ private fun TunnelLaunchParametersDialog(
                                     )
                                     IconButton(
                                         onClick = onPowerHelp,
-                                        modifier = Modifier.size(28.dp),
+                                        modifier = Modifier.size(28.dp).remoteHelpFocus(),
                                     ) {
                                         Icon(
                                             Icons.AutoMirrored.Filled.HelpOutline,
@@ -2392,7 +2408,9 @@ private fun LaunchParameterSwitchRow(
     onTitleClick: (() -> Unit)? = null,
 ) {
     Row(
-        modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 8.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween,
     ) {
@@ -2403,17 +2421,27 @@ private fun LaunchParameterSwitchRow(
         ) {
             Text(
                 title,
-                modifier = if (onTitleClick != null) {
-                    Modifier.clickable(onClick = onTitleClick).padding(vertical = 10.dp)
-                } else {
-                    Modifier
-                },
+                modifier = Modifier
+                    .weight(1f)
+                    .then(if (onTitleClick != null) {
+                        Modifier
+                        .remoteFocusOutline(RoundedCornerShape(8.dp))
+                        .clickable(onClick = onTitleClick)
+                    } else {
+                        Modifier.remoteToggleableRow(
+                            value = checked,
+                            enabled = enabled,
+                            shape = RoundedCornerShape(8.dp),
+                            onValueChange = onCheckedChange,
+                        )
+                    })
+                    .padding(horizontal = 8.dp, vertical = 10.dp),
                 style = MaterialTheme.typography.bodyMedium,
                 fontWeight = FontWeight.Medium,
             )
             IconButton(
                 onClick = onHelp,
-                modifier = Modifier.size(28.dp),
+                modifier = Modifier.size(28.dp).remoteHelpFocus(),
             ) {
                 Icon(
                     Icons.AutoMirrored.Filled.HelpOutline,
@@ -2427,6 +2455,7 @@ private fun LaunchParameterSwitchRow(
             checked = checked,
             enabled = enabled,
             onCheckedChange = onCheckedChange,
+            modifier = Modifier.remoteSwitchFocus(enabled = enabled),
         )
     }
 }
@@ -2437,6 +2466,7 @@ private fun AnimatedTunnelPowerButton(
     waiting: Boolean,
     transition: TunnelTransition,
     activeWorkers: Int,
+    vpnInterfaceUp: Boolean,
     targetWorkers: Int,
     cooldownActive: Boolean,
     underlyingNetworkAvailable: Boolean,
@@ -2458,6 +2488,7 @@ private fun AnimatedTunnelPowerButton(
         starting = isStarting,
         stopping = isStopping,
         activeWorkers = activeWorkers,
+        vpnInterfaceUp = vpnInterfaceUp,
         underlyingNetworkAvailable = underlyingNetworkAvailable,
         hasConnectionError = connectionErrorTitle != null,
         cooldownActive = cooldownActive,
@@ -2752,6 +2783,7 @@ private fun AnimatedTunnelPowerButton(
                 modifier = Modifier
                     .size(96.dp)
                     .clip(CircleShape)
+                    .remoteFocusOutline(CircleShape, enabled = enabled)
                     .clickable(
                         enabled = enabled,
                         onClick = {
@@ -2825,6 +2857,7 @@ internal fun tunnelPowerVisualState(
     starting: Boolean,
     stopping: Boolean,
     activeWorkers: Int,
+    vpnInterfaceUp: Boolean,
     underlyingNetworkAvailable: Boolean,
     hasConnectionError: Boolean,
     cooldownActive: Boolean,
@@ -2833,7 +2866,7 @@ internal fun tunnelPowerVisualState(
     waitingForTrustedWifi -> TunnelPowerVisualState.WaitingForTrustedWifi
     (starting || running) && !underlyingNetworkAvailable -> TunnelPowerVisualState.NoNetwork
     hasConnectionError -> TunnelPowerVisualState.Error
-    starting || running && activeWorkers <= 0 -> TunnelPowerVisualState.Connecting
+    starting || running && (activeWorkers <= 0 || !vpnInterfaceUp) -> TunnelPowerVisualState.Connecting
     running -> TunnelPowerVisualState.Connected
     cooldownActive -> TunnelPowerVisualState.CoolingDown
     else -> TunnelPowerVisualState.Off
@@ -2940,13 +2973,20 @@ private fun SettingsHelpDialog(
     secondaryActionEnabled: Boolean = true,
     onSecondaryActionDisabled: (() -> Unit)? = null,
 ) {
-    Dialog(onDismissRequest = onDismiss) {
+    val television = isTelevisionDevice()
+    val scrollState = rememberScrollState()
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = !television),
+    ) {
         BoxWithConstraints(
             modifier = Modifier.fillMaxSize().padding(8.dp),
             contentAlignment = Alignment.Center
         ) {
             Surface(
-                modifier = Modifier.heightIn(max = maxHeight * 0.92f),
+                modifier = Modifier
+                    .televisionDialogWidth(television)
+                    .heightIn(max = maxHeight * 0.92f),
                 shape = RoundedCornerShape(24.dp),
                 color = MaterialTheme.colorScheme.surface,
                 contentColor = MaterialTheme.colorScheme.onSurface,
@@ -2956,7 +2996,8 @@ private fun SettingsHelpDialog(
                     modifier = Modifier
                         .padding(22.dp)
                         .fillMaxWidth()
-                        .verticalScroll(rememberScrollState()),
+                        .verticalScroll(scrollState)
+                        .tvDpadScrollable(scrollState, television),
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     Row(
@@ -2971,7 +3012,10 @@ private fun SettingsHelpDialog(
                             fontWeight = FontWeight.Bold,
                             color = MaterialTheme.colorScheme.primary
                         )
-                        IconButton(onClick = onDismiss) {
+                        IconButton(
+                            onClick = onDismiss,
+                            modifier = Modifier.remoteIconButtonFocus(),
+                        ) {
                             Icon(Icons.Default.Close, contentDescription = "Закрыть")
                         }
                     }
@@ -3017,6 +3061,7 @@ private fun SettingsHelpDialog(
                                 Box(
                                     modifier = Modifier
                                         .matchParentSize()
+                                        .remoteFocusOutline(RoundedCornerShape(16.dp))
                                         .clickable(onClick = onSecondaryActionDisabled),
                                 )
                             }
@@ -3045,13 +3090,20 @@ private fun PowerHelpDialog(
     profileMaxWorkers: Int,
     onDismiss: () -> Unit
 ) {
-    Dialog(onDismissRequest = onDismiss) {
+    val television = isTelevisionDevice()
+    val scrollState = rememberScrollState()
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = !television),
+    ) {
         BoxWithConstraints(
             modifier = Modifier.fillMaxSize().padding(8.dp),
             contentAlignment = Alignment.Center
         ) {
             Surface(
-                modifier = Modifier.heightIn(max = maxHeight * 0.92f),
+                modifier = Modifier
+                    .televisionDialogWidth(television)
+                    .heightIn(max = maxHeight * 0.92f),
                 shape = RoundedCornerShape(24.dp),
                 color = MaterialTheme.colorScheme.surface,
                 contentColor = MaterialTheme.colorScheme.onSurface,
@@ -3061,7 +3113,8 @@ private fun PowerHelpDialog(
                     modifier = Modifier
                         .padding(22.dp)
                         .fillMaxWidth()
-                        .verticalScroll(rememberScrollState()),
+                        .verticalScroll(scrollState)
+                        .tvDpadScrollable(scrollState, television),
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     Row(
@@ -3075,7 +3128,10 @@ private fun PowerHelpDialog(
                             fontWeight = FontWeight.Bold,
                             color = MaterialTheme.colorScheme.primary
                         )
-                        IconButton(onClick = onDismiss) {
+                        IconButton(
+                            onClick = onDismiss,
+                            modifier = Modifier.remoteIconButtonFocus(),
+                        ) {
                             Icon(Icons.Default.Close, contentDescription = "Закрыть")
                         }
                     }
@@ -3197,6 +3253,7 @@ private fun CompactSteppedSlider(
     val currentValue by rememberUpdatedState(value)
     val currentOnValueChange by rememberUpdatedState(onValueChange)
     val currentOnValueChangeFinished by rememberUpdatedState(onValueChangeFinished)
+    var remoteValue by remember(value) { mutableFloatStateOf(value) }
 
     fun snap(raw: Float): Float {
         val min = valueRange.start
@@ -3214,7 +3271,49 @@ private fun CompactSteppedSlider(
 
     Canvas(
         modifier = modifier
-            .height(30.dp)
+            .height(40.dp)
+            .remoteFocusOutline(
+                shape = RoundedCornerShape(20.dp),
+                enabled = enabled,
+            )
+            .onKeyEvent { event ->
+                if (!enabled || event.type != KeyEventType.KeyDown) return@onKeyEvent false
+                val direction = when (event.key) {
+                    Key.DirectionLeft -> -1
+                    Key.DirectionRight -> 1
+                    else -> return@onKeyEvent false
+                }
+                val selected = steppedSliderValue(
+                    value = remoteValue,
+                    range = valueRange,
+                    stepSize = stepSize,
+                    direction = direction,
+                )
+                if (selected != remoteValue) {
+                    remoteValue = selected
+                    currentOnValueChange(selected)
+                    currentOnValueChangeFinished(selected)
+                }
+                true
+            }
+            .semantics {
+                progressBarRangeInfo = ProgressBarRangeInfo(
+                    current = value,
+                    range = valueRange,
+                    steps = (((valueRange.endInclusive - valueRange.start) / stepSize).roundToInt() - 1)
+                        .coerceAtLeast(0),
+                )
+                if (enabled) {
+                    setProgress { requested ->
+                        val selected = snap(requested)
+                        remoteValue = selected
+                        currentOnValueChange(selected)
+                        currentOnValueChangeFinished(selected)
+                        true
+                    }
+                }
+            }
+            .focusable(enabled = enabled)
             .pointerInput(enabled, valueRange, stepSize) {
                 if (!enabled) return@pointerInput
                 detectTapGestures { offset ->
@@ -3283,9 +3382,22 @@ private fun CompactSteppedSlider(
     }
 }
 
+internal fun steppedSliderValue(
+    value: Float,
+    range: ClosedFloatingPointRange<Float>,
+    stepSize: Float,
+    direction: Int,
+): Float {
+    if (stepSize <= 0f || direction == 0) return value.coerceIn(range.start, range.endInclusive)
+    val steps = ((value - range.start) / stepSize).roundToInt() + if (direction < 0) -1 else 1
+    return (range.start + steps * stepSize).coerceIn(range.start, range.endInclusive)
+}
+
 // ═══ Important Info Dialog ═══
 @Composable
 fun ImportantInfoDialog(onDismiss: () -> Unit) {
+    val television = isTelevisionDevice()
+    val scrollState = rememberScrollState()
     Dialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false)
@@ -3295,8 +3407,11 @@ fun ImportantInfoDialog(onDismiss: () -> Unit) {
             contentAlignment = Alignment.Center
         ) {
             Surface(
-                modifier = Modifier
-                    .fillMaxWidth(0.95f)
+                modifier = (if (television) {
+                    Modifier.televisionDialogWidth(television)
+                } else {
+                    Modifier.fillMaxWidth(0.95f)
+                })
                     .heightIn(max = maxHeight * 0.92f),
                 shape = RoundedCornerShape(24.dp),
                 color = MaterialTheme.colorScheme.surface,
@@ -3306,7 +3421,8 @@ fun ImportantInfoDialog(onDismiss: () -> Unit) {
                 Column(
                     modifier = Modifier
                         .padding(24.dp)
-                        .verticalScroll(rememberScrollState())
+                        .verticalScroll(scrollState)
+                        .tvDpadScrollable(scrollState, television)
                 ) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -3314,7 +3430,10 @@ fun ImportantInfoDialog(onDismiss: () -> Unit) {
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text("Важная информация", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                        IconButton(onClick = onDismiss) {
+                        IconButton(
+                            onClick = onDismiss,
+                            modifier = Modifier.remoteIconButtonFocus(),
+                        ) {
                             Icon(Icons.Default.Close, null)
                         }
                     }
@@ -3758,7 +3877,12 @@ private fun UserManualConnectionDialog(
 
                     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .remoteToggleableRow(value = manualPortsEnabled) {
+                                manualPortsEnabled = it
+                            }
+                            .padding(horizontal = 8.dp, vertical = 6.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
@@ -3772,7 +3896,7 @@ private fun UserManualConnectionDialog(
                         }
                         Switch(
                             checked = manualPortsEnabled,
-                            onCheckedChange = { manualPortsEnabled = it }
+                            onCheckedChange = null,
                         )
                     }
 
@@ -3898,7 +4022,7 @@ private fun UserWdttLinkDialog(
                         if (remoteUpdateOnly) {
                             IconButton(
                                 onClick = { showRemoteUpdateHelp = true },
-                                modifier = Modifier.size(40.dp),
+                                modifier = Modifier.size(40.dp).remoteHelpFocus(),
                             ) {
                                 Icon(
                                     Icons.AutoMirrored.Filled.HelpOutline,
@@ -4046,6 +4170,8 @@ private fun RemoteUpdateHelpDialog(
     cachedAction: CachedRemoteAction,
     onDismiss: () -> Unit,
 ) {
+    val television = isTelevisionDevice()
+    val scrollState = rememberScrollState()
     Dialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false),
@@ -4055,9 +4181,11 @@ private fun RemoteUpdateHelpDialog(
             contentAlignment = Alignment.Center,
         ) {
             Surface(
-                modifier = Modifier
-                    .fillMaxWidth(0.92f)
-                    .widthIn(max = 540.dp)
+                modifier = (if (television) {
+                    Modifier.televisionDialogWidth(television)
+                } else {
+                    Modifier.fillMaxWidth(0.92f).widthIn(max = 540.dp)
+                })
                     .heightIn(max = maxHeight * 0.92f),
                 shape = RoundedCornerShape(24.dp),
                 color = MaterialTheme.colorScheme.surface,
@@ -4065,7 +4193,10 @@ private fun RemoteUpdateHelpDialog(
                 tonalElevation = 10.dp,
             ) {
                 Column(
-                    modifier = Modifier.padding(20.dp).verticalScroll(rememberScrollState()),
+                    modifier = Modifier
+                        .padding(20.dp)
+                        .verticalScroll(scrollState)
+                        .tvDpadScrollable(scrollState, television),
                     verticalArrangement = Arrangement.spacedBy(14.dp),
                 ) {
                     Row(
@@ -4079,7 +4210,10 @@ private fun RemoteUpdateHelpDialog(
                             fontWeight = FontWeight.Bold,
                             color = MaterialTheme.colorScheme.primary,
                         )
-                        IconButton(onClick = onDismiss) {
+                        IconButton(
+                            onClick = onDismiss,
+                            modifier = Modifier.remoteIconButtonFocus(),
+                        ) {
                             Icon(
                                 Icons.Default.Close,
                                 contentDescription = "Вернуться к обновлению маршрута",
@@ -4769,7 +4903,7 @@ fun HashesDialog(
                             Spacer(Modifier.width(4.dp))
                             IconButton(
                                 onClick = { showHashesHelp = true },
-                                modifier = Modifier.size(36.dp)
+                                modifier = Modifier.size(36.dp).remoteHelpFocus()
                             ) {
                                 Surface(
                                     shape = CircleShape,
@@ -5111,6 +5245,8 @@ private fun VkHashesInstructionDialog(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val television = isTelevisionDevice()
+    val scrollState = rememberScrollState()
     Dialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false)
@@ -5120,9 +5256,11 @@ private fun VkHashesInstructionDialog(
             contentAlignment = Alignment.Center
         ) {
             Surface(
-                modifier = Modifier
-                    .fillMaxWidth(0.96f)
-                    .widthIn(max = 680.dp)
+                modifier = (if (television) {
+                    Modifier.televisionDialogWidth(television)
+                } else {
+                    Modifier.fillMaxWidth(0.96f).widthIn(max = 680.dp)
+                })
                     .heightIn(max = maxHeight * 0.92f),
                 shape = RoundedCornerShape(24.dp),
                 color = MaterialTheme.colorScheme.surface,
@@ -5134,7 +5272,8 @@ private fun VkHashesInstructionDialog(
                         modifier = Modifier
                             .padding(22.dp)
                             .fillMaxWidth()
-                            .verticalScroll(rememberScrollState()),
+                            .verticalScroll(scrollState)
+                            .tvDpadScrollable(scrollState, television),
                         verticalArrangement = Arrangement.spacedBy(14.dp)
                     ) {
                     Row(
@@ -5274,7 +5413,10 @@ private fun VkHashesInstructionDialog(
                 }
                     IconButton(
                         onClick = onDismiss,
-                        modifier = Modifier.align(Alignment.TopEnd).padding(top = 10.dp, end = 10.dp)
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .padding(top = 10.dp, end = 10.dp)
+                            .remoteIconButtonFocus()
                     ) {
                         Surface(
                             shape = CircleShape,
@@ -5532,8 +5674,7 @@ private suspend fun checkVkHashes(
     val command = mutableListOf(
         binaryPath,
         "-check-hashes",
-        "-vk",
-        hashes.joinToString(",") { it.second },
+        "-startup-config-stdin=true",
         "-captcha-mode",
         captchaMode,
         "-vkcalls-preflight=$vkCallsPreflight",
@@ -5551,15 +5692,20 @@ private suspend fun checkVkHashes(
         .redirectErrorStream(true)
         .apply {
             environment()["LD_LIBRARY_PATH"] = context.applicationInfo.nativeLibraryDir
-            if (customVkCredentialsEnabled) {
-                environment()["WDTT_CUSTOM_VK_CLIENT_ID"] = customVkClientId
-                environment()["WDTT_CUSTOM_VK_CLIENT_SECRET"] = customVkClientSecret
-            } else {
-                environment().remove("WDTT_CUSTOM_VK_CLIENT_ID")
-                environment().remove("WDTT_CUSTOM_VK_CLIENT_SECRET")
-            }
+            environment().remove("WDTT_CUSTOM_VK_CLIENT_ID")
+            environment().remove("WDTT_CUSTOM_VK_CLIENT_SECRET")
         }
         .start()
+
+    val startupLine = nativeClientStartupConfigLine(
+        NativeClientStartupSecrets(
+            vkHashes = hashes.joinToString(",") { it.second },
+            customVkClientId = if (customVkCredentialsEnabled) customVkClientId else "",
+            customVkClientSecret = if (customVkCredentialsEnabled) customVkClientSecret else "",
+        )
+    )
+    process.outputStream.write("$startupLine\n".toByteArray(Charsets.UTF_8))
+    process.outputStream.flush()
 
     val byOrder = hashes.mapIndexed { order, pair -> order + 1 to pair }.toMap()
     val parsed = mutableMapOf<Int, HashCheckResult>()
@@ -5825,7 +5971,10 @@ fun SecretsDialog(
                 if (allowPortsSelection) {
                     Spacer(modifier = Modifier.height(12.dp))
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .remoteToggleableRow(value = portsEnabled) { portsEnabled = it }
+                            .padding(horizontal = 8.dp, vertical = 6.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
@@ -5843,7 +5992,7 @@ fun SecretsDialog(
                         }
                         Switch(
                             checked = portsEnabled,
-                            onCheckedChange = { portsEnabled = it }
+                            onCheckedChange = null,
                         )
                     }
                 }

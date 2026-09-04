@@ -42,7 +42,8 @@ func putPktBuf(b []byte) {
 }
 
 const (
-	returnChBuf = 384
+	returnChBuf           = 384
+	deviceWakeHealthGrace = 60 * time.Second
 
 	// chunkSize — количество последовательных пакетов, отправляемых в один worker
 	// перед переключением на следующий.
@@ -52,19 +53,21 @@ const (
 	// интерпретирует reorder как потери → cwnd collapse → скорость single-flow
 	// падает до ~8 KB/s.
 	//
-	// С chunk=8: пакеты в пределах одного TCP congestion window (~10 пакетов при
-	// initial cwnd) уходят через один TURN relay → прилетают по порядку.
+	// С chunk=16 пакеты реже перескакивают между путями с разной задержкой. Это
+	// уменьшает reorder на активной многоканальной сессии, сохраняя равномерную
+	// загрузку всех workers.
 	// Reorder возможен только между chunk-границами, что покрывается WG replay
 	// window (2048 пакетов).
 	//
-	// Агрегатная пропускная способность не меняется — все workers загружены
-	// равномерно по-прежнему (каждый получает 1/N от общего трафика за время).
-	chunkSize = 8
+	// Все workers по-прежнему получают одинаковую долю трафика за полный цикл;
+	// фактический выигрыш зависит от различия задержек между TURN-путями.
+	chunkSize = 16
 )
 
 type WorkerSlot struct {
 	ID     int
 	SendCh chan []byte
+	WakeCh chan struct{}
 }
 
 type Dispatcher struct {
@@ -85,6 +88,9 @@ type Dispatcher struct {
 	// continuous stream of retries from postponing stall detection forever.
 	firstUnansweredUserTxAt atomic.Int64
 	stalledUserTraffic      atomic.Bool
+	deviceSleeping          atomic.Bool
+	wakeGeneration          atomic.Uint64
+	wakeHealthGraceUntil    atomic.Int64
 }
 
 func NewDispatcher(ctx context.Context, localConn net.PacketConn, stats *Stats) *Dispatcher {
@@ -148,6 +154,42 @@ func (d *Dispatcher) noteUserTrafficResponse() bool {
 func (d *Dispatcher) resetUserTrafficHealth() {
 	d.firstUnansweredUserTxAt.Store(0)
 	d.stalledUserTraffic.Store(false)
+}
+
+func (d *Dispatcher) noteDeviceSleep() {
+	d.deviceSleeping.Store(true)
+	d.wakeHealthGraceUntil.Store(0)
+	d.resetUserTrafficHealth()
+}
+
+func (d *Dispatcher) noteDeviceWake(now time.Time) uint64 {
+	d.resetUserTrafficHealth()
+	d.wakeHealthGraceUntil.Store(now.Add(deviceWakeHealthGrace).UnixNano())
+	generation := d.wakeGeneration.Add(1)
+	d.deviceSleeping.Store(false)
+
+	workers := d.workers.Load()
+	if workers == nil {
+		return generation
+	}
+	for _, worker := range *workers {
+		if worker.WakeCh == nil {
+			continue
+		}
+		select {
+		case worker.WakeCh <- struct{}{}:
+		default:
+		}
+	}
+	return generation
+}
+
+func (d *Dispatcher) shouldSuppressTransportHealth(now time.Time) bool {
+	if d.deviceSleeping.Load() {
+		return true
+	}
+	graceUntil := d.wakeHealthGraceUntil.Load()
+	return graceUntil > 0 && now.UnixNano() < graceUntil
 }
 
 func (d *Dispatcher) claimStalledUserTraffic(now time.Time, timeout time.Duration) (time.Duration, bool) {

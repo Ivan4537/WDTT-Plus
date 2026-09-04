@@ -18,6 +18,7 @@ import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.focusGroup
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -217,6 +218,12 @@ fun FloatingToolbar(
         scope.launch { settingsStore.saveFloatingToolbarYFraction(fraction) }
     }
 
+    val tabShape = if (isRightSide) {
+        RoundedCornerShape(topStart = 14.dp, bottomStart = 14.dp)
+    } else {
+        RoundedCornerShape(topEnd = 14.dp, bottomEnd = 14.dp)
+    }
+
     Box(
         modifier = modifier
             .fillMaxSize()
@@ -229,6 +236,7 @@ fun FloatingToolbar(
             onClick = { isExpanded = !isExpanded },
             modifier = Modifier
                 .offset { IntOffset(animatedTabXPx.roundToInt(), offsetY.roundToInt()) }
+                .remoteCompactFocus(tabShape)
                 .onGloballyPositioned { coordinates ->
                     tabHeightPx = coordinates.size.height.toFloat()
                 }
@@ -242,10 +250,7 @@ fun FloatingToolbar(
                         }
                     )
                 },
-            shape = if (isRightSide)
-                RoundedCornerShape(topStart = 14.dp, bottomStart = 14.dp)
-            else
-                RoundedCornerShape(topEnd = 14.dp, bottomEnd = 14.dp),
+            shape = tabShape,
             color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.9f),
             shadowElevation = 0.dp,
             tonalElevation = 0.dp,
@@ -282,6 +287,7 @@ fun FloatingToolbar(
                         modifier = Modifier
                             .padding(16.dp)
                             .fillMaxWidth()
+                            .focusGroup()
                             .animateContentSize(animationSpec = spring(stiffness = Spring.StiffnessMediumLow))
                             .verticalScroll(rememberScrollState()),
                         verticalArrangement = Arrangement.spacedBy(4.dp)
@@ -324,6 +330,7 @@ fun FloatingToolbar(
                                 modifier = Modifier
                                     .widthIn(min = 72.dp, max = 180.dp)
                                     .clip(profileShape)
+                                    .remoteFocusOutline(profileShape)
                                     .combinedClickable(
                                         onClick = {
                                             onActiveProfileChange(profile)
@@ -378,11 +385,12 @@ fun FloatingToolbar(
                         Column(
                             modifier = Modifier
                                 .weight(1f)
+                                .remoteFocusOutline(RoundedCornerShape(8.dp))
                                 .clickable {
                                     enableTrustedWifiAfterSetup = false
                                     showTrustedWifiSettings = true
                                 }
-                                .padding(end = 10.dp)
+                                .padding(horizontal = 8.dp, vertical = 6.dp)
                         ) {
                             Text(
                                 "Доверенные сети Wi‑Fi",
@@ -426,19 +434,24 @@ fun FloatingToolbar(
                                     }
                                 }
                             },
-                            modifier = Modifier.scale(0.85f)
+                            modifier = Modifier.remoteSwitchFocus().scale(0.85f)
                         )
                     }
 
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clickable { showSleepTimerSettings = true }
                             .padding(horizontal = 4.dp, vertical = 4.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Column(modifier = Modifier.weight(1f).padding(end = 10.dp)) {
+                        Column(
+                            modifier = Modifier
+                                .weight(1f)
+                                .remoteFocusOutline(RoundedCornerShape(8.dp))
+                                .clickable { showSleepTimerSettings = true }
+                                .padding(horizontal = 8.dp, vertical = 6.dp)
+                        ) {
                             Text(
                                 "Экономия батареи во сне",
                                 style = MaterialTheme.typography.bodyMedium,
@@ -511,7 +524,7 @@ fun FloatingToolbar(
                                     }
                                 }
                             },
-                            modifier = Modifier.scale(0.85f)
+                            modifier = Modifier.remoteSwitchFocus().scale(0.85f)
                         )
                     }
 
@@ -556,7 +569,7 @@ fun FloatingToolbar(
                                 }
                             },
                             enabled = adminModeAllowed,
-                            modifier = Modifier.scale(0.85f)
+                            modifier = Modifier.remoteSwitchFocus(enabled = adminModeAllowed).scale(0.85f)
                         )
                     }
 
@@ -623,7 +636,7 @@ fun FloatingToolbar(
                             checked = showDynamicColorOn,
                             onCheckedChange = { onDynamicColorChange(it) },
                             enabled = supportsDynamicColor,
-                            modifier = Modifier.scale(0.8f)
+                            modifier = Modifier.remoteSwitchFocus(enabled = supportsDynamicColor).scale(0.8f)
                         )
                     }
 
@@ -679,7 +692,9 @@ fun FloatingToolbar(
                                 onClick = { onFingerprintChange(fp) },
                                 shape = RoundedCornerShape(8.dp),
                                 color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
-                                modifier = Modifier.weight(1f)
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .remoteFocusOutline(RoundedCornerShape(8.dp))
                             ) {
                                 Box(
                                     modifier = Modifier.padding(vertical = 10.dp),
@@ -711,6 +726,7 @@ fun FloatingToolbar(
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
+                            .remoteFocusOutline(RoundedCornerShape(8.dp))
                             .clickable { showVkClientSettings = true }
                             .padding(horizontal = 4.dp, vertical = 4.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
@@ -1121,7 +1137,9 @@ private fun ThemeOption(
         shape = RoundedCornerShape(24.dp),
         color = if (selected) MaterialTheme.colorScheme.primaryContainer
         else MaterialTheme.colorScheme.surface,
-        modifier = modifier.height(42.dp)
+        modifier = modifier
+            .height(42.dp)
+            .remoteFocusOutline(RoundedCornerShape(24.dp), focusedScale = 1.04f)
     ) {
         Box(
             modifier = Modifier.fillMaxSize(),
@@ -1151,6 +1169,7 @@ fun PaletteCircle(
             .size(30.dp)
             .clip(CircleShape)
             .background(Color(colorHex))
+            .remoteCompactFocus(CircleShape)
             .clickable { onClick(paletteId) }
             .then(
                 if (isSelected) Modifier.border(3.dp, MaterialTheme.colorScheme.primary, CircleShape)

@@ -25,7 +25,7 @@ class VpnAppRoutingTest {
 
         assertTrue(routing.included.isEmpty())
         assertEquals(
-            setOf(ownPackage, "com.vkontakte.android", "com.vk.calls", "app.one"),
+            setOf(ownPackage, "app.one"),
             routing.excluded
         )
     }
@@ -39,7 +39,7 @@ class VpnAppRoutingTest {
             ownPackageName = ownPackage
         )
 
-        assertEquals(setOf("app.two"), routing.included)
+        assertEquals(setOf("app.two", "com.vkontakte.android"), routing.included)
         assertTrue(routing.excluded.isEmpty())
     }
 
@@ -72,7 +72,7 @@ class VpnAppRoutingTest {
 
         assertTrue(routing.included.isEmpty())
         assertEquals(
-            setOf(ownPackage, "com.vkontakte.android", "com.vk.calls"),
+            setOf(ownPackage),
             routing.excluded,
         )
         assertTrue(!routing.blocksAllApps)
@@ -99,7 +99,7 @@ class VpnAppRoutingTest {
     @Test
     fun importedRoutingCannotKeepHiddenRequiredBypassPackages() {
         assertEquals(
-            listOf("app.one", "app.two"),
+            listOf("app.one", "app.two", "com.vk.calls", "com.vkontakte.android"),
             sanitizeVpnRoutingPackages(
                 packageNames = listOf(
                     ownPackage,

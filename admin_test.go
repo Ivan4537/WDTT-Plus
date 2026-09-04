@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"reflect"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 )
@@ -417,6 +418,43 @@ func TestClientPasswordValidation(t *testing.T) {
 	for _, value := range invalid {
 		if _, err := normalizeClientPassword(value); err == nil {
 			t.Fatalf("invalid password %q accepted", value)
+		}
+	}
+}
+
+func TestReadAdminPasswordLine(t *testing.T) {
+	for _, input := range []string{"ABCDEFGHJKLMNPQR\n", "ABCDEFGHJKLMNPQR\r\n", "ABCDEFGHJKLMNPQR"} {
+		value, err := readAdminPasswordLine(strings.NewReader(input))
+		if err != nil {
+			t.Fatalf("valid password input %q rejected: %v", input, err)
+		}
+		if value != "ABCDEFGHJKLMNPQR" {
+			t.Fatalf("unexpected password value %q", value)
+		}
+	}
+	for _, input := range []string{"", "\n", "first\nsecond\n", strings.Repeat("x", 258)} {
+		if _, err := readAdminPasswordLine(strings.NewReader(input)); err == nil {
+			t.Fatalf("invalid password input %q accepted", input)
+		}
+	}
+}
+
+func TestReadAdminRequest(t *testing.T) {
+	request, err := readAdminRequest(strings.NewReader(`{"main_password":"secret-value","args":["create","--days","30"]}`))
+	if err != nil {
+		t.Fatalf("valid request rejected: %v", err)
+	}
+	if request.MainPassword != "secret-value" || !reflect.DeepEqual(request.Args, []string{"create", "--days", "30"}) {
+		t.Fatalf("unexpected request: %#v", request)
+	}
+	for _, input := range []string{
+		`{}`,
+		`{"main_password":"secret-value"}`,
+		`{"args":["list"]}`,
+		`not-json`,
+	} {
+		if _, err := readAdminRequest(strings.NewReader(input)); err == nil {
+			t.Fatalf("invalid request %q accepted", input)
 		}
 	}
 }

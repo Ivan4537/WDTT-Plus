@@ -733,6 +733,8 @@ class SettingsStore(context: Context) {
         private val WHITELIST_APPS = stringPreferencesKey("whitelist_apps")
         private val BLACKLIST_ADDRESSES = stringPreferencesKey("blacklist_addresses")
         private val WHITELIST_ADDRESSES = stringPreferencesKey("whitelist_addresses")
+        private val VPN_APP_LISTS_VISIBLE_VK_MIGRATED =
+            booleanPreferencesKey("vpn_app_lists_visible_vk_migrated")
 
         // ═══ Theme Mode ═══
         private val THEME_MODE = stringPreferencesKey("theme_mode") // "system", "light", "dark"
@@ -2336,7 +2338,8 @@ class SettingsStore(context: Context) {
                 prefs[getProfileKey(SECONDARY_VK_HASH, profile)] = item.optString("secondaryVkHash")
                 prefs[getProfileKey(VK_HASH_NEXT_SLOT, profile)] = 0
                 prefs.remove(getProfileKey(EXCLUDED_APPS, profile))
-                prefs[getProfileKey(WORKERS_PER_HASH, profile)] = item.optInt("workersPerHash", 18).coerceIn(1, 128)
+                prefs[getProfileKey(WORKERS_PER_HASH, profile)] =
+                    item.optInt("workersPerHash", 18).coerceIn(1, 128)
                 val importedProfileMaxWorkers = item.optInt("profileMaxWorkers", 0)
                 if (
                     importedProfileMaxWorkers in TUNNEL_WORKERS_PER_GROUP..APP_MAX_WORKERS &&
@@ -3781,6 +3784,7 @@ class SettingsStore(context: Context) {
 
     private suspend fun migrateVpnAppLists() {
         dataStore.edit { prefs ->
+            val migrateVisibleVkBypass = prefs[VPN_APP_LISTS_VISIBLE_VK_MIGRATED] != true
             for (profile in 0 until VPN_PROFILE_COUNT) {
                 val legacyKey = getProfileKey(EXCLUDED_APPS, profile)
                 val legacyPackages = prefs[legacyKey].orEmpty()
@@ -3808,7 +3812,18 @@ class SettingsStore(context: Context) {
                     ).joinToString(",")
                     if (stored != sanitized) prefs[key] = sanitized
                 }
+                if (migrateVisibleVkBypass) {
+                    val blacklistKey = getProfileKey(BLACKLIST_APPS, profile)
+                    prefs[blacklistKey] = sanitizeVpnRoutingPackages(
+                        decodeStoredVpnPackages(prefs[blacklistKey].orEmpty()) +
+                            LEGACY_DEFAULT_BYPASSED_VPN_PACKAGES,
+                        appContext.packageName,
+                    ).joinToString(",")
+                }
                 if (prefs[legacyKey] != null) prefs.remove(legacyKey)
+            }
+            if (migrateVisibleVkBypass) {
+                prefs[VPN_APP_LISTS_VISIBLE_VK_MIGRATED] = true
             }
         }
     }
