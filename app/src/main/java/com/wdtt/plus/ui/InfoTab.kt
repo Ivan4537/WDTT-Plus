@@ -127,6 +127,7 @@ import com.wdtt.plus.SleepBatteryRuntimeState
 import com.wdtt.plus.TunnelManager
 import com.wdtt.plus.TrustedWifiManager
 import com.wdtt.plus.decodeStoredVpnPackages
+import com.wdtt.plus.displayedTunnelProfile
 import com.wdtt.plus.trustedWifiAccessProblem
 import com.wdtt.plus.sleepBatteryModeItem
 import com.wdtt.plus.trustedWifiModeItem
@@ -369,9 +370,15 @@ fun InfoTab(
         )
         val selectedProfile = runCatching { settingsStore.activeProfile.first() }.getOrDefault(0)
         val savedTunnelProfile = runCatching { settingsStore.activeTunnelProfile.first() }.getOrNull()
-        val diagnosticProfile = TunnelManager.activeTunnelProfile.value
-            ?: savedTunnelProfile
-            ?: selectedProfile
+        val trustedWifiRuntime = TrustedWifiManager.state.value
+        val trustedWifiWaiting = trustedWifiRuntime.waiting ||
+            runCatching { settingsStore.trustedWifiWaiting.first() }.getOrDefault(false)
+        val diagnosticProfile = displayedTunnelProfile(
+            selectedProfile = selectedProfile,
+            activeTunnelProfile = TunnelManager.activeTunnelProfile.value ?: savedTunnelProfile,
+            running = TunnelManager.running.value,
+            trustedWifiWaiting = trustedWifiWaiting,
+        )
         val profileNames = runCatching { settingsStore.profileNames.first() }.getOrDefault(emptyList())
         val diagnosticProfileName = vpnProfileDisplayName(diagnosticProfile, profileNames)
         val tunnelProfile = runCatching {
@@ -394,9 +401,6 @@ fun InfoTab(
         }
         val trustedWifiEnabled = runCatching { settingsStore.trustedWifiEnabled.first() }.getOrDefault(false)
         val trustedWifiSsids = runCatching { settingsStore.trustedWifiSsids.first() }.getOrDefault(emptyList())
-        val trustedWifiRuntime = TrustedWifiManager.state.value
-        val trustedWifiWaiting = trustedWifiRuntime.waiting ||
-            runCatching { settingsStore.trustedWifiWaiting.first() }.getOrDefault(false)
         val trustedWifiWaitingSsid = trustedWifiRuntime.ssid.ifBlank {
             runCatching { settingsStore.trustedWifiWaitingSsid.first() }.getOrDefault("")
         }
@@ -2175,9 +2179,16 @@ private suspend fun buildSupportReportSummary(context: Context, settingsStore: S
 
     val selectedProfileIndex = runCatching { settingsStore.activeProfile.first() }.getOrNull()
     val savedTunnelProfileIndex = runCatching { settingsStore.activeTunnelProfile.first() }.getOrNull()
-    val diagnosticProfileIndex = TunnelManager.activeTunnelProfile.value
-        ?: savedTunnelProfileIndex
-        ?: selectedProfileIndex
+    val trustedWifiWaiting = TrustedWifiManager.state.value.waiting ||
+        runCatching { settingsStore.trustedWifiWaiting.first() }.getOrDefault(false)
+    val diagnosticProfileIndex = selectedProfileIndex?.let { selected ->
+        displayedTunnelProfile(
+            selectedProfile = selected,
+            activeTunnelProfile = TunnelManager.activeTunnelProfile.value ?: savedTunnelProfileIndex,
+            running = TunnelManager.running.value,
+            trustedWifiWaiting = trustedWifiWaiting,
+        )
+    }
     val activeProfile = diagnosticProfileIndex?.plus(1)
     val routingSettings = diagnosticProfileIndex?.let { profile ->
         runCatching { settingsStore.vpnRoutingSettingsForProfile(profile) }.getOrNull()
@@ -2221,8 +2232,6 @@ private suspend fun buildSupportReportSummary(context: Context, settingsStore: S
     val loggingEnabled = runCatching { settingsStore.loggingEnabled.first() }.getOrNull()
     val trustedWifiEnabled = runCatching { settingsStore.trustedWifiEnabled.first() }.getOrNull()
     val trustedWifiCount = runCatching { settingsStore.trustedWifiSsids.first().size }.getOrNull()
-    val trustedWifiWaiting = TrustedWifiManager.state.value.waiting ||
-        runCatching { settingsStore.trustedWifiWaiting.first() }.getOrDefault(false)
     val sleepBatteryEnabled = runCatching { settingsStore.pauseVpnDuringSleep.first() }.getOrNull()
     val sleepBatteryPauseDelay = runCatching { settingsStore.pauseVpnDuringSleepDelayMinutes.first() }.getOrNull()
     val sleepBatteryMode = runCatching { settingsStore.sleepBatteryMode.first() }.getOrNull()

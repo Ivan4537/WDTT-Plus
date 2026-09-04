@@ -164,7 +164,10 @@ private sealed interface WdttConnectFlow {
         val access: RemoteAccessCapability,
         val message: String
     ) : WdttConnectFlow
-    data class Complete(val message: String) : WdttConnectFlow
+    data class Complete(
+        val message: String,
+        val title: String = "Подключение WDTT Plus",
+    ) : WdttConnectFlow
     data class Failed(
         val message: String,
         val action: RemoteDocumentFailureAction? = null,
@@ -839,7 +842,18 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                     if (shouldRestoreUiAfterBoundUpdate(isBoundUpdate)) {
-                        wdttConnectFlow = null
+                        val profileLabel = vpnProfileDisplayName(
+                            profile,
+                            store.profileNames.first(),
+                        )
+                        val confirmation = boundProfileUpdateConfirmation(
+                            profileLabel = profileLabel,
+                            alreadyApplied = result?.alreadyApplied == true,
+                        )
+                        wdttConnectFlow = WdttConnectFlow.Complete(
+                            message = confirmation.message,
+                            title = confirmation.title,
+                        )
                     } else if (
                         existingRemoteProfile &&
                         store.tunnelProfileSnapshot(profile).vkHashes.isNotBlank()
@@ -2290,7 +2304,15 @@ private fun WdttConnectActivationDialog(
             }
         },
         modifier = Modifier.televisionDialogWidth(television),
-        title = { Text("Подключение WDTT Plus") },
+        title = {
+            Text(
+                if (flow is WdttConnectFlow.Complete) {
+                    flow.title
+                } else {
+                    "Подключение WDTT Plus"
+                }
+            )
+        },
         text = {
             AnimatedContent(
                 targetState = flow,

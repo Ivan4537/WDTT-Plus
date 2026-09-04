@@ -416,6 +416,14 @@ internal fun isExpiredAccessAuthFailure(line: String): Boolean =
 
 internal const val WRAP_HANDSHAKE_RETRY_MESSAGE =
     "[WRAP] Отдельные каналы не ответили, выполняется повтор"
+
+internal fun wrapHandshakeTerminalMessage(rtNetwork: Boolean): String =
+    if (rtNetwork) {
+        "\uD83C\uDF10 Через сеть РТ не получен ответ WRAP. Обычно сеть не пропустила выбранный TURN/SNI; реже причина в пароле или совместимости WRAP. Воркеры остановлены."
+    } else {
+        "\uD83D\uDD0C Сервер не ответил на WRAP. Возможны проблемы с сервером или маршрутом, блокировка UDP/TURN, неверный пароль либо несовместимость WRAP. Воркеры остановлены."
+    }
+
 internal const val RT_MASQUE_CONFIG_FILE_NAME = "rt-masque-v1.json"
 
 internal fun shouldUseRtMasque(rtNetwork: Boolean, rtMasque: Boolean): Boolean =
@@ -1552,7 +1560,7 @@ object TunnelManager {
 
                 if (params.configFirstStart) {
                     cmd.add("-config-first-start=true")
-                    if (totalWorkers == TUNNEL_WORKERS_PER_GROUP) {
+                    if (shouldUseManagedHashFallback(params.profileMaxWorkers, hashCount)) {
                         cmd.add("-hash-fallback=true")
                     }
                 }
@@ -2517,11 +2525,8 @@ object TunnelManager {
                         lastActiveAtMs == 0L &&
                         !isCaptchaInProgress()
                     ) {
-                        val wrapStopMessage = if (currentParams?.rtNetwork == true) {
-                            "\uD83C\uDF10 Через сеть РТ не получен ответ WRAP. Обычно сеть не пропустила выбранный TURN/SNI; реже причина в пароле или совместимости WRAP. Воркеры остановлены."
-                        } else {
-                            "\uD83D\uDD12 Неверный пароль подключения или несовместимый WRAP. Воркеры остановлены."
-                        }
+                        val wrapStopMessage =
+                            wrapHandshakeTerminalMessage(currentParams?.rtNetwork == true)
                         handleCriticalError(wrapStopMessage)
                         return@launch
                     } else if (

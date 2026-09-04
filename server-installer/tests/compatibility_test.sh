@@ -147,12 +147,14 @@ require_text "$ANDROID_BUILD" 'mustRunAfter(invalidateGithubReleaseArtifacts)'
 reject_text "$DEPLOY_TAB" 'context.assets.open("server-installer.sh")'
 reject_text "$DEPLOY_TAB" 'ssh.upload(installerFile, "/tmp/wdtt-server-installer.sh"'
 reject_text "$DEPLOY_TAB" '"bash /tmp/wdtt-server-installer.sh install "'
-require_text "$DEPLOY_TAB" 'DeploymentOwnership.StandaloneInstaller -> throw IllegalStateException('
+require_text "$DEPLOY_TAB" 'ownership == DeploymentOwnership.StandaloneInstaller -> throw IllegalStateException('
 require_text "$DEPLOY_TAB" 'Android-приложение не обновляет'
 require_text "$DEPLOY_TAB" 'используйте server-installer/install.sh на VPS'
 require_text "$DEPLOY_TAB" 'assertAndroidDeployMayManageServer(ssh, "удаления")'
 require_text "$DEPLOY_TAB" 'enabled = resetAllowed'
-require_text "$DEPLOY_TAB" 'checkSucceeded && ownership == DeploymentOwnership.AndroidDeploy'
+require_text "$DEPLOY_TAB" 'checkSucceeded && ownership in setOf('
+require_text "$DEPLOY_TAB" 'DeploymentOwnership.IncompleteAndroidDeploy'
+require_text "$DEPLOY_TAB" 'incompleteAndroidDeployCandidate'
 
 probe_source="$(
     sed -n \

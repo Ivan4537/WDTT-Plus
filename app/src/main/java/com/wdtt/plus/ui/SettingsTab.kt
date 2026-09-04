@@ -112,7 +112,6 @@ import com.wdtt.plus.DEFAULT_VK_CLIENT_IDS
 import com.wdtt.plus.DEFAULT_RT_TURN_SNI
 import com.wdtt.plus.ManlCaptchaWebViewManager
 import com.wdtt.plus.MainActivity
-import com.wdtt.plus.CONFIG_FIRST_START_EXTRA
 import com.wdtt.plus.NativeClientStartupSecrets
 import com.wdtt.plus.RemoteContinuation
 import com.wdtt.plus.RemoteContinuationLauncher
@@ -128,12 +127,11 @@ import com.wdtt.plus.TunnelService
 import com.wdtt.plus.TunnelStopCoordinator
 import com.wdtt.plus.TunnelStopResult
 import com.wdtt.plus.TunnelTransition
-import com.wdtt.plus.TUNNEL_PROFILE_INDEX_EXTRA
 import com.wdtt.plus.VpnDnsSettingsSnapshot
+import com.wdtt.plus.buildTunnelStartIntentFromSettings
 import com.wdtt.plus.normalizeTunnelWorkerCount
 import com.wdtt.plus.normalizeRtTurnSni
 import com.wdtt.plus.nativeClientStartupConfigLine
-import com.wdtt.plus.shouldUseConfigFirstStart
 import com.wdtt.plus.TrustedWifiManager
 import com.wdtt.plus.VkJoinLink
 import com.wdtt.plus.WDTTColors
@@ -621,76 +619,33 @@ fun SettingsTabContent(
     val showManualConnectionFields = false
     val effectiveServerDtlsPort = if (manualPortsEnabled) serverDtlsPortInput.toIntOrNull()?.coerceIn(1, 65535) ?: 56000 else 56000
     val effectiveLocalPort = if (manualPortsEnabled) portInput.toIntOrNull()?.coerceIn(1, 65535) ?: 9000 else 9000
-    var pendingStartAfterVpnPermission by remember { mutableStateOf(false) }
+    var pendingStartProfileAfterVpnPermission by remember { mutableStateOf<Int?>(null) }
 
-    fun startTunnelService() {
-        val effectiveCaptchaMode = if (autoCaptchaEnabled) "auto" else "wv"
-        val effectiveCaptchaSolveMethod = if (autoCaptchaEnabled) "auto" else "manual"
-        val normalizedWorkers = normalizeTunnelWorkerCount(workersInput.toInt(), profileMaxWorkers)
-        saveJob?.cancel()
+    fun startTunnelService(profileIndex: Int) {
         scope.launch {
-            settingsStore.save(
-                peerInput, hashSlotsForStorage, "",
-                normalizedWorkers, "udp", effectiveLocalPort, sniInput, false
-            )
-            settingsStore.saveCaptchaMode(effectiveCaptchaMode)
-            settingsStore.saveCaptchaSolveMethod(effectiveCaptchaSolveMethod)
-        }
-
-        var finalPeer = "$peerInput:$effectiveServerDtlsPort"
-        var finalHashes = combinedHashes
-        var finalLocalPort = effectiveLocalPort
-        var finalPassword = savedConnectionPassword
-
-        if (wdttLinkMode) {
-            if (parsedWdttLink != null) {
-                finalPeer = "${parsedWdttLink.host}:${parsedWdttLink.dtlsPort}"
-                finalLocalPort = parsedWdttLink.localPort
-                finalPassword = parsedWdttLink.password
-                finalHashes = parsedWdttLink.hashes
+            val intent = buildTunnelStartIntentFromSettings(context, profileIndex)
+            if (intent == null) {
+                TunnelManager.reportConnectionIssue(
+                    "Профиль заполнен не полностью",
+                    "Проверьте адрес, пароль подключения и VK-хеши."
+                )
+                TunnelManager.clearTransition()
+                Toast.makeText(context, "Проверьте настройки профиля", Toast.LENGTH_LONG).show()
+                return@launch
             }
+            if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(intent)
+            else context.startService(intent)
         }
-
-        val intent = Intent(context, TunnelService::class.java).apply {
-            action = "START"
-            putExtra("peer", finalPeer)
-            putExtra("vk_hashes", finalHashes)
-            putExtra("secondary_vk_hash", "")
-            putExtra("workers_per_hash", normalizedWorkers)
-            putExtra("port", finalLocalPort)
-            putExtra("sni", sniInput)
-            putExtra("connection_password", finalPassword)
-            putExtra("vkcalls_preflight", vkCallsPreflight)
-            putExtra("rt_network", rtNetwork)
-            putExtra("rt_masque", rtMasque)
-            putExtra("rt_masque_server_bootstrap", effectiveRtMasqueServerBootstrap)
-            putExtra("rt_turn_sni", rtTurnSniInput)
-            putExtra("captcha_mode", effectiveCaptchaMode)
-            putExtra("captcha_solve_method", effectiveCaptchaSolveMethod)
-            putExtra("fingerprint", activeFingerprint)
-            putExtra("client_ids", activeClientIds)
-            putExtra("custom_vk_credentials_enabled", customVkCredentialsEnabled)
-            putExtra("custom_vk_client_id", customVkClientId)
-            putExtra("custom_vk_client_secret", customVkClientSecret)
-            putExtra("profile_max_workers", profileMaxWorkers)
-            putExtra(
-                CONFIG_FIRST_START_EXTRA,
-                shouldUseConfigFirstStart(),
-            )
-            putExtra(TUNNEL_PROFILE_INDEX_EXTRA, activeProfile)
-        }
-        if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(intent)
-        else context.startService(intent)
     }
 
     val vpnPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) {
-        if (pendingStartAfterVpnPermission) {
-            pendingStartAfterVpnPermission = false
+        pendingStartProfileAfterVpnPermission?.let { profileIndex ->
+            pendingStartProfileAfterVpnPermission = null
             if (VpnService.prepare(context) == null) {
                 TunnelManager.clearConnectionIssue()
-                startTunnelService()
+                startTunnelService(profileIndex)
             } else {
                 TunnelManager.reportConnectionIssue(
                     "VPN-разрешение не выдано",
@@ -702,14 +657,14 @@ fun SettingsTabContent(
         }
     }
 
-    fun requestVpnAndStart() {
+    fun requestVpnAndStart(profileIndex: Int) {
         val vpnIntent = VpnService.prepare(context)
         if (vpnIntent != null) {
-            pendingStartAfterVpnPermission = true
+            pendingStartProfileAfterVpnPermission = profileIndex
             vpnPermissionLauncher.launch(vpnIntent)
         } else {
             TunnelManager.clearConnectionIssue()
-            startTunnelService()
+            startTunnelService(profileIndex)
         }
     }
 
@@ -717,13 +672,35 @@ fun SettingsTabContent(
         TunnelManager.noteStartRequested()
         scope.launch {
             try {
+                val requestedProfile = activeProfile
+                val effectiveCaptchaMode = if (autoCaptchaEnabled) "auto" else "wv"
+                val effectiveCaptchaSolveMethod = if (autoCaptchaEnabled) "auto" else "manual"
+                val normalizedWorkers = normalizeTunnelWorkerCount(
+                    workersInput.toInt(),
+                    profileMaxWorkers,
+                )
+                saveJob?.cancel()
+                settingsStore.saveTunnelOptionsBeforeStart(
+                    profileIndex = requestedProfile,
+                    peer = peerInput,
+                    preserveManagedConnection = remoteManagedProfile,
+                    vkHashes = hashSlotsForStorage,
+                    secondaryVkHash = "",
+                    workersPerHash = normalizedWorkers,
+                    protocol = "udp",
+                    listenPort = effectiveLocalPort,
+                    sni = sniInput,
+                    noDns = false,
+                    captchaMode = effectiveCaptchaMode,
+                    captchaSolveMethod = effectiveCaptchaSolveMethod,
+                )
                 when (
                     val decision = AccessLifecycleCoordinator.prepareStart(
                         context,
-                        activeProfile,
+                        requestedProfile,
                     )
                 ) {
-                    AccessStartDecision.Allowed -> requestVpnAndStart()
+                    AccessStartDecision.Allowed -> requestVpnAndStart(requestedProfile)
                     is AccessStartDecision.Denied -> {
                         TunnelManager.clearConnectionIssue(ConnectionIssueKind.ACCESS)
                         TunnelManager.clearTransition()

@@ -11,9 +11,6 @@ readonly CONTRACT="$SCRIPT_DIR/compatibility-contract.env"
 readonly LOCAL_SERVER="$SCRIPT_DIR/wdtt-server"
 readonly LOCAL_SUMS="$SCRIPT_DIR/SHA256SUMS"
 readonly SERVER_ASSET="$REPOSITORY_ROOT/app/src/main/assets/server"
-readonly WARP_DIR="$REPOSITORY_ROOT/warp-interface-manager"
-readonly WARP_SCRIPT="$WARP_DIR/warp-interface-manager.sh"
-readonly WARP_README="$WARP_DIR/README.md"
 readonly APK_DIR="$REPOSITORY_ROOT/app/build/outputs/apk/release/named"
 readonly OUTPUTS_ROOT="$REPOSITORY_ROOT/app/build/outputs"
 readonly READY_DIR="$OUTPUTS_ROOT/release-ready"
@@ -103,15 +100,6 @@ validate_versions() {
     BUNDLE_NAME="WDTT-Plus-server-v${WDTT_SERVER_VERSION}-installer-${INSTALLER_VERSION}-linux-amd64"
     ARCHIVE_NAME="$BUNDLE_NAME.tar.gz"
     ARCHIVE_SUM_NAME="$ARCHIVE_NAME.sha256"
-    require_regular_file "$WARP_SCRIPT"
-    require_regular_file "$WARP_README"
-    WARP_VERSION="$(sed -n 's/^VERSION="\([0-9][0-9.]*\)"$/\1/p' "$WARP_SCRIPT")"
-    [[ "$WARP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
-        die "не удалось однозначно прочитать версию WARP-менеджера"
-    grep -Fqx "Документация соответствует версии скрипта \`$WARP_VERSION\`." "$WARP_README" ||
-        die "README WARP-менеджера не соответствует версии $WARP_VERSION"
-    WARP_BUNDLE_NAME="warp-interface-manager-v${WARP_VERSION}"
-    WARP_ARCHIVE_NAME="$WARP_BUNDLE_NAME.tar.gz"
 }
 
 validate_linux_server() {
@@ -162,8 +150,7 @@ expected_release_files() {
         "WDTT-Plus-v${APP_VERSION}-universal-release.apk" \
         "WDTT-Plus-v${APP_VERSION}-x86_64-release.apk" \
         "$ARCHIVE_NAME" \
-        "$ARCHIVE_SUM_NAME" \
-        "$WARP_ARCHIVE_NAME" |
+        "$ARCHIVE_SUM_NAME" |
         LC_ALL=C sort
 }
 
@@ -231,47 +218,6 @@ verify_archive() {
     validate_linux_server "$extracted/wdtt-server"
 }
 
-verify_warp_archive() {
-    local release_dir="$1"
-    local archive="$release_dir/$WARP_ARCHIVE_NAME"
-    local members expected_members extract_root extracted
-    require_regular_file "$archive"
-    members="$(tar -tzf "$archive")"
-    expected_members="$(printf '%s\n' \
-        "$WARP_BUNDLE_NAME/" \
-        "$WARP_BUNDLE_NAME/README.md" \
-        "$WARP_BUNDLE_NAME/SHA256SUMS" \
-        "$WARP_BUNDLE_NAME/warp-interface-manager.sh")"
-    [[ "$members" == "$expected_members" ]] ||
-        die "архив WARP-менеджера содержит неожиданные пути или неполный комплект"
-
-    extract_root="$TEMP_ROOT/warp-extracted"
-    install -d -m 0700 "$extract_root"
-    tar --no-same-owner --same-permissions -xzf "$archive" -C "$extract_root"
-    extracted="$extract_root/$WARP_BUNDLE_NAME"
-    [[ -d "$extracted" && ! -L "$extracted" ]] ||
-        die "архив WARP-менеджера не создал ожидаемый каталог"
-    require_regular_file "$extracted/README.md"
-    require_regular_file "$extracted/SHA256SUMS"
-    require_regular_file "$extracted/warp-interface-manager.sh"
-    [[ "$(stat -c '%a' "$extracted/README.md")" == "644" ]] ||
-        die "у README.md в WARP-архиве должны быть права 644"
-    [[ "$(stat -c '%a' "$extracted/SHA256SUMS")" == "644" ]] ||
-        die "у SHA256SUMS в WARP-архиве должны быть права 644"
-    [[ "$(stat -c '%a' "$extracted/warp-interface-manager.sh")" == "755" ]] ||
-        die "у WARP-скрипта в архиве должны быть права 755"
-    cmp -s "$WARP_README" "$extracted/README.md" ||
-        die "в WARP-архив попал другой README.md"
-    cmp -s "$WARP_SCRIPT" "$extracted/warp-interface-manager.sh" ||
-        die "в WARP-архив попал другой скрипт"
-    (
-        cd "$extracted"
-        sha256sum -c SHA256SUMS >/dev/null
-    ) || die "внутренние суммы WARP-архива не совпали"
-    [[ "$("$extracted/warp-interface-manager.sh" --version | awk '{ print $NF }')" == "$WARP_VERSION" ]] ||
-        die "версия WARP-скрипта изменилась внутри архива"
-}
-
 verify_apks() {
     local release_dir="$1" abi apk extracted_server
     for abi in arm64-v8a armeabi-v7a x86_64 universal; do
@@ -298,7 +244,6 @@ verify_release_set() {
     verify_source_and_local_files
     verify_exact_release_file_set "$release_dir"
     verify_archive "$release_dir"
-    verify_warp_archive "$release_dir"
     verify_apks "$release_dir"
 }
 
@@ -346,38 +291,6 @@ create_archive() {
         sha256sum "$ARCHIVE_NAME" >"$ARCHIVE_SUM_NAME"
     )
     chmod 0644 "$release_stage/$ARCHIVE_NAME" "$release_stage/$ARCHIVE_SUM_NAME"
-}
-
-create_warp_archive() {
-    local release_stage="$1"
-    local content_root="$TEMP_ROOT/warp-content"
-    local bundle_dir="$content_root/$WARP_BUNDLE_NAME"
-    local archive_pending="$release_stage/$WARP_ARCHIVE_NAME.new"
-    local epoch
-    epoch="${SOURCE_DATE_EPOCH:-$(git -C "$REPOSITORY_ROOT" log -1 --format=%ct)}"
-    [[ "$epoch" =~ ^[0-9]+$ ]] || die "SOURCE_DATE_EPOCH должен быть Unix-временем"
-    install -d -m 0755 "$bundle_dir"
-    install -m 0644 "$WARP_README" "$bundle_dir/README.md"
-    install -m 0755 "$WARP_SCRIPT" "$bundle_dir/warp-interface-manager.sh"
-    (
-        cd "$bundle_dir"
-        sha256sum README.md warp-interface-manager.sh >SHA256SUMS
-    )
-    chmod 0644 "$bundle_dir/SHA256SUMS"
-    (
-        cd "$content_root"
-        LC_ALL=C tar \
-            --sort=name \
-            --mtime="@$epoch" \
-            --owner=0 \
-            --group=0 \
-            --numeric-owner \
-            --format=posix \
-            --pax-option=delete=atime,delete=ctime \
-            -cf - "$WARP_BUNDLE_NAME" | gzip -n >"$archive_pending"
-    )
-    mv -f "$archive_pending" "$release_stage/$WARP_ARCHIVE_NAME"
-    chmod 0644 "$release_stage/$WARP_ARCHIVE_NAME"
 }
 
 copy_release_apks() {
@@ -434,7 +347,6 @@ prepare_release() {
         die "временный каталог уже существует"
     install -d -m 0755 "$release_stage"
     create_archive "$release_stage"
-    create_warp_archive "$release_stage"
     copy_release_apks "$release_stage"
     verify_release_set "$release_stage"
     replace_ready_directory "$release_stage"

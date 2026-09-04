@@ -159,7 +159,8 @@ private const val THREEPROXY_SOURCE_SHA256 =
 private const val THREEPROXY_SOURCE_URL =
     "https://github.com/3proxy/3proxy/archive/refs/tags/$THREEPROXY_VERSION.tar.gz"
 
-private enum class DeployMode {
+internal enum class DeployMode {
+    FreshInstall,
     PreserveData,
     ResetAll
 }
@@ -479,6 +480,7 @@ private data class ExistingInstallInfo(
     val standaloneManaged: Boolean = false,
     val androidDeployManaged: Boolean = false,
     val legacyAndroidDeployCandidate: Boolean = false,
+    val incompleteAndroidDeployCandidate: Boolean = false,
     val checkError: String? = null,
     val comparison: DeployServerComparison? = null
 ) {
@@ -491,17 +493,20 @@ internal enum class DeploymentOwnership {
     StandaloneInstaller,
     AndroidDeploy,
     LegacyAndroidDeploy,
+    IncompleteAndroidDeploy,
     UnknownExisting
 }
 
 internal fun existingInstallOwnershipFromFlags(
     standaloneManaged: Boolean,
     androidDeployManaged: Boolean,
-    legacyAndroidDeployCandidate: Boolean
+    legacyAndroidDeployCandidate: Boolean,
+    incompleteAndroidDeployCandidate: Boolean = false,
 ): DeploymentOwnership = when {
     standaloneManaged -> DeploymentOwnership.StandaloneInstaller
     androidDeployManaged -> DeploymentOwnership.AndroidDeploy
     legacyAndroidDeployCandidate -> DeploymentOwnership.LegacyAndroidDeploy
+    incompleteAndroidDeployCandidate -> DeploymentOwnership.IncompleteAndroidDeploy
     else -> DeploymentOwnership.UnknownExisting
 }
 
@@ -516,7 +521,10 @@ internal fun existingInstallAllowsPreservingUpdate(
 internal fun existingInstallAllowsReset(
     ownership: DeploymentOwnership,
     checkSucceeded: Boolean
-): Boolean = checkSucceeded && ownership == DeploymentOwnership.AndroidDeploy
+): Boolean = checkSucceeded && ownership in setOf(
+    DeploymentOwnership.AndroidDeploy,
+    DeploymentOwnership.IncompleteAndroidDeploy,
+)
 
 internal data class OutboundProfileForms(
     val localProxyPort: String,
@@ -1951,7 +1959,7 @@ fun DeployTab(
                     pendingDeployRequest = request
                     existingInstallInfo = info
                 } else {
-                    launchDeploy(request, DeployMode.PreserveData)
+                    launchDeploy(request, DeployMode.FreshInstall)
                 }
             } catch (e: Exception) {
                 val friendly = friendlyDeployError(e, "проверка сервера")
@@ -6733,9 +6741,9 @@ private fun serverDiagnosticsErrorReport(
 private fun serverProfileDiagnosticItem(profileName: String, profileIndex: Int?): DeviceCheckItem {
     val number = profileIndex?.let { (it + 1).coerceAtLeast(1).toString() } ?: "?"
     return DeviceCheckItem(
-        title = "Активный VPN-профиль",
+        title = "Выбранный профиль",
         status = "профиль $number — $profileName",
-        details = "Диагностика собрана строго из текущего активного профиля приложения: его адреса сервера, логина, SSH-порта и выбранного способа входа.",
+        details = "Диагностика собрана строго из профиля, выбранного в приложении на момент запуска: его адреса сервера, логина, SSH-порта и способа входа.",
         recommendation = "Если нужно проверить другой сервер, сначала переключите VPN-профиль в приложении и запустите диагностику заново.",
         severity = DeviceCheckSeverity.Info
     )
@@ -10737,7 +10745,11 @@ private suspend fun checkExistingInstall(
 			active = Regex("^ACTIVE=active$", RegexOption.MULTILINE).containsMatchIn(output),
 			standaloneManaged = markerValue(output, "WDTT_STANDALONE_MANAGED") == "1",
             androidDeployManaged = markerValue(output, "WDTT_ANDROID_DEPLOY_MANAGED") == "1",
-            legacyAndroidDeployCandidate = markerValue(output, "WDTT_LEGACY_ANDROID_DEPLOY_CANDIDATE") == "1"
+            legacyAndroidDeployCandidate = markerValue(output, "WDTT_LEGACY_ANDROID_DEPLOY_CANDIDATE") == "1",
+            incompleteAndroidDeployCandidate = markerValue(
+                output,
+                "WDTT_INCOMPLETE_ANDROID_DEPLOY_CANDIDATE"
+            ) == "1"
 		)
 	} finally {
 		try { session?.disconnect() } catch (_: Exception) {}
@@ -10784,6 +10796,20 @@ internal fun standaloneInstallerOwnershipProbeScript(pathPrefix: String = ""): S
     else
       printf 'WDTT_LEGACY_ANDROID_DEPLOY_CANDIDATE=0\n'
     fi
+    incomplete_extra=''
+    if [ -d "${'$'}config" ] && [ ! -L "${'$'}config" ]; then
+      incomplete_extra="${'$'}(find "${'$'}config" -mindepth 1 -maxdepth 1 ! -path "${'$'}passwords" -print -quit 2>/dev/null || true)"
+    fi
+    if [ ! -e "${'$'}ownership" ] && [ ! -e "${'$'}unit" ] && [ ! -e "${'$'}binary" ] &&
+       [ -d "${'$'}config" ] && [ ! -L "${'$'}config" ] &&
+       [ -f "${'$'}passwords" ] && [ ! -L "${'$'}passwords" ] && [ -s "${'$'}passwords" ] &&
+       [ ! -e "${'$'}wg_keys" ] && [ -z "${'$'}incomplete_extra" ] &&
+       [ "${'$'}(stat -c '%a' "${'$'}config" 2>/dev/null || true)" = "700" ] &&
+       [ "${'$'}(stat -c '%a' "${'$'}passwords" 2>/dev/null || true)" = "600" ]; then
+      printf 'WDTT_INCOMPLETE_ANDROID_DEPLOY_CANDIDATE=1\n'
+    else
+      printf 'WDTT_INCOMPLETE_ANDROID_DEPLOY_CANDIDATE=0\n'
+    fi
     if [ -f "${'$'}unit" ] || [ -f "${'$'}binary" ] || [ -d "${'$'}config" ] ||
        [ -f "${'$'}passwords" ] || [ -f "${'$'}wg_keys" ]; then
       printf 'WDTT_INSTALL_TRACE=1\n'
@@ -10794,13 +10820,22 @@ internal fun standaloneInstallerOwnershipProbeScript(pathPrefix: String = ""): S
 }
 
 internal fun deploymentOwnershipFromProbe(output: String): DeploymentOwnership {
+    val requiredMarkers = listOf(
+        "WDTT_STANDALONE_MANAGED",
+        "WDTT_ANDROID_DEPLOY_MANAGED",
+        "WDTT_LEGACY_ANDROID_DEPLOY_CANDIDATE",
+        "WDTT_INCOMPLETE_ANDROID_DEPLOY_CANDIDATE",
+        "WDTT_INSTALL_TRACE",
+    )
+    if (requiredMarkers.any { markerValue(output, it) !in setOf("0", "1") }) {
+        throw IllegalStateException("не удалось безопасно проверить владельца установки. Изменяющая операция остановлена.")
+    }
     return when {
-        markerValue(output, "WDTT_STANDALONE_MANAGED") != "0" &&
-            markerValue(output, "WDTT_STANDALONE_MANAGED") != "1" ->
-            throw IllegalStateException("не удалось безопасно проверить владельца установки. Изменяющая операция остановлена.")
         markerValue(output, "WDTT_STANDALONE_MANAGED") == "1" -> DeploymentOwnership.StandaloneInstaller
         markerValue(output, "WDTT_ANDROID_DEPLOY_MANAGED") == "1" -> DeploymentOwnership.AndroidDeploy
         markerValue(output, "WDTT_LEGACY_ANDROID_DEPLOY_CANDIDATE") == "1" -> DeploymentOwnership.LegacyAndroidDeploy
+        markerValue(output, "WDTT_INCOMPLETE_ANDROID_DEPLOY_CANDIDATE") == "1" ->
+            DeploymentOwnership.IncompleteAndroidDeploy
         markerValue(output, "WDTT_INSTALL_TRACE") == "0" -> DeploymentOwnership.NoInstall
         markerValue(output, "WDTT_INSTALL_TRACE") == "1" -> DeploymentOwnership.UnknownExisting
         else -> throw IllegalStateException("не удалось безопасно проверить владельца установки. Изменяющая операция остановлена.")
@@ -10812,23 +10847,44 @@ private fun deploymentOwnership(ssh: SSHClient): DeploymentOwnership {
     return deploymentOwnershipFromProbe(output)
 }
 
-private fun assertDeploymentMayBeUpdated(ownership: DeploymentOwnership, mode: DeployMode) {
-    when (ownership) {
-        DeploymentOwnership.StandaloneInstaller -> throw IllegalStateException(
+internal fun assertDeploymentMayBeUpdated(
+    ownership: DeploymentOwnership,
+    mode: DeployMode,
+) {
+    when {
+        ownership == DeploymentOwnership.StandaloneInstaller -> throw IllegalStateException(
             "сервер управляется отдельным standalone-инсталлером. Android-приложение не обновляет " +
                 "и не перезаписывает такую установку; используйте server-installer/install.sh на VPS."
         )
-        DeploymentOwnership.AndroidDeploy, DeploymentOwnership.NoInstall -> Unit
-        DeploymentOwnership.LegacyAndroidDeploy -> if (mode == DeployMode.ResetAll) {
+        ownership == DeploymentOwnership.UnknownExisting -> throw IllegalStateException(
+            "на сервере есть неизвестная установка WDTT без безопасных признаков Android-деплоя. " +
+                "Изменяющая операция остановлена."
+        )
+        mode == DeployMode.FreshInstall && ownership != DeploymentOwnership.NoInstall ->
+            throw IllegalStateException(
+                "первичная установка остановлена: на сервере появились следы WDTT. " +
+                    "Повторите проверку и выберите безопасное действие для найденной установки."
+            )
+        mode == DeployMode.PreserveData && ownership !in setOf(
+            DeploymentOwnership.AndroidDeploy,
+            DeploymentOwnership.LegacyAndroidDeploy,
+        ) -> throw IllegalStateException(
+            "обновление с сохранением разрешено только для подтверждённой Android-установки."
+        )
+        ownership == DeploymentOwnership.LegacyAndroidDeploy && mode == DeployMode.ResetAll -> {
             throw IllegalStateException(
                 "старая Android-установка без метки допускает только обновление с сохранением. " +
                     "После успешного обновления появится метка, а сброс по-прежнему потребует отдельного подтверждения."
             )
         }
-        DeploymentOwnership.UnknownExisting -> throw IllegalStateException(
-            "на сервере есть неизвестная установка WDTT без безопасных признаков Android-деплоя. " +
-                "Изменяющая операция остановлена."
-        )
+        mode == DeployMode.ResetAll && ownership !in setOf(
+            DeploymentOwnership.AndroidDeploy,
+            DeploymentOwnership.IncompleteAndroidDeploy,
+        ) ->
+            throw IllegalStateException(
+                "полный сброс разрешён только для установки с подтверждённой меткой Android-деплоя."
+            )
+        else -> Unit
     }
 }
 
@@ -10841,7 +10897,9 @@ private fun assertAndroidDeployMayManageServer(ssh: SSHClient, operation: String
         DeploymentOwnership.LegacyAndroidDeploy -> throw IllegalStateException(
             "старая Android-установка без метки не допускает $operation. Сначала выполните обновление с сохранением."
         )
-        DeploymentOwnership.NoInstall, DeploymentOwnership.UnknownExisting -> throw IllegalStateException(
+        DeploymentOwnership.NoInstall,
+        DeploymentOwnership.IncompleteAndroidDeploy,
+        DeploymentOwnership.UnknownExisting -> throw IllegalStateException(
             "не удалось безопасно подтвердить, что установка принадлежит Android-деплою. $operation остановлено."
         )
     }
@@ -13387,12 +13445,19 @@ private suspend fun performDeploy(
 		if (
 			mode == DeployMode.PreserveData ||
 			importPlan != null ||
-			(mode == DeployMode.ResetAll && ownership == DeploymentOwnership.AndroidDeploy)
+			(mode == DeployMode.ResetAll && ownership in setOf(
+                DeploymentOwnership.AndroidDeploy,
+                DeploymentOwnership.IncompleteAndroidDeploy,
+            ))
 		) {
-            onProgress(0.055f, "Проверка сохранённых данных...")
-            val currentDbJson = readRemotePasswordsJson(ssh)?.also {
-                validatePasswordsDbForPreserving(JSONObject(it), mainPass)
-            }
+			onProgress(0.055f, "Проверка сохранённых данных...")
+			val currentDbJson = readRemotePasswordsJson(ssh)?.also {
+				if (ownership == DeploymentOwnership.IncompleteAndroidDeploy) {
+					validatePasswordsDbStructure(JSONObject(it))
+				} else {
+					validatePasswordsDbForPreserving(JSONObject(it), mainPass)
+				}
+			}
             if (mode == DeployMode.PreserveData && currentDbJson == null) {
                 throw IllegalStateException(
                     "обновление с сохранением остановлено: на сервере нет passwords.json; " +
@@ -13437,6 +13502,11 @@ private suspend fun performDeploy(
 		onProgress(0.08f, "Установка...")
 		if (mode == DeployMode.ResetAll) {
 			onProgress(0.075f, "Сброс старых данных...")
+			val resetOwnership = deploymentOwnership(ssh)
+			require(resetOwnership == ownership) {
+				"состояние установки изменилось после проверки; сброс остановлен"
+			}
+			assertDeploymentMayBeUpdated(resetOwnership, DeployMode.ResetAll)
 			ssh.exec(
 				rootCommand(
 					"systemctl stop wdtt 2>/dev/null || true; " +
@@ -13478,6 +13548,11 @@ private suspend fun performDeploy(
 		val output = ssh.exec(
 			rootCommand(
                 "env WDTT_DTLS_PORT=$dtlsPort WDTT_WG_PORT=$wgPort WDTT_SSH_PORT=$port " +
+                    "WDTT_INSTALL_MODE=${when (mode) {
+                        DeployMode.FreshInstall -> "fresh"
+                        DeployMode.PreserveData -> "preserve"
+                        DeployMode.ResetAll -> "reset"
+                    }} " +
                     "WDTT_PRESERVE_DATA=${if (mode == DeployMode.PreserveData) 1 else 0} " +
                     "${if (stagedDatabaseFile != null) "WDTT_STAGED_DB=/tmp/wdtt-passwords.json.new " else ""}" +
                     "bash /tmp/deploy.sh"
@@ -15701,7 +15776,8 @@ private fun ExistingInstallDialog(
 	val ownership = existingInstallOwnershipFromFlags(
 		standaloneManaged = info.standaloneManaged,
 		androidDeployManaged = info.androidDeployManaged,
-		legacyAndroidDeployCandidate = info.legacyAndroidDeployCandidate
+		legacyAndroidDeployCandidate = info.legacyAndroidDeployCandidate,
+		incompleteAndroidDeployCandidate = info.incompleteAndroidDeployCandidate,
 	)
 	val preservingUpdateAllowed = existingInstallAllowsPreservingUpdate(
 		ownership = ownership,
@@ -15795,6 +15871,12 @@ private fun ExistingInstallDialog(
 								style = MaterialTheme.typography.bodySmall,
 								color = MaterialTheme.colorScheme.primary
 							)
+						} else if (ownership == DeploymentOwnership.IncompleteAndroidDeploy) {
+							Text(
+								"Найден точный остаток незавершённой Android-установки: защищённая база есть, но служба, бинарник и WireGuard-ключи не были созданы. Обновление с сохранением недоступно; можно только явно начать установку с нуля.",
+								style = MaterialTheme.typography.bodySmall,
+								color = MaterialTheme.colorScheme.primary
+							)
 						} else if (info.hasAnyTrace) {
 							Text(
 								"Установка без подтверждённых признаков Android-деплоя. Чтобы не изменить чужой сервер, обновление, импорт, удаление и сброс заблокированы.",
@@ -15864,6 +15946,8 @@ private fun ExistingInstallDialog(
 						"С сохранением данных: обновится бинарник, серверные настройки будут взяты из приложения, а клиентские пароли, привязки устройств, история и ключи сохранятся. Перед изменением создаётся страховочная копия.\n\nЭто одноразовый путь миграции старого Android-деплоя. Сброс, удаление и импорт будут доступны только после успешного обновления и появления метки."
 					} else if (ownership == DeploymentOwnership.AndroidDeploy) {
 						"С сохранением данных: обновится бинарник, серверные настройки будут взяты из приложения, а клиентские пароли, привязки устройств, история и ключи сохранятся. Перед изменением создаётся страховочная копия.\n\nС нуля: данные WDTT Plus на сервере будут удалены, все выданные ссылки и привязки пропадут; затем сервер получит текущие поля приложения."
+					} else if (ownership == DeploymentOwnership.IncompleteAndroidDeploy) {
+						"Незавершённая установка не содержит работающего сервера. «Начать с нуля» сначала проверит базу и подготовит транзакционный откат, а затем заново установит сервер. Любые другие неизвестные следы по-прежнему блокируются."
 					} else {
 						"Владелец установки не подтверждён. Обновление, импорт, сброс и удаление заблокированы до успешной безопасной проверки."
 					},
@@ -15923,6 +16007,7 @@ private fun ExistingInstallDialog(
 	}
 	if (showResetConfirmation) {
 		ServerResetConfirmDialog(
+			incompleteInstall = ownership == DeploymentOwnership.IncompleteAndroidDeploy,
 			onDismiss = { showResetConfirmation = false },
 			onConfirm = {
 				showResetConfirmation = false
@@ -15935,6 +16020,7 @@ private fun ExistingInstallDialog(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ServerResetConfirmDialog(
+	incompleteInstall: Boolean = false,
 	onDismiss: () -> Unit,
 	onConfirm: () -> Unit
 ) {
@@ -15953,8 +16039,11 @@ private fun ServerResetConfirmDialog(
 						"Затем сервер будет заново установлен из текущих полей приложения."
 				)
 				Text(
-					"Перед удалением приложение создаст проверенную страховочную копию. " +
-						"Для запуска непрерывно удерживайте кнопку 3 секунды.",
+					(if (incompleteInstall) {
+						"База будет проверена и сохранена для отката, если новая установка не запустится. "
+					} else {
+						"Перед удалением приложение создаст проверенную страховочную копию. "
+					}) + "Для запуска непрерывно удерживайте кнопку 3 секунды.",
 					style = MaterialTheme.typography.bodySmall,
 					color = MaterialTheme.colorScheme.onSurfaceVariant
 				)

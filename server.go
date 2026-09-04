@@ -43,7 +43,7 @@ import (
 )
 
 const (
-	wdttServerVersion     = "16"
+	wdttServerVersion     = "17"
 	wgIfaceName           = "wdtt0"
 	wgServerAddr          = "10.66.66.1"
 	wgServerCIDR          = wgServerAddr + "/24"
@@ -699,6 +699,19 @@ func initDB(dir, mainPass, adminID, botToken, dnsValue string) error {
 		return fmt.Errorf("инициализация ключей обёртки: %w", err)
 	}
 	return nil
+}
+
+// botRuntimeCredentials returns the values persisted in the protected database.
+// Deploy updates intentionally do not put these values back into systemd or the
+// process command line, so every restart must use the database as the runtime
+// source of truth.
+func botRuntimeCredentials() (string, string) {
+	dbMutex.Lock()
+	defer dbMutex.Unlock()
+	if db == nil {
+		return "", ""
+	}
+	return strings.TrimSpace(db.BotToken), strings.TrimSpace(db.AdminID)
 }
 
 func saveDB() error {
@@ -1624,7 +1637,8 @@ func main() {
 	go statsLoop(ctx, *configDir)
 	go systemMetricsLoop(ctx)
 	go expiredPasswordJanitor(ctx, wgDev)
-	go botLoop(*botToken, *adminID, wgDev)
+	storedBotToken, storedAdminID := botRuntimeCredentials()
+	go botLoop(storedBotToken, storedAdminID, wgDev)
 
 	addr, _ := net.ResolveUDPAddr("udp", *listen)
 	cert, _ := selfsign.GenerateSelfSigned()

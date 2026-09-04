@@ -122,3 +122,25 @@ func TestSessionTURNCandidatesApplyOverride(t *testing.T) {
 		}
 	}
 }
+
+func TestSessionTURNCandidatesRotateAfterRelayHandshakeTimeout(t *testing.T) {
+	raw := []string{
+		"turn:one.example:3478?transport=udp",
+		"turn:two.example:3478?transport=udp",
+		"turn:three.example:3478?transport=udp",
+	}
+
+	initial := sessionTURNCandidatesForAttempt(raw, 1, 0, nil, false)
+	retry := sessionTURNCandidatesForAttempt(raw, 1, 1, nil, false)
+	wrapped := sessionTURNCandidatesForAttempt(raw, 1, len(raw), nil, false)
+
+	if initial[0].Host != "two.example" {
+		t.Fatalf("initial candidate changed: %#v", initial)
+	}
+	if retry[0].Host != "three.example" {
+		t.Fatalf("retry did not rotate candidate: %#v", retry)
+	}
+	if wrapped[0].Host != initial[0].Host {
+		t.Fatalf("candidate rotation did not wrap: initial=%#v wrapped=%#v", initial, wrapped)
+	}
+}

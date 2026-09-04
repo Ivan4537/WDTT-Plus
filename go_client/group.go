@@ -60,6 +60,38 @@ func workerDistributionByHash(workerCount, hashCount int) []int {
 	return distribution
 }
 
+func workerHashCandidates(hashes []string, hashIndex, requestedWorkers int, fallback bool) []string {
+	if len(hashes) == 0 {
+		return nil
+	}
+	primary := ((hashIndex % len(hashes)) + len(hashes)) % len(hashes)
+	if !fallback || len(hashes) == 1 {
+		return []string{hashes[primary]}
+	}
+
+	groupCount := requestedWorkers / workersPerGroup
+	if groupCount < 1 {
+		groupCount = 1
+	}
+	primaryCount := min(groupCount, len(hashes))
+	result := make([]string, 0, len(hashes))
+	result = append(result, hashes[primary])
+
+	// Prefer hashes that have no primary group. With 18 workers and four
+	// hashes this gives group 1 hash 3 as its first reserve and group 2 hash 4,
+	// so one degraded group does not move onto the other group's live hash.
+	unusedCount := len(hashes) - primaryCount
+	for offset := 0; offset < unusedCount; offset++ {
+		index := primaryCount + (primary+offset)%unusedCount
+		result = append(result, hashes[index])
+	}
+	for offset := 1; offset < primaryCount; offset++ {
+		index := (primary + offset) % primaryCount
+		result = append(result, hashes[index])
+	}
+	return result
+}
+
 // startPacer распределяет первичные подключения всех групп по общей шкале
 // времени. Это позволяет готовить группы параллельно, не создавая всплеск из
 // десятков одновременных DTLS/TURN-handshake.
@@ -236,6 +268,15 @@ func workerRetryDelayAfterCredentialRefresh(err error, result credentialRefreshR
 	slot := workerIndex % workersPerGroup
 	jitter := time.Duration(rand.Int63n(int64(refreshedCredsRetryJitterMax) + 1))
 	return refreshedCredsRetryMin + time.Duration(slot)*refreshedCredsRetrySlot + jitter
+}
+
+func shouldRotateTurnCandidateAfterSessionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToUpper(err.Error())
+	return strings.Contains(message, "WRAP_AUTH_TIMEOUT") ||
+		strings.Contains(message, "DTLS ХЕНДШЕЙК")
 }
 
 type workerPolicyRetryGate struct {
@@ -432,16 +473,7 @@ func WorkerGroup(
 		}
 	}
 
-	hashCandidates := []string{tp.Hashes[hashIndex%len(tp.Hashes)]}
-	if hashFallback && len(tp.Hashes) > 1 {
-		hashCandidates = make([]string, 0, len(tp.Hashes))
-		for offset := 0; offset < len(tp.Hashes); offset++ {
-			hashCandidates = append(
-				hashCandidates,
-				tp.Hashes[(hashIndex+offset)%len(tp.Hashes)],
-			)
-		}
-	}
+	hashCandidates := workerHashCandidates(tp.Hashes, hashIndex, requestedWorkers, hashFallback)
 	selectedHash := 0
 	hash := hashCandidates[selectedHash]
 	log.Printf("[ГРУППА #%d] Запрос реквизитов подключения", groupID)
@@ -595,6 +627,7 @@ func WorkerGroup(
 
 			shouldGetConfig := getConfig
 			attempt := 0
+			turnCandidateRetry := 0
 
 			for {
 				if ctx.Err() != nil {
@@ -624,7 +657,8 @@ func WorkerGroup(
 				configDelivered, sessErr := RunSession(ctx, tp, peer, d, localPort,
 					getConf, cc, requireConfig, onConfigDelivered, wid, &credsSnapshot,
 					deviceID, password, deviceInfo,
-					transportSession, stats, turnStreamFirst, turnCapacityGate.reset)
+					transportSession, stats, turnStreamFirst, turnCandidateRetry,
+					turnCapacityGate.reset)
 				refreshResult := credentialRefreshNone
 
 				if getConf {
@@ -638,6 +672,10 @@ func WorkerGroup(
 				if sessErr != nil {
 					if ctx.Err() != nil {
 						return
+					}
+					relayHandshakeFailed := shouldRotateTurnCandidateAfterSessionError(sessErr)
+					if relayHandshakeFailed {
+						turnCandidateRetry++
 					}
 					if maxWorkers, limited := workerPolicyLimit(sessErr); limited {
 						if shouldRetryWorkerPolicy(maxWorkers, requestedWorkers) {
@@ -697,8 +735,22 @@ func WorkerGroup(
 							return
 						}
 						continue
+					} else if relayHandshakeFailed &&
+						hashFallback &&
+						len(credsSnapshot.TurnURLs) > 0 &&
+						turnCandidateRetry%len(credsSnapshot.TurnURLs) == 0 {
+						log.Printf("[ВОРКЕР #%d] Ошибка (попытка %d): %s", wid, attempt, errStr)
+						log.Printf(
+							"[ВОРКЕР #%d] [TURN] Все relay-пути текущего VK-хеша не провели DTLS; пробуем резервный хеш",
+							wid,
+						)
+						refreshResult = refreshCreds("TURN relay handshake timeout", credsRevision)
 					} else {
 						log.Printf("[ВОРКЕР #%d] Ошибка (попытка %d): %s", wid, attempt, errStr)
+					}
+					if refreshResult == credentialRefreshApplied ||
+						refreshResult == credentialRefreshSuperseded {
+						turnCandidateRetry = 0
 					}
 
 					// Если ошибка STUN (credentials invalid), воркер не сможет переподключиться. Завершаем.

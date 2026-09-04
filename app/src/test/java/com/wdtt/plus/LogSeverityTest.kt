@@ -17,6 +17,18 @@ class LogSeverityTest {
     }
 
     @Test
+    fun wrapHandshakeTerminalMessage_doesNotPresentTimeoutAsBadPassword() {
+        val message = wrapHandshakeTerminalMessage(rtNetwork = false)
+
+        assertEquals(
+            "\uD83D\uDD0C Сервер не ответил на WRAP. Возможны проблемы с сервером или маршрутом, блокировка UDP/TURN, " +
+                "неверный пароль либо несовместимость WRAP. Воркеры остановлены.",
+            message,
+        )
+        assertFalse(message.startsWith("🔒 Неверный пароль"))
+    }
+
+    @Test
     fun repeatedTurnWorkerFailures_useOneRecoverableWarningKey() {
         val first = classifyRecoverableWorkerRetry(
             "[ВОРКЕР #1] Ошибка (попытка 1): TURN Allocate: all retransmissions failed for first",

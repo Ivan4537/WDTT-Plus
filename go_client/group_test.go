@@ -81,6 +81,29 @@ func TestWorkerDistributionByHashUsesAllHashesWithoutOverloadingOne(t *testing.T
 	}
 }
 
+func TestWorkerHashCandidatesPreferUnusedManagedProfileHashes(t *testing.T) {
+	hashes := []string{"hash-1", "hash-2", "hash-3", "hash-4"}
+
+	first := workerHashCandidates(hashes, 0, 18, true)
+	second := workerHashCandidates(hashes, 1, 18, true)
+	if !reflect.DeepEqual(first, []string{"hash-1", "hash-3", "hash-4", "hash-2"}) {
+		t.Fatalf("first group candidates = %v", first)
+	}
+	if !reflect.DeepEqual(second, []string{"hash-2", "hash-4", "hash-3", "hash-1"}) {
+		t.Fatalf("second group candidates = %v", second)
+	}
+	if first[1] == second[1] {
+		t.Fatalf("independent groups unexpectedly share first reserve: %v / %v", first, second)
+	}
+}
+
+func TestWorkerHashCandidatesKeepOrdinaryProfileOnPrimaryHash(t *testing.T) {
+	hashes := []string{"hash-1", "hash-2", "hash-3", "hash-4"}
+	if got := workerHashCandidates(hashes, 1, 18, false); !reflect.DeepEqual(got, []string{"hash-2"}) {
+		t.Fatalf("ordinary profile candidates = %v", got)
+	}
+}
+
 func TestStartPacerWaitHonorsCancellation(t *testing.T) {
 	pacer := newStartPacer(time.Hour)
 	if err := pacer.wait(context.Background()); err != nil {
@@ -373,6 +396,28 @@ func TestWrapHandshakeTimeoutAllowsFourFlightsBeforeFastRetry(t *testing.T) {
 	}
 	if got := dtlsHandshakeTimeout(false); got != 20*time.Second {
 		t.Fatalf("regular handshake timeout = %v, want 20s", got)
+	}
+}
+
+func TestTurnCandidateRotationIsLimitedToPostAllocateHandshakeFailures(t *testing.T) {
+	for _, err := range []error{
+		errors.New("WRAP_AUTH_TIMEOUT: отдельный DTLS-канал не ответил вовремя"),
+		errors.New("DTLS хендшейк до VPS example.test:56000 не прошёл: timeout"),
+	} {
+		if !shouldRotateTurnCandidateAfterSessionError(err) {
+			t.Fatalf("expected TURN candidate rotation for %q", err)
+		}
+	}
+
+	for _, err := range []error{
+		nil,
+		errors.New("TURN Allocate: error 508 Insufficient Capacity"),
+		errors.New("401 Unauthorized"),
+		errors.New("use of closed network connection"),
+	} {
+		if shouldRotateTurnCandidateAfterSessionError(err) {
+			t.Fatalf("unexpected TURN candidate rotation for %v", err)
+		}
 	}
 }
 

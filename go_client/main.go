@@ -355,7 +355,7 @@ func main() {
 	hashFallback := flag.Bool(
 		"hash-fallback",
 		false,
-		"использовать остальные VK-хеши как резерв единственной группы",
+		"использовать остальные VK-хеши как резерв групп",
 	)
 
 	deviceID := flag.String("device-id", "unknown", "уникальный ID устройства")
@@ -515,7 +515,7 @@ func main() {
 	}
 	*numW = (*numW / workersPerGroup) * workersPerGroup
 	useConfigFirstStart := *configFirstStart
-	useHashFallback := *hashFallback && *numW == workersPerGroup
+	useHashFallback := *hashFallback
 
 	var masqueManager *warpMasqueManager
 	if *turnStreamFirst && *rtMasque {

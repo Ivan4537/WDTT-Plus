@@ -2855,6 +2855,44 @@ class SettingsStore(context: Context) {
         }
     }
 
+    /**
+     * Flushes editable launch options for one exact profile before an access refresh.
+     * A remotely managed profile keeps its connection endpoint and secret exclusively
+     * under the atomic remote-document transaction; stale UI state must never write
+     * those fields back after a server move.
+     */
+    suspend fun saveTunnelOptionsBeforeStart(
+        profileIndex: Int,
+        peer: String,
+        preserveManagedConnection: Boolean,
+        vkHashes: String,
+        secondaryVkHash: String,
+        workersPerHash: Int,
+        protocol: String,
+        listenPort: Int,
+        sni: String = "",
+        noDns: Boolean = false,
+        captchaMode: String,
+        captchaSolveMethod: String,
+    ) {
+        val profile = profileIndex.coerceIn(0, VPN_PROFILE_COUNT - 1)
+        dataStore.edit { prefs ->
+            val managedNow = prefs[getProfileKey(REMOTE_MANAGED_PROFILE, profile)] == true
+            if (!(preserveManagedConnection || managedNow)) {
+                prefs[getProfileKey(PEER, profile)] = peer
+            }
+            prefs[getProfileKey(VK_HASHES, profile)] = vkHashes
+            prefs[getProfileKey(SECONDARY_VK_HASH, profile)] = secondaryVkHash
+            prefs[getProfileKey(WORKERS_PER_HASH, profile)] = workersPerHash
+            prefs[getProfileKey(PROTOCOL, profile)] = protocol
+            prefs[getProfileKey(LISTEN_PORT, profile)] = listenPort
+            prefs[getProfileKey(SNI, profile)] = sni
+            prefs[getProfileKey(NO_DNS, profile)] = noDns
+            prefs[getProfileKey(CAPTCHA_MODE, profile)] = captchaMode
+            prefs[getProfileKey(CAPTCHA_SOLVE_METHOD, profile)] = captchaSolveMethod
+        }
+    }
+
     suspend fun applyImportedServerConnection(
         profileIndex: Int,
         host: String,

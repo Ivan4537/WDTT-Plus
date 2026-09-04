@@ -163,6 +163,45 @@ func TestInitDBPreservesStoredDNSWithoutExplicitOverride(t *testing.T) {
 	}
 }
 
+func TestBotRuntimeCredentialsComeFromProtectedDatabaseAfterUpdate(t *testing.T) {
+	oldDB, oldDBFile := db, dbFile
+	t.Cleanup(func() {
+		db, dbFile = oldDB, oldDBFile
+	})
+	dir := t.TempDir()
+	stored := testDatabase("owner-secret", 0)
+	stored.BotToken = "stored-bot-token"
+	stored.AdminID = "123456"
+	if err := persistDatabaseFile(filepath.Join(dir, "passwords.json"), stored); err != nil {
+		t.Fatal(err)
+	}
+
+	// Version 16+ starts without secret command-line flags. The already stored
+	// values must still activate the internal bot after the service restarts.
+	if err := initDB(dir, "", "", "", ""); err != nil {
+		t.Fatalf("restart with stored bot credentials failed: %v", err)
+	}
+	token, adminID := botRuntimeCredentials()
+	if token != "stored-bot-token" || adminID != "123456" {
+		t.Fatalf("stored bot credentials were not selected: token=%t admin=%q", token != "", adminID)
+	}
+}
+
+func TestBotRuntimeCredentialsUseExplicitFirstInstallValues(t *testing.T) {
+	oldDB, oldDBFile := db, dbFile
+	t.Cleanup(func() {
+		db, dbFile = oldDB, oldDBFile
+	})
+	dir := t.TempDir()
+	if err := initDB(dir, "owner-secret", "654321", "first-install-token", ""); err != nil {
+		t.Fatalf("first install failed: %v", err)
+	}
+	token, adminID := botRuntimeCredentials()
+	if token != "first-install-token" || adminID != "654321" {
+		t.Fatalf("first-install bot credentials were not selected: token=%t admin=%q", token != "", adminID)
+	}
+}
+
 func TestInitDBValidatesExplicitDNSOverride(t *testing.T) {
 	oldDB, oldDBFile := db, dbFile
 	t.Cleanup(func() {

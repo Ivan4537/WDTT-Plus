@@ -18,6 +18,8 @@ class DeployDataSafetyTest {
         assertTrue("legacy free-form process arguments remain", "WDTT_ARGS" !in script)
         assertTrue("preserve mode must keep the whole config tree", "всё содержимое /etc/wdtt сохранено" in script)
         assertTrue("existing database reset guard is missing", "Найдена существующая база WDTT" in script)
+        assertTrue("deploy mode must be explicit", "WDTT_INSTALL_MODE" in script)
+        assertTrue("fresh install must reject new traces", "после проверки появились следы WDTT" in script)
         assertTrue("staged server version is not checked before replacement", "staged_version" in script)
         assertTrue("failed service start does not fail deployment", "Сервис wdtt не прошёл проверку запуска" in script)
     }
@@ -34,8 +36,34 @@ class DeployDataSafetyTest {
         assertFalse("legacy reset phrase must not clutter the main dialog", "Для сброса введите СБРОСИТЬ" in source)
         assertTrue(
             "managed Android reset must prepare rollback",
-            "mode == DeployMode.ResetAll && ownership == DeploymentOwnership.AndroidDeploy" in source
+            "DeploymentOwnership.IncompleteAndroidDeploy" in source &&
+                "prepareServerUpdateRollback(ssh)" in source
         )
+    }
+
+    @Test
+    fun `fresh and preserving deploy modes cannot be confused`() {
+        assertDeploymentMayBeUpdated(DeploymentOwnership.NoInstall, DeployMode.FreshInstall)
+        assertDeploymentMayBeUpdated(DeploymentOwnership.AndroidDeploy, DeployMode.PreserveData)
+        assertDeploymentMayBeUpdated(DeploymentOwnership.LegacyAndroidDeploy, DeployMode.PreserveData)
+        assertDeploymentMayBeUpdated(DeploymentOwnership.IncompleteAndroidDeploy, DeployMode.ResetAll)
+
+        assertFails { assertDeploymentMayBeUpdated(DeploymentOwnership.NoInstall, DeployMode.PreserveData) }
+        assertFails { assertDeploymentMayBeUpdated(DeploymentOwnership.AndroidDeploy, DeployMode.FreshInstall) }
+        assertFails { assertDeploymentMayBeUpdated(DeploymentOwnership.UnknownExisting, DeployMode.FreshInstall) }
+        assertFails { assertDeploymentMayBeUpdated(DeploymentOwnership.StandaloneInstaller, DeployMode.PreserveData) }
+        assertFails { assertDeploymentMayBeUpdated(DeploymentOwnership.LegacyAndroidDeploy, DeployMode.ResetAll) }
+        assertFails { assertDeploymentMayBeUpdated(DeploymentOwnership.IncompleteAndroidDeploy, DeployMode.PreserveData) }
+    }
+
+    private fun assertFails(block: () -> Unit) {
+        var failed = false
+        try {
+            block()
+        } catch (_: IllegalStateException) {
+            failed = true
+        }
+        assertTrue("unsafe deployment mode was accepted", failed)
     }
 
     @Test

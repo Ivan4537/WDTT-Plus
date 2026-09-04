@@ -161,10 +161,26 @@ func sessionTURNCandidatesWithPreference(
 	tp *TurnParams,
 	preferStream bool,
 ) []turnEndpoint {
+	return sessionTURNCandidatesForAttempt(rawURLs, sessionID, 0, tp, preferStream)
+}
+
+// sessionTURNCandidatesForAttempt rotates only the first TURN candidate after
+// a relay accepted Allocate but did not carry the following DTLS handshake.
+// The initial attempt keeps the historical endpoint order unchanged.
+func sessionTURNCandidatesForAttempt(
+	rawURLs []string,
+	sessionID int,
+	retryOffset int,
+	tp *TurnParams,
+	preferStream bool,
+) []turnEndpoint {
 	if len(rawURLs) == 0 {
 		return nil
 	}
-	selectedIndex := sessionID % len(rawURLs)
+	if retryOffset < 0 {
+		retryOffset = 0
+	}
+	selectedIndex := (sessionID + retryOffset) % len(rawURLs)
 	if selectedIndex < 0 {
 		selectedIndex = 0
 	}

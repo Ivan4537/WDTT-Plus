@@ -87,6 +87,11 @@ internal fun displayedTunnelProfile(
  */
 internal fun shouldUseConfigFirstStart(): Boolean = true
 
+internal fun shouldUseManagedHashFallback(
+    profileMaxWorkers: Int,
+    hashCount: Int,
+): Boolean = profileMaxWorkers >= TUNNEL_WORKERS_PER_GROUP && hashCount > 1
+
 suspend fun buildTunnelParamsFromSettings(
     context: Context,
     profileIndex: Int? = null,
@@ -173,8 +178,11 @@ internal fun buildTunnelParams(saved: TunnelProfileSnapshot): TunnelParams? {
     }
 }
 
-suspend fun buildTunnelStartIntentFromSettings(context: Context): Intent? {
-    val params = buildTunnelParamsFromSettings(context) ?: return null
+suspend fun buildTunnelStartIntentFromSettings(
+    context: Context,
+    profileIndex: Int? = null,
+): Intent? {
+    val params = buildTunnelParamsFromSettings(context, profileIndex) ?: return null
     return Intent(context, TunnelService::class.java).apply {
         action = "START"
         putExtra("peer", params.peer)

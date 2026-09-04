@@ -157,6 +157,22 @@ class ServerMigrationTest {
     }
 
     @Test
+    fun updateFrom16To17RequiresServerMigration() {
+        val result = resolveServerMigrationInitialization(
+            currentVersionCode = 17,
+            isUpdatedInstall = true,
+            storedLastSeenAppVersionCode = 16,
+            storedPendingLevel = 16,
+            storedAcknowledgedLevel = 16,
+            legacyAcknowledgedLevel = 5
+        )
+
+        assertEquals(17, result.pendingLevel)
+        assertEquals(16, result.acknowledgedLevel)
+        assertEquals(17, latestServerMigrationLevel(17))
+    }
+
+    @Test
     fun reinstallSameVersionDoesNotCreateServerMigrationNotice() {
         val result = resolveServerMigrationInitialization(
             currentVersionCode = 16,

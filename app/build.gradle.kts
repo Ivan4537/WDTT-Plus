@@ -46,7 +46,7 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
-val appVersionName = "16"
+val appVersionName = "17"
 val releaseApkBaseName = "WDTT-Plus"
 
 val localProperties = Properties()
@@ -90,7 +90,7 @@ android {
         applicationId = "com.wdtt.plus"
         minSdk = 28
         targetSdk = 35
-        versionCode = 16
+        versionCode = 17
         versionName = appVersionName
         buildConfigField("String", "MOD_RELEASE_DATE", "\"04.09.2026\"")
         buildConfigField("String", "WDTT_PLUS_DOMAIN", buildConfigString(wdttPlusDomain))

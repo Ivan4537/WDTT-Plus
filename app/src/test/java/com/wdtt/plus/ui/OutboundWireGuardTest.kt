@@ -322,6 +322,7 @@ class OutboundWireGuardTest {
         assertTrue("WDTT_ANDROID_DEPLOY_MANAGED=1" in script)
         assertTrue("Managed by WDTT Plus Android deploy" in script)
         assertTrue("WDTT_LEGACY_ANDROID_DEPLOY_CANDIDATE=1" in script)
+        assertTrue("WDTT_INCOMPLETE_ANDROID_DEPLOY_CANDIDATE=1" in script)
         assertTrue("WDTT_INSTALL_TRACE=1" in script)
         assertTrue("-config-dir[[:space:]]+/etc/wdtt" in script)
         assertTrue("grep -Fq 'wdtt0'" in script)
@@ -337,6 +338,7 @@ class OutboundWireGuardTest {
         assertEquals(1, Regex("(?m)^WDTT_STANDALONE_MANAGED=[01]$").findAll(output).count())
         assertEquals(1, Regex("(?m)^WDTT_ANDROID_DEPLOY_MANAGED=[01]$").findAll(output).count())
         assertEquals(1, Regex("(?m)^WDTT_LEGACY_ANDROID_DEPLOY_CANDIDATE=[01]$").findAll(output).count())
+        assertEquals(1, Regex("(?m)^WDTT_INCOMPLETE_ANDROID_DEPLOY_CANDIDATE=[01]$").findAll(output).count())
         assertEquals(1, Regex("(?m)^WDTT_INSTALL_TRACE=[01]$").findAll(output).count())
         deploymentOwnershipFromProbe(output)
     }
@@ -381,6 +383,21 @@ class OutboundWireGuardTest {
             )
         )
         assertFalse(existingInstallAllowsReset(ownership = legacy, checkSucceeded = true))
+
+        val incomplete = existingInstallOwnershipFromFlags(
+            standaloneManaged = false,
+            androidDeployManaged = false,
+            legacyAndroidDeployCandidate = false,
+            incompleteAndroidDeployCandidate = true
+        )
+        assertFalse(
+            existingInstallAllowsPreservingUpdate(
+                ownership = incomplete,
+                checkSucceeded = true
+            )
+        )
+        assertTrue(existingInstallAllowsReset(ownership = incomplete, checkSucceeded = true))
+        assertFalse(existingInstallAllowsReset(ownership = incomplete, checkSucceeded = false))
 
         val android = existingInstallOwnershipFromFlags(
             standaloneManaged = false,
@@ -431,6 +448,49 @@ class OutboundWireGuardTest {
     }
 
     @Test
+    fun ownershipProbe_allowsOnlyExactInterruptedAndroidFootprintToBeReset() {
+        val root = Files.createTempDirectory("wdtt-incomplete-owner-probe").toFile()
+        try {
+            val config = File(root, "etc/wdtt")
+            config.mkdirs()
+            assertTrue(config.setReadable(false, false))
+            assertTrue(config.setWritable(false, false))
+            assertTrue(config.setExecutable(false, false))
+            assertTrue(config.setReadable(true, true))
+            assertTrue(config.setWritable(true, true))
+            assertTrue(config.setExecutable(true, true))
+            val database = File(config, "passwords.json")
+            database.writeText("{\"passwords\":{},\"devices\":{}}\n")
+            assertTrue(database.setReadable(false, false))
+            assertTrue(database.setWritable(false, false))
+            assertTrue(database.setExecutable(false, false))
+            assertTrue(database.setReadable(true, true))
+            assertTrue(database.setWritable(true, true))
+
+            fun probe(): DeploymentOwnership {
+                val process = ProcessBuilder(
+                    "bash",
+                    "-c",
+                    standaloneInstallerOwnershipProbeScript(root.absolutePath)
+                ).redirectErrorStream(true).start()
+                val output = process.inputStream.bufferedReader().use { it.readText() }
+                assertEquals(0, process.waitFor())
+                return deploymentOwnershipFromProbe(output)
+            }
+
+            val incomplete = probe()
+            assertEquals(DeploymentOwnership.IncompleteAndroidDeploy, incomplete)
+            assertFalse(existingInstallAllowsPreservingUpdate(incomplete, checkSucceeded = true))
+            assertTrue(existingInstallAllowsReset(incomplete, checkSucceeded = true))
+
+            File(config, "foreign.conf").writeText("do-not-touch\n")
+            assertEquals(DeploymentOwnership.UnknownExisting, probe())
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
     fun deploymentOwnership_allowsOnlyStrictLegacyAndroidShapeForPreserveMigration() {
         assertEquals(
             DeploymentOwnership.LegacyAndroidDeploy,
@@ -439,6 +499,7 @@ class OutboundWireGuardTest {
                 WDTT_STANDALONE_MANAGED=0
                 WDTT_ANDROID_DEPLOY_MANAGED=0
                 WDTT_LEGACY_ANDROID_DEPLOY_CANDIDATE=1
+                WDTT_INCOMPLETE_ANDROID_DEPLOY_CANDIDATE=0
                 WDTT_INSTALL_TRACE=1
                 """.trimIndent()
             )
@@ -450,6 +511,7 @@ class OutboundWireGuardTest {
                 WDTT_STANDALONE_MANAGED=0
                 WDTT_ANDROID_DEPLOY_MANAGED=0
                 WDTT_LEGACY_ANDROID_DEPLOY_CANDIDATE=0
+                WDTT_INCOMPLETE_ANDROID_DEPLOY_CANDIDATE=0
                 WDTT_INSTALL_TRACE=1
                 """.trimIndent()
             )
@@ -461,6 +523,7 @@ class OutboundWireGuardTest {
                 WDTT_STANDALONE_MANAGED=0
                 WDTT_ANDROID_DEPLOY_MANAGED=0
                 WDTT_LEGACY_ANDROID_DEPLOY_CANDIDATE=0
+                WDTT_INCOMPLETE_ANDROID_DEPLOY_CANDIDATE=0
                 WDTT_INSTALL_TRACE=0
                 """.trimIndent()
             )

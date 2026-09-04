@@ -38,7 +38,7 @@ new_sandbox() {
 make_fake_binary() {
     local target="$1"
     local build_id="$2"
-    local reported_version="${3:-16}"
+    local reported_version="${3:-17}"
     cat >"$target" <<EOF
 #!/usr/bin/env bash
 if [[ "\${1:-}" == "--version" ]]; then
@@ -140,7 +140,7 @@ test_help_and_syntax() {
     output="$(mktemp /tmp/wdtt-installer-menu.XXXXXX)"
     bash -n "$INSTALLER"
     "$INSTALLER" --help >"$output"
-    [[ "$("$INSTALLER" --version)" == "0.19.0" ]] ||
+    [[ "$("$INSTALLER" --version)" == "0.19.1" ]] ||
         fail "команда --version вернула неожиданный результат"
     ! grep -Fq "install.sh start" "$output" ||
         fail "справка показывает alias start как отдельный основной сценарий"
@@ -330,7 +330,7 @@ test_wizard_on_android_deploy_is_guidance_not_failure() {
     tr -d '\r' <"$output" >"$clean"
     grep -Fq "На сервере уже обнаружен совместимый Android-деплой." "$clean" ||
         fail "мастер не объяснил найденный Android-деплой"
-    grep -Fq "✓ Совместимость подтверждена: контракт 1, wdtt-server 16." "$clean" ||
+    grep -Fq "✓ Совместимость подтверждена: контракт 1, wdtt-server 17." "$clean" ||
         fail "мастер не показал краткую совместимость"
     grep -Fq "Сейчас изменений на сервере не выполнено." "$clean" ||
         fail "мастер не подтвердил отсутствие изменений"
@@ -1223,7 +1223,9 @@ test_parallel_installer_is_rejected() {
         exec 8>"$lock_path"
         flock -x 8
         printf 'locked\n' >"$lock_ready"
-        sleep 2
+        # Keep the lock long enough for slow/loaded CI hosts to reach the
+        # competing invocation without turning this into a timing race.
+        sleep 10
     ) &
     locker=$!
     for ((attempt = 0; attempt < 100; attempt++)); do
@@ -1598,20 +1600,20 @@ test_installer_version_difference_triggers_update() {
 
     run_installer "$root" install --binary "$binary" --yes >"$output"
 
-    grep -Fq "установщик:  0.19.0" "$output" ||
+    grep -Fq "установщик:  0.19.1" "$output" ||
         fail "план не показал версию запущенного установщика"
     grep -Fq "установлен:  0.2.0" "$output" ||
         fail "план не показал прежнюю установленную версию"
-    grep -Fxq "installer_version=0.19.0" "$ownership" ||
+    grep -Fxq "installer_version=0.19.1" "$ownership" ||
         fail "повтор не обновил версию в метке владения"
     find "$root/var/lib/wdtt-server-installer/backups" -mindepth 1 -maxdepth 1 \
         -type d | grep -q . ||
         fail "различие версий ошибочно обработано как no-op"
 
     run_installer "$root" status >"$output"
-    grep -Fq "Версия этого установщика: 0.19.0" "$output" ||
+    grep -Fq "Версия этого установщика: 0.19.1" "$output" ||
         fail "status не показывает версию файла"
-    grep -Fq "Установлено версией: 0.19.0" "$output" ||
+    grep -Fq "Установлено версией: 0.19.1" "$output" ||
         fail "status не показывает установленную версию"
     grep -Fq "Версии установщика: совпадают" "$output" ||
         fail "status не сравнивает версии"
@@ -1631,7 +1633,7 @@ test_rejects_incompatible_server_version() {
     make_config "$config" "SafeOwnerPassword42"
 
     expect_failure "$output" run_installer "$root" check --binary "$binary" --config "$config"
-    grep -Fq "Поддерживается wdtt-server версии 16" "$output" ||
+    grep -Fq "Поддерживается wdtt-server версии 17" "$output" ||
         fail "несовместимая версия сервера отклонена без понятной ошибки"
     pass "несовместимая версия wdtt-server отклоняется"
 }

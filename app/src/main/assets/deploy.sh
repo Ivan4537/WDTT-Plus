@@ -2,20 +2,22 @@
 # ==============================================================================
 #  WDTT Plus Server — Универсальный установщик для VPS
 #  Поддержка: Debian 11+, Ubuntu 20.04+, CentOS/RHEL/Fedora/AlmaLinux/Rocky
-#  Версия: 3.9  |  Дата: 2026-09-02
+#  Версия: 3.10  |  Дата: 2026-09-04
 #  NAT:  MASQUERADE через iptables
 #  WG:   порт 56001 (не конфликтует с существующим WG на 51820)
 #  DTLS: порт 56000
 # ==============================================================================
 set -euo pipefail
 
-readonly SCRIPT_VERSION="3.9"
+readonly SCRIPT_VERSION="3.10"
 readonly WDTT_DEPLOY_CONTRACT_VERSION="1"
-readonly WDTT_SERVER_VERSION="16"
+readonly WDTT_SERVER_VERSION="17"
 readonly WDTT_SERVER_BINARY_PATH="/usr/local/bin/wdtt-server"
 readonly WDTT_SYSTEMD_UNIT_PATH="/etc/systemd/system/wdtt.service"
 readonly WDTT_ANDROID_DEPLOY_MARKER="Managed by WDTT Plus Android deploy"
 readonly WDTT_ANDROID_CONTRACT_MARKER="WDTT deploy compatibility: 1"
+readonly WDTT_STANDALONE_MARKER="Managed by WDTT Plus standalone server installer"
+readonly WDTT_STANDALONE_OWNERSHIP_PATH="/var/lib/wdtt-server-installer/ownership"
 readonly LOG_FILE="/var/log/wdtt-install.log"
 readonly WG_PORT="${WDTT_WG_PORT:-56001}"
 readonly DTLS_PORT="${WDTT_DTLS_PORT:-56000}"
@@ -27,6 +29,7 @@ readonly HANDSHAKE_RATE="${WDTT_HANDSHAKE_RATE:-24}"
 readonly MAX_CLIENT_MBPS="${WDTT_MAX_CLIENT_MBPS:-0}"
 readonly WG_BACKEND="${WDTT_WG_BACKEND:-auto}"
 readonly WDTT_PRESERVE_DATA="${WDTT_PRESERVE_DATA:-0}"
+readonly WDTT_INSTALL_MODE="${WDTT_INSTALL_MODE:-}"
 readonly WDTT_IFACE="wdtt0"
 readonly WDTT_CONFIG_DIR="/etc/wdtt"
 readonly WDTT_ACCESS_DB="passwords.json"
@@ -387,6 +390,43 @@ secure_preserved_config() {
 
 validate_deploy_data_mode() {
     local database="$WDTT_CONFIG_DIR/$WDTT_ACCESS_DB"
+    case "$WDTT_INSTALL_MODE" in
+        fresh)
+            [ "$WDTT_PRESERVE_DATA" = "0" ] ||
+                die "Первичная установка несовместима с режимом сохранения"
+            if [ -e "$WDTT_SYSTEMD_UNIT_PATH" ] || [ -e "$WDTT_SERVER_BINARY_PATH" ] ||
+               [ -e "$WDTT_CONFIG_DIR" ]; then
+                die "Первичная установка остановлена: после проверки появились следы WDTT"
+            fi
+            ;;
+        preserve)
+            [ "$WDTT_PRESERVE_DATA" = "1" ] ||
+                die "Обновление с сохранением запущено без защиты данных"
+            if [ -f "$WDTT_STANDALONE_OWNERSHIP_PATH" ] &&
+               grep -Fqx "${WDTT_STANDALONE_MARKER}" "$WDTT_STANDALONE_OWNERSHIP_PATH"; then
+                die "Обновление остановлено: сервер управляется standalone-инсталлером"
+            fi
+            [ -f "$WDTT_SYSTEMD_UNIT_PATH" ] && [ ! -L "$WDTT_SYSTEMD_UNIT_PATH" ] &&
+              [ -x "$WDTT_SERVER_BINARY_PATH" ] && [ ! -L "$WDTT_SERVER_BINARY_PATH" ] &&
+              [ -d "$WDTT_CONFIG_DIR" ] && [ ! -L "$WDTT_CONFIG_DIR" ] ||
+                die "Обновление остановлено: признаки Android-установки изменились после проверки"
+            if ! grep -Fqx "# ${WDTT_ANDROID_DEPLOY_MARKER}" "$WDTT_SYSTEMD_UNIT_PATH"; then
+                [ -f "$WDTT_CONFIG_DIR/$WDTT_WG_KEYS" ] &&
+                  [ ! -L "$WDTT_CONFIG_DIR/$WDTT_WG_KEYS" ] &&
+                  grep -Eq '^ExecStart=/usr/local/bin/wdtt-server([[:space:]]|$)' "$WDTT_SYSTEMD_UNIT_PATH" &&
+                  grep -Eq '(^|[[:space:]])-config-dir[[:space:]]+/etc/wdtt([[:space:]]|$)' "$WDTT_SYSTEMD_UNIT_PATH" &&
+                  grep -Fq 'wdtt0' "$WDTT_SYSTEMD_UNIT_PATH" ||
+                    die "Обновление остановлено: не удалось подтвердить старую Android-установку"
+            fi
+            ;;
+        reset)
+            [ "$WDTT_PRESERVE_DATA" = "0" ] ||
+                die "Полный сброс несовместим с режимом сохранения"
+            ;;
+        *)
+            die "Приложение не указало безопасный режим установки"
+            ;;
+    esac
     if [ -e "$database" ] && [ "$WDTT_PRESERVE_DATA" != "1" ]; then
         die "Найдена существующая база WDTT. Обновление разрешено только в режиме сохранения; явный сброс должен заранее удалить старую базу после подтверждения в приложении."
     fi

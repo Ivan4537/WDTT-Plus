@@ -387,6 +387,7 @@ func RunSession(
 	deviceID, password, deviceInfo, transportSession string,
 	stats *Stats,
 	preferTURNStream bool,
+	turnCandidateRetry int,
 	onTURNAllocated func(),
 ) (bool, error) {
 	configDelivered := false
@@ -394,9 +395,10 @@ func RunSession(
 	if len(creds.TurnURLs) == 0 {
 		return false, fmt.Errorf("нет TURN URL в учетных данных")
 	}
-	candidates := sessionTURNCandidatesWithPreference(
+	candidates := sessionTURNCandidatesForAttempt(
 		creds.TurnURLs,
 		sessionID,
+		turnCandidateRetry,
 		tp,
 		preferTURNStream,
 	)
