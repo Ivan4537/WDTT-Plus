@@ -1034,16 +1034,17 @@ private class AdminSshClient(private val session: Session, private val sudoPassw
 
     fun execRootWithStdin(command: String, stdinPayload: String, timeout: Long): String {
         val isRoot = session.userName == "root"
-        if (!isRoot) {
-            exec("sudo -S -p '' -v", 20_000L, sudoPassword + "\n")
-        }
         val quoted = "'" + command.replace("'", "'\"'\"'") + "'"
         val rootCommand = if (isRoot) {
             "bash -c $quoted"
         } else {
-            "sudo -n bash -c $quoted"
+            "sudo -S -p '' bash -c $quoted"
         }
-        return exec(rootCommand, timeout, stdinPayload)
+        // sudo authentication timestamps are not shared between separate SSH exec channels
+        // on every server. Keep authentication and the stdin-based WDTT admin request in
+        // this one channel: sudo consumes the first line and wdtt-server receives the rest.
+        val payload = if (isRoot) stdinPayload else "$sudoPassword\n$stdinPayload"
+        return exec(rootCommand, timeout, payload)
     }
 
     fun exec(command: String, timeout: Long): String = exec(command, timeout, null)
