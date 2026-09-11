@@ -55,6 +55,8 @@ class VpnWidgetProvider : AppWidgetProvider() {
                 trustedWifiWaiting = trustedWifi.waiting,
             )
             val profileNames = settingsStore.profileNames.first()
+            val configuredMode = settingsStore.proxyMode.first()
+            val displayedMode = if (running) TunnelManager.activeMode.value else configuredMode
             val accessLifecycle =
                 settingsStore.accessLifecycleForProfile(displayedProfile).toUiState()
             for (appWidgetId in appWidgetIds) {
@@ -67,6 +69,7 @@ class VpnWidgetProvider : AppWidgetProvider() {
                     activeProfile = displayedProfile,
                     profileNames = profileNames,
                     accessLifecycle = accessLifecycle,
+                    tunnelMode = displayedMode,
                 )
             }
         }
@@ -78,16 +81,22 @@ class VpnWidgetProvider : AppWidgetProvider() {
             runCatching {
                 val running = TunnelManager.running.value
                 val trustedWifiWaiting = TrustedWifiManager.state.value.waiting
-                val action = if (running || trustedWifiWaiting) {
-                    TunnelToggleAction.STOP
-                } else {
-                    tunnelToggleAction(
+                if (running || trustedWifiWaiting) {
+                    context.startService(
+                        Intent(context, TunnelService::class.java).apply { action = "STOP" }
+                    )
+                    updateAllWidgets(context)
+                    return
+                }
+                scope.launch {
+                    val mode = SettingsStore(context).proxyMode.first()
+                    val action = tunnelToggleAction(
                         running = false,
                         trustedWifiWaiting = false,
-                        vpnPermissionRequired = VpnService.prepare(context) != null,
+                        vpnPermissionRequired = tunnelModeNeedsVpnPermission(mode) &&
+                            VpnService.prepare(context) != null,
                     )
-                }
-                when (action) {
+                    when (action) {
                     TunnelToggleAction.STOP -> {
                         context.startService(
                             Intent(context, TunnelService::class.java).apply { this.action = "STOP" }
@@ -102,7 +111,7 @@ class VpnWidgetProvider : AppWidgetProvider() {
                         ).show()
                         openMainActivity(context)
                     }
-                    TunnelToggleAction.START -> scope.launch {
+                    TunnelToggleAction.START -> {
                         try {
                             val startIntent = buildTunnelStartIntentFromSettings(context)
                             if (startIntent == null) {
@@ -129,6 +138,7 @@ class VpnWidgetProvider : AppWidgetProvider() {
                             ).show()
                         }
                     }
+                    }
                 }
             }.onFailure { e ->
                 Log.e("VpnWidget", "Error handling widget click", e)
@@ -145,6 +155,7 @@ class VpnWidgetProvider : AppWidgetProvider() {
         activeProfile: Int,
         profileNames: List<String>,
         accessLifecycle: AccessLifecycleUiState,
+        tunnelMode: String,
     ) {
         val views = RemoteViews(context.packageName, R.layout.vpn_widget)
 
@@ -156,7 +167,7 @@ class VpnWidgetProvider : AppWidgetProvider() {
             views.setInt(R.id.widget_toggle_btn, "setBackgroundResource", R.drawable.bg_widget_button_inactive)
         } else if (running) {
             val profileName = vpnProfileDisplayName(activeProfile, profileNames)
-            val status = "Подключено к $profileName"
+            val status = fullWidgetRunningStatus(tunnelMode, profileName)
             views.setTextViewText(R.id.widget_status, status)
             views.setTextColor(R.id.widget_status, 0xFF00E5FF.toInt()) // Неоновый голубой
             views.setInt(R.id.widget_toggle_btn, "setBackgroundResource", R.drawable.bg_widget_button_active)
@@ -205,6 +216,10 @@ class VpnWidgetProvider : AppWidgetProvider() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
         views.setOnClickPendingIntent(R.id.widget_toggle_btn, togglePendingIntent)
+        views.setContentDescription(
+            R.id.widget_toggle_btn,
+            tunnelToggleContentDescription(running && !trustedWifi.waiting, tunnelMode),
+        )
 
         appWidgetManager.updateAppWidget(appWidgetId, views)
     }

@@ -16,6 +16,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
 class QuickToggleTileService : TileService() {
@@ -47,6 +48,8 @@ class QuickToggleTileService : TileService() {
                     )
                 }.combine(settingsStore.activeAccessLifecycle) { state, accessLifecycle ->
                     state.copy(accessLifecycle = accessLifecycle)
+                }.combine(TunnelManager.activeMode) { state, tunnelMode ->
+                    state.copy(tunnelMode = tunnelMode)
                 }.collect { uiState ->
                     updateTile(uiState)
                 }
@@ -66,31 +69,35 @@ class QuickToggleTileService : TileService() {
         runCatching {
             val running = TunnelManager.running.value
             val trustedWifiWaiting = TrustedWifiManager.state.value.waiting
-            val action = if (running || trustedWifiWaiting) {
-                TunnelToggleAction.STOP
-            } else {
-                tunnelToggleAction(
+            if (running || trustedWifiWaiting) {
+                startService(Intent(this, TunnelService::class.java).apply { action = "STOP" })
+                return
+            }
+            scope.launch {
+                val mode = SettingsStore(this@QuickToggleTileService).proxyMode.first()
+                val action = tunnelToggleAction(
                     running = false,
                     trustedWifiWaiting = false,
-                    vpnPermissionRequired = VpnService.prepare(this) != null,
+                    vpnPermissionRequired = tunnelModeNeedsVpnPermission(mode) &&
+                        VpnService.prepare(this@QuickToggleTileService) != null,
                 )
-            }
-            when (action) {
+                when (action) {
                 TunnelToggleAction.STOP -> {
                     // Состояние плитки изменится после фактической остановки службы.
                     startService(
-                        Intent(this, TunnelService::class.java).apply { this.action = "STOP" }
+                        Intent(this@QuickToggleTileService, TunnelService::class.java)
+                            .setAction("STOP")
                     )
                 }
                 TunnelToggleAction.REQUEST_VPN_PERMISSION -> {
                     Toast.makeText(
-                        this,
+                        this@QuickToggleTileService,
                         "Откройте WDTT Plus и выдайте VPN-разрешение",
                         Toast.LENGTH_LONG
                     ).show()
                     openMainActivity()
                 }
-                TunnelToggleAction.START -> scope.launch {
+                TunnelToggleAction.START -> {
                     try {
                         val intent = buildTunnelStartIntentFromSettings(this@QuickToggleTileService)
                         if (intent == null) {
@@ -116,6 +123,7 @@ class QuickToggleTileService : TileService() {
                             Toast.LENGTH_SHORT
                         ).show()
                     }
+                }
                 }
             }
         }.onFailure { e ->
@@ -159,7 +167,7 @@ class QuickToggleTileService : TileService() {
                 if (Build.VERSION.SDK_INT >= 29) {
                     subtitle = when {
                         waiting -> uiState.trustedWifi.ssid.ifBlank { "Wi-Fi" }
-                        running -> ""
+                        running -> tunnelModeStatusLabel(uiState.tunnelMode)
                         accessBlocked -> uiState.accessLifecycle.title
                             .ifBlank { uiState.accessLifecycle.fallbackTitle() }
                         else -> "Отключено"
@@ -179,6 +187,7 @@ class QuickToggleTileService : TileService() {
         val activeTunnelProfile: Int?,
         val profileNames: List<String>,
         val accessLifecycle: AccessLifecycleUiState,
+        val tunnelMode: String = TUNNEL_MODE_VPN,
     )
 
     @SuppressLint("StartActivityAndCollapseDeprecated")

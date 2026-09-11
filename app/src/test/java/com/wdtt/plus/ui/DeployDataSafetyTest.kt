@@ -9,6 +9,48 @@ import org.junit.Test
 
 class DeployDataSafetyTest {
     @Test
+    fun `single owner profile difference is shown without a whole-profile warning`() {
+        assertEquals(
+            listOf("Потоки на хеш: сервер — 36, приложение — 27"),
+            ownerProfileOverwriteLines(
+                listOf("Потоки на хеш: сервер — 36, приложение — 27"),
+            ),
+        )
+        assertEquals(
+            listOf(
+                "Поля профиля владельца («Туннель» и порты):",
+                "  Потоки на хеш: сервер — 36, приложение — 27",
+                "  Протокол: сервер — tcp, приложение — udp",
+            ),
+            ownerProfileOverwriteLines(
+                listOf(
+                    "Потоки на хеш: сервер — 36, приложение — 27",
+                    "Протокол: сервер — tcp, приложение — udp",
+                ),
+            ),
+        )
+    }
+
+    @Test
+    fun `deploy ssh never binds the app socket to its own android vpn network`() {
+        val sourceRoot = sequenceOf(
+            File("app/src/main/java/com/wdtt/plus"),
+            File("src/main/java/com/wdtt/plus")
+        ).first(File::isDirectory)
+        val deploySources = sourceRoot.walkTopDown()
+            .filter { it.isFile && it.extension in setOf("kt", "java") }
+            .joinToString("\n") { it.readText() }
+
+        assertFalse("own-VPN Network socket binding reintroduces EPERM", "network.socketFactory" in deploySources)
+        assertFalse("removed SSH VPN socket factory was restored", "WdttVpnSocketFactory" in deploySources)
+        assertFalse("removed SSH VPN network selector was restored", "WdttVpnSshFallback" in deploySources)
+        assertTrue(
+            "safe Deploy operations must use the typed in-tunnel relay",
+            "executeDeploySafeRequest" in deploySources && "DEPLOY_SAFE|" in deploySources,
+        )
+    }
+
+    @Test
     fun `deploy script keeps all config and never accepts secret process arguments`() {
         val script = sequenceOf(
             File("app/src/main/assets/deploy.sh"),
@@ -39,6 +81,21 @@ class DeployDataSafetyTest {
             "DeploymentOwnership.IncompleteAndroidDeploy" in source &&
                 "prepareServerUpdateRollback(ssh)" in source
         )
+    }
+
+    @Test
+    fun `server removal offers independently guarded preserve and full modes`() {
+        val source = sequenceOf(
+            File("app/src/main/java/com/wdtt/plus/ui/DeployTab.kt"),
+            File("src/main/java/com/wdtt/plus/ui/DeployTab.kt")
+        ).first(File::isFile).readText()
+
+        assertTrue("Удалить сервер, сохранить данные" in source)
+        assertTrue("Удалить полностью" in source)
+        assertTrue("server-uninstall-preserve" in source)
+        assertTrue("server-uninstall-all" in source)
+        assertTrue("WDTT_UNINSTALL_DATA" in source)
+        assertTrue("WDTT_ROOT_ACCESS" in source)
     }
 
     @Test

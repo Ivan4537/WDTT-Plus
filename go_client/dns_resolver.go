@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -31,6 +33,18 @@ type dnsRouteProbe struct {
 
 type directDNSProbe func(context.Context, dnsRoute, time.Duration) error
 type systemDNSProbe func(context.Context, *net.Resolver, time.Duration) error
+
+type peerEndpoint struct {
+	Host    string
+	Port    int
+	Literal net.IP
+}
+
+type peerIPLookup func(context.Context, string) ([]net.IPAddr, error)
+type peerResolveAttempt func(context.Context, peerEndpoint) (*net.UDPAddr, error)
+type peerRetryWait func(context.Context, time.Duration) error
+
+const peerDNSLookupTimeout = 1800 * time.Millisecond
 
 func setupGlobalResolver() {
 	systemResolver := deviceSystemResolver
@@ -164,4 +178,159 @@ func shortDNSError(err error) string {
 		return text[:120] + "…"
 	}
 	return text
+}
+
+func parsePeerEndpoint(value string) (peerEndpoint, error) {
+	host, portText, err := net.SplitHostPort(strings.TrimSpace(value))
+	if err != nil {
+		return peerEndpoint{}, fmt.Errorf("некорректный адрес сервера: %w", err)
+	}
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return peerEndpoint{}, errors.New("адрес сервера не содержит имя или IP")
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return peerEndpoint{}, errors.New("адрес сервера содержит некорректный порт")
+	}
+	endpoint := peerEndpoint{Host: host, Port: port}
+	if literal := net.ParseIP(host); literal != nil {
+		literal = literal.To4()
+		if literal == nil {
+			return peerEndpoint{}, errors.New("адрес сервера должен использовать IPv4")
+		}
+		endpoint.Literal = literal
+	}
+	return endpoint, nil
+}
+
+func peerDNSLookups() []peerIPLookup {
+	lookups := make([]peerIPLookup, 0, 6)
+	appendResolver := func(resolver *net.Resolver) {
+		if resolver == nil {
+			return
+		}
+		lookups = append(lookups, resolver.LookupIPAddr)
+	}
+	appendResolver(net.DefaultResolver)
+	if deviceSystemResolver != net.DefaultResolver {
+		appendResolver(deviceSystemResolver)
+	}
+	for _, route := range []dnsRoute{
+		{Network: "udp", Address: "77.88.8.8:53"},
+		{Network: "udp", Address: "77.88.8.1:53"},
+		{Network: "tcp", Address: "77.88.8.8:53"},
+		{Network: "tcp", Address: "77.88.8.1:53"},
+	} {
+		appendResolver(fixedDNSResolver(route))
+	}
+	return lookups
+}
+
+func resolvePeerUDPAddrOnceWithLookups(
+	ctx context.Context,
+	endpoint peerEndpoint,
+	lookups []peerIPLookup,
+) (*net.UDPAddr, error) {
+	if endpoint.Literal != nil {
+		return &net.UDPAddr{IP: append(net.IP(nil), endpoint.Literal...), Port: endpoint.Port}, nil
+	}
+	if len(lookups) == 0 {
+		return nil, errors.New("нет доступных DNS-маршрутов")
+	}
+	var lastErr error
+	for _, lookup := range lookups {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		lookupCtx, cancel := context.WithTimeout(ctx, peerDNSLookupTimeout)
+		addresses, err := lookup(lookupCtx, endpoint.Host)
+		cancel()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		for _, address := range addresses {
+			if ipv4 := address.IP.To4(); ipv4 != nil {
+				return &net.UDPAddr{IP: append(net.IP(nil), ipv4...), Port: endpoint.Port}, nil
+			}
+		}
+		lastErr = errors.New("DNS-ответ не содержит IPv4")
+	}
+	if lastErr == nil {
+		lastErr = errors.New("пустой DNS-ответ")
+	}
+	return nil, lastErr
+}
+
+func peerDNSRetryDelay(attempt int) time.Duration {
+	switch {
+	case attempt <= 1:
+		return 2 * time.Second
+	case attempt == 2:
+		return 4 * time.Second
+	case attempt == 3:
+		return 8 * time.Second
+	default:
+		return 15 * time.Second
+	}
+}
+
+func waitForRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func waitForPeerUDPAddrWith(
+	ctx context.Context,
+	endpoint peerEndpoint,
+	resolve peerResolveAttempt,
+	wait peerRetryWait,
+	onWaiting func(int, error),
+) (*net.UDPAddr, int, error) {
+	for attempt := 1; ; attempt++ {
+		peer, err := resolve(ctx, endpoint)
+		if err == nil {
+			return peer, attempt - 1, nil
+		}
+		if ctx.Err() != nil {
+			return nil, attempt - 1, ctx.Err()
+		}
+		if onWaiting != nil {
+			onWaiting(attempt, err)
+		}
+		if err := wait(ctx, peerDNSRetryDelay(attempt)); err != nil {
+			return nil, attempt, err
+		}
+	}
+}
+
+func waitForPeerUDPAddr(ctx context.Context, endpoint peerEndpoint) (*net.UDPAddr, error) {
+	lookups := peerDNSLookups()
+	peer, failures, err := waitForPeerUDPAddrWith(
+		ctx,
+		endpoint,
+		func(resolveCtx context.Context, value peerEndpoint) (*net.UDPAddr, error) {
+			return resolvePeerUDPAddrOnceWithLookups(resolveCtx, value, lookups)
+		},
+		waitForRetry,
+		func(attempt int, _ error) {
+			if attempt == 1 || attempt%4 == 0 {
+				log.Printf("PEER_DNS_WAIT|%s", endpoint.Host)
+			}
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	if failures > 0 {
+		log.Printf("PEER_DNS_READY|%s|%s", endpoint.Host, peer.IP.String())
+	}
+	return peer, nil
 }

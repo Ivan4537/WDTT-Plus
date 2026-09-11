@@ -33,7 +33,6 @@ func TestVKCallsUsesVkMeAPIWithCompatibilityFallback(t *testing.T) {
 
 func TestVKCallsPreflightRetryClassification(t *testing.T) {
 	for _, err := range []error{
-		&VkCaptchaError{ErrorCode: 14},
 		errors.New("temporary network failure"),
 	} {
 		if !shouldRetryVKCallsPreflight(err) {
@@ -41,6 +40,7 @@ func TestVKCallsPreflightRetryClassification(t *testing.T) {
 		}
 	}
 	for _, err := range []error{
+		&VkCaptchaError{ErrorCode: 14},
 		fmt.Errorf("%w: rate limited", errVKCallsFlood),
 		errors.New("INVALID_JOIN_LINK"),
 		errors.New("ANON_BLOCKED"),

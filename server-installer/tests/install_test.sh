@@ -119,6 +119,30 @@ EOF
     chmod 0644 "$root/etc/systemd/system/wdtt.service"
 }
 
+make_preserved_android_data() {
+    local root="$1"
+    local password="$2"
+    local dns="${3:-1.1.1.1}"
+    local max_passwords="${4:-50}"
+    local ports="${5:-56000,56001,9000}"
+    mkdir -p "$root/etc/wdtt"
+    chmod 0700 "$root/etc/wdtt"
+    make_config_with_settings \
+        "$root/etc/wdtt/passwords.json" "$password" "$dns" "$max_passwords" "$ports"
+    printf '%s\n%s\n%s\n%s\n' \
+        'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=' \
+        'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=' \
+        'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=' \
+        'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=' \
+        >"$root/etc/wdtt/wg-keys.dat"
+    chmod 0600 "$root/etc/wdtt/wg-keys.dat"
+    printf '%s\n' 'preserved operator setting' >"$root/etc/wdtt/operator-state"
+    chmod 0600 "$root/etc/wdtt/operator-state"
+    printf '%s\n' 'Preserved by WDTT Plus Android deploy' \
+        >"$root/etc/wdtt/.android-deploy-preserved"
+    chmod 0600 "$root/etc/wdtt/.android-deploy-preserved"
+}
+
 run_installer() {
     local root="$1"
     shift
@@ -140,7 +164,7 @@ test_help_and_syntax() {
     output="$(mktemp /tmp/wdtt-installer-menu.XXXXXX)"
     bash -n "$INSTALLER"
     "$INSTALLER" --help >"$output"
-    [[ "$("$INSTALLER" --version)" == "0.19.1" ]] ||
+    [[ "$("$INSTALLER" --version)" == "0.20.0" ]] ||
         fail "команда --version вернула неожиданный результат"
     ! grep -Fq "install.sh start" "$output" ||
         fail "справка показывает alias start как отдельный основной сценарий"
@@ -165,6 +189,35 @@ test_help_and_syntax() {
         grep -Eq '(^|:)56000$' ||
         fail "формат ss не позволяет проверить локальный UDP-порт"
     pass "синтаксис и справка"
+}
+
+test_large_disk_value_is_checked_without_awk_overflow() {
+    local sandbox root binary config fake_bin output
+    new_sandbox
+    sandbox="$NEW_SANDBOX"
+    root="$sandbox/root"
+    binary="$sandbox/wdtt-server"
+    config="$sandbox/initial.json"
+    fake_bin="$sandbox/fake-bin"
+    output="$sandbox/check.out"
+    mkdir -p "$root" "$fake_bin"
+    make_fake_binary "$binary" "large-disk"
+    make_config "$config" "SafeOwnerPassword42"
+    cat >"$fake_bin/df" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' \
+    'Filesystem 1024-blocks Used Available Capacity Mounted on' \
+    '/dev/test 1000000000000000000 1 999999999999999999 1% /'
+EOF
+    chmod 0755 "$fake_bin/df"
+
+    PATH="$fake_bin:$PATH" run_installer "$root" check \
+        --binary "$binary" --config "$config" >"$output"
+    ! grep -Fq "Не удалось проверить свободное место" "$output" ||
+        fail "большое целое значение df ошибочно отклонено"
+    ! grep -Fq '{print $4 * 1024}' "$INSTALLER" ||
+        fail "проверка диска по-прежнему умножает значение внутри awk"
+    pass "большой объём диска проверяется без переполнения awk"
 }
 
 test_menu_stays_open_after_failed_doctor() {
@@ -514,6 +567,182 @@ test_android_deploy_requires_explicit_adoption() {
         "$root/var/lib/wdtt-server-installer/ownership" ||
         fail "ручное обновление утратило standalone-владение"
     pass "Android-установка принимается явно и затем обновляется ручным установщиком"
+}
+
+test_preserved_android_data_requires_explicit_adoption() {
+    local sandbox root binary output database_before keys_before state_before
+    new_sandbox
+    sandbox="$NEW_SANDBOX"
+    root="$sandbox/root"
+    binary="$sandbox/standalone-server"
+    output="$sandbox/output"
+    mkdir -p "$root"
+    make_fake_binary "$binary" "standalone-from-preserved"
+    make_preserved_android_data \
+        "$root" "SafeOwnerPassword42" "9.9.9.9" 77 "56200,56201,9200"
+    database_before="$(sha256sum "$root/etc/wdtt/passwords.json" | awk '{print $1}')"
+    keys_before="$(sha256sum "$root/etc/wdtt/wg-keys.dat" | awk '{print $1}')"
+    state_before="$(sha256sum "$root/etc/wdtt/operator-state" | awk '{print $1}')"
+
+    run_installer "$root" check --binary "$binary" >"$output"
+    grep -Fq "Обнаружены сохранённые Android-данные без установленной службы" "$output" ||
+        fail "check не распознал сохранённые Android-данные"
+    run_installer "$root" doctor >"$output"
+    grep -Fq "Android сохранил данные без службы" "$output" ||
+        fail "doctor не объяснил безопасное состояние сохранённых Android-данных"
+    ! grep -Fq "✗ состояние установки" "$output" ||
+        fail "doctor ошибочно считает сохранённые Android-данные повреждённой установкой"
+    expect_failure "$output" run_installer "$root" install --binary "$binary" --yes
+    grep -Fq "adopt-android" "$output" ||
+        fail "обычный install не потребовал явного принятия сохранённых Android-данных"
+
+    run_installer "$root" adopt-android --binary "$binary" --yes >/dev/null
+
+    [[ "$("$root/usr/local/bin/wdtt-server" --build-id)" == "standalone-from-preserved" ]] ||
+        fail "принятие сохранённых Android-данных не установило новый бинарник"
+    grep -Fqx '# Managed by WDTT Plus standalone server installer' \
+        "$root/etc/systemd/system/wdtt.service" ||
+        fail "принятие сохранённых Android-данных не установило standalone unit"
+    grep -Fq -- '-listen 0.0.0.0:56200 -wg-port 56201' \
+        "$root/etc/systemd/system/wdtt.service" ||
+        fail "принятие сохранённых Android-данных не восстановило DTLS/WireGuard-порты из базы"
+    grep -Fq -- '-dns 9.9.9.9' "$root/etc/systemd/system/wdtt.service" ||
+        fail "принятие сохранённых Android-данных не восстановило DNS из базы"
+    [[ "$(jq -r '.max_passwords' "$root/etc/wdtt/passwords.json")" == "77" ]] ||
+        fail "принятие сохранённых Android-данных изменило лимит клиентов"
+    [[ "$(jq -r '.default_ports' "$root/etc/wdtt/passwords.json")" == "56200,56201,9200" ]] ||
+        fail "принятие сохранённых Android-данных изменило сохранённые порты"
+    grep -Fqx 'Managed by WDTT Plus standalone server installer' \
+        "$root/var/lib/wdtt-server-installer/ownership" ||
+        fail "принятие сохранённых Android-данных не создало метку владения"
+    [[ ! -e "$root/etc/wdtt/.android-deploy-preserved" ]] ||
+        fail "после успешного принятия осталась Android-метка сохранённых данных"
+    [[ -f "$root/var/lib/wdtt-server-installer/.test-service-active" ]] ||
+        fail "восстановленная служба не запущена"
+    [[ -f "$root/var/lib/wdtt-server-installer/.test-service-enabled" ]] ||
+        fail "восстановленная служба не включена"
+    [[ "$(sha256sum "$root/etc/wdtt/passwords.json" | awk '{print $1}')" == "$database_before" ]] ||
+        fail "принятие сохранённых Android-данных изменило базу"
+    [[ "$(sha256sum "$root/etc/wdtt/wg-keys.dat" | awk '{print $1}')" == "$keys_before" ]] ||
+        fail "принятие сохранённых Android-данных изменило WireGuard-ключи"
+    [[ "$(sha256sum "$root/etc/wdtt/operator-state" | awk '{print $1}')" == "$state_before" ]] ||
+        fail "принятие сохранённых Android-данных изменило дополнительный файл"
+    pass "сохранённые Android-данные принимаются только явно и без потерь"
+}
+
+test_failed_preserved_android_adoption_restores_data_only_state() {
+    local sandbox root binary output database_before keys_before state_before
+    new_sandbox
+    sandbox="$NEW_SANDBOX"
+    root="$sandbox/root"
+    binary="$sandbox/standalone-server"
+    output="$sandbox/output"
+    mkdir -p "$root"
+    make_fake_binary "$binary" "standalone-failing"
+    make_preserved_android_data "$root" "SafeOwnerPassword42"
+    database_before="$(sha256sum "$root/etc/wdtt/passwords.json" | awk '{print $1}')"
+    keys_before="$(sha256sum "$root/etc/wdtt/wg-keys.dat" | awk '{print $1}')"
+    state_before="$(sha256sum "$root/etc/wdtt/operator-state" | awk '{print $1}')"
+
+    expect_failure "$output" env \
+        WDTT_INSTALLER_TEST_MODE=1 \
+        WDTT_INSTALLER_TEST_ROOT="$root" \
+        WDTT_INSTALLER_TEST_FAIL_AT=files_replaced \
+        "$INSTALLER" adopt-android --binary "$binary" --yes
+
+    [[ ! -e "$root/usr/local/bin/wdtt-server" ]] ||
+        fail "откат принятия сохранённых данных оставил бинарник"
+    [[ ! -e "$root/etc/systemd/system/wdtt.service" ]] ||
+        fail "откат принятия сохранённых данных оставил unit"
+    [[ ! -e "$root/var/lib/wdtt-server-installer/ownership" ]] ||
+        fail "откат принятия сохранённых данных оставил standalone-владение"
+    grep -Fxq 'Preserved by WDTT Plus Android deploy' \
+        "$root/etc/wdtt/.android-deploy-preserved" ||
+        fail "откат не восстановил точную Android-метку сохранённых данных"
+    [[ "$(sha256sum "$root/etc/wdtt/passwords.json" | awk '{print $1}')" == "$database_before" ]] ||
+        fail "откат принятия сохранённых данных изменил базу"
+    [[ "$(sha256sum "$root/etc/wdtt/wg-keys.dat" | awk '{print $1}')" == "$keys_before" ]] ||
+        fail "откат принятия сохранённых данных изменил WireGuard-ключи"
+    [[ "$(sha256sum "$root/etc/wdtt/operator-state" | awk '{print $1}')" == "$state_before" ]] ||
+        fail "откат принятия сохранённых данных изменил дополнительный файл"
+    [[ ! -e "$root/var/lib/wdtt-server-installer/transaction" ]] ||
+        fail "после отката принятия сохранённых данных остался журнал"
+    run_installer "$root" check --binary "$binary" >/dev/null ||
+        fail "после отката сохранённые Android-данные больше не распознаются"
+    pass "ошибка принятия точно возвращает состояние без службы и бинарника"
+}
+
+test_preserved_android_data_rejects_forged_or_unsafe_marker() {
+    local sandbox root binary output marker target
+    new_sandbox
+    sandbox="$NEW_SANDBOX"
+    root="$sandbox/root"
+    binary="$sandbox/standalone-server"
+    output="$sandbox/output"
+    marker="$root/etc/wdtt/.android-deploy-preserved"
+    target="$sandbox/marker-target"
+    mkdir -p "$root"
+    make_fake_binary "$binary" "standalone-safe"
+    make_preserved_android_data "$root" "SafeOwnerPassword42"
+
+    printf '%s\n' 'forged marker' >"$marker"
+    chmod 0600 "$marker"
+    expect_failure "$output" run_installer "$root" adopt-android --binary "$binary" --yes
+    [[ ! -e "$root/usr/local/bin/wdtt-server" && ! -e "$root/etc/systemd/system/wdtt.service" ]] ||
+        fail "поддельная метка позволила изменить сервер"
+
+    printf '%s\n%s\n' \
+        'Preserved by WDTT Plus Android deploy' \
+        'unexpected extra content' >"$marker"
+    chmod 0600 "$marker"
+    expect_failure "$output" run_installer "$root" adopt-android --binary "$binary" --yes
+    [[ ! -e "$root/usr/local/bin/wdtt-server" && ! -e "$root/etc/systemd/system/wdtt.service" ]] ||
+        fail "метка с лишним содержимым позволила изменить сервер"
+
+    printf '%s\n' 'Preserved by WDTT Plus Android deploy' >"$target"
+    chmod 0600 "$target"
+    rm -f "$marker"
+    ln -s "$target" "$marker"
+    expect_failure "$output" run_installer "$root" adopt-android --binary "$binary" --yes
+    [[ ! -e "$root/usr/local/bin/wdtt-server" && ! -e "$root/etc/systemd/system/wdtt.service" ]] ||
+        fail "symlink метки позволил изменить сервер"
+    pass "поддельная и небезопасная метка сохранённых данных отклоняются"
+}
+
+test_interrupted_preserved_android_adoption_recovers_before_retry() {
+    local sandbox root binary output database_before keys_before
+    new_sandbox
+    sandbox="$NEW_SANDBOX"
+    root="$sandbox/root"
+    binary="$sandbox/standalone-server"
+    output="$sandbox/output"
+    mkdir -p "$root"
+    make_fake_binary "$binary" "standalone-interrupted"
+    make_preserved_android_data "$root" "SafeOwnerPassword42"
+    database_before="$(sha256sum "$root/etc/wdtt/passwords.json" | awk '{print $1}')"
+    keys_before="$(sha256sum "$root/etc/wdtt/wg-keys.dat" | awk '{print $1}')"
+
+    expect_failure "$output" env \
+        WDTT_INSTALLER_TEST_MODE=1 \
+        WDTT_INSTALLER_TEST_ROOT="$root" \
+        WDTT_INSTALLER_TEST_FAIL_AT=files_replaced \
+        WDTT_INSTALLER_TEST_LEAVE_TRANSACTION=1 \
+        "$INSTALLER" adopt-android --binary "$binary" --yes
+    [[ -f "$root/var/lib/wdtt-server-installer/transaction" ]] ||
+        fail "прерванное принятие сохранённых данных не оставило журнал"
+
+    make_fake_binary "$binary" "standalone-retry"
+    run_installer "$root" adopt-android --binary "$binary" --yes >/dev/null
+
+    [[ "$("$root/usr/local/bin/wdtt-server" --build-id)" == "standalone-retry" ]] ||
+        fail "повтор не установил бинарник после восстановления прерванного принятия"
+    [[ ! -e "$root/var/lib/wdtt-server-installer/transaction" ]] ||
+        fail "после повторного принятия остался журнал"
+    [[ "$(sha256sum "$root/etc/wdtt/passwords.json" | awk '{print $1}')" == "$database_before" ]] ||
+        fail "восстановление прерванного принятия изменило базу"
+    [[ "$(sha256sum "$root/etc/wdtt/wg-keys.dat" | awk '{print $1}')" == "$keys_before" ]] ||
+        fail "восстановление прерванного принятия изменило WireGuard-ключи"
+    pass "прерванное принятие сохранённых Android-данных восстанавливается и повторяется"
 }
 
 test_android_backup_history_survives_adoption() {
@@ -1600,20 +1829,20 @@ test_installer_version_difference_triggers_update() {
 
     run_installer "$root" install --binary "$binary" --yes >"$output"
 
-    grep -Fq "установщик:  0.19.1" "$output" ||
+    grep -Fq "установщик:  0.20.0" "$output" ||
         fail "план не показал версию запущенного установщика"
     grep -Fq "установлен:  0.2.0" "$output" ||
         fail "план не показал прежнюю установленную версию"
-    grep -Fxq "installer_version=0.19.1" "$ownership" ||
+    grep -Fxq "installer_version=0.20.0" "$ownership" ||
         fail "повтор не обновил версию в метке владения"
     find "$root/var/lib/wdtt-server-installer/backups" -mindepth 1 -maxdepth 1 \
         -type d | grep -q . ||
         fail "различие версий ошибочно обработано как no-op"
 
     run_installer "$root" status >"$output"
-    grep -Fq "Версия этого установщика: 0.19.1" "$output" ||
+    grep -Fq "Версия этого установщика: 0.20.0" "$output" ||
         fail "status не показывает версию файла"
-    grep -Fq "Установлено версией: 0.19.1" "$output" ||
+    grep -Fq "Установлено версией: 0.20.0" "$output" ||
         fail "status не показывает установленную версию"
     grep -Fq "Версии установщика: совпадают" "$output" ||
         fail "status не сравнивает версии"
@@ -2050,8 +2279,9 @@ test_state_directory_permissions_are_checked() {
     pass "небезопасные права каталога состояния блокируют действия"
 }
 
-printf '1..63\n'
+printf '1..68\n'
 test_help_and_syntax
+test_large_disk_value_is_checked_without_awk_overflow
 test_menu_stays_open_after_failed_doctor
 test_menu_firewall_settings_are_russian
 test_menu_russian_back_key_works
@@ -2064,6 +2294,10 @@ test_first_install_keeps_secrets_out_of_unit
 test_owned_update_preserves_database
 test_refuses_foreign_install
 test_android_deploy_requires_explicit_adoption
+test_preserved_android_data_requires_explicit_adoption
+test_failed_preserved_android_adoption_restores_data_only_state
+test_preserved_android_data_rejects_forged_or_unsafe_marker
+test_interrupted_preserved_android_adoption_recovers_before_retry
 test_android_backup_history_survives_adoption
 test_android_adoption_requires_current_contract_marker
 test_failed_android_adoption_restores_legacy_owner

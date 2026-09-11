@@ -54,6 +54,8 @@ class VpnCompactWidgetProvider : AppWidgetProvider() {
             )
             val profileNames = settingsStore.profileNames.first()
             val profileName = vpnProfileDisplayName(displayedProfile, profileNames)
+            val configuredMode = settingsStore.proxyMode.first()
+            val displayedMode = if (running) TunnelManager.activeMode.value else configuredMode
             val accessLifecycle =
                 settingsStore.accessLifecycleForProfile(displayedProfile).toUiState()
             val accessBlocked =
@@ -75,8 +77,13 @@ class VpnCompactWidgetProvider : AppWidgetProvider() {
                         waiting -> "Ожидание"
                         accessBlocked ->
                             accessLifecycle.title.ifBlank { accessLifecycle.fallbackTitle() }
+                        running -> compactWidgetRunningStatus(displayedMode, profileName)
                         else -> profileName
                     }
+                )
+                views.setContentDescription(
+                    R.id.compact_widget_toggle,
+                    tunnelToggleContentDescription(running && !waiting, displayedMode),
                 )
 
                 val toggleIntent = Intent(context, VpnWidgetProvider::class.java).apply {

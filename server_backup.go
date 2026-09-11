@@ -42,6 +42,7 @@ const (
 var (
 	serverBackupIDPattern      = regexp.MustCompile(`^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$`)
 	serverBackupVersionPattern = regexp.MustCompile(`^[0-9A-Za-z._-]{1,32}$`)
+	serverBackupRequestMu      sync.Mutex
 	serverBackupMu             sync.Mutex
 )
 
@@ -297,18 +298,24 @@ func captureServerBackupFiles(configDir string, loaded *Database) ([]serverBacku
 	if loaded == nil {
 		return nil, 0, 0, errors.New("база WDTT не загружена")
 	}
-	if err := persistDatabaseFile(filepath.Join(configDir, "passwords.json"), loaded); err != nil {
-		return nil, 0, 0, fmt.Errorf("не удалось зафиксировать базу перед резервным копированием: %w", err)
+	// loaded is an immutable point-in-time copy. Encoding it directly avoids
+	// writing an older snapshot back over a newer live passwords.json.
+	databaseData, err := marshalDatabase(loaded)
+	if err != nil {
+		return nil, 0, 0, fmt.Errorf("не удалось зафиксировать базу для резервного копирования: %w", err)
 	}
 
 	files := make([]serverBackupFile, 0, 4)
-	var total int64
+	total := int64(len(databaseData))
+	if total > maxDatabaseFileBytes {
+		return nil, 0, 0, errors.New("база WDTT превышает допустимый размер резервной копии")
+	}
+	files = append(files, backupFileFromBytes("passwords.json", 0600, databaseData))
 	for _, item := range []struct {
 		name     string
 		required bool
 		limit    int64
 	}{
-		{name: "passwords.json", required: true, limit: maxDatabaseFileBytes},
 		{name: "wg-keys.dat", required: true, limit: 4096},
 		{name: "outbound-profile.env", required: false, limit: 2 << 20},
 	} {
@@ -322,11 +329,6 @@ func captureServerBackupFiles(configDir string, loaded *Database) ([]serverBacku
 		}
 		if mode.Perm() != 0600 {
 			return nil, 0, 0, fmt.Errorf("резервируемый файл должен иметь права 600: %s", path)
-		}
-		if item.name == "passwords.json" {
-			if _, err := decodeDatabase(data); err != nil {
-				return nil, 0, 0, fmt.Errorf("база не прошла проверку перед резервным копированием: %w", err)
-			}
 		}
 		if item.name == "wg-keys.dat" {
 			if err := validateBackupWGKeys(data); err != nil {
@@ -1024,8 +1026,14 @@ func startServerBackupScheduler(ctx context.Context, configDir string) {
 					continue
 				}
 				dbMutex.Lock()
-				_, err = createServerBackup(configDir, db, "scheduled")
+				databaseSnapshot, snapshotErr := cloneDatabaseForBackup(db)
 				dbMutex.Unlock()
+				if snapshotErr != nil {
+					continue
+				}
+				serverBackupRequestMu.Lock()
+				_, err = createServerBackup(configDir, databaseSnapshot, "scheduled")
+				serverBackupRequestMu.Unlock()
 				if err != nil {
 					// createServerBackup records a bounded error in its state when possible.
 					continue
@@ -1033,4 +1041,12 @@ func startServerBackupScheduler(ctx context.Context, configDir string) {
 			}
 		}
 	}()
+}
+
+func cloneDatabaseForBackup(source *Database) (*Database, error) {
+	data, err := marshalDatabase(source)
+	if err != nil {
+		return nil, err
+	}
+	return decodeDatabase(data)
 }

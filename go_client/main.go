@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -32,6 +33,8 @@ type nativeStartupSecrets struct {
 	ConnectionPassword   string `json:"connection_password"`
 	CustomVKClientID     string `json:"custom_vk_client_id"`
 	CustomVKClientSecret string `json:"custom_vk_client_secret"`
+	SocksUsername        string `json:"socks_username,omitempty"`
+	SocksPassword        string `json:"socks_password,omitempty"`
 }
 
 type nativeStartupConfigResult struct {
@@ -282,6 +285,8 @@ func main() {
 
 	var pauseFlag int32
 	var activeDispatcher atomic.Pointer[Dispatcher]
+	var transportLifecycleMu sync.Mutex
+	deviceSleeping := false
 	startupConfigCh := make(chan nativeStartupConfigResult, 1)
 
 	// STDIN для конфигурации запуска, PAUSE/RESUME/STOP и CAPTCHA_RESULT.
@@ -289,7 +294,7 @@ func main() {
 	// прочитать системная диагностика Android.
 	go func() {
 		scanner := bufio.NewScanner(os.Stdin)
-		scanner.Buffer(make([]byte, 4096), 40*1024)
+		scanner.Buffer(make([]byte, 4096), 48*1024)
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
 			switch {
@@ -307,15 +312,80 @@ func main() {
 				log.Printf("[STDIN] Команда RESUME")
 				atomic.StoreInt32(&pauseFlag, 0)
 			case line == "DEVICE_SLEEP":
+				transportLifecycleMu.Lock()
+				deviceSleeping = true
 				if dispatcher := activeDispatcher.Load(); dispatcher != nil {
 					dispatcher.noteDeviceSleep()
 				}
+				transportLifecycleMu.Unlock()
 				log.Printf("[STDIN] Экран выключен, контроль сетевых тайм-аутов приостановлен")
 			case line == "DEVICE_WAKE":
+				transportLifecycleMu.Lock()
+				deviceSleeping = false
 				if dispatcher := activeDispatcher.Load(); dispatcher != nil {
 					dispatcher.noteDeviceWake(time.Now())
 				}
+				transportLifecycleMu.Unlock()
 				log.Printf("[STDIN] Экран включён, отправлена немедленная проверка каналов")
+			case strings.HasPrefix(line, updateMetadataCommandPrefix):
+				requestID := normalizeUpdateMetadataRequestID(strings.TrimPrefix(line, updateMetadataCommandPrefix))
+				dispatcher := activeDispatcher.Load()
+				if requestID == "" || dispatcher == nil {
+					printUpdateMetadataResult(requestID, nil, errors.New("рабочий канал WDTT ещё не готов"))
+					continue
+				}
+				go func() {
+					requestCtx, requestCancel := context.WithTimeout(ctx, 9*time.Second)
+					defer requestCancel()
+					payload, requestErr := dispatcher.requestUpdateMetadata(requestCtx, requestID)
+					printUpdateMetadataResult(requestID, payload, requestErr)
+				}()
+			case strings.HasPrefix(line, updateAPKCommandPrefix):
+				command, commandErr := parseUpdateAPKDownloadCommand(line)
+				dispatcher := activeDispatcher.Load()
+				if commandErr != nil || dispatcher == nil {
+					if commandErr == nil {
+						commandErr = errors.New("рабочий канал WDTT ещё не готов")
+					}
+					printUpdateAPKResult(command.requestID, commandErr)
+					continue
+				}
+				go func() {
+					requestCtx, requestCancel := context.WithTimeout(ctx, 20*time.Minute)
+					defer requestCancel()
+					printUpdateAPKResult(command.requestID, dispatcher.downloadUpdateAPK(requestCtx, command))
+				}()
+			case strings.HasPrefix(line, opaqueHTTPSCommandPrefix):
+				command, commandErr := parseOpaqueHTTPSCommand(line)
+				dispatcher := activeDispatcher.Load()
+				if commandErr != nil || dispatcher == nil {
+					if commandErr == nil {
+						commandErr = errors.New("рабочий канал WDTT ещё не готов")
+					}
+					printOpaqueHTTPSResult(command.requestID, nil, commandErr)
+					continue
+				}
+				go func() {
+					requestCtx, requestCancel := context.WithTimeout(ctx, 10*time.Second)
+					defer requestCancel()
+					payload, requestErr := dispatcher.requestOpaqueHTTPS(requestCtx, command)
+					printOpaqueHTTPSResult(command.requestID, payload, requestErr)
+				}()
+			case strings.HasPrefix(line, deploySafeCommandPrefix):
+				command, commandErr := parseDeploySafeCommand(line)
+				dispatcher := activeDispatcher.Load()
+				if commandErr != nil || dispatcher == nil {
+					if commandErr == nil {
+						commandErr = errors.New("рабочий канал WDTT ещё не готов")
+					}
+					printDeploySafeResult(command.requestID, commandErr)
+					continue
+				}
+				go func() {
+					requestCtx, requestCancel := context.WithTimeout(ctx, 3*time.Minute)
+					defer requestCancel()
+					printDeploySafeResult(command.requestID, dispatcher.executeDeploySafe(requestCtx, command))
+				}()
 			case line == "STOP":
 				log.Printf("[STDIN] Команда STOP")
 				cancel()
@@ -401,6 +471,16 @@ func main() {
 		false,
 		"получить секретные параметры запуска из stdin",
 	)
+	clientMode := flag.String("mode", "vpn", "режим выхода: vpn, auto, socks5 или http")
+	proxyListen := flag.String("proxy-listen", "127.0.0.1:1080", "основной адрес автоматического прокси")
+	proxyExtraListen := flag.String("proxy-extra-listen", "", "дополнительный точный IPv4-адрес прокси")
+	proxyAuth := flag.Bool("proxy-auth", false, "требовать логин и пароль автоматического прокси из stdin")
+	socksListen := flag.String("socks-listen", "127.0.0.1:1080", "локальный адрес SOCKS5")
+	socksUDP := flag.Bool("socks-udp", true, "разрешить SOCKS5 UDP ASSOCIATE")
+	socksAuth := flag.Bool("socks-auth", false, "требовать логин и пароль SOCKS5 из stdin")
+	httpListen := flag.String("http-listen", "127.0.0.1:8080", "локальный адрес HTTP CONNECT")
+	httpAuth := flag.Bool("http-auth", false, "требовать логин и пароль HTTP-прокси из stdin")
+	proxyAllowedCIDR := flag.String("proxy-allow-cidr", "", "разрешённая подсеть клиента для LAN-прокси")
 
 	flag.Parse()
 	var startupSecrets nativeStartupSecrets
@@ -417,6 +497,31 @@ func main() {
 			log.Fatal("[КЛИЕНТ] Конфигурация запуска из stdin не получена")
 		case <-ctx.Done():
 			return
+		}
+	}
+	normalizedClientMode := strings.ToLower(strings.TrimSpace(*clientMode))
+	if normalizedClientMode != "vpn" && normalizedClientMode != "auto" && normalizedClientMode != "socks5" && normalizedClientMode != "http" {
+		log.Fatal("[КЛИЕНТ] Режим должен быть vpn, auto, socks5 или http")
+	}
+	if normalizedClientMode != "vpn" {
+		primaryListen := *proxyListen
+		authEnabled := *proxyAuth
+		if normalizedClientMode == "socks5" {
+			primaryListen = *socksListen
+			authEnabled = *socksAuth
+		} else if normalizedClientMode == "http" {
+			primaryListen = *httpListen
+			authEnabled = *httpAuth
+		}
+		listenAddresses := []string{primaryListen}
+		if strings.TrimSpace(*proxyExtraListen) != "" {
+			listenAddresses = append(listenAddresses, *proxyExtraListen)
+		}
+		if _, _, err := validateProxyListenAddresses(listenAddresses, *proxyAllowedCIDR, authEnabled); err != nil {
+			log.Fatalf("[ПРОКСИ] %v", err)
+		}
+		if authEnabled && (startupSecrets.SocksUsername == "" || startupSecrets.SocksPassword == "") {
+			log.Fatal("[ПРОКСИ] Включена аутентификация, но логин или пароль отсутствует")
 		}
 	}
 	transportSession := normalizeTransportSession(*transportSessionFlag)
@@ -482,17 +587,16 @@ func main() {
 	}
 
 	cleanPeerAddr := strings.TrimSpace(*peerAddr)
-	var err error
-	var peer *net.UDPAddr
-	for i := 0; i < 15; i++ {
-		peer, err = net.ResolveUDPAddr("udp", cleanPeerAddr)
-		if err == nil {
-			break
-		}
-		time.Sleep(1 * time.Second)
-	}
+	peerEndpoint, err := parsePeerEndpoint(cleanPeerAddr)
 	if err != nil {
-		log.Fatalf("[КЛИЕНТ] Ошибка разбора пира: %v", err)
+		log.Fatalf("[КЛИЕНТ] Ошибка адреса сервера: %v", err)
+	}
+	peer, err := waitForPeerUDPAddr(ctx, peerEndpoint)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
+		log.Fatalf("[КЛИЕНТ] Не удалось определить адрес сервера: %v", err)
 	}
 
 	if *connPassword == "" {
@@ -611,7 +715,13 @@ func main() {
 	go stats.RunLoop(shutdownCh)
 
 	disp := NewDispatcher(ctx, localConn, stats)
+	disp.setUnansweredUserTrafficHealthEnabled(normalizedClientMode == "vpn")
+	transportLifecycleMu.Lock()
 	activeDispatcher.Store(disp)
+	if deviceSleeping {
+		disp.noteDeviceSleep()
+	}
+	transportLifecycleMu.Unlock()
 	defer disp.Shutdown()
 
 	configCh := make(chan string, 1)
@@ -634,6 +744,53 @@ func main() {
 					}
 				}
 				finalConf = strings.Join(newLines, "\n")
+			}
+			if normalizedClientMode == "auto" || normalizedClientMode == "socks5" || normalizedClientMode == "http" {
+				wgDevice, tunnelNetwork, err := startSocksWireGuard(finalConf)
+				if err != nil {
+					log.Printf("PROXY_ERROR|Не удалось запустить userspace WireGuard: %v", err)
+					cancel()
+					return
+				}
+				defer wgDevice.Close()
+				primaryListen := *proxyListen
+				authEnabled := *proxyAuth
+				if normalizedClientMode == "socks5" {
+					primaryListen = *socksListen
+					authEnabled = *socksAuth
+				} else if normalizedClientMode == "http" {
+					primaryListen = *httpListen
+					authEnabled = *httpAuth
+				}
+				listenAddresses := []string{primaryListen}
+				if strings.TrimSpace(*proxyExtraListen) != "" {
+					listenAddresses = append(listenAddresses, *proxyExtraListen)
+				}
+				err = runUnifiedProxyServer(
+					ctx,
+					normalizedClientMode,
+					listenAddresses,
+					netstackSocksDialer{network: tunnelNetwork},
+					authEnabled,
+					startupSecrets.SocksUsername,
+					startupSecrets.SocksPassword,
+					*socksUDP || normalizedClientMode == "auto",
+					*proxyAllowedCIDR,
+					func(addresses []string) {
+						log.Printf(
+							"PROXY_READY|%s|%s|udp=%t|auth=%t",
+							normalizedClientMode,
+							strings.Join(addresses, ","),
+							*socksUDP || normalizedClientMode == "auto",
+							authEnabled,
+						)
+					},
+				)
+				if err != nil && ctx.Err() == nil {
+					log.Printf("PROXY_ERROR|%v", err)
+					cancel()
+				}
+				return
 			}
 			fmt.Println()
 			fmt.Println("╔══════════════ WireGuard Конфиг ══════════════╗")

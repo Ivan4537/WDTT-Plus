@@ -47,7 +47,7 @@
         android:layout_centerVertical="true"
         android:background="@drawable/bg_widget_button_inactive"
         android:src="@drawable/ic_tile_logo"
-        android:contentDescription="Toggle VPN"
+        android:contentDescription="Включить или отключить соединение"
         android:padding="10dp"
         android:scaleType="fitCenter" />
 

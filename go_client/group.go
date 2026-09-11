@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"math/rand"
 	"net"
@@ -77,9 +78,9 @@ func workerHashCandidates(hashes []string, hashIndex, requestedWorkers int, fall
 	result := make([]string, 0, len(hashes))
 	result = append(result, hashes[primary])
 
-	// Prefer hashes that have no primary group. With 18 workers and four
-	// hashes this gives group 1 hash 3 as its first reserve and group 2 hash 4,
-	// so one degraded group does not move onto the other group's live hash.
+	// First prefer hashes that do not own a primary group for the selected
+	// worker count, then cycle through every other configured hash. This works
+	// for every supported combination of 9..108 workers and 1..4 hashes.
 	unusedCount := len(hashes) - primaryCount
 	for offset := 0; offset < unusedCount; offset++ {
 		index := primaryCount + (primary+offset)%unusedCount
@@ -509,10 +510,23 @@ func WorkerGroup(
 		return
 	}
 	if err != nil {
+		failedRetries := 0
 		for attempt := 2; err != nil; attempt++ {
 			if isTerminalGroupCredentialError(err) {
 				log.Printf("[ГРУППА #%d] Креды недоступны без восстановления: %v", groupID, err)
 				return
+			}
+			if failedRetries > 0 && selectedHash+1 < len(hashCandidates) &&
+				shouldRotateHashAfterRepeatedCredentialError(err) {
+				selectedHash++
+				hash = hashCandidates[selectedHash]
+				log.Printf(
+					"[ГРУППА #%d] Повтор текущего VK-хеша не помог; пробуем резерв %d из %d",
+					groupID,
+					selectedHash+1,
+					len(hashCandidates),
+				)
+				failedRetries = 0
 			}
 			delay := groupCredentialRetryDelay(err)
 			log.Printf("[ГРУППА #%d] Креды пока не получены: повтор %d через %v", groupID, attempt, delay)
@@ -523,6 +537,7 @@ func WorkerGroup(
 			}
 			credentials = fetchCredentials(hash)
 			user, pass, turnURLs, err = credentials.user, credentials.pass, credentials.turnURLs, credentials.err
+			failedRetries++
 		}
 	}
 	credsState := newGroupCredentialsState(Credentials{
@@ -800,6 +815,17 @@ func isHashFallbackCredentialError(err error) bool {
 	return strings.Contains(message, "INVALID_JOIN_LINK") ||
 		strings.Contains(message, "ANON_BLOCKED") ||
 		strings.Contains(message, "CALL_FULL")
+}
+
+func shouldRotateHashAfterRepeatedCredentialError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	message := strings.ToUpper(err.Error())
+	return !strings.Contains(message, "CAPTCHA_WAIT_REQUIRED") &&
+		!strings.Contains(message, "FATAL_CAPTCHA") &&
+		!strings.Contains(message, "FLOOD") &&
+		!strings.Contains(message, "FATAL_AUTH")
 }
 
 func hashRefreshOrder(current, total int, rotate bool) []int {

@@ -8,6 +8,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -122,7 +123,9 @@ object AccessLifecycleCoordinator {
                     } catch (cancelled: CancellationException) {
                         throw cancelled
                     } catch (error: Exception) {
-                        TunnelManager.noteAccessLifecycleEvent(
+                        noteAccessLifecycleEventIfRelevant(
+                            store = store,
+                            profile = profile,
                             key = "profile_${profile}_values_sync_failed",
                             message = error.message
                                 ?: "Не удалось обновить сохранённые данные профиля",
@@ -153,7 +156,9 @@ object AccessLifecycleCoordinator {
                     current.status?.allowConnect != received.allowConnect ||
                     current.status?.title != received.title
                 ) {
-                    TunnelManager.noteAccessLifecycleEvent(
+                    noteAccessLifecycleEventIfRelevant(
+                        store = store,
+                        profile = profile,
                         key = "profile_${profile}_decision",
                         message = received.title.ifBlank { "Состояние профиля обновлено" },
                         warning = received.severity != AccessLifecycleSeverity.NORMAL,
@@ -165,7 +170,7 @@ object AccessLifecycleCoordinator {
                 throw cancelled
             } catch (error: AccessLifecycleRequestException) {
                 if (!error.kind.authoritative) {
-                    return@withLock accessRefreshFailure(profile, current, error)
+                    return@withLock accessRefreshFailure(store, profile, current, error)
                 }
                 val denied = authoritativeAccessDenialStatus(
                     failure = error,
@@ -185,7 +190,9 @@ object AccessLifecycleCoordinator {
                     current.status?.allowConnect != denied.allowConnect ||
                     current.status?.title != denied.title
                 ) {
-                    TunnelManager.noteAccessLifecycleEvent(
+                    noteAccessLifecycleEventIfRelevant(
+                        store = store,
+                        profile = profile,
                         key = "profile_${profile}_${error.code}",
                         message = denied.title,
                         warning = true,
@@ -194,19 +201,22 @@ object AccessLifecycleCoordinator {
                 updateExternalSurfaces(appContext)
                 AccessLifecycleRefreshResult.Success(denied)
             } catch (error: Exception) {
-                accessRefreshFailure(profile, current, error)
+                accessRefreshFailure(store, profile, current, error)
             } finally {
                 setRefreshing(profile, false)
             }
         }
     }
 
-    private fun accessRefreshFailure(
+    private suspend fun accessRefreshFailure(
+        store: SettingsStore,
         profile: Int,
         current: StoredAccessLifecycle,
         error: Exception,
     ): AccessLifecycleRefreshResult.Failed {
-        TunnelManager.noteAccessLifecycleEvent(
+        noteAccessLifecycleEventIfRelevant(
+            store = store,
+            profile = profile,
             key = "profile_${profile}_check_failed",
             message = error.message ?: "Не удалось обновить сведения о доступе",
             warning = true,
@@ -517,12 +527,28 @@ object AccessLifecycleCoordinator {
         require(applied != null) { "Не удалось применить обновление профиля." }
         store.saveAppliedAccessProfileRevision(profile, update.revision)
         requestTunnelProfileRuntimeUpdate(profile)
-        TunnelManager.noteAccessLifecycleEvent(
+        noteAccessLifecycleEventIfRelevant(
+            store = store,
+            profile = profile,
             key = "profile_${profile}_updated",
             message = "Параметры профиля обновлены",
             warning = false,
         )
         return true
+    }
+
+    private suspend fun noteAccessLifecycleEventIfRelevant(
+        store: SettingsStore,
+        profile: Int,
+        key: String,
+        message: String,
+        warning: Boolean,
+    ) {
+        val selectedProfile = store.activeProfile.first().coerceIn(0, 2)
+        val connectedProfile = TunnelManager.activeTunnelProfile.value
+            .takeIf { TunnelManager.running.value }
+        if (profile != selectedProfile && profile != connectedProfile) return
+        TunnelManager.noteAccessLifecycleEvent(key, message, warning)
     }
 
     private fun androidDeviceLabel(): String {

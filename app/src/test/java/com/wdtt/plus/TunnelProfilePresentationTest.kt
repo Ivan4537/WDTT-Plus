@@ -1,8 +1,12 @@
 package com.wdtt.plus
 
 import com.wdtt.plus.ui.hasTunnelConnectionSource
-import com.wdtt.plus.ui.isSelectedCompactConnectionReady
 import com.wdtt.plus.ui.resolveConnectionInputMethod
+import com.wdtt.plus.ui.resolveTunnelStartReadiness
+import com.wdtt.plus.ui.selectedTunnelConnectionRequirements
+import com.wdtt.plus.ui.storedLinkConnectionRequirements
+import com.wdtt.plus.ui.TunnelConnectionRequirements
+import com.wdtt.plus.ui.TunnelStartIssueTarget
 import com.wdtt.plus.ui.usesCompactTunnelInterface
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -10,6 +14,58 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class TunnelProfilePresentationTest {
+    @Test
+    fun `start issues are ordered by the next actionable setting`() {
+        val readiness = resolveTunnelStartReadiness(
+            connectionConfigured = false,
+            hashesPresent = false,
+            hashesInvalid = false,
+            rtSniValid = false,
+            proxySettingsValid = false,
+        )
+        val issues = readiness.issues
+
+        assertFalse(readiness.canStart)
+        assertEquals(
+            listOf(
+                TunnelStartIssueTarget.CONNECTION,
+                TunnelStartIssueTarget.HASHES,
+                TunnelStartIssueTarget.PARAMETERS,
+                TunnelStartIssueTarget.PROXY_SETTINGS,
+            ),
+            issues.map { it.target },
+        )
+        assertTrue(issues[1].message.contains("хотя бы один ВК-хеш"))
+    }
+
+    @Test
+    fun `invalid hashes replace the missing hash message`() {
+        val issues = resolveTunnelStartReadiness(
+            connectionConfigured = true,
+            hashesPresent = true,
+            hashesInvalid = true,
+            rtSniValid = true,
+            proxySettingsValid = true,
+        ).issues
+
+        assertEquals(1, issues.size)
+        assertEquals(TunnelStartIssueTarget.HASHES, issues.single().target)
+        assertTrue(issues.single().message.contains("исправьте"))
+    }
+
+    @Test
+    fun `complete profile has no start issues`() {
+        assertTrue(
+            resolveTunnelStartReadiness(
+                connectionConfigured = true,
+                hashesPresent = true,
+                hashesInvalid = false,
+                rtSniValid = true,
+                proxySettingsValid = true,
+            ).canStart
+        )
+    }
+
     @Test
     fun `user role uses compact tunnel interface`() {
         assertTrue(usesCompactTunnelInterface("user"))
@@ -29,25 +85,25 @@ class TunnelProfilePresentationTest {
         assertEquals("link", resolveConnectionInputMethod("", true, false, false))
         assertEquals("link", resolveConnectionInputMethod("", true, true, true))
         assertEquals("manual", resolveConnectionInputMethod("", false, true, false))
+        val ready = TunnelConnectionRequirements(true, true, false)
+        val incomplete = TunnelConnectionRequirements(false, false, false)
         assertTrue(
-            isSelectedCompactConnectionReady(
+            selectedTunnelConnectionRequirements(
                 selectedMethod = "link",
                 savedMethod = "",
                 storedLinkMode = true,
-                linkPresent = true,
-                linkValid = true,
-                manualValid = false,
-            )
+                storedLink = ready,
+                manual = incomplete,
+            ).canStart
         )
         assertTrue(
-            isSelectedCompactConnectionReady(
+            selectedTunnelConnectionRequirements(
                 selectedMethod = "manual",
                 savedMethod = "",
                 storedLinkMode = false,
-                linkPresent = false,
-                linkValid = false,
-                manualValid = true,
-            )
+                storedLink = incomplete,
+                manual = ready,
+            ).canStart
         )
     }
 
@@ -61,70 +117,101 @@ class TunnelProfilePresentationTest {
 
     @Test
     fun `selected connection method must match configured method`() {
+        val ready = TunnelConnectionRequirements(true, true, false)
+        val incomplete = TunnelConnectionRequirements(false, false, false)
         assertTrue(
-            isSelectedCompactConnectionReady(
+            selectedTunnelConnectionRequirements(
                 selectedMethod = "manual",
                 savedMethod = "manual",
                 storedLinkMode = false,
-                linkPresent = false,
-                linkValid = false,
-                manualValid = true,
-            )
+                storedLink = incomplete,
+                manual = ready,
+            ).canStart
         )
         assertFalse(
-            isSelectedCompactConnectionReady(
+            selectedTunnelConnectionRequirements(
                 selectedMethod = "link",
                 savedMethod = "manual",
                 storedLinkMode = false,
-                linkPresent = false,
-                linkValid = false,
-                manualValid = true,
-            )
+                storedLink = incomplete,
+                manual = ready,
+            ).canStart
         )
         assertTrue(
-            isSelectedCompactConnectionReady(
+            selectedTunnelConnectionRequirements(
                 selectedMethod = "link",
                 savedMethod = "link",
                 storedLinkMode = false,
-                linkPresent = false,
-                linkValid = false,
-                manualValid = true,
-            )
+                storedLink = incomplete,
+                manual = ready,
+            ).canStart
         )
         assertFalse(
-            isSelectedCompactConnectionReady(
+            selectedTunnelConnectionRequirements(
                 selectedMethod = "manual",
                 savedMethod = "link",
                 storedLinkMode = false,
-                linkPresent = false,
-                linkValid = false,
-                manualValid = true,
-            )
+                storedLink = incomplete,
+                manual = ready,
+            ).canStart
         )
     }
 
     @Test
     fun `incomplete selected method is not ready`() {
+        val ready = TunnelConnectionRequirements(true, true, false)
+        val incomplete = TunnelConnectionRequirements(false, false, false)
         assertFalse(
-            isSelectedCompactConnectionReady(
+            selectedTunnelConnectionRequirements(
                 selectedMethod = "manual",
                 savedMethod = "manual",
                 storedLinkMode = false,
-                linkPresent = false,
-                linkValid = false,
-                manualValid = false,
-            )
+                storedLink = ready,
+                manual = incomplete,
+            ).canStart
         )
         assertFalse(
-            isSelectedCompactConnectionReady(
+            selectedTunnelConnectionRequirements(
                 selectedMethod = "link",
                 savedMethod = "",
                 storedLinkMode = true,
-                linkPresent = true,
-                linkValid = false,
-                manualValid = true,
-            )
+                storedLink = incomplete,
+                manual = ready,
+            ).canStart
         )
+    }
+
+    @Test
+    fun `stored link separates connection and hash problems`() {
+        val missingHashesLink = WdttTransferCodec.buildConnectionLink(
+            WdttLinkParts("vpn.example.org", 56000, 56001, 9000, "secret", "")
+        )
+        val missingHashes = storedLinkConnectionRequirements(
+            missingHashesLink,
+            WdttDeepLink.validate(missingHashesLink),
+        )
+        assertTrue(missingHashes.connectionConfigured)
+        assertFalse(missingHashes.hashesPresent)
+        assertFalse(missingHashes.hashesInvalid)
+
+        val invalidHashesLink = WdttTransferCodec.buildConnectionLink(
+            WdttLinkParts("vpn.example.org", 56000, 56001, 9000, "secret", "неверный")
+        )
+        val invalidHashes = storedLinkConnectionRequirements(
+            invalidHashesLink,
+            WdttDeepLink.validate(invalidHashesLink),
+        )
+        assertTrue(invalidHashes.connectionConfigured)
+        assertFalse(invalidHashes.hashesPresent)
+        assertTrue(invalidHashes.hashesInvalid)
+
+        val malformedConnection = "wdtt://connect?v=1&host=vpn.example.org"
+        val malformed = storedLinkConnectionRequirements(
+            malformedConnection,
+            WdttDeepLink.validate(malformedConnection),
+        )
+        assertFalse(malformed.connectionConfigured)
+        assertTrue(malformed.hashesPresent)
     }
 
     @Test

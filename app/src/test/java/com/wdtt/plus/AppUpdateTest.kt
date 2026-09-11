@@ -13,6 +13,14 @@ class AppUpdateTest {
     private val staleSha = "2".repeat(64)
 
     @Test
+    fun slowDirectDownloadFallsBackOnlyWhenRelayIsReady() {
+        assertFalse(shouldFallbackSlowDirectUpdateDownload(true, 100L, 7_999L))
+        assertFalse(shouldFallbackSlowDirectUpdateDownload(false, 1L, 60_000L))
+        assertTrue(shouldFallbackSlowDirectUpdateDownload(true, 128L * 1024L, 8_000L))
+        assertFalse(shouldFallbackSlowDirectUpdateDownload(true, 1024L * 1024L, 8_000L))
+    }
+
+    @Test
     fun sameVersionFix_isNotReportedWhenInstalledShaMatchesAnyReleaseApk() {
         val release = releaseWithHashes(universalSha, arm64Sha)
 
@@ -127,6 +135,58 @@ class AppUpdateTest {
                 initialRequest = false,
             ),
         )
+    }
+
+    @Test
+    fun relayedMetadataPreservesOfficialReleaseAndApkVerificationData() {
+        val digest = "sha256:${"a".repeat(64)}"
+        val parsed = parseRelayedUpdateMetadata(
+            """{
+                "version_tag":"17",
+                "release_url":"https://github.com/Ivan4537/WDTT-Plus/releases/tag/v17",
+                "source":"release",
+                "assets":[{
+                    "name":"WDTT-Plus-v17-arm64-v8a-release.apk",
+                    "download_url":"https://github.com/Ivan4537/WDTT-Plus/releases/download/v17/WDTT-Plus-v17-arm64-v8a-release.apk",
+                    "size":12345,
+                    "digest":"$digest"
+                }]
+            }""".trimIndent(),
+        )
+
+        requireNotNull(parsed)
+        assertEquals("v17", parsed.versionTag)
+        assertEquals(RemoteVersionSource.Release, parsed.source)
+        assertEquals(digest, parsed.assets.single().digest)
+    }
+
+    @Test
+    fun relayedMetadataRejectsUntrustedReleaseOrAssetUrls() {
+        assertNull(
+            parseRelayedUpdateMetadata(
+                """{
+                    "version_tag":"v17",
+                    "release_url":"https://example.com/Ivan4537/WDTT-Plus/releases/tag/v17",
+                    "source":"release"
+                }""".trimIndent(),
+            ),
+        )
+
+        val parsed = parseRelayedUpdateMetadata(
+            """{
+                "version_tag":"v17",
+                "release_url":"https://github.com/Ivan4537/WDTT-Plus/releases/tag/v17",
+                "source":"release",
+                "assets":[{
+                    "name":"evil.apk",
+                    "download_url":"https://example.com/evil.apk",
+                    "size":123,
+                    "digest":"sha256:${"b".repeat(64)}"
+                }]
+            }""".trimIndent(),
+        )
+        requireNotNull(parsed)
+        assertTrue(parsed.assets.isEmpty())
     }
 
     private fun releaseWithHashes(vararg hashes: String): AppReleaseInfo {

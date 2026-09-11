@@ -10,6 +10,12 @@ const val MAX_SSH_PRIVATE_KEY_CHARS = 128 * 1024
 private const val JSCH_BC_EDDSA_KEYPAIRGEN = "com.jcraft.jsch.bc.KeyPairGenEdDSA"
 private const val JSCH_BC_ED25519_SIGNATURE = "com.jcraft.jsch.bc.SignatureEd25519"
 private const val JSCH_BC_ED448_SIGNATURE = "com.jcraft.jsch.bc.SignatureEd448"
+private const val SSH_CONNECT_TIMEOUT_MS = 20_000
+enum class SshRoutePolicy {
+    DIRECT_ONLY,
+    SERVER_MUTATION_DIRECT_ONLY,
+    SAFE_READ_ONLY_DIRECT,
+}
 
 @Volatile
 private var jschEdDsaConfigured = false
@@ -132,7 +138,11 @@ fun sshPrivateKeyIssue(value: String): String? {
     return null
 }
 
-internal fun friendlySshConnectionError(message: String, credentials: SshCredentials): String = when {
+internal fun friendlySshConnectionError(
+    message: String,
+    credentials: SshCredentials,
+    connectTimeoutMs: Int = SSH_CONNECT_TIMEOUT_MS,
+): String = when {
     message.contains("SignatureEd25519", ignoreCase = true) ||
         message.contains("ssh-ed25519", ignoreCase = true) && (
             message.contains("not available", ignoreCase = true) ||
@@ -159,8 +169,20 @@ internal fun friendlySshConnectionError(message: String, credentials: SshCredent
         message.contains("unknown host", ignoreCase = true) ->
         "Не удалось найти SSH-сервер. Проверьте IP-адрес или домен."
     message.contains("timeout", ignoreCase = true) ->
-        "SSH-сервер не ответил за 20 секунд. Проверьте адрес, порт, сеть и межсетевой экран."
+        "SSH-сервер не ответил за ${sshTimeoutLabel(connectTimeoutMs)}. " +
+            "Проверьте адрес, порт, сеть и межсетевой экран."
     else -> "Не удалось подключиться по SSH: ${message.ifBlank { "неизвестная ошибка" }}"
+}
+
+private fun sshTimeoutLabel(connectTimeoutMs: Int): String {
+    val seconds = (connectTimeoutMs / 1_000).coerceAtLeast(1)
+    val suffix = when {
+        seconds % 100 in 11..14 -> "секунд"
+        seconds % 10 == 1 -> "секунду"
+        seconds % 10 in 2..4 -> "секунды"
+        else -> "секунд"
+    }
+    return "$seconds $suffix"
 }
 
 private fun Throwable.messageWithCauses(): String =
@@ -168,55 +190,142 @@ private fun Throwable.messageWithCauses(): String =
         .mapNotNull { it.message?.takeIf(String::isNotBlank) }
         .joinToString(": ")
 
+internal fun isSshConnectivityFailure(message: String): Boolean {
+    val lower = message.lowercase()
+    if (
+        "auth fail" in lower ||
+        "authentication" in lower ||
+        "invalid privatekey" in lower ||
+        "passphrase" in lower ||
+        "algorithm negotiation" in lower ||
+        "hostkey" in lower
+    ) return false
+    return "timeout" in lower ||
+        "timed out" in lower ||
+        "unknownhost" in lower ||
+        "unknown host" in lower ||
+        "connection refused" in lower ||
+        "connect failed" in lower ||
+        "failed to connect" in lower ||
+        "connection reset" in lower ||
+        "socket is not established" in lower ||
+        "network is unreachable" in lower ||
+        "network unreachable" in lower ||
+        "no route to host" in lower ||
+        "enetunreach" in lower ||
+        "ehostunreach" in lower
+}
+
+internal fun capitalizeUserSentence(message: String): String =
+    message.replaceFirstChar { first ->
+        if (first.isLowerCase()) first.uppercaseChar().toString() else first.toString()
+    }
+
+private fun createSshSessionAttempt(
+    host: String,
+    user: String,
+    credentials: SshCredentials,
+    port: Int,
+    connectTimeoutMs: Int,
+): Session {
+    configureJschEdDsaCompatibility()
+    val jsch = JSch()
+    val privateKey = normalizeSshPrivateKey(credentials.privateKey)
+    if (privateKey.isNotBlank()) {
+        sshPrivateKeyIssue(privateKey)?.let { throw IllegalArgumentException(it) }
+        jsch.addIdentity(
+            "wdtt-plus-memory-key",
+            privateKey.toByteArray(Charsets.UTF_8),
+            null,
+            credentials.privateKeyPassphrase.takeIf { it.isNotEmpty() }?.toByteArray(Charsets.UTF_8)
+        )
+    }
+
+    val session = jsch.getSession(user.ifBlank { "root" }, host.trim(), port)
+    if (credentials.allowPasswordAuthentication && credentials.password.isNotBlank()) {
+        session.setPassword(credentials.password)
+    }
+    session.setConfig(Properties().apply {
+        put("StrictHostKeyChecking", "no")
+        put("ServerAliveInterval", "10")
+        put("ServerAliveCountMax", "6")
+        put("ConnectTimeout", connectTimeoutMs.toString())
+        put(
+            "PreferredAuthentications",
+            when {
+                privateKey.isNotBlank() && credentials.allowPasswordAuthentication -> "publickey,password,keyboard-interactive"
+                privateKey.isNotBlank() -> "publickey"
+                credentials.allowPasswordAuthentication -> "password,keyboard-interactive"
+                else -> "publickey"
+            }
+        )
+    })
+    session.connect(connectTimeoutMs)
+    return session
+}
+
 fun createSshSession(
     host: String,
     user: String,
     credentials: SshCredentials,
-    port: Int = 22
+    port: Int = 22,
+    routePolicy: SshRoutePolicy = SshRoutePolicy.DIRECT_ONLY,
+    connectTimeoutMs: Int = SSH_CONNECT_TIMEOUT_MS,
 ): Session {
     require(host.isNotBlank()) { "Не указан адрес SSH-сервера." }
     require(port in 1..65535) { "SSH-порт должен быть от 1 до 65535." }
     require(credentials.hasAuthentication) { "Укажите SSH-пароль или приватный SSH-ключ." }
+    require(connectTimeoutMs in 1_000..SSH_CONNECT_TIMEOUT_MS) {
+        "Время ожидания SSH должно быть от 1 до ${SSH_CONNECT_TIMEOUT_MS / 1_000} секунд."
+    }
 
+    val wdttVpnActive = routePolicy != SshRoutePolicy.DIRECT_ONLY &&
+        TunnelManager.running.value &&
+        TunnelManager.vpnInterfaceUp.value &&
+        TunnelManager.activeMode.value == TUNNEL_MODE_VPN &&
+        !TunnelManager.vpnSlotYieldRequested.value
     try {
-        configureJschEdDsaCompatibility()
-        val jsch = JSch()
-        val privateKey = normalizeSshPrivateKey(credentials.privateKey)
-        if (privateKey.isNotBlank()) {
-            sshPrivateKeyIssue(privateKey)?.let { throw IllegalArgumentException(it) }
-            jsch.addIdentity(
-                "wdtt-plus-memory-key",
-                privateKey.toByteArray(Charsets.UTF_8),
-                null,
-                credentials.privateKeyPassphrase.takeIf { it.isNotEmpty() }?.toByteArray(Charsets.UTF_8)
-            )
-        }
-
-        val session = jsch.getSession(user.ifBlank { "root" }, host.trim(), port)
-        if (credentials.allowPasswordAuthentication && credentials.password.isNotBlank()) {
-            session.setPassword(credentials.password)
-        }
-        session.setConfig(Properties().apply {
-            put("StrictHostKeyChecking", "no")
-            put("ServerAliveInterval", "10")
-            put("ServerAliveCountMax", "6")
-            put("ConnectTimeout", "15000")
-            put(
-                "PreferredAuthentications",
-                when {
-                    privateKey.isNotBlank() && credentials.allowPasswordAuthentication -> "publickey,password,keyboard-interactive"
-                    privateKey.isNotBlank() -> "publickey"
-                    credentials.allowPasswordAuthentication -> "password,keyboard-interactive"
-                    else -> "publickey"
-                }
-            )
-        })
-        session.connect(20_000)
-        return session
+        return createSshSessionAttempt(
+            host = host,
+            user = user,
+            credentials = credentials,
+            port = port,
+            connectTimeoutMs = connectTimeoutMs,
+        )
     } catch (error: IllegalArgumentException) {
         throw error
     } catch (error: JSchException) {
-        val message = error.messageWithCauses()
-        throw IllegalStateException(friendlySshConnectionError(message, credentials), error)
+        val directMessage = error.messageWithCauses()
+        val friendlyMessage = friendlySshConnectionError(directMessage, credentials, connectTimeoutMs)
+        if (
+            routePolicy == SshRoutePolicy.SERVER_MUTATION_DIRECT_ONLY &&
+            wdttVpnActive &&
+            isSshConnectivityFailure(directMessage)
+        ) {
+            TunnelManager.noteDeployNetworkRoute(
+                key = "ssh_mutation_direct_only",
+                message = "Изменяющая операция Деплоя выполняется только напрямую. Через активный WDTT она сейчас запрещена: для того же сервера это защищает от потери управления, а управление другим сервером через отдельный активный профиль пока не поддерживается.",
+                warning = true,
+            )
+            throw IllegalStateException(
+                "$friendlyMessage Эта операция изменяет сервер и не выполняется через активный WDTT: " +
+                    "при подключении к тому же серверу это может оборвать канал управления. " +
+                    "Используйте прямой интернет или временно отключите WDTT. " +
+                    "Управление другим сервером через отдельный активный профиль пока не поддерживается.",
+                error,
+            )
+        }
+        if (
+            routePolicy == SshRoutePolicy.SAFE_READ_ONLY_DIRECT &&
+            wdttVpnActive &&
+            isSshConnectivityFailure(directMessage)
+        ) {
+            throw IllegalStateException(
+                "$friendlyMessage WDTT Plus не перенаправляет собственный SSH-сокет в активный VPN, " +
+                    "поскольку это создаёт сетевую петлю.",
+                error,
+            )
+        }
+        throw IllegalStateException(friendlyMessage, error)
     }
 }

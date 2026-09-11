@@ -6,6 +6,118 @@ import android.content.Intent
 internal const val TUNNEL_PROFILE_INDEX_EXTRA = "profile_index"
 internal const val CONFIG_FIRST_START_EXTRA = "config_first_start"
 internal const val DEFAULT_RT_TURN_SNI = "ya.ru"
+internal const val TUNNEL_MODE_VPN = "vpn"
+internal const val TUNNEL_MODE_AUTO = "auto"
+internal const val TUNNEL_MODE_SOCKS5 = "socks5"
+internal const val TUNNEL_MODE_HTTP = "http"
+internal const val SOCKS5_LOOPBACK_HOST = "127.0.0.1"
+internal const val DEFAULT_SOCKS5_PORT = 1080
+internal const val DEFAULT_HTTP_CONNECT_PORT = 8080
+internal const val PROXY_VPN_CAPTURE_CONFIRMATIONS = 2
+
+internal fun normalizeTunnelMode(value: String?): String = when (value?.trim()?.lowercase()) {
+    TUNNEL_MODE_AUTO, "mixed" -> TUNNEL_MODE_AUTO
+    TUNNEL_MODE_SOCKS5 -> TUNNEL_MODE_SOCKS5
+    TUNNEL_MODE_HTTP, "http-connect", "connect" -> TUNNEL_MODE_HTTP
+    "tun", TUNNEL_MODE_VPN -> TUNNEL_MODE_VPN
+    else -> TUNNEL_MODE_VPN
+}
+
+internal fun resolveStoredTunnelMode(value: String?, explicitlyActivated: Boolean): String =
+    if (explicitlyActivated) normalizeTunnelMode(value) else TUNNEL_MODE_VPN
+
+internal fun tunnelModeNeedsVpnPermission(value: String?): Boolean =
+    normalizeTunnelMode(value) == TUNNEL_MODE_VPN
+
+internal fun tunnelModeUsesLocalProxy(value: String?): Boolean =
+    normalizeTunnelMode(value) != TUNNEL_MODE_VPN
+
+/**
+ * ConnectivityManager returns a UID-aware default network. If it is another
+ * VPN while WDTT runs as a local proxy, that VPN did not exclude WDTT Plus and
+ * will feed the transport back into the same proxy. Confirm twice so a single
+ * capabilities handover cannot stop a healthy proxy session.
+ */
+internal fun nextProxyVpnCaptureObservationCount(
+    tunnelMode: String?,
+    appDefaultNetworkIsVpn: Boolean,
+    previousCount: Int,
+): Int = if (tunnelModeUsesLocalProxy(tunnelMode) && appDefaultNetworkIsVpn) {
+    (previousCount + 1).coerceAtMost(PROXY_VPN_CAPTURE_CONFIRMATIONS)
+} else {
+    0
+}
+
+internal fun proxyVpnCaptureConfirmed(observationCount: Int): Boolean =
+    observationCount >= PROXY_VPN_CAPTURE_CONFIRMATIONS
+
+internal fun tunnelModeStatusLabel(value: String?): String = when (normalizeTunnelMode(value)) {
+    TUNNEL_MODE_AUTO -> "АВТО ПРОКСИ"
+    TUNNEL_MODE_SOCKS5 -> "SOCKS5"
+    TUNNEL_MODE_HTTP -> "HTTP CONNECT"
+    else -> "VPN"
+}
+
+internal fun fullWidgetRunningStatus(tunnelMode: String?, profileName: String): String = when (
+    normalizeTunnelMode(tunnelMode)
+) {
+    TUNNEL_MODE_AUTO -> "ПРОКСИ · $profileName"
+    TUNNEL_MODE_SOCKS5 -> "SOCKS5 · $profileName"
+    TUNNEL_MODE_HTTP -> "HTTP · $profileName"
+    else -> "Подключено к $profileName"
+}
+
+internal fun compactWidgetRunningStatus(tunnelMode: String?, profileName: String): String = when (
+    normalizeTunnelMode(tunnelMode)
+) {
+    TUNNEL_MODE_AUTO -> "ПРОКСИ · $profileName"
+    TUNNEL_MODE_SOCKS5 -> "SOCKS · $profileName"
+    TUNNEL_MODE_HTTP -> "HTTP · $profileName"
+    else -> profileName
+}
+
+internal fun normalizeProxyPort(value: Int, mode: String): Int = value.takeIf { it in 1..65535 }
+    ?: if (normalizeTunnelMode(mode) == TUNNEL_MODE_HTTP) DEFAULT_HTTP_CONNECT_PORT else DEFAULT_SOCKS5_PORT
+
+internal fun proxySettingsAreValid(
+    mode: String,
+    port: Int,
+    access: String,
+    authEnabled: Boolean,
+    username: String,
+    password: String,
+): Boolean = !tunnelModeUsesLocalProxy(mode) ||
+    port in 1..65535 &&
+    (!authEnabled || isValidSocks5Credential(username) && isValidSocks5Credential(password)) &&
+    (!proxyAccessIncludesLan(access) || authEnabled)
+
+internal fun tunnelToggleContentDescription(running: Boolean, tunnelMode: String?): String =
+    if (running) {
+        "Остановить ${tunnelModeStatusLabel(tunnelMode)}"
+    } else {
+        "Запустить ${tunnelModeStatusLabel(tunnelMode)}"
+    }
+
+internal fun normalizeSocks5Port(value: Int): Int =
+    value.takeIf { it in 1..65535 } ?: DEFAULT_SOCKS5_PORT
+
+internal fun isValidSocks5Credential(value: String): Boolean =
+    value.isNotBlank() && value.toByteArray(Charsets.UTF_8).size <= 255
+
+internal fun truncateSocks5Credential(value: String, maxBytes: Int = 255): String {
+    if (maxBytes <= 0 || value.isEmpty()) return ""
+    if (value.toByteArray(Charsets.UTF_8).size <= maxBytes) return value
+    var index = 0
+    var usedBytes = 0
+    while (index < value.length) {
+        val nextIndex = value.offsetByCodePoints(index, 1)
+        val codePointBytes = value.substring(index, nextIndex).toByteArray(Charsets.UTF_8).size
+        if (usedBytes + codePointBytes > maxBytes) break
+        usedBytes += codePointBytes
+        index = nextIndex
+    }
+    return value.substring(0, index)
+}
 
 internal fun normalizeRtTurnSni(value: String): String? {
     val host = value.trim().lowercase()
@@ -87,10 +199,7 @@ internal fun displayedTunnelProfile(
  */
 internal fun shouldUseConfigFirstStart(): Boolean = true
 
-internal fun shouldUseManagedHashFallback(
-    profileMaxWorkers: Int,
-    hashCount: Int,
-): Boolean = profileMaxWorkers >= TUNNEL_WORKERS_PER_GROUP && hashCount > 1
+internal fun shouldUseHashFallback(hashCount: Int): Boolean = hashCount > 1
 
 suspend fun buildTunnelParamsFromSettings(
     context: Context,
@@ -138,6 +247,14 @@ internal fun buildTunnelParams(saved: TunnelProfileSnapshot): TunnelParams? {
             profileMaxWorkers = saved.profileMaxWorkers,
             configFirstStart = configFirstStart,
             profileIndex = saved.profileIndex,
+            mode = normalizeTunnelMode(saved.proxyMode),
+            socksPort = normalizeProxyPort(saved.proxyPort, saved.proxyMode),
+            socksUdpEnabled = saved.proxyUdpEnabled || normalizeTunnelMode(saved.proxyMode) == TUNNEL_MODE_AUTO,
+            proxyAccess = normalizeProxyAccess(saved.proxyAccess),
+            proxyLanEnabled = saved.proxyLanEnabled,
+            socksAuthEnabled = saved.proxyAuthEnabled,
+            socksUsername = saved.proxyUsername,
+            socksPassword = saved.proxyPassword,
         )
     } else {
         val basePeer = saved.peer.trim()
@@ -174,6 +291,14 @@ internal fun buildTunnelParams(saved: TunnelProfileSnapshot): TunnelParams? {
             profileMaxWorkers = saved.profileMaxWorkers,
             configFirstStart = configFirstStart,
             profileIndex = saved.profileIndex,
+            mode = normalizeTunnelMode(saved.proxyMode),
+            socksPort = normalizeProxyPort(saved.proxyPort, saved.proxyMode),
+            socksUdpEnabled = saved.proxyUdpEnabled || normalizeTunnelMode(saved.proxyMode) == TUNNEL_MODE_AUTO,
+            proxyAccess = normalizeProxyAccess(saved.proxyAccess),
+            proxyLanEnabled = saved.proxyLanEnabled,
+            socksAuthEnabled = saved.proxyAuthEnabled,
+            socksUsername = saved.proxyUsername,
+            socksPassword = saved.proxyPassword,
         )
     }
 }
@@ -208,6 +333,14 @@ suspend fun buildTunnelStartIntentFromSettings(
         putExtra("profile_max_workers", params.profileMaxWorkers)
         putExtra(CONFIG_FIRST_START_EXTRA, params.configFirstStart)
         putExtra(TUNNEL_PROFILE_INDEX_EXTRA, params.profileIndex)
+        putExtra("tunnel_mode", params.mode)
+        putExtra("socks_port", params.socksPort)
+        putExtra("socks_udp", params.socksUdpEnabled)
+        putExtra("proxy_access", params.proxyAccess)
+        putExtra("proxy_lan", params.proxyLanEnabled)
+        putExtra("socks_auth", params.socksAuthEnabled)
+        putExtra("socks_username", params.socksUsername)
+        putExtra("socks_password", params.socksPassword)
     }
 }
 

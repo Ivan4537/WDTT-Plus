@@ -97,10 +97,53 @@ func TestWorkerHashCandidatesPreferUnusedManagedProfileHashes(t *testing.T) {
 	}
 }
 
-func TestWorkerHashCandidatesKeepOrdinaryProfileOnPrimaryHash(t *testing.T) {
+func TestWorkerHashCandidatesCanDisableFallbackExplicitly(t *testing.T) {
 	hashes := []string{"hash-1", "hash-2", "hash-3", "hash-4"}
 	if got := workerHashCandidates(hashes, 1, 18, false); !reflect.DeepEqual(got, []string{"hash-2"}) {
 		t.Fatalf("ordinary profile candidates = %v", got)
+	}
+}
+
+func TestWorkerHashCandidatesCoverEveryWorkerAndHashLayout(t *testing.T) {
+	allHashes := []string{"hash-1", "hash-2", "hash-3", "hash-4"}
+	for hashCount := 1; hashCount <= len(allHashes); hashCount++ {
+		hashes := allHashes[:hashCount]
+		for workers := workersPerGroup; workers <= 108; workers += workersPerGroup {
+			groups := workers / workersPerGroup
+			for group := 0; group < groups; group++ {
+				candidates := workerHashCandidates(hashes, group, workers, true)
+				if len(candidates) != len(hashes) {
+					t.Fatalf("hashes=%d workers=%d group=%d candidates=%v", hashCount, workers, group, candidates)
+				}
+				seen := make(map[string]bool, len(candidates))
+				for _, candidate := range candidates {
+					seen[candidate] = true
+				}
+				if len(seen) != len(hashes) {
+					t.Fatalf("hashes=%d workers=%d group=%d does not cover all hashes: %v", hashCount, workers, group, candidates)
+				}
+				wantPrimary := hashes[group%len(hashes)]
+				if candidates[0] != wantPrimary {
+					t.Fatalf("hashes=%d workers=%d group=%d primary=%q, want %q", hashCount, workers, group, candidates[0], wantPrimary)
+				}
+			}
+		}
+	}
+}
+
+func TestRepeatedCredentialErrorRotatesOnlyWhenAnotherHashCanHelp(t *testing.T) {
+	if !shouldRotateHashAfterRepeatedCredentialError(errors.New("temporary provider error")) {
+		t.Fatal("ordinary repeated provider error did not allow a spare hash")
+	}
+	for _, err := range []error{
+		context.Canceled,
+		context.DeadlineExceeded,
+		errors.New("CAPTCHA_WAIT_REQUIRED"),
+		errors.New("VK FLOOD"),
+	} {
+		if shouldRotateHashAfterRepeatedCredentialError(err) {
+			t.Fatalf("unsafe retry rotation accepted for %v", err)
+		}
 	}
 }
 

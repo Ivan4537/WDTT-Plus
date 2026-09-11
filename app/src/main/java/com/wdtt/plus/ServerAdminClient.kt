@@ -215,22 +215,43 @@ data class ServerStoredBackupDocument(
 )
 
 object ServerAdminClient {
+    private const val SAFE_DIRECT_CONNECT_TIMEOUT_MS = 4_000
     private const val ADMIN_TIMEOUT = 45_000L
     private const val RESTART_TIMEOUT = 70_000L
     private const val BACKUP_TIMEOUT = 120_000L
     private const val MAX_BACKUP_DOCUMENT_BYTES = 8 * 1024 * 1024
 
     suspend fun list(target: ServerAdminTarget): ServerAdminState = withContext(Dispatchers.IO) {
-        withSession(target) { ssh ->
-            parseState(callAdmin(ssh, target, listOf("list")))
-        }
+        parseState(callSafeAdmin(target, listOf("list")))
     }
 
     suspend fun details(target: ServerAdminTarget, password: String): ServerClientInfo = withContext(Dispatchers.IO) {
-        withSession(target) { ssh ->
-            val json = callAdmin(ssh, target, listOf("details", "--password", password))
-            json.optJSONObject("password")?.let(::parseClient)
-                ?: throw IllegalStateException("сервер не вернул данные клиента")
+        val json = callSafeAdmin(target, listOf("details", "--password", password))
+        json.optJSONObject("password")?.let(::parseClient)
+            ?: throw IllegalStateException("сервер не вернул данные клиента")
+    }
+
+    internal suspend fun safeInspectThroughTunnel(
+        target: ServerAdminTarget,
+        operationArgs: List<String>,
+        timeout: Long = ADMIN_TIMEOUT,
+    ): String {
+        require(operationArgs.isNotEmpty()) { "Не указан вид безопасной проверки" }
+        val availability = TunnelManager.deploySafeRelayAvailability(target.host)
+        if (!availability.available) {
+            throw IllegalStateException(availability.unavailableMessage())
+        }
+        val args = listOf("safe-inspect") + operationArgs
+        return when (val relay = TunnelManager.executeDeploySafeRequest(
+            targetHost = target.host,
+            requestJson = adminRequestJson(target, args),
+            timeoutMs = timeout.coerceAtLeast(15_000L),
+        )) {
+            is DeploySafeRelayResult.Success -> parseAdminRelayResponse(relay.payload)
+                .optString("safe_output", "")
+                .takeIf(String::isNotBlank)
+                ?: throw IllegalStateException("сервер не вернул результат безопасной проверки")
+            is DeploySafeRelayResult.Unavailable -> throw IllegalStateException(relay.reason)
         }
     }
 
@@ -392,7 +413,7 @@ object ServerAdminClient {
         runArgsAction(target, listOf("reset-traffic"))
 
     suspend fun backupStatus(target: ServerAdminTarget): ServerBackupManagerInfo = withContext(Dispatchers.IO) {
-        withSession(target) { ssh -> parseBackupStatus(callAdmin(ssh, target, listOf("backup-status"), BACKUP_TIMEOUT)) }
+        parseBackupStatus(callSafeAdmin(target, listOf("backup-status"), BACKUP_TIMEOUT))
     }
 
     suspend fun configureBackups(
@@ -425,31 +446,29 @@ object ServerAdminClient {
         reason: String = "manual"
     ): ServerBackupManagerInfo = withContext(Dispatchers.IO) {
         require(reason in setOf("manual", "pre_deploy", "pre_restore")) { "Некорректная причина резервной копии" }
-        withSession(target) {
-            ssh -> parseBackupStatus(
-                callAdmin(ssh, target, listOf("backup-create", "--reason", reason), BACKUP_TIMEOUT)
-            )
+        if (reason == "manual") {
+            parseBackupStatus(callSafeAdmin(target, listOf("backup-create", "--reason", reason), BACKUP_TIMEOUT))
+        } else {
+            withSession(target) { ssh ->
+                parseBackupStatus(callAdmin(ssh, target, listOf("backup-create", "--reason", reason), BACKUP_TIMEOUT))
+            }
         }
     }
 
     suspend fun verifyBackup(target: ServerAdminTarget, id: String): ServerStoredBackupInfo = withContext(Dispatchers.IO) {
         requireBackupId(id)
-        withSession(target) { ssh ->
-            parseBackupInfo(
-                callAdmin(ssh, target, listOf("backup-verify", "--id", id), BACKUP_TIMEOUT)
-                    .getJSONObject("backup")
-            )
-        }
+        parseBackupInfo(
+            callSafeAdmin(target, listOf("backup-verify", "--id", id), BACKUP_TIMEOUT)
+                .getJSONObject("backup")
+        )
     }
 
     suspend fun exportBackup(target: ServerAdminTarget, id: String): ServerStoredBackupDocument = withContext(Dispatchers.IO) {
         requireBackupId(id)
-        withSession(target) { ssh ->
-            parseBackupDocument(
-                callAdmin(ssh, target, listOf("backup-export", "--id", id), BACKUP_TIMEOUT)
-                    .getJSONObject("backup_document")
-            )
-        }
+        parseBackupDocument(
+            callSafeAdmin(target, listOf("backup-export", "--id", id), BACKUP_TIMEOUT)
+                .getJSONObject("backup_document")
+        )
     }
 
     suspend fun deleteBackup(target: ServerAdminTarget, id: String): ServerBackupManagerInfo = withContext(Dispatchers.IO) {
@@ -491,10 +510,14 @@ object ServerAdminClient {
             withSession(target) { ssh -> actionFromResponse(callAdmin(ssh, target, args)) }
         }
 
-    private fun <T> withSession(target: ServerAdminTarget, block: (AdminSshClient) -> T): T {
+    private fun <T> withSession(
+        target: ServerAdminTarget,
+        safeReadOnly: Boolean = false,
+        block: (AdminSshClient) -> T,
+    ): T {
         var session: Session? = null
         try {
-            session = createSession(target)
+            session = createSession(target, safeReadOnly)
             return block(AdminSshClient(session, target.sshPassword))
         } finally {
             try { session?.disconnect() } catch (_: Exception) {}
@@ -521,6 +544,103 @@ object ServerAdminClient {
             throw IllegalStateException(friendlyAdminError(json.optString("message", output)))
         }
         return json
+    }
+
+    private fun adminRequestJson(target: ServerAdminTarget, args: List<String>): String =
+        JSONObject()
+            .put("main_password", target.mainPassword)
+            .put("args", JSONArray(args))
+            .toString()
+
+    private suspend fun callSafeAdmin(
+        target: ServerAdminTarget,
+        args: List<String>,
+        timeout: Long = ADMIN_TIMEOUT,
+    ): JSONObject {
+        val availability = TunnelManager.deploySafeRelayAvailability(target.host)
+        if (!availability.transportAvailable) {
+            return withSession(target, safeReadOnly = true) { ssh -> callAdmin(ssh, target, args, timeout) }
+        }
+
+        var directFailure: Exception? = null
+        var session: Session? = null
+        try {
+            session = createSession(
+                target = target,
+                safeReadOnly = true,
+                connectTimeoutMs = SAFE_DIRECT_CONNECT_TIMEOUT_MS,
+            )
+        } catch (error: Exception) {
+            if (!isConnectivityFailure(error)) throw error
+            directFailure = error
+        }
+        val connectedSession = session
+        if (connectedSession != null) {
+            try {
+                // После установленного SSH-соединения не повторяем команду другим
+                // путём: ответ мог потеряться уже после выполнения на сервере.
+                return callAdmin(AdminSshClient(connectedSession, target.sshPassword), target, args, timeout)
+            } finally {
+                runCatching { connectedSession.disconnect() }
+            }
+        }
+
+        if (!availability.available) {
+            throw IllegalStateException(availability.unavailableMessage(), directFailure)
+        }
+
+        TunnelManager.noteDeployNetworkRoute(
+            key = "deploy_safe_relay",
+            message = "Прямое подключение не ответило; безопасная операция выполняется через активный WDTT.",
+            warning = false,
+        )
+        return when (val relay = TunnelManager.executeDeploySafeRequest(
+            targetHost = target.host,
+            requestJson = adminRequestJson(target, args),
+            timeoutMs = timeout.coerceAtLeast(15_000L),
+        )) {
+            is DeploySafeRelayResult.Success -> parseAdminRelayResponse(relay.payload)
+            is DeploySafeRelayResult.Unavailable -> {
+                if (relay.reason.indicatesOldDeployRelay()) {
+                    TunnelManager.noteDeployNetworkRoute(
+                        key = "deploy_safe_relay_legacy",
+                        message = "Сервер ещё не поддерживает безопасный канал Деплоя; используется совместимое прямое SSH-подключение.",
+                        warning = true,
+                    )
+                    return withSession(target, safeReadOnly = true) { ssh -> callAdmin(ssh, target, args, timeout) }
+                }
+                val directText = directFailure?.message.orEmpty().substringBefore(" WDTT Plus")
+                throw IllegalStateException(
+                    buildString {
+                        append("Безопасная операция не выполнена через активный WDTT: ")
+                        append(relay.reason.ifBlank { "сервер не ответил" })
+                        if (directText.isNotBlank()) append(". Прямая попытка: $directText")
+                    },
+                    directFailure,
+                )
+            }
+        }
+    }
+
+    private fun parseAdminRelayResponse(payload: String): JSONObject {
+        val json = runCatching { JSONObject(payload) }
+            .getOrElse { throw IllegalStateException("сервер вернул повреждённый ответ безопасной операции", it) }
+        if (!json.optBoolean("ok", false)) {
+            throw IllegalStateException(friendlyAdminError(json.optString("message", "операция отклонена сервером")))
+        }
+        return json
+    }
+
+    private fun isConnectivityFailure(error: Throwable): Boolean =
+        isSshConnectivityFailure(
+            generateSequence(error) { it.cause }
+                .mapNotNull { it.message?.takeIf(String::isNotBlank) }
+                .joinToString(": "),
+        )
+
+    private fun String.indicatesOldDeployRelay(): Boolean {
+        val value = lowercase()
+        return "ещё не поддерживает" in value || "не поддерживает проверку через туннель" in value
     }
 
     private fun requireBackupId(id: String) {
@@ -786,7 +906,11 @@ object ServerAdminClient {
         status = json.optString("status"), note = json.optString("note")
     )
 
-    private fun createSession(target: ServerAdminTarget): Session {
+    private fun createSession(
+        target: ServerAdminTarget,
+        safeReadOnly: Boolean = false,
+        connectTimeoutMs: Int = 20_000,
+    ): Session {
         return createSshSession(
             host = target.host,
             user = target.user,
@@ -796,7 +920,13 @@ object ServerAdminClient {
                 privateKeyPassphrase = target.sshKeyPassphrase,
                 allowPasswordAuthentication = target.allowPasswordAuthentication
             ),
-            port = target.sshPort
+            port = target.sshPort,
+            routePolicy = if (safeReadOnly) {
+                SshRoutePolicy.SAFE_READ_ONLY_DIRECT
+            } else {
+                SshRoutePolicy.SERVER_MUTATION_DIRECT_ONLY
+            },
+            connectTimeoutMs = connectTimeoutMs,
         )
     }
 
@@ -839,12 +969,12 @@ object ServerAdminClient {
             "root privileges required" in lower || "sudo not found" in lower ->
                 "для управления нужны root-права или sudo на сервере."
             "connection refused" in lower ->
-                "сервер отклонил SSH-подключение. Проверьте SSH-порт."
+                "Сервер отклонил SSH-подключение. Проверьте SSH-порт."
             "timeout" in lower || "timed out" in lower ->
-                "сервер не ответил вовремя."
+                "Сервер не ответил вовремя."
             text.isBlank() -> "операция не выполнена"
             else -> text.take(220)
-        }
+        }.let(::capitalizeUserSentence)
     }
 }
 

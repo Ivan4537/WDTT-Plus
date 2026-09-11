@@ -2,6 +2,8 @@ package com.wdtt.plus
 
 import android.content.Context
 import android.os.Build
+import android.util.Base64
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -13,12 +15,16 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 import java.io.File
+import java.net.InetAddress
 import java.text.SimpleDateFormat
+import java.security.MessageDigest
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 
@@ -42,6 +48,16 @@ data class LogEntry(
     val isError: Boolean get() = severity == LogSeverity.Error
 }
 
+@Stable
+data class ConnectionHoldDiagnostics(
+    val modeSelected: Boolean = false,
+    val active: Boolean = false,
+    val cpuWakeLockHeld: Boolean = false,
+    val wifiLockHeld: Boolean = false,
+    val wifiTransportAvailable: Boolean = false,
+    val deviceInteractive: Boolean = true,
+)
+
 internal fun addPhoneTimeToSleepLog(
     message: String,
     nowMs: Long = System.currentTimeMillis(),
@@ -63,6 +79,23 @@ internal fun addPhoneTimeToSleepLog(
         "$prefix$body в $phoneTime"
     }
 }
+
+internal fun accessLifecycleLogKey(sourceKey: String, message: String, warning: Boolean): String {
+    val normalizedMessage = message.trim().replace(Regex("\\s+"), " ")
+    val severity = if (warning) "warning" else "info"
+    return "access_${severity}_${normalizedMessage.ifBlank { sourceKey.trim() }}"
+}
+
+internal fun shouldLogWakeWorkerCompletion(
+    progressChanged: Boolean,
+    readyWorkers: Int,
+    targetWorkers: Int,
+    generation: Long,
+    completedGeneration: Long,
+): Boolean = progressChanged &&
+    targetWorkers > 0 &&
+    readyWorkers >= targetWorkers &&
+    generation != completedGeneration
 
 internal fun shouldUseVkCallsPreflight(
     enabledByUser: Boolean,
@@ -86,24 +119,172 @@ internal data class VkCallsLogPresentation(
     val warning: Boolean = false,
 )
 
+private data class UpdateApkDownloadWaiter(
+    val result: CompletableDeferred<Boolean>,
+    val onProgress: suspend (Long, Long) -> Unit,
+)
+
+internal sealed interface DeploySafeRelayResult {
+    data class Success(val payload: String) : DeploySafeRelayResult
+    data class Unavailable(val reason: String) : DeploySafeRelayResult
+}
+
+internal sealed interface OpaqueHttpsRelayResult {
+    data class Success(
+        val status: Int,
+        val body: String,
+        val codeHint: String,
+    ) : OpaqueHttpsRelayResult
+
+    data class Unavailable(val reason: String) : OpaqueHttpsRelayResult
+}
+
+private data class DeploySafeRelayWaiter(
+    val result: CompletableDeferred<DeploySafeRelayResult>,
+    val outputFile: File,
+)
+
+internal fun deployTargetMatchesActivePeer(targetHost: String, peer: String): Boolean {
+    val target = normalizedDeployHost(targetHost)
+    val active = normalizedDeployHost(peer)
+    return target.isNotBlank() && target == active
+}
+
+private fun normalizedDeployHost(value: String): String {
+    val trimmed = value.trim()
+    if (trimmed.isBlank()) return ""
+    val host = when {
+        trimmed.startsWith("[") && trimmed.contains(']') -> trimmed.substring(1, trimmed.indexOf(']'))
+        trimmed.count { it == ':' } == 1 && trimmed.substringAfterLast(':').toIntOrNull() != null ->
+            trimmed.substringBeforeLast(':')
+        else -> trimmed
+    }
+    return host.trimEnd('.').lowercase()
+}
+
+private fun isDeployIpLiteral(host: String): Boolean {
+    if (host.contains(':')) return true // После нормализации двоеточие остаётся только у IPv6.
+    val parts = host.split('.')
+    return parts.size == 4 && parts.all { part ->
+        part.isNotEmpty() && part.all(Char::isDigit) && part.toIntOrNull() in 0..255
+    }
+}
+
+internal fun deployResolvedHostsMatch(
+    targetHost: String,
+    peer: String,
+    resolve: (String) -> Set<String>,
+): Boolean = classifyDeployTargetMatch(targetHost, peer, resolve).isSameServer
+
+internal fun classifyDeployTargetMatch(
+    targetHost: String,
+    peer: String,
+    resolve: (String) -> Set<String>,
+): DeploySafeRelayTargetMatch {
+    val target = normalizedDeployHost(targetHost)
+    val active = normalizedDeployHost(peer)
+    if (target.isBlank() || active.isBlank()) return DeploySafeRelayTargetMatch.Unresolved
+    if (target == active) return DeploySafeRelayTargetMatch.Exact
+    // Разные домены могут делить один IP (CDN, reverse proxy), поэтому одного
+    // совпавшего DNS-ответа недостаточно, чтобы передавать пароль администратора.
+    // Автосопоставление предназначено только для безопасной пары «домен ↔ IP».
+    if (!isDeployIpLiteral(target) && !isDeployIpLiteral(active)) {
+        return DeploySafeRelayTargetMatch.Unresolved
+    }
+    val targetAddresses = resolve(target)
+    if (targetAddresses.isEmpty()) return DeploySafeRelayTargetMatch.Unresolved
+    val activeAddresses = resolve(active)
+    return when {
+        activeAddresses.isEmpty() -> DeploySafeRelayTargetMatch.Unresolved
+        targetAddresses.any(activeAddresses::contains) -> DeploySafeRelayTargetMatch.Resolved
+        else -> DeploySafeRelayTargetMatch.Different
+    }
+}
+
+internal enum class DeploySafeRelayTargetMatch {
+    Exact,
+    Resolved,
+    Different,
+    Unresolved,
+
+    ;
+
+    val isSameServer: Boolean
+        get() = this == Exact || this == Resolved
+}
+
+internal data class DeploySafeRelayAvailability(
+    val transportAvailable: Boolean,
+    val targetMatch: DeploySafeRelayTargetMatch,
+) {
+    val available: Boolean
+        get() = transportAvailable && targetMatch.isSameServer
+
+    fun unavailableMessage(): String = when {
+        !transportAvailable -> "рабочий канал WDTT ещё не готов"
+        targetMatch == DeploySafeRelayTargetMatch.Different ->
+            "Адрес в «Деплое» ведёт к другому серверу, чем активный профиль WDTT. " +
+                "Безопасный канал сейчас читает состояние только активного сервера. " +
+                "Если это один VPS, укажите в «Туннеле» и «Деплое» один и тот же IP-адрес или домен. " +
+                "Управление другим сервером через отдельный активный профиль пока не поддерживается."
+        else ->
+            "Не удалось подтвердить, что адрес в «Деплое» и адрес активного профиля WDTT относятся к одному серверу. " +
+                "Укажите в «Туннеле» и «Деплое» один и тот же IP-адрес или домен."
+    }
+}
+
+private fun resolveDeployHostAddresses(host: String): Set<String> = runCatching {
+    InetAddress.getAllByName(host).mapTo(linkedSetOf()) { address ->
+        address.address.joinToString(":") { byte -> "%02x".format(byte.toInt() and 0xff) }
+    }
+}.getOrDefault(emptySet())
+
+internal fun transportControlRelayAvailable(
+    running: Boolean,
+    activeWorkers: Int,
+    activeMode: String,
+    vpnSlotYieldRequested: Boolean,
+): Boolean = running &&
+    activeWorkers > 0 &&
+    (activeMode != TUNNEL_MODE_VPN || !vpnSlotYieldRequested)
+
 internal fun classifyVkCallsLog(line: String, isError: Boolean = false): VkCallsLogPresentation? {
     if (!line.contains("[VKCalls]", true)) return null
     val text = line.substringAfter("[VKCalls]", line).trim()
     return when {
         text.contains("TURN credentials получены", true) ->
             VkCallsLogPresentation("vkcalls_ok", "[VKCalls] Основной бескапчевый провайдер сработал ✓")
-        text.contains("preflight не сработал", true) ||
-            text.contains("временно ограничил", true) ||
-            text.contains("временно пропущен", true) ||
-            text.contains("две современные анонимные сессии запросили CAPTCHA", true) ->
+        (text.contains("запросил", true) && text.contains("CAPTCHA", true)) ||
+            text.contains("captcha required", true) ->
             VkCallsLogPresentation(
-                "vkcalls_fallback",
-                "[VKCalls] Основной провайдер временно недоступен — пробуем совместимый резерв",
+                "vkcalls_captcha_fallback",
+                "[VKCalls] Основной провайдер запросил CAPTCHA — используем автоматический резерв",
             )
-        text.contains("продолжаем резервную legacy-цепочку", true) ->
+        text.contains("временно ограничил", true) || text.contains("flood", true) || text.contains("rate limit", true) ->
             VkCallsLogPresentation(
-                "vkcalls_fallback",
-                "[VKCalls] Основной провайдер временно недоступен — пробуем совместимый резерв",
+                "vkcalls_limit_fallback",
+                "[VKCalls] VK временно ограничил анонимные запросы — используем резерв",
+            )
+        text.contains("временно пропущен", true) ->
+            VkCallsLogPresentation(
+                "vkcalls_paused_fallback",
+                "[VKCalls] Основной провайдер временно пропущен после недавнего сбоя — используем резерв",
+            )
+        text.contains("preflight не сработал", true) && isVkCallsNetworkFailure(text) ->
+            VkCallsLogPresentation(
+                "vkcalls_network_fallback",
+                "[VKCalls] Основной провайдер не ответил по сети — используем резерв",
+            )
+        text.contains("preflight не сработал", true) && isVkCallsResponseDrift(text) ->
+            VkCallsLogPresentation(
+                "vkcalls_response_fallback",
+                "[VKCalls] Ответ основного провайдера изменился — используем резерв",
+            )
+        text.contains("preflight не сработал", true) ||
+            text.contains("продолжаем резервную legacy-цепочку", true) ->
+            VkCallsLogPresentation(
+                "vkcalls_rejected_fallback",
+                "[VKCalls] Основной провайдер не принял анонимную сессию — используем резерв",
             )
         text.contains("пробуем совместимый резерв", true) ->
             VkCallsLogPresentation(
@@ -123,6 +304,35 @@ internal fun classifyVkCallsLog(line: String, isError: Boolean = false): VkCalls
         else ->
             VkCallsLogPresentation("vkcalls_status", "[VKCalls] $text")
     }
+}
+
+private fun isVkCallsNetworkFailure(text: String): Boolean {
+    val value = text.lowercase()
+    return listOf(
+        "timeout",
+        "deadline exceeded",
+        "no such host",
+        "network is unreachable",
+        "connection refused",
+        "connection reset",
+        "broken pipe",
+        "unexpected eof",
+        "can't assign requested address",
+        "vk https",
+        "read response",
+    ).any(value::contains)
+}
+
+private fun isVkCallsResponseDrift(text: String): Boolean {
+    val value = text.lowercase()
+    return listOf(
+        " decode ",
+        " parse",
+        "expected object",
+        "expected non-empty",
+        "expected number",
+        "invalid response",
+    ).any(value::contains)
 }
 
 internal fun boundedVkCallsPreflightCooldownUntil(
@@ -267,8 +477,17 @@ internal fun stableRecoveryGraceMs(hardFailure: Boolean): Long =
 internal fun stableRecoveryRetryMs(hardFailure: Boolean): Long =
     if (hardFailure) 2 * 60_000L else 10 * 60_000L
 
+internal fun shouldDeferRecoveryForPeerDns(
+    waitStartedAtMs: Long,
+    nowMs: Long,
+    graceMs: Long = 5 * 60_000L,
+): Boolean = waitStartedAtMs > 0L && nowMs - waitStartedAtMs < graceMs
+
 internal fun isConfirmedUserTrafficFailure(userTrafficStalled: Boolean): Boolean =
     userTrafficStalled
+
+internal fun shouldEscalateUserTrafficStall(tunnelMode: String): Boolean =
+    !tunnelModeUsesLocalProxy(tunnelMode)
 
 internal fun shouldDeferConnectionIssueNotification(
     confirmedUserTrafficFailure: Boolean,
@@ -291,20 +510,52 @@ internal fun shouldReconnectTunnelAfterWake(
 
 internal enum class WakeRescueAction {
     HEALTHY,
-    WAIT_FOR_PROBE,
+    PARTIALLY_AVAILABLE,
     RECONNECT,
 }
 
 internal fun decideWakeRescueAction(
     freshTransportPath: Boolean,
-    activeWorkers: Int,
+    readyWorkers: Int,
+    targetWorkers: Int,
     confirmedNetworkFailure: Boolean,
-    finalCheck: Boolean,
 ): WakeRescueAction = when {
-    freshTransportPath -> WakeRescueAction.HEALTHY
-    finalCheck || shouldReconnectTunnelAfterWake(activeWorkers, confirmedNetworkFailure) ->
+    freshTransportPath && targetWorkers > 0 && readyWorkers >= targetWorkers -> WakeRescueAction.HEALTHY
+    freshTransportPath && readyWorkers > 0 -> WakeRescueAction.PARTIALLY_AVAILABLE
+    confirmedNetworkFailure || readyWorkers <= 0 ->
         WakeRescueAction.RECONNECT
-    else -> WakeRescueAction.WAIT_FOR_PROBE
+    else -> WakeRescueAction.RECONNECT
+}
+
+internal data class WakeWorkerStatus(
+    val generation: Long,
+    val ready: Int,
+    val total: Int,
+)
+
+private val wakeWorkerStatusRegex = Regex(
+    "\\[WAKE_STATUS]\\s+generation=(\\d+)\\s+ready=(\\d+)\\s+total=(\\d+)",
+)
+
+internal fun parseWakeWorkerStatus(line: String): WakeWorkerStatus? {
+    val match = wakeWorkerStatusRegex.find(line) ?: return null
+    val generation = match.groupValues[1].toLongOrNull() ?: return null
+    val ready = match.groupValues[2].toIntOrNull() ?: return null
+    val total = match.groupValues[3].toIntOrNull() ?: return null
+    if (generation <= 0L || ready < 0 || total < 0 || ready > total) return null
+    return WakeWorkerStatus(generation, ready, total)
+}
+
+internal fun shouldReportProcessReaderFailure(
+    readerJobActive: Boolean,
+    observedProcessIsCurrent: Boolean,
+): Boolean = readerJobActive && observedProcessIsCurrent
+
+internal fun localizedProcessReaderFailure(message: String): String = when {
+    message.contains("stream closed", ignoreCase = true) -> "поток чтения неожиданно закрыт"
+    message.contains("read interrupted by close", ignoreCase = true) ->
+        "чтение транспорта неожиданно прервано закрытием"
+    else -> message
 }
 
 internal fun wakeRecoveryReferenceAt(
@@ -337,6 +588,7 @@ internal fun shouldReloadWireGuardRouting(
 
 enum class TunnelStopReason(val displayText: String) {
     User("отключено пользователем"),
+    ProxyCapturedByVpn("внешний VPN перехватил транспорт прокси"),
     VpnSlotTransferred("VPN-слот передан другому приложению"),
     VpnStoppedExternally("Android отключил VPN или передал слот другому приложению"),
     VpnInterfaceLost("системный VPN-интерфейс потерян"),
@@ -345,8 +597,8 @@ enum class TunnelStopReason(val displayText: String) {
     CriticalError("критическая ошибка подключения"),
     CaptchaCancelled("проверка отменена пользователем"),
     TrustedWifi("подключена доверенная сеть Wi-Fi"),
-    RestoreFailed("не удалось восстановить VPN"),
-    ServiceDestroyed("служба VPN остановлена системой"),
+    RestoreFailed("не удалось восстановить соединение"),
+    ServiceDestroyed("служба соединения остановлена системой"),
     AccessExpired("срок доступа закончился")
 }
 
@@ -360,12 +612,18 @@ private val stoppedStatsTrafficPairRegex = Regex(
     "↓\\s*[0-9]+(?:[.,][0-9]+)?\\s*МБ\\s*/\\s*↑\\s*[0-9]+(?:[.,][0-9]+)?\\s*МБ"
 )
 
-internal fun buildStoppedSessionStats(previousStats: String, reason: TunnelStopReason): String {
+internal fun buildStoppedSessionStats(
+    previousStats: String,
+    reason: TunnelStopReason,
+    tunnelMode: String = TUNNEL_MODE_VPN,
+): String {
     val traffic = stoppedStatsTrafficPairRegex.find(previousStats)?.value
     return buildString {
         append(
             if (reason == TunnelStopReason.TrustedWifi) {
                 "VPN в ожидании · Причина: "
+            } else if (tunnelModeUsesLocalProxy(tunnelMode)) {
+                "${tunnelModeStatusLabel(tunnelMode)} отключён · Причина: "
             } else {
                 "VPN отключён · Причина: "
             }
@@ -715,6 +973,7 @@ private const val STABLE_RECOVERY_RETRY_MS = 10 * 60_000L
 private const val STABLE_ZERO_WORKERS_GRACE_MS = 15 * 60_000L
 private const val STAGNANT_ACTIVE_TRAFFIC_MS = 20 * 60_000L
 private const val WAKE_RECOVERY_GRACE_MS = 60_000L
+private const val PEER_DNS_RECOVERY_GRACE_MS = 5 * 60_000L
 
 object TunnelManager {
     private const val VK_CALLS_RUNTIME_PREFERENCES = "tunnel_runtime"
@@ -723,6 +982,7 @@ object TunnelManager {
     // 100% защита от утечек: единый управляемый глобальный Scope
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
+    @Volatile
     private var process: Process? = null
     private val processInputLock = Any()
     private var readerJob: Job? = null
@@ -774,10 +1034,16 @@ object TunnelManager {
     private var lastDeviceWakeStartedAtMs = 0L
     private var lastNetworkSettleRestartAtMs = 0L
     private var lastStableNetworkIssueLogAtMs = 0L
+    private var peerDnsWaitStartedAtMs = 0L
     private val sessionTraffic = TunnelSessionTrafficAccumulator()
     private var sessionTrafficStore: TunnelSessionTrafficStore? = null
     private val captchaSolveRequestId = AtomicLong(0)
     private val activeCaptchaSolveRequests = ConcurrentHashMap.newKeySet<Long>()
+    private val updateMetadataRequests = ConcurrentHashMap<String, CompletableDeferred<String?>>()
+    private val opaqueHttpsRequests =
+        ConcurrentHashMap<String, CompletableDeferred<OpaqueHttpsRelayResult>>()
+    private val updateApkDownloadRequests = ConcurrentHashMap<String, UpdateApkDownloadWaiter>()
+    private val deploySafeRequests = ConcurrentHashMap<String, DeploySafeRelayWaiter>()
 
     @Volatile
     var isLoggingEnabled = true
@@ -790,17 +1056,48 @@ object TunnelManager {
     val config = MutableStateFlow<String?>(null)
     val stats = MutableStateFlow("Ожидание данных...")
     val activeWorkers = MutableStateFlow(0)
+    val wakeRecoveryInProgress = MutableStateFlow(false)
+    val wakeRecoveryReadyWorkers = MutableStateFlow(0)
+    val wakeRecoveryTargetWorkers = MutableStateFlow(0)
+    val wakeRecoveryHeldConnection = MutableStateFlow(false)
     val vpnInterfaceUp = MutableStateFlow(false)
+    val activeMode = MutableStateFlow(TUNNEL_MODE_VPN)
+    val proxyReadyAddress = MutableStateFlow<String?>(null)
+    val proxyReadyAddresses = MutableStateFlow<List<String>>(emptyList())
     val connectionIssue = MutableStateFlow<ConnectionIssue?>(null)
     val vpnSlotYieldRequested = MutableStateFlow(false)
+    val lastStopReason = MutableStateFlow<TunnelStopReason?>(null)
+    val connectionHoldDiagnostics = MutableStateFlow(ConnectionHoldDiagnostics())
     
     val cooldownActive = MutableStateFlow(false)
     private var cooldownJob: Job? = null
     private val statsDownTrafficRegex = Regex("↓\\s*([0-9]+(?:[.,][0-9]+)?)\\s*МБ")
     private val statsUpTrafficRegex = Regex("↑\\s*([0-9]+(?:[.,][0-9]+)?)\\s*МБ")
+    private var wakeRecoveryGeneration = 0L
+    private var completedWakeRecoveryGeneration = 0L
+    @Volatile
+    private var deviceSleeping = false
 
     fun clearUnreadErrors() {
         unreadErrorCount.value = 0
+    }
+
+    fun proxyBindingsNeedRefresh(): Boolean {
+        val params = currentParams ?: return false
+        val mode = normalizeTunnelMode(params.mode)
+        if (!running.value || !tunnelModeUsesLocalProxy(mode)) return false
+        val access = normalizeProxyAccess(params.proxyAccess)
+        if (!proxyAccessIncludesLan(access)) return false
+        val actual = proxyReadyAddresses.value
+        // До PROXY_READY текущий запуск сам выбирает адреса. Не создаём
+        // второй нативный процесс поверх ещё запускающегося первого.
+        if (actual.isEmpty()) return false
+        val expected = expectedProxyReadyAddresses(
+            access = access,
+            port = normalizeProxyPort(params.socksPort, mode),
+            lanHost = findProxyLanBinding()?.host,
+        )
+        return actual.toSet() != expected.toSet()
     }
 
     private fun restoreVkCallsPreflightCooldown(context: Context, now: Long = System.currentTimeMillis()): Long {
@@ -847,6 +1144,7 @@ object TunnelManager {
 
     fun noteStartRequested() {
         transition.value = TunnelTransition.STARTING
+        lastStopReason.value = null
     }
 
     fun allowVpnSlotAcquisition() {
@@ -888,6 +1186,22 @@ object TunnelManager {
         kind: ConnectionIssueKind = ConnectionIssueKind.GENERAL,
     ) {
         setConnectionIssue(title, action, isError, kind)
+    }
+
+    fun noteProxyCapturedByVpn() {
+        setConnectionIssue(
+            title = "Внешний VPN перехватил WDTT Plus",
+            action = "Чтобы не возникала петля и лишний трафик, прокси остановлен. " +
+                "В настройках внешнего VPN исключите WDTT Plus (com.wdtt.plus) " +
+                "из VPN-маршрутизации, затем запустите WDTT Plus и внешний VPN снова.",
+        )
+        updateWarningLog(
+            "proxy_captured_by_vpn",
+            "[ПРОКСИ] Внешний VPN направил транспорт WDTT Plus обратно в локальный прокси. " +
+                "Соединение остановлено до образования петли; исключите com.wdtt.plus " +
+                "из маршрутизации внешнего VPN.",
+            2,
+        )
     }
 
     fun isCaptchaInProgress(): Boolean =
@@ -945,6 +1259,15 @@ object TunnelManager {
         lastUpstreamTrafficChangedAtMs = 0L
         lastKeepaliveResponseAtMs = 0L
         lastStagnantTrafficIssueAtMs = 0L
+    }
+
+    private fun resetWakeRecoveryState() {
+        wakeRecoveryGeneration = 0L
+        completedWakeRecoveryGeneration = 0L
+        wakeRecoveryInProgress.value = false
+        wakeRecoveryReadyWorkers.value = 0
+        wakeRecoveryTargetWorkers.value = 0
+        wakeRecoveryHeldConnection.value = false
     }
 
     private fun trafficSignature(regex: Regex, message: String): String =
@@ -1046,8 +1369,8 @@ object TunnelManager {
         val stagnantActiveTraffic = isStatsTrafficStagnant(now)
         if (recoverableNetworkErrorAtMs == 0L && stalePositiveWorkers) {
             noteRecoverableNetworkIssue(
-                "Туннель не подаёт признаков жизни",
-                "VPN включён, но давно нет свежей статистики от рабочих потоков. WDTT Plus попробует восстановить соединение автоматически."
+                "Соединение не подаёт признаков жизни",
+                "Давно нет свежей статистики от рабочих потоков. WDTT Plus попробует восстановить транспорт автоматически."
             )
         }
         if (recoverableNetworkErrorAtMs == 0L) return null
@@ -1067,8 +1390,8 @@ object TunnelManager {
             val stopDelayMs = if (hardNetworkOutage) HARD_NETWORK_STOP_DELAY_MS else 5 * 60_000L
             if (now - lastRecoveryAtMs < stopDelayMs) return null
             setConnectionIssue(
-                "VPN остановлен, чтобы вернуть интернет",
-                "WDTT Plus несколько раз не смог восстановить связь. VPN выключен, чтобы телефон не остался без интернета."
+                "Соединение остановлено после сбоя",
+                "WDTT Plus несколько раз не смог восстановить связь и остановил соединение безопасно."
             )
             return NetworkRecoveryAction.StopVpn
         }
@@ -1087,9 +1410,9 @@ object TunnelManager {
         recoveryAttempts++
         return if (recoveryAttempts <= maxSoftRestarts) {
             val attemptsText = if (hardNetworkOutage) {
-                "жёсткая попытка восстановления перед отключением VPN"
+                "жёсткая попытка восстановления перед остановкой соединения"
             } else {
-                "мягкая попытка $recoveryAttempts из $maxSoftRestarts без пересоздания VPN"
+                "мягкая попытка $recoveryAttempts из $maxSoftRestarts без полного перезапуска"
             }
             setConnectionIssue(
                 "Восстанавливаю транспорт",
@@ -1098,8 +1421,8 @@ object TunnelManager {
             NetworkRecoveryAction.SoftRestart
         } else {
             setConnectionIssue(
-                "VPN остановлен, чтобы вернуть интернет",
-                "Мягкие попытки не восстановили связь. WDTT Plus выключит VPN, чтобы телефон не остался без интернета."
+                "Соединение остановлено после сбоя",
+                "Мягкие попытки не восстановили связь. WDTT Plus безопасно остановит соединение."
             )
             NetworkRecoveryAction.StopVpn
         }
@@ -1108,6 +1431,13 @@ object TunnelManager {
     private fun pollStableNetworkRecoveryAction(now: Long): NetworkRecoveryAction? {
         if (!running.value || isCaptchaInProgress()) return null
         if (now < networkTransitionGraceUntilMs) return null
+        if (
+            shouldDeferRecoveryForPeerDns(
+                waitStartedAtMs = peerDnsWaitStartedAtMs,
+                nowMs = now,
+                graceMs = PEER_DNS_RECOVERY_GRACE_MS,
+            )
+        ) return null
 
         val startupGrace = processStartedAtMs == 0L || now - processStartedAtMs < 90_000L
         val noFreshStats = lastStatsAtMs > 0L && now - lastStatsAtMs > STABLE_RECOVERY_GRACE_MS
@@ -1116,7 +1446,7 @@ object TunnelManager {
             recoverableNetworkErrorAtMs = now
             updateLog(
                 "network_stable_stats_quiet",
-                "[СЕТЬ] Долго нет свежей статистики, но VPN не пересоздаём. Подождём перед одной мягкой попыткой.",
+                "[СЕТЬ] Долго нет свежей статистики. Подождём перед одной мягкой попыткой без полного перезапуска.",
                 50,
                 false
             )
@@ -1139,11 +1469,11 @@ object TunnelManager {
         when (action) {
             NetworkRecoveryAction.SoftRestart -> setConnectionIssue(
                 "Восстанавливаю транспорт",
-                "Сеть долго не подаёт признаков жизни. Выполняется тихая попытка без пересоздания VPN."
+                "Сеть долго не подаёт признаков жизни. Выполняется тихая попытка без полного перезапуска."
             )
             NetworkRecoveryAction.StopVpn -> setConnectionIssue(
-                "VPN остановлен, чтобы вернуть интернет",
-                "Повторные попытки не восстановили связь. WDTT Plus выключит VPN, чтобы телефон не остался без интернета."
+                "Соединение остановлено после сбоя",
+                "Повторные попытки не восстановили связь. WDTT Plus безопасно остановит соединение."
             )
         }
         return action
@@ -1209,6 +1539,15 @@ object TunnelManager {
         updateLog("deploy_ok_$hash", message, 2, false)
     }
 
+    fun noteDeployNetworkRoute(key: String, message: String, warning: Boolean = false) {
+        val text = "[ДЕПЛОЙ] $message"
+        if (warning) {
+            updateWarningLog("deploy_route_$key", text, 20)
+        } else {
+            updateLog("deploy_route_$key", text, 20, false)
+        }
+    }
+
     fun noteTrustedWifiEvent(key: String, message: String, warning: Boolean = false) {
         val logKey = "trusted_wifi_$key"
         val text = "[ДОВЕРЕННЫЙ WI-FI] $message"
@@ -1220,7 +1559,10 @@ object TunnelManager {
     }
 
     fun noteAccessLifecycleEvent(key: String, message: String, warning: Boolean = false) {
-        val logKey = "access_$key"
+        // Один и тот же пользовательский результат может прийти из фонового
+        // обновления, карточки профиля и проверки перед запуском. В журнале это
+        // одно событие, даже если внутренние причины вызова различаются.
+        val logKey = accessLifecycleLogKey(key, message, warning)
         val text = "[ДОСТУП] $message"
         if (warning) {
             updateWarningLog(logKey, text, 20)
@@ -1237,6 +1579,14 @@ object TunnelManager {
         } else {
             updateLog(logKey, text, 20, false)
         }
+    }
+
+    fun noteSystemLifecycleEvent(key: String, message: String) {
+        updateWarningLog(
+            key = "system_lifecycle_$key",
+            message = "[СИСТЕМА] $message",
+            priority = 10,
+        )
     }
 
     fun noteAddressRoutingWarning(key: String, message: String) {
@@ -1272,6 +1622,14 @@ object TunnelManager {
             message = "[VPN] $message",
             priority = 10,
         )
+    }
+
+    internal fun noteVpnInterfaceLifecycle(key: String, message: String, warning: Boolean = false) {
+        if (warning) {
+            updateWarningLog("vpn_interface_$key", "[VPN] $message", 10)
+        } else {
+            updateLog("vpn_interface_$key", "[VPN] $message", 10)
+        }
     }
 
     private fun updateLog(key: String, message: String, priority: Int, isError: Boolean = false) {
@@ -1335,7 +1693,8 @@ object TunnelManager {
         preserveLogs: Boolean = false,
         restoreSessionTraffic: Boolean = false,
     ) {
-        if (shouldBlockVpnStart(vpnSlotYieldRequested.value)) return
+        val requestedMode = normalizeTunnelMode(params.mode)
+        if (requestedMode == TUNNEL_MODE_VPN && shouldBlockVpnStart(vpnSlotYieldRequested.value)) return
         if (!isSwitching) noteStartRequested()
         scope.launch {
             startStopMutex.lock()
@@ -1360,7 +1719,7 @@ object TunnelManager {
                         if (restoredTraffic != null) {
                             updateLog(
                                 "service_session_restored",
-                                "[СЛУЖБА] Android восстановил VPN-службу; счётчик текущей сессии продолжен.",
+                                "[СЛУЖБА] Android повторно запустил службу соединения. Счётчик трафика восстановлен из сохранения; это не подтверждает непрерывную работу VPN.",
                                 20,
                                 false,
                             )
@@ -1375,6 +1734,7 @@ object TunnelManager {
                     currentHashErrorCount = 0
                     wrapAuthTimeoutCount = 0
                     resetNetworkRecoveryState()
+                    peerDnsWaitStartedAtMs = 0L
                     clearConnectionIssue()
                     processStartedAtMs = 0L
                     resetStatsLivenessState()
@@ -1384,6 +1744,9 @@ object TunnelManager {
                     lastNetworkSettleRestartAtMs = 0L
                     activeHashIndex = 0
                     currentParams = params
+                    activeMode.value = requestedMode
+                    proxyReadyAddress.value = null
+                    proxyReadyAddresses.value = emptyList()
                     lastContext = appContext
                     accessRefreshRequestedForProcess = false
                     forceRegenerateUA = false
@@ -1391,7 +1754,7 @@ object TunnelManager {
                     currentCaptchaSolveMethod = params.captchaSolveMethod
                 }
                 
-                wgHelper = WireGuardHelper(appContext)
+                wgHelper = if (requestedMode == TUNNEL_MODE_VPN) WireGuardHelper(appContext) else null
 
                 val targetHash = if (activeHashIndex == 0) params.vkHashes else params.secondaryVkHash
 
@@ -1435,6 +1798,70 @@ object TunnelManager {
                     return@launch
                 }
 
+                val proxyAccess = normalizeProxyAccess(params.proxyAccess)
+                val proxyBindings = if (tunnelModeUsesLocalProxy(requestedMode)) {
+                    if (!proxySettingsAreValid(
+                            mode = requestedMode,
+                            port = params.socksPort,
+                            access = proxyAccess,
+                            authEnabled = params.socksAuthEnabled,
+                            username = params.socksUsername,
+                            password = params.socksPassword,
+                        )
+                    ) {
+                        setConnectionIssue(
+                            "Небезопасные настройки прокси",
+                            if (proxyAccessIncludesLan(proxyAccess)) {
+                                "Для доступа из локальной сети обязательны непустые логин и пароль."
+                            } else {
+                                "Проверьте порт, логин и пароль локального прокси."
+                            },
+                        )
+                        running.value = false
+                        currentParams = null
+                        return@launch
+                    }
+                    val lanBinding = if (proxyAccessIncludesLan(proxyAccess)) {
+                        findProxyLanBinding()
+                    } else {
+                        null
+                    }
+                    if (proxyAccess == PROXY_ACCESS_LAN && lanBinding == null) {
+                            setConnectionIssue(
+                                "Локальная сеть недоступна",
+                                "Подключитесь к частной сети Wi-Fi или включите точку доступа и попробуйте снова.",
+                            )
+                            running.value = false
+                            currentParams = null
+                            return@launch
+                    }
+                    buildList {
+                        if (proxyAccessIncludesDevice(proxyAccess)) {
+                            add(ProxyListenBinding(SOCKS5_LOOPBACK_HOST, ""))
+                        }
+                        lanBinding?.let(::add)
+                    }.also { bindings ->
+                        if (bindings.isEmpty()) {
+                            setConnectionIssue(
+                                "Прокси недоступен",
+                                "Не удалось выбрать безопасный адрес для прокси.",
+                            )
+                            running.value = false
+                            currentParams = null
+                            return@launch
+                        }
+                        if (proxyAccess == PROXY_ACCESS_BOTH && lanBinding == null) {
+                            updateWarningLog(
+                                "proxy_lan_unavailable",
+                                "[ПРОКСИ] Частная сеть не найдена: пока доступен только адрес 127.0.0.1.",
+                                20,
+                            )
+                        }
+                    }
+                } else {
+                    null
+                }
+
                 val hashCount = hashList.size.coerceIn(1, 4)
                 val totalWorkers = normalizeTunnelWorkerCount(
                     requested = params.workersPerHash,
@@ -1461,6 +1888,37 @@ object TunnelManager {
                     "-n", totalWorkers.toString(),
                     "-listen", "127.0.0.1:${params.port}"
                 )
+                cmd.add("-mode")
+                cmd.add(requestedMode)
+                if (tunnelModeUsesLocalProxy(requestedMode)) {
+                    val bindings = checkNotNull(proxyBindings)
+                    val binding = bindings.first()
+                    val proxyPort = normalizeProxyPort(params.socksPort, requestedMode)
+                    val primaryListenFlag = when (requestedMode) {
+                        TUNNEL_MODE_AUTO -> "-proxy-listen"
+                        TUNNEL_MODE_SOCKS5 -> "-socks-listen"
+                        else -> "-http-listen"
+                    }
+                    cmd.add(primaryListenFlag)
+                    cmd.add("${binding.host}:$proxyPort")
+                    bindings.drop(1).forEach { extraBinding ->
+                        cmd.add("-proxy-extra-listen")
+                        cmd.add("${extraBinding.host}:$proxyPort")
+                    }
+                    cmd.add("-socks-udp=${params.socksUdpEnabled || requestedMode == TUNNEL_MODE_AUTO}")
+                    when (requestedMode) {
+                        TUNNEL_MODE_AUTO -> cmd.add("-proxy-auth=${params.socksAuthEnabled}")
+                        TUNNEL_MODE_SOCKS5 -> cmd.add("-socks-auth=${params.socksAuthEnabled}")
+                        else -> cmd.add("-http-auth=${params.socksAuthEnabled}")
+                    }
+                    val allowedCidr = bindings.firstNotNullOfOrNull {
+                        it.allowedCidr.takeIf(String::isNotBlank)
+                    }
+                    if (allowedCidr != null) {
+                        cmd.add("-proxy-allow-cidr")
+                        cmd.add(allowedCidr)
+                    }
+                }
 
                 if (params.fingerprint.isNotEmpty()) {
                     cmd.add("-fingerprint")
@@ -1560,7 +2018,10 @@ object TunnelManager {
 
                 if (params.configFirstStart) {
                     cmd.add("-config-first-start=true")
-                    if (shouldUseManagedHashFallback(params.profileMaxWorkers, hashCount)) {
+                    // Each group keeps its assigned hash as primary. Every other
+                    // configured hash remains an eligible reserve regardless of the
+                    // selected worker count or the number of resulting groups.
+                    if (shouldUseHashFallback(hashCount)) {
                         cmd.add("-hash-fallback=true")
                     }
                 }
@@ -1578,12 +2039,15 @@ object TunnelManager {
                 env.remove("WDTT_CUSTOM_VK_CLIENT_SECRET")
 
                 process = pb.start()
+                peerDnsWaitStartedAtMs = 0L
                 val startupLine = nativeClientStartupConfigLine(
                     NativeClientStartupSecrets(
                         vkHashes = hashList.joinToString(","),
                         connectionPassword = params.connectionPassword,
                         customVkClientId = if (params.customVkCredentialsEnabled) params.customVkClientId else "",
                         customVkClientSecret = if (params.customVkCredentialsEnabled) params.customVkClientSecret else "",
+                        socksUsername = if (params.socksAuthEnabled) params.socksUsername else "",
+                        socksPassword = if (params.socksAuthEnabled) params.socksPassword else "",
                     )
                 )
                 synchronized(processInputLock) {
@@ -1597,6 +2061,11 @@ object TunnelManager {
                 running.value = true
                 clearTransition()
                 startLogReader()
+                if (deviceSleeping) {
+                    // Service могла быть создана уже с выключенным экраном.
+                    // Передаём сохранённое состояние после запуска процесса.
+                    sendTransportLifecycleCommand("DEVICE_SLEEP")
+                }
                 startWatchdog(appContext, params)
 
             } catch (e: Exception) {
@@ -1613,7 +2082,7 @@ object TunnelManager {
                     processStartedAtMs = System.currentTimeMillis()
                     updateWarningLog(
                         "vpn_recovery_retry_pending",
-                        "[VPN] Автоматическое восстановление пока не завершилось; сохраняем сессию и повторим попытку позже.",
+                        "[СВЯЗЬ] Автоматическое восстановление пока не завершилось; сохраняем сессию и повторим попытку позже.",
                         50,
                     )
                 } else {
@@ -1639,6 +2108,9 @@ object TunnelManager {
                 var lastResetTime = System.currentTimeMillis()
 
                 reader.forEachLine { line ->
+                    // Output buffered by a process that has just been replaced must
+                    // not poison the recovery state of the new transport generation.
+                    if (!isActive || process !== observedProcess) return@forEachLine
                     val now = System.currentTimeMillis()
                     if (now - lastResetTime > 60000) {
                         refusedCount = 0
@@ -1650,6 +2122,205 @@ object TunnelManager {
 
                     val msgPrefixReplaced = line.replace(Regex("^\\d{4}/\\d{2}/\\d{2}\\s\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?\\s"), "")
                     val lineTrim = msgPrefixReplaced.trim()
+
+                    if (
+                        handleUpdateMetadataResult(lineTrim) ||
+                        handleOpaqueHttpsResult(lineTrim) ||
+                        handleUpdateApkResult(lineTrim) ||
+                        handleDeploySafeResult(lineTrim)
+                    ) {
+                        return@forEachLine
+                    }
+
+                    if (lineTrim.startsWith("PEER_DNS_WAIT|")) {
+                        val host = lineTrim.substringAfter('|').trim().ifBlank { "сервер" }
+                        if (peerDnsWaitStartedAtMs == 0L) {
+                            peerDnsWaitStartedAtMs = System.currentTimeMillis()
+                        }
+                        noteRecoverableNetworkIssue(
+                            "Не определяется адрес сервера",
+                            "DNS временно не отвечает. WDTT Plus ждёт восстановления сети и не завершает транспорт.",
+                        )
+                        setConnectionIssue(
+                            "Ожидание адреса сервера",
+                            "DNS временно не отвечает. Соединение продолжит запуск автоматически после восстановления сети.",
+                            isError = false,
+                        )
+                        updateWarningLog(
+                            "peer_dns_wait",
+                            "[DNS] Адрес сервера $host временно не определяется; ждём восстановления сети",
+                            20,
+                        )
+                        return@forEachLine
+                    }
+
+                    if (lineTrim.startsWith("PEER_DNS_READY|")) {
+                        val host = lineTrim.split('|').getOrNull(1).orEmpty().ifBlank { "сервера" }
+                        peerDnsWaitStartedAtMs = 0L
+                        resetNetworkRecoveryState()
+                        if (connectionIssue.value?.title == "Ожидание адреса сервера") {
+                            clearConnectionIssue()
+                        }
+                        updateLog(
+                            "peer_dns_ready",
+                            "[DNS] Адрес $host снова определяется; подключение продолжается ✓",
+                            20,
+                            false,
+                        )
+                        return@forEachLine
+                    }
+
+                    parseWakeWorkerStatus(lineTrim)?.let { status ->
+                        if (!deviceSleeping && status.generation >= wakeRecoveryGeneration) {
+                            val progressChanged = status.generation != wakeRecoveryGeneration ||
+                                status.ready != wakeRecoveryReadyWorkers.value ||
+                                status.total != wakeRecoveryTargetWorkers.value
+                            wakeRecoveryGeneration = status.generation
+                            wakeRecoveryReadyWorkers.value = status.ready
+                            val target = maxOf(wakeRecoveryTargetWorkers.value, status.total)
+                            wakeRecoveryTargetWorkers.value = target
+                            wakeRecoveryInProgress.value = target == 0 || status.ready < target
+                            if (progressChanged && target > 0 && status.ready < target) {
+                                val heldConnection = wakeRecoveryHeldConnection.value
+                                updateLog(
+                                    "wake_worker_progress",
+                                    if (status.ready > 0) {
+                                        if (heldConnection) {
+                                            "[СОН] Проверка удержанного соединения: подтверждено ${status.ready}/$target каналов; остальные проверяются отдельно."
+                                        } else {
+                                            "[СОН] Восстановление после сна: доступно ${status.ready}/$target каналов."
+                                        }
+                                    } else {
+                                        if (heldConnection) {
+                                            "[СОН] Проверяем $target каналов удержанного соединения; ответы ещё ожидаются."
+                                        } else {
+                                            "[СОН] Проверяем $target каналов после сна; ответы ещё ожидаются."
+                                        }
+                                    },
+                                    20,
+                                    false,
+                                )
+                            }
+                            if (
+                                shouldLogWakeWorkerCompletion(
+                                    progressChanged = progressChanged,
+                                    readyWorkers = status.ready,
+                                    targetWorkers = target,
+                                    generation = status.generation,
+                                    completedGeneration = completedWakeRecoveryGeneration,
+                                )
+                            ) {
+                                completedWakeRecoveryGeneration = status.generation
+                                updateLog(
+                                    "wake_worker_progress",
+                                    if (wakeRecoveryHeldConnection.value) {
+                                        "[СОН] Удержание соединения подтверждено: доступны все ${status.ready}/$target каналов."
+                                    } else {
+                                        "[СОН] Восстановление после сна завершено: доступно ${status.ready}/$target каналов."
+                                    },
+                                    20,
+                                    false,
+                                )
+                            }
+                        }
+                        return@forEachLine
+                    }
+
+                    if (lineTrim.startsWith("SOCKS_READY|")) {
+                        val parts = lineTrim.substringAfter("SOCKS_READY|").split('|')
+                        val address = parts.firstOrNull().orEmpty()
+                        proxyReadyAddress.value = address.takeIf { it.isNotBlank() }
+                        proxyReadyAddresses.value = listOfNotNull(address.takeIf { it.isNotBlank() })
+                        updateLog(
+                            "socks_ready",
+                            "[SOCKS5] Прокси готов: $address · TCP · " +
+                                if (currentParams?.socksUdpEnabled == true) "UDP" else "UDP выключен",
+                            2,
+                            false,
+                        )
+                        clearConnectionIssue()
+                        return@forEachLine
+                    }
+                    if (lineTrim.startsWith("SOCKS_ERROR|")) {
+                        val reason = lineTrim.substringAfter("SOCKS_ERROR|").ifBlank { "неизвестная ошибка" }
+                        proxyReadyAddress.value = null
+                        proxyReadyAddresses.value = emptyList()
+                        setConnectionIssue(
+                            "SOCKS5 не запустился",
+                            "Проверьте порт локального прокси и настройки профиля. Причина: $reason",
+                        )
+                        updateLog("socks_error", "[SOCKS5] $reason", 99, true)
+                        stop(TunnelStopReason.CriticalError)
+                        return@forEachLine
+                    }
+                    if (lineTrim.startsWith("HTTP_READY|")) {
+                        val parts = lineTrim.substringAfter("HTTP_READY|").split('|')
+                        val address = parts.firstOrNull().orEmpty()
+                        proxyReadyAddress.value = address.takeIf { it.isNotBlank() }
+                        proxyReadyAddresses.value = listOfNotNull(address.takeIf { it.isNotBlank() })
+                        updateLog(
+                            "http_ready",
+                            "[HTTP] CONNECT-прокси готов: $address · TCP",
+                            2,
+                            false,
+                        )
+                        clearConnectionIssue()
+                        return@forEachLine
+                    }
+                    if (lineTrim.startsWith("HTTP_ERROR|")) {
+                        val reason = lineTrim.substringAfter("HTTP_ERROR|").ifBlank { "неизвестная ошибка" }
+                        proxyReadyAddress.value = null
+                        proxyReadyAddresses.value = emptyList()
+                        setConnectionIssue(
+                            "HTTP CONNECT не запустился",
+                            "Проверьте порт, сеть и настройки аутентификации. Причина: $reason",
+                        )
+                        updateLog("http_error", "[HTTP] $reason", 99, true)
+                        stop(TunnelStopReason.CriticalError)
+                        return@forEachLine
+                    }
+                    if (lineTrim.startsWith("PROXY_READY|")) {
+                        val parts = lineTrim.substringAfter("PROXY_READY|").split('|')
+                        val readyMode = normalizeTunnelMode(parts.getOrNull(0))
+                        val addresses = parts.getOrNull(1)
+                            .orEmpty()
+                            .split(',')
+                            .map(String::trim)
+                            .filter(String::isNotBlank)
+                            .distinct()
+                        proxyReadyAddresses.value = addresses
+                        proxyReadyAddress.value = addresses.firstOrNull()
+                        val protocolText = when (readyMode) {
+                            TUNNEL_MODE_AUTO -> "SOCKS5 TCP + UDP · HTTP TCP"
+                            TUNNEL_MODE_SOCKS5 -> if (currentParams?.socksUdpEnabled == true) {
+                                "SOCKS5 TCP + UDP"
+                            } else {
+                                "SOCKS5 TCP"
+                            }
+                            else -> "HTTP CONNECT TCP"
+                        }
+                        updateLog(
+                            "proxy_ready",
+                            "[ПРОКСИ] Готов: ${addresses.joinToString(" · ")} · $protocolText",
+                            2,
+                            false,
+                        )
+                        clearConnectionIssue()
+                        return@forEachLine
+                    }
+                    if (lineTrim.startsWith("PROXY_ERROR|")) {
+                        val reason = lineTrim.substringAfter("PROXY_ERROR|")
+                            .ifBlank { "неизвестная ошибка" }
+                        proxyReadyAddress.value = null
+                        proxyReadyAddresses.value = emptyList()
+                        setConnectionIssue(
+                            "Прокси не запустился",
+                            "Проверьте порт, сеть и настройки аутентификации. Причина: $reason",
+                        )
+                        updateLog("proxy_error", "[ПРОКСИ] $reason", 99, true)
+                        stop(TunnelStopReason.CriticalError)
+                        return@forEachLine
+                    }
 
                     val vkCallsCooldownMs = vkCallsPreflightCooldownForLog(lineTrim)
                     if (vkCallsCooldownMs > 0L) {
@@ -1874,7 +2545,7 @@ object TunnelManager {
                             lineTrim.contains("ip mismatch", true) -> {
                                 mismatchCount++
                                 if (mismatchCount >= 5) {
-                                    setConnectionIssue("VK потерял текущий IP", "Переподключите VPN. Если сеть часто меняется между Wi-Fi/LTE, попробуйте закрепиться на одной сети.")
+                                    setConnectionIssue("VK потерял текущий IP", "Переподключите соединение. Если сеть часто меняется между Wi-Fi/LTE, попробуйте закрепиться на одной сети.")
                                     handleCriticalError("IP Mismatch (IP утерян). Попробуйте переподключиться.")
                                     return@forEachLine
                                 }
@@ -1887,7 +2558,7 @@ object TunnelManager {
                                     refusedCount = 0
                                     noteRecoverableNetworkIssue(
                                         "Сеть временно недоступна",
-                                        "Транспорт получил много сетевых таймаутов. WDTT Plus попробует восстановить соединение автоматически; если сеть не вернётся, VPN будет остановлен позже безопасным recovery-механизмом.",
+                                        "Транспорт получил много сетевых таймаутов. WDTT Plus попробует восстановить соединение автоматически; если сеть не вернётся, соединение будет безопасно остановлено позже.",
                                         hardFailure = isHardNetworkFailure(lineTrim),
                                         confirmedUserTrafficFailure = true,
                                     )
@@ -2275,29 +2946,45 @@ object TunnelManager {
                             } else {
                                 val seconds = trailingSeconds(text)
                                 val userTrafficStalled = text.contains("пользовательский трафик", true)
-                                noteRecoverableNetworkIssue(
-                                    if (userTrafficStalled) "Нет ответа на пользовательский трафик" else "Транспорт потерял ответ сервера",
-                                    if (userTrafficStalled) {
-                                        "Трафик уже ушёл в VPN, но сервер не ответил. WDTT Plus восстановит транспорт или выключит VPN, чтобы вернуть обычный интернет."
-                                    } else {
-                                        "Keepalive от сервера не пришёл. WDTT Plus перезапустит транспорт, если связь не восстановится сама."
-                                    },
-                                    // Нативный клиент уже выдержал собственный таймаут
-                                    // неотвеченного пользовательского трафика. Keepalive
-                                    // сюда не попадает, поэтому второй минутный порог
-                                    // только откладывал восстановление реального зависания.
-                                    hardFailure = isConfirmedUserTrafficFailure(userTrafficStalled),
-                                    confirmedUserTrafficFailure = userTrafficStalled,
-                                )
-                                updateWarningLog(
-                                    if (userTrafficStalled) "transport_health_user_traffic" else "transport_health_keepalive",
-                                    if (userTrafficStalled) {
-                                        "[СВЯЗЬ] Трафик ушёл в VPN, ответа сервера нет${seconds?.let { " $it сек" } ?: ""}. Восстанавливаем транспорт"
-                                    } else {
-                                        "[СВЯЗЬ] Сервер не отвечает на keepalive${seconds?.let { " $it сек" } ?: ""}. Переподключаем канал"
-                                    },
-                                    50
-                                )
+                                if (userTrafficStalled &&
+                                    !shouldEscalateUserTrafficStall(activeMode.value)
+                                ) {
+                                    // Совместимость с нативными клиентами, собранными до
+                                    // разделения health-политик: молчащий SOCKS-поток не
+                                    // должен создавать красную ошибку всего прокси.
+                                    updateLog(
+                                        "socks_flow_no_response",
+                                        "[SOCKS5] Один запрос не получил ответ" +
+                                            (seconds?.let { " за $it сек" } ?: "") +
+                                            "; прокси продолжает работу",
+                                        10,
+                                        false,
+                                    )
+                                } else {
+                                    noteRecoverableNetworkIssue(
+                                        if (userTrafficStalled) "Нет ответа на пользовательский трафик" else "Транспорт потерял ответ сервера",
+                                        if (userTrafficStalled) {
+                                            "Трафик уже передан в соединение, но сервер не ответил. WDTT Plus восстановит транспорт или безопасно остановит соединение."
+                                        } else {
+                                            "Keepalive от сервера не пришёл. WDTT Plus перезапустит транспорт, если связь не восстановится сама."
+                                        },
+                                        // Нативный клиент уже выдержал собственный таймаут
+                                        // неотвеченного пользовательского трафика. Keepalive
+                                        // сюда не попадает, поэтому второй минутный порог
+                                        // только откладывал восстановление реального зависания.
+                                        hardFailure = isConfirmedUserTrafficFailure(userTrafficStalled),
+                                        confirmedUserTrafficFailure = userTrafficStalled,
+                                    )
+                                    updateWarningLog(
+                                        if (userTrafficStalled) "transport_health_user_traffic" else "transport_health_keepalive",
+                                        if (userTrafficStalled) {
+                                            "[СВЯЗЬ] Трафик передан, ответа сервера нет${seconds?.let { " $it сек" } ?: ""}. Восстанавливаем транспорт"
+                                        } else {
+                                            "[СВЯЗЬ] Сервер не отвечает на keepalive${seconds?.let { " $it сек" } ?: ""}. Переподключаем канал"
+                                        },
+                                        50
+                                    )
+                                }
                             }
                         }
                         lineTrim.contains("Relay:") ->
@@ -2349,19 +3036,19 @@ object TunnelManager {
                             if (errorKey == "err_hard_network") {
                                 noteRecoverableNetworkIssue(
                                     "Сеть телефона недоступна для транспорта",
-                                    "WDTT Plus попробует быстро восстановить транспорт. Если связь не вернётся, VPN будет выключен, чтобы вернуть обычный интернет.",
+                                    "WDTT Plus попробует быстро восстановить транспорт. Если связь не вернётся, соединение будет безопасно остановлено.",
                                     hardFailure = true
                                 )
                             } else if (errorKey == "err_local_dns_refused") {
                                 noteRecoverableNetworkIssue(
                                     "DNS телефона не отвечает",
-                                    "Локальный DNS вернул отказ. WDTT Plus попробует быстро восстановить транспорт, затем выключит VPN, если интернет не вернётся.",
+                                    "Локальный DNS вернул отказ. WDTT Plus попробует быстро восстановить транспорт, затем безопасно остановит соединение, если интернет не вернётся.",
                                     hardFailure = true
                                 )
                             } else if (errorKey == "err_vk_dns") {
                                 noteRecoverableNetworkIssue(
                                     "DNS до VK недоступен",
-                                    "WDTT Plus попробует восстановить транспорт автоматически. Если не восстановится, проверьте интернет без VPN и DNS на устройстве."
+                                    "WDTT Plus попробует восстановить транспорт автоматически. Если не восстановится, проверьте обычный интернет и DNS на устройстве."
                                 )
                             } else if (errorKey == "err_vk_https") {
                                 noteRecoverableNetworkIssue(
@@ -2420,14 +3107,18 @@ object TunnelManager {
                     }
                 }
             } catch (e: Exception) {
-                if (!e.message.toString().contains("read interrupted by close", ignoreCase = true)) {
-                    val message = e.readableMessage()
-                    updateLog("sys_error", "Системная ошибка: $message", -1, true)
+                if (shouldReportProcessReaderFailure(isActive, process === observedProcess)) {
+                    val message = localizedProcessReaderFailure(e.readableMessage())
+                    updateLog("sys_error", "Системная ошибка чтения транспорта: $message", -1, true)
                     setConnectionIssue("Системная ошибка туннеля", "Попробуйте подключиться снова. Причина: $message")
                 }
             } finally {
                 if (process === observedProcess) {
                     process = null
+                    failPendingUpdateMetadataRequests()
+                    failPendingOpaqueHttpsRequests("Соединение WDTT остановлено")
+                    failPendingUpdateApkRequests()
+                    failPendingDeploySafeRequests("Соединение WDTT остановлено")
                     if (currentParams == null) {
                         running.value = false
                     }
@@ -2563,10 +3254,17 @@ object TunnelManager {
     fun restartTransport(
         reason: String = "[СЕТЬ] Мягкий перезапуск транспорта...",
         minIntervalMs: Long = 20_000L,
-        force: Boolean = false
+        force: Boolean = false,
+        resetNetworkRecovery: Boolean = false,
     ): Boolean {
         val params = currentParams ?: return false
         val context = lastContext ?: return false
+        if (resetNetworkRecovery) {
+            // Wake rescue is already the decision taken for the previous
+            // transport generation. Its delayed health lines must not trigger
+            // a second full-process restart as soon as the new generation starts.
+            resetNetworkRecoveryState()
+        }
         val now = System.currentTimeMillis()
         val cooldownMs = (minIntervalMs + softRestartCount.coerceAtMost(4) * 30_000L).coerceAtMost(5 * 60_000L)
         if (!force && now - lastSoftRestartAtMs < cooldownMs) {
@@ -2695,29 +3393,65 @@ object TunnelManager {
         now < wakeRecoveryGraceUntilMs
 
     fun noteDeviceSleepStarted() {
-        if (!running.value) return
+        deviceSleeping = true
         // Ошибки, возникшие до или во время сна, нельзя переносить в решение о
         // восстановлении после пробуждения: сеть и вывод статистики в этот период
         // могут штатно приостанавливаться Android.
         wakeRecoveryGraceUntilMs = 0L
+        wakeRecoveryInProgress.value = false
+        wakeRecoveryReadyWorkers.value = 0
+        wakeRecoveryTargetWorkers.value = 0
+        wakeRecoveryHeldConnection.value = false
+        if (!running.value) return
         sendTransportLifecycleCommand("DEVICE_SLEEP")
     }
 
-    fun noteDeviceWakeStarted(now: Long = System.currentTimeMillis()) {
+    fun noteDeviceWakeStarted(
+        now: Long = System.currentTimeMillis(),
+        heldConnection: Boolean = false,
+    ) {
+        deviceSleeping = false
         if (!running.value) return
         // Запоминаем границу до команды native-процессу: быстрый pong может
         // прийти раньше, чем TunnelService успеет создать rescue-задачу.
         lastDeviceWakeStartedAtMs = now
+        wakeRecoveryGeneration = 0L
+        completedWakeRecoveryGeneration = 0L
+        wakeRecoveryReadyWorkers.value = 0
+        wakeRecoveryTargetWorkers.value = currentParams?.let { params ->
+            normalizeTunnelWorkerCount(
+                requested = params.workersPerHash,
+                profileMaxWorkers = params.profileMaxWorkers,
+            )
+        } ?: activeWorkers.value.coerceAtLeast(0)
+        wakeRecoveryHeldConnection.value = heldConnection
+        wakeRecoveryInProgress.value = true
         resetNetworkRecoveryState()
         sendTransportLifecycleCommand("DEVICE_WAKE")
         wakeRecoveryGraceUntilMs = now + WAKE_RECOVERY_GRACE_MS
         networkTransitionGraceUntilMs = maxOf(networkTransitionGraceUntilMs, wakeRecoveryGraceUntilMs)
         updateLog(
             "wake_stabilization",
-            "[СОН] Экран включён; даём текущему VPN восстановить активность без перезапуска.",
+            if (heldConnection) {
+                "[СОН] Экран включён; подтверждаем удержанное соединение по каждому каналу без перезапуска VPN."
+            } else {
+                "[СОН] Экран включён; проверяем каналы отдельно и даём текущему соединению восстановиться без полного перезапуска."
+            },
             20,
             false,
         )
+        wakeRecoveryTargetWorkers.value.takeIf { it > 0 }?.let { target ->
+            updateLog(
+                "wake_worker_progress",
+                if (heldConnection) {
+                    "[СОН] Проверяем $target каналов удержанного соединения; до ответов сервера они не считаются потерянными."
+                } else {
+                    "[СОН] Проверяем $target каналов после сна; до ответов сервера они не считаются потерянными."
+                },
+                20,
+                false,
+            )
+        }
     }
 
     fun wakeRecoveryReferenceAt(now: Long = System.currentTimeMillis()): Long =
@@ -2797,18 +3531,44 @@ object TunnelManager {
     }
 
     fun noteWakeRescueHealthy() {
+        finishWakeRecoveryPresentation()
         updateLog(
             "wake_rescue_ok",
-            "[СОН] VPN подал свежие признаки жизни после пробуждения.",
+            if (wakeRecoveryHeldConnection.value) {
+                "[СОН] Удержанное соединение отвечает после включения экрана."
+            } else {
+                "[СОН] VPN подал свежие признаки жизни после пробуждения."
+            },
             50,
             false
+        )
+    }
+
+    fun noteWakeRescuePartial(ready: Int, total: Int) {
+        // Поканальное восстановление продолжается внутри native-транспорта,
+        // но через контрольные 15 секунд это уже не переходное состояние UI.
+        // Дальше основной экран и уведомление показывают обычное фактическое
+        // число активных потоков, а не бессрочную надпись «после сна».
+        finishWakeRecoveryPresentation()
+        updateWarningLog(
+            "wake_rescue_partial",
+            if (wakeRecoveryHeldConnection.value) {
+                "[СОН] Удержанное соединение подтвердило $ready/$total каналов; используем их, остальные восстанавливаются отдельно."
+            } else {
+                "[СОН] После пробуждения доступны $ready/$total каналов; используем их, остальные восстанавливаются отдельно."
+            },
+            50,
         )
     }
 
     fun noteWakeRescueDeferred() {
         updateWarningLog(
             "wake_rescue_deferred",
-            "[СОН] После пробуждения транспорт ещё не подал свежих признаков жизни. VPN-интерфейс оставлен активным; продолжаем наблюдение без аварийного отключения.",
+            if (wakeRecoveryHeldConnection.value) {
+                "[СОН] Удержанное соединение ещё не подтвердило работу. VPN-интерфейс оставлен активным; продолжаем проверку без аварийного отключения."
+            } else {
+                "[СОН] После пробуждения транспорт ещё не подал свежих признаков жизни. VPN-интерфейс оставлен активным; продолжаем наблюдение без аварийного отключения."
+            },
             50,
         )
     }
@@ -2866,11 +3626,23 @@ object TunnelManager {
     }
 
     fun noteWakeRescueReconnect() {
+        // После принятого решения о мягком перезапуске прежняя проверка сна
+        // завершена. Новый транспорт сообщает своё обычное состояние запуска.
+        finishWakeRecoveryPresentation()
         updateWarningLog(
             "wake_rescue_reconnect",
-            "[СОН] Транспорт не ожил после пробуждения. Мягко переподключаем его без пересоздания системного VPN.",
+            if (wakeRecoveryHeldConnection.value) {
+                "[СОН] Удержанный транспорт не подтвердил ни одного канала. Мягко переподключаем его без пересоздания системного VPN."
+            } else {
+                "[СОН] Транспорт не ожил после пробуждения. Мягко переподключаем его без пересоздания системного VPN."
+            },
             50
         )
+    }
+
+    private fun finishWakeRecoveryPresentation() {
+        wakeRecoveryInProgress.value = false
+        wakeRecoveryHeldConnection.value = false
     }
 
     fun noteSleepTimerTransportHealthy() {
@@ -2907,7 +3679,7 @@ object TunnelManager {
     fun recreateVpnTunnel(
         reason: String = "[VPN] Android потерял системный VPN-интерфейс, создаём его заново",
     ) {
-        if (vpnSlotYieldRequested.value) return
+        if (activeMode.value != TUNNEL_MODE_VPN || vpnSlotYieldRequested.value) return
         val params = currentParams ?: return
         val context = lastContext ?: return
         resetNetworkRecoveryState()
@@ -2929,14 +3701,23 @@ object TunnelManager {
     }
 
     fun markStoppedAfterFailedRecovery() {
+        val peerDnsUnavailable = peerDnsWaitStartedAtMs > 0L
         resetNetworkRecoveryState()
         setConnectionIssue(
-            "VPN остановлен, чтобы вернуть интернет",
-            "WDTT Plus несколько раз не смог восстановить транспорт после сетевой ошибки. Интернет телефона возвращён напрямую; включите VPN снова, когда сеть стабилизируется."
+            if (peerDnsUnavailable) "Не удалось определить адрес сервера" else "Соединение остановлено после сбоя",
+            if (peerDnsUnavailable) {
+                "Сеть вернулась, но DNS долго не мог определить адрес сервера. Проверьте адрес профиля и DNS либо попробуйте другую сеть."
+            } else {
+                "WDTT Plus несколько раз не смог восстановить транспорт после сетевой ошибки. Включите соединение снова, когда сеть стабилизируется."
+            }
         )
         updateLog(
-            "network_fail_open",
-            "[СЕТЬ] Автовосстановление не помогло. VPN остановлен, чтобы телефон не остался без интернета.",
+            if (peerDnsUnavailable) "peer_dns_fail_open" else "network_fail_open",
+            if (peerDnsUnavailable) {
+                "[DNS] Адрес сервера долго не определялся. Соединение безопасно остановлено."
+            } else {
+                "[СЕТЬ] Автовосстановление не помогло. Соединение безопасно остановлено."
+            },
             -1,
             true
         )
@@ -2948,6 +3729,7 @@ object TunnelManager {
         killProcess()
         activeWorkers.value = 0
         resetStatsLivenessState()
+        resetWakeRecoveryState()
     }
 
     fun resume() {
@@ -2967,6 +3749,10 @@ object TunnelManager {
         readerJob?.cancel()
         val proc = process
         process = null
+        failPendingUpdateMetadataRequests()
+        failPendingOpaqueHttpsRequests("Соединение WDTT остановлено")
+        failPendingUpdateApkRequests()
+        failPendingDeploySafeRequests("Соединение WDTT остановлено")
         if (proc != null) {
             try {
                 synchronized(processInputLock) {
@@ -2985,6 +3771,7 @@ object TunnelManager {
             }
         }
         closeWarpApiSshRelay()
+        resetWakeRecoveryState()
     }
 
     @Synchronized
@@ -3000,15 +3787,15 @@ object TunnelManager {
         running.value = false
     }
 
-    private fun markLogSessionStopped(reason: TunnelStopReason) {
+    private fun markLogSessionStopped(reason: TunnelStopReason, tunnelMode: String = activeMode.value) {
         activeWorkers.value = 0
-        val stoppedStats = buildStoppedSessionStats(stats.value, reason)
+        val stoppedStats = buildStoppedSessionStats(stats.value, reason, tunnelMode)
         stats.value = stoppedStats
         updateLog("stats", "[СТАТИСТИКА] $stoppedStats", 3, false)
     }
 
     fun onWireGuardInterfaceDropped(vpnSlotTransferred: Boolean) {
-        if (!running.value) return
+        if (!running.value || activeMode.value != TUNNEL_MODE_VPN) return
         if (vpnSlotTransferred) {
             if (vpnSlotYieldRequested.value) return
             vpnSlotYieldRequested.value = true
@@ -3039,10 +3826,16 @@ object TunnelManager {
                 }
                 killProcess()
                 running.value = false
-                markLogSessionStopped(reason)
+                proxyReadyAddress.value = null
+                proxyReadyAddresses.value = emptyList()
+                val stoppedMode = activeMode.value
+                activeMode.value = TUNNEL_MODE_VPN
+                lastStopReason.value = reason
+                markLogSessionStopped(reason, stoppedMode)
                 resetStatsLivenessState()
                 currentParams = null
                 resetNetworkRecoveryState()
+                peerDnsWaitStartedAtMs = 0L
                 wakeRecoveryGraceUntilMs = 0L
                 ManlCaptchaWebViewManager.cancelCaptcha()
             } finally {
@@ -3072,12 +3865,18 @@ object TunnelManager {
             withContext(Dispatchers.IO) {
                 killProcess()
                 running.value = false
+                proxyReadyAddress.value = null
+                proxyReadyAddresses.value = emptyList()
+                val stoppedMode = activeMode.value
+                activeMode.value = TUNNEL_MODE_VPN
                 if (hadManagedSession) {
-                    markLogSessionStopped(reason)
+                    lastStopReason.value = reason
+                    markLogSessionStopped(reason, stoppedMode)
                 }
                 resetStatsLivenessState()
                 currentParams = null
                 resetNetworkRecoveryState()
+                peerDnsWaitStartedAtMs = 0L
                 wakeRecoveryGraceUntilMs = 0L
                 ManlCaptchaWebViewManager.cancelCaptcha()
             }
@@ -3093,7 +3892,9 @@ object TunnelManager {
     fun reloadWireGuard() {
         wireGuardReloadJob?.cancel()
         wireGuardReloadJob = scope.launch {
-            if (running.value && !vpnSlotYieldRequested.value) wgHelper?.reloadTunnel()
+            if (running.value && activeMode.value == TUNNEL_MODE_VPN && !vpnSlotYieldRequested.value) {
+                wgHelper?.reloadTunnel()
+            }
         }
     }
 
@@ -3107,6 +3908,7 @@ object TunnelManager {
         wireGuardReloadJob = scope.launch {
             delay(delayMs.coerceAtLeast(0L))
             if (
+                activeMode.value == TUNNEL_MODE_VPN &&
                 !vpnSlotYieldRequested.value &&
                 shouldReloadWireGuardRouting(running.value, activeTunnelProfile.value, profileIndex)
             ) {
@@ -3247,6 +4049,354 @@ object TunnelManager {
         }
     }
 
+    internal fun isUpdateRelayAvailable(): Boolean =
+        transportControlRelayAvailable(
+            running = running.value,
+            activeWorkers = activeWorkers.value,
+            activeMode = activeMode.value,
+            vpnSlotYieldRequested = vpnSlotYieldRequested.value,
+        )
+
+    internal suspend fun fetchUpdateMetadataThroughTunnel(): String? {
+        if (!isUpdateRelayAvailable()) return null
+        val expectedProcess = process?.takeIf { it.isAlive } ?: return null
+        val requestId = UUID.randomUUID().toString()
+        val deferred = CompletableDeferred<String?>()
+        updateMetadataRequests[requestId] = deferred
+        try {
+            synchronized(processInputLock) {
+                if (process !== expectedProcess || !expectedProcess.isAlive) return null
+                expectedProcess.outputStream.write("UPDATE_METADATA|$requestId\n".toByteArray(Charsets.UTF_8))
+                expectedProcess.outputStream.flush()
+            }
+            return withTimeoutOrNull(10_000L) { deferred.await() }
+        } catch (_: Exception) {
+            return null
+        } finally {
+            updateMetadataRequests.remove(requestId, deferred)
+        }
+    }
+
+    private fun handleUpdateMetadataResult(line: String): Boolean {
+        if (!line.startsWith("UPDATE_METADATA_RESULT|")) return false
+        val parts = line.split('|', limit = 4)
+        if (parts.size != 4) return true
+        val deferred = updateMetadataRequests[parts[1]] ?: return true
+        if (parts[2] != "OK") {
+            deferred.complete(null)
+            return true
+        }
+        val decoded = runCatching {
+            Base64.decode(parts[3], Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
+                .toString(Charsets.UTF_8)
+                .takeIf { it.length <= 64 * 1024 }
+        }.getOrNull()
+        deferred.complete(decoded)
+        return true
+    }
+
+    private fun failPendingUpdateMetadataRequests() {
+        updateMetadataRequests.values.forEach { it.complete(null) }
+        updateMetadataRequests.clear()
+    }
+
+    internal suspend fun postOpaqueHttpsStatusThroughTunnel(
+        url: String,
+        payload: ByteArray,
+    ): OpaqueHttpsRelayResult {
+        if (!isUpdateRelayAvailable()) {
+            return OpaqueHttpsRelayResult.Unavailable("рабочий канал WDTT ещё не готов")
+        }
+        if (url.length !in 12..2048 || payload.size !in 1..768) {
+            return OpaqueHttpsRelayResult.Unavailable("служебный HTTPS-запрос имеет недопустимый размер")
+        }
+        val expectedProcess = process?.takeIf { it.isAlive }
+            ?: return OpaqueHttpsRelayResult.Unavailable("рабочий канал WDTT ещё не готов")
+        val requestId = UUID.randomUUID().toString()
+        val encodedUrl = Base64.encodeToString(
+            url.toByteArray(Charsets.UTF_8),
+            Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING,
+        )
+        val encodedPayload = Base64.encodeToString(
+            payload,
+            Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING,
+        )
+        val deferred = CompletableDeferred<OpaqueHttpsRelayResult>()
+        opaqueHttpsRequests[requestId] = deferred
+        try {
+            synchronized(processInputLock) {
+                if (process !== expectedProcess || !expectedProcess.isAlive) {
+                    return OpaqueHttpsRelayResult.Unavailable("соединение WDTT изменилось")
+                }
+                expectedProcess.outputStream.write(
+                    "OPAQUE_HTTPS_POST|$requestId|$encodedUrl|$encodedPayload\n"
+                        .toByteArray(Charsets.UTF_8),
+                )
+                expectedProcess.outputStream.flush()
+            }
+            return withTimeoutOrNull(10_500L) { deferred.await() }
+                ?: OpaqueHttpsRelayResult.Unavailable("сервер WDTT не ответил вовремя")
+        } catch (error: Exception) {
+            return OpaqueHttpsRelayResult.Unavailable(
+                error.message ?: "не удалось отправить HTTPS-запрос через WDTT",
+            )
+        } finally {
+            opaqueHttpsRequests.remove(requestId, deferred)
+        }
+    }
+
+    private fun handleOpaqueHttpsResult(line: String): Boolean {
+        if (!line.startsWith("OPAQUE_HTTPS_RESULT|")) return false
+        val parts = line.split('|', limit = 4)
+        if (parts.size < 3) return true
+        val deferred = opaqueHttpsRequests[parts[1]] ?: return true
+        if (parts[2] != "OK" || parts.size != 4) {
+            val reason = parts.getOrNull(3)
+                ?.let { encoded ->
+                    runCatching {
+                        Base64.decode(encoded, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
+                            .toString(Charsets.UTF_8)
+                            .take(240)
+                    }.getOrNull()
+                }
+                .orEmpty()
+                .ifBlank { "сервер WDTT не выполнил HTTPS-запрос" }
+            deferred.complete(OpaqueHttpsRelayResult.Unavailable(reason))
+            return true
+        }
+        val result = runCatching {
+            val decoded = Base64.decode(
+                parts[3],
+                Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING,
+            ).toString(Charsets.UTF_8)
+            require(decoded.length <= 48 * 1024)
+            val root = JSONObject(decoded)
+            val status = root.getInt("status")
+            val body = root.optString("body")
+            val codeHint = root.optString("code_hint").trim().take(128)
+            require(status in 100..599 && body.length <= 32 * 1024)
+            OpaqueHttpsRelayResult.Success(status, body, codeHint)
+        }.getOrElse {
+            OpaqueHttpsRelayResult.Unavailable("сервер WDTT вернул повреждённый HTTPS-ответ")
+        }
+        deferred.complete(result)
+        return true
+    }
+
+    private fun failPendingOpaqueHttpsRequests(reason: String) {
+        opaqueHttpsRequests.values.forEach { deferred ->
+            deferred.complete(OpaqueHttpsRelayResult.Unavailable(reason))
+        }
+        opaqueHttpsRequests.clear()
+    }
+
+    internal suspend fun downloadUpdateApkThroughTunnel(
+        downloadUrl: String,
+        sizeBytes: Long,
+        sha256: String,
+        outputFile: File,
+        onProgress: suspend (Long, Long) -> Unit,
+    ): Boolean {
+        if (!isUpdateRelayAvailable()) return false
+        val expectedProcess = process?.takeIf { it.isAlive } ?: return false
+        val requestId = UUID.randomUUID().toString()
+        val deferred = CompletableDeferred<Boolean>()
+        val waiter = UpdateApkDownloadWaiter(deferred, onProgress)
+        updateApkDownloadRequests[requestId] = waiter
+        outputFile.delete()
+        val encodedUrl = Base64.encodeToString(
+            downloadUrl.toByteArray(Charsets.UTF_8),
+            Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING,
+        )
+        val encodedPath = Base64.encodeToString(
+            outputFile.absolutePath.toByteArray(Charsets.UTF_8),
+            Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING,
+        )
+        try {
+            synchronized(processInputLock) {
+                if (process !== expectedProcess || !expectedProcess.isAlive) return false
+                val command = "UPDATE_APK|$requestId|$sizeBytes|$sha256|$encodedUrl|$encodedPath\n"
+                expectedProcess.outputStream.write(command.toByteArray(Charsets.UTF_8))
+                expectedProcess.outputStream.flush()
+            }
+            return withTimeoutOrNull(20L * 60L * 1000L) { deferred.await() } == true
+        } catch (_: Exception) {
+            return false
+        } finally {
+            updateApkDownloadRequests.remove(requestId, waiter)
+        }
+    }
+
+    private fun handleUpdateApkResult(line: String): Boolean {
+        if (line.startsWith("UPDATE_APK_PROGRESS|")) {
+            val parts = line.split('|', limit = 4)
+            if (parts.size != 4) return true
+            val waiter = updateApkDownloadRequests[parts[1]] ?: return true
+            val downloaded = parts[2].toLongOrNull() ?: return true
+            val total = parts[3].toLongOrNull() ?: return true
+            if (downloaded < 0L || total < 1L || downloaded > total) return true
+            scope.launch(Dispatchers.Main) {
+                waiter.onProgress(downloaded, total)
+            }
+            return true
+        }
+        if (!line.startsWith("UPDATE_APK_RESULT|")) return false
+        val parts = line.split('|', limit = 4)
+        if (parts.size < 3) return true
+        updateApkDownloadRequests[parts[1]]?.result?.complete(parts[2] == "OK")
+        return true
+    }
+
+    private fun failPendingUpdateApkRequests() {
+        updateApkDownloadRequests.values.forEach { it.result.complete(false) }
+        updateApkDownloadRequests.clear()
+    }
+
+    internal fun isDeploySafeRelayAvailable(targetHost: String): Boolean =
+        isUpdateRelayAvailable() &&
+            currentParams?.let { deployTargetMatchesActivePeer(targetHost, it.peer) } == true
+
+    internal suspend fun deploySafeRelayAvailability(targetHost: String): DeploySafeRelayAvailability {
+        val params = currentParams
+        if (params == null || !isUpdateRelayAvailable()) {
+            return DeploySafeRelayAvailability(
+                transportAvailable = false,
+                targetMatch = DeploySafeRelayTargetMatch.Unresolved,
+            )
+        }
+        if (deployTargetMatchesActivePeer(targetHost, params.peer)) {
+            return DeploySafeRelayAvailability(
+                transportAvailable = true,
+                targetMatch = DeploySafeRelayTargetMatch.Exact,
+            )
+        }
+        val target = normalizedDeployHost(targetHost)
+        val active = normalizedDeployHost(params.peer)
+        if (!isDeployIpLiteral(target) && !isDeployIpLiteral(active)) {
+            return DeploySafeRelayAvailability(
+                transportAvailable = true,
+                targetMatch = DeploySafeRelayTargetMatch.Unresolved,
+            )
+        }
+        val resolved = withTimeoutOrNull(2_500L) {
+            withContext(Dispatchers.IO) {
+                val targetAddresses = resolveDeployHostAddresses(target)
+                val activeAddresses = resolveDeployHostAddresses(active)
+                targetAddresses to activeAddresses
+            }
+        }
+        if (currentParams !== params || !isUpdateRelayAvailable()) {
+            return DeploySafeRelayAvailability(
+                transportAvailable = false,
+                targetMatch = DeploySafeRelayTargetMatch.Unresolved,
+            )
+        }
+        val targetMatch = when {
+            resolved == null || resolved.first.isEmpty() || resolved.second.isEmpty() ->
+                DeploySafeRelayTargetMatch.Unresolved
+            resolved.first.any(resolved.second::contains) -> DeploySafeRelayTargetMatch.Resolved
+            else -> DeploySafeRelayTargetMatch.Different
+        }
+        return DeploySafeRelayAvailability(
+            transportAvailable = true,
+            targetMatch = targetMatch,
+        )
+    }
+
+    internal suspend fun executeDeploySafeRequest(
+        targetHost: String,
+        requestJson: String,
+        timeoutMs: Long = 3L * 60L * 1000L,
+    ): DeploySafeRelayResult {
+        val availability = deploySafeRelayAvailability(targetHost)
+        if (!availability.available) {
+            return DeploySafeRelayResult.Unavailable(availability.unavailableMessage())
+        }
+        if (requestJson.isBlank() || requestJson.toByteArray(Charsets.UTF_8).size > 64 * 1024) {
+            return DeploySafeRelayResult.Unavailable("безопасный запрос имеет недопустимый размер")
+        }
+        val expectedProcess = process?.takeIf { it.isAlive }
+            ?: return DeploySafeRelayResult.Unavailable("рабочий канал WDTT ещё не готов")
+        val context = lastContext
+            ?: return DeploySafeRelayResult.Unavailable("контекст приложения недоступен")
+        val requestId = UUID.randomUUID().toString()
+        val requestBytes = requestJson.toByteArray(Charsets.UTF_8)
+        val digest = MessageDigest.getInstance("SHA-256")
+            .digest(requestBytes)
+            .joinToString("") { "%02x".format(it) }
+        val encodedRequest = Base64.encodeToString(
+            requestBytes,
+            Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING,
+        )
+        val outputFile = File.createTempFile("wdtt-deploy-safe-", ".json", context.cacheDir)
+        val encodedPath = Base64.encodeToString(
+            outputFile.absolutePath.toByteArray(Charsets.UTF_8),
+            Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING,
+        )
+        val deferred = CompletableDeferred<DeploySafeRelayResult>()
+        val waiter = DeploySafeRelayWaiter(deferred, outputFile)
+        deploySafeRequests[requestId] = waiter
+        try {
+            synchronized(processInputLock) {
+                if (process !== expectedProcess || !expectedProcess.isAlive) {
+                    return DeploySafeRelayResult.Unavailable("соединение WDTT изменилось")
+                }
+                expectedProcess.outputStream.write(
+                    "DEPLOY_SAFE|$requestId|$digest|$encodedRequest|$encodedPath\n"
+                        .toByteArray(Charsets.UTF_8),
+                )
+                expectedProcess.outputStream.flush()
+            }
+            return withTimeoutOrNull(timeoutMs.coerceIn(5_000L, 3L * 60L * 1000L)) {
+                deferred.await()
+            } ?: DeploySafeRelayResult.Unavailable("сервер не завершил безопасную операцию вовремя")
+        } catch (error: Exception) {
+            return DeploySafeRelayResult.Unavailable(error.message ?: "не удалось отправить безопасный запрос")
+        } finally {
+            deploySafeRequests.remove(requestId, waiter)
+            runCatching { outputFile.delete() }
+        }
+    }
+
+    private fun handleDeploySafeResult(line: String): Boolean {
+        if (!line.startsWith("DEPLOY_SAFE_RESULT|")) return false
+        val parts = line.split('|', limit = 4)
+        if (parts.size < 3) return true
+        val waiter = deploySafeRequests[parts[1]] ?: return true
+        if (parts[2] != "OK") {
+            val reason = parts.getOrNull(3)
+                ?.takeIf(String::isNotBlank)
+                ?.let { encoded ->
+                    runCatching {
+                        Base64.decode(encoded, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
+                            .toString(Charsets.UTF_8)
+                    }.getOrNull()
+                }
+                .orEmpty()
+                .ifBlank { "сервер не выполнил безопасную операцию" }
+            waiter.result.complete(DeploySafeRelayResult.Unavailable(reason))
+            return true
+        }
+        val payload = runCatching {
+            val file = waiter.outputFile
+            if (!file.isFile || file.length() !in 1L..(12L * 1024L * 1024L)) return@runCatching null
+            file.readText(Charsets.UTF_8)
+        }.getOrNull()
+        waiter.result.complete(
+            payload?.let(DeploySafeRelayResult::Success)
+                ?: DeploySafeRelayResult.Unavailable("результат безопасной операции повреждён"),
+        )
+        return true
+    }
+
+    private fun failPendingDeploySafeRequests(reason: String) {
+        deploySafeRequests.values.forEach { waiter ->
+            waiter.result.complete(DeploySafeRelayResult.Unavailable(reason))
+            runCatching { waiter.outputFile.delete() }
+        }
+        deploySafeRequests.clear()
+    }
+
     fun clearLogs() {
         logs.value = emptyList()
         if (!running.value) {
@@ -3293,6 +4443,14 @@ data class TunnelParams(
     val profileMaxWorkers: Int = 0,
     val configFirstStart: Boolean = true,
     val profileIndex: Int = 0,
+    val mode: String = TUNNEL_MODE_VPN,
+    val socksPort: Int = DEFAULT_SOCKS5_PORT,
+    val socksUdpEnabled: Boolean = true,
+    val proxyAccess: String = PROXY_ACCESS_BOTH,
+    val proxyLanEnabled: Boolean = false,
+    val socksAuthEnabled: Boolean = false,
+    val socksUsername: String = "",
+    val socksPassword: String = "",
 )
 
 internal enum class TunnelProfileRuntimeApplyResult {

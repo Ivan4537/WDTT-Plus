@@ -15,6 +15,8 @@ class NativeClientStartupConfigTest {
             connectionPassword = "connection-secret",
             customVkClientId = "1234567",
             customVkClientSecret = "client-secret",
+            socksUsername = "local-user",
+            socksPassword = "local-password",
         )
 
         val line = nativeClientStartupConfigLine(secrets)
@@ -23,6 +25,7 @@ class NativeClientStartupConfigTest {
         assertFalse(line.contains(secrets.vkHashes))
         assertFalse(line.contains(secrets.connectionPassword))
         assertFalse(line.contains(secrets.customVkClientSecret))
+        assertFalse(line.contains(secrets.socksPassword))
 
         val decoded = String(
             Base64.getUrlDecoder().decode(line.substringAfter("START_CONFIG|")),
@@ -33,5 +36,7 @@ class NativeClientStartupConfigTest {
         assertEquals(secrets.connectionPassword, json.getString("connection_password"))
         assertEquals(secrets.customVkClientId, json.getString("custom_vk_client_id"))
         assertEquals(secrets.customVkClientSecret, json.getString("custom_vk_client_secret"))
+        assertEquals(secrets.socksUsername, json.getString("socks_username"))
+        assertEquals(secrets.socksPassword, json.getString("socks_password"))
     }
 }

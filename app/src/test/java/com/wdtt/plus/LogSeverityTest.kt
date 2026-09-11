@@ -76,9 +76,42 @@ class LogSeverityTest {
         assertEquals("vkcalls_retry", retry?.key)
         assertEquals("[VKCalls] Повторяем проверку с новой анонимной сессией...", retry?.message)
         assertEquals(false, retry?.warning)
-        assertEquals("vkcalls_fallback", fallback?.key)
-        assertEquals("[VKCalls] Основной провайдер временно недоступен — пробуем совместимый резерв", fallback?.message)
+        assertEquals("vkcalls_network_fallback", fallback?.key)
+        assertEquals("[VKCalls] Основной провайдер не ответил по сети — используем резерв", fallback?.message)
         assertEquals(false, fallback?.warning)
+    }
+
+    @Test
+    fun vkCallsFallbackLogs_keepTheActualFailureCategory() {
+        val captcha = classifyVkCallsLog(
+            "[VKCalls] основной провайдер запросил CAPTCHA; продолжаем одной legacy-цепочкой",
+            isError = true,
+        )
+        val limit = classifyVkCallsLog(
+            "[VKCalls] VK временно ограничил анонимный вход; продолжаем резервную legacy-цепочку",
+            isError = true,
+        )
+        val response = classifyVkCallsLog(
+            "[VKCalls] preflight не сработал после безопасного повтора: messages.getCallPreview parse secret: expected non-empty string",
+            isError = true,
+        )
+        val rejected = classifyVkCallsLog(
+            "[VKCalls] preflight не сработал: VK API error 5: anonymous session rejected; продолжаем резервную legacy-цепочку",
+            isError = true,
+        )
+
+        assertEquals("vkcalls_captcha_fallback", captcha?.key)
+        assertEquals("[VKCalls] Основной провайдер запросил CAPTCHA — используем автоматический резерв", captcha?.message)
+        assertEquals("vkcalls_limit_fallback", limit?.key)
+        assertEquals("[VKCalls] VK временно ограничил анонимные запросы — используем резерв", limit?.message)
+        assertEquals("vkcalls_response_fallback", response?.key)
+        assertEquals("[VKCalls] Ответ основного провайдера изменился — используем резерв", response?.message)
+        assertEquals("vkcalls_rejected_fallback", rejected?.key)
+        assertEquals("[VKCalls] Основной провайдер не принял анонимную сессию — используем резерв", rejected?.message)
+        assertEquals(false, captcha?.warning)
+        assertEquals(false, limit?.warning)
+        assertEquals(false, response?.warning)
+        assertEquals(false, rejected?.warning)
     }
 
     @Test

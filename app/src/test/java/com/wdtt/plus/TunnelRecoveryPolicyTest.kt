@@ -1,10 +1,18 @@
 package com.wdtt.plus
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.TimeZone
 
 class TunnelRecoveryPolicyTest {
+    @Test
+    fun unansweredUserTrafficIsEscalatedOnlyForSystemVpn() {
+        assertEquals(true, shouldEscalateUserTrafficStall(TUNNEL_MODE_VPN))
+        assertEquals(false, shouldEscalateUserTrafficStall(TUNNEL_MODE_SOCKS5))
+        assertEquals(false, shouldEscalateUserTrafficStall(TUNNEL_MODE_HTTP))
+    }
+
     @Test
     fun vkCallsFloodCooldownSurvivesFastNativeRestarts() {
         assertEquals(
@@ -768,42 +776,194 @@ class TunnelRecoveryPolicyTest {
     }
 
     @Test
-    fun wakeRecoveryRequiresFreshServerPathAndHasBoundedFinalDecision() {
+    fun wakeRecoveryRequiresEveryChannelButKeepsPartialCapacityAvailable() {
         assertEquals(
             WakeRescueAction.HEALTHY,
             decideWakeRescueAction(
                 freshTransportPath = true,
-                activeWorkers = 9,
+                readyWorkers = 18,
+                targetWorkers = 18,
                 confirmedNetworkFailure = false,
-                finalCheck = false,
             ),
         )
         assertEquals(
             WakeRescueAction.RECONNECT,
             decideWakeRescueAction(
                 freshTransportPath = false,
-                activeWorkers = 0,
+                readyWorkers = 0,
+                targetWorkers = 18,
                 confirmedNetworkFailure = false,
-                finalCheck = false,
             ),
         )
         assertEquals(
-            WakeRescueAction.WAIT_FOR_PROBE,
+            WakeRescueAction.PARTIALLY_AVAILABLE,
             decideWakeRescueAction(
-                freshTransportPath = false,
-                activeWorkers = 9,
+                freshTransportPath = true,
+                readyWorkers = 9,
+                targetWorkers = 18,
                 confirmedNetworkFailure = false,
-                finalCheck = false,
             ),
         )
         assertEquals(
             WakeRescueAction.RECONNECT,
             decideWakeRescueAction(
                 freshTransportPath = false,
-                activeWorkers = 9,
-                confirmedNetworkFailure = false,
-                finalCheck = true,
+                readyWorkers = 9,
+                targetWorkers = 18,
+                confirmedNetworkFailure = true,
             ),
+        )
+    }
+
+    @Test
+    fun wakeWorkerStatusIsParsedAndRejectsImpossibleCounts() {
+        assertEquals(
+            WakeWorkerStatus(generation = 3L, ready = 9, total = 18),
+            parseWakeWorkerStatus("2026/09/08 10:00:00 [WAKE_STATUS] generation=3 ready=9 total=18"),
+        )
+        assertEquals(null, parseWakeWorkerStatus("[WAKE_STATUS] generation=3 ready=19 total=18"))
+        assertEquals(null, parseWakeWorkerStatus("[WAKE_STATUS] generation=0 ready=0 total=18"))
+    }
+
+    @Test
+    fun processReaderErrorsAreHiddenOnlyAfterExpectedCancellationOrReplacement() {
+        assertEquals(true, shouldReportProcessReaderFailure(true, true))
+        assertEquals(false, shouldReportProcessReaderFailure(false, true))
+        assertEquals(false, shouldReportProcessReaderFailure(true, false))
+        assertEquals(
+            "поток чтения неожиданно закрыт",
+            localizedProcessReaderFailure("IOException: Stream closed"),
+        )
+    }
+
+    @Test
+    fun screenOffHoldPolicyReleasesForEveryStopLikeStateAndSupportsProxy() {
+        assertEquals(
+            true,
+            shouldHoldConnectionWhileScreenOff(
+                ScreenOffMode.HOLD_CONNECTION, false, true, false, false, false, false,
+                TUNNEL_MODE_VPN,
+            ),
+        )
+        assertEquals(
+            true,
+            shouldHoldConnectionWhileScreenOff(
+                ScreenOffMode.HOLD_CONNECTION, false, true, false, false, false, true,
+                TUNNEL_MODE_SOCKS5,
+            ),
+        )
+        assertEquals(
+            true,
+            shouldHoldConnectionWhileScreenOff(
+                ScreenOffMode.HOLD_CONNECTION, false, true, false, false, false, true,
+                TUNNEL_MODE_HTTP,
+            ),
+        )
+        val blocked = listOf(
+            shouldHoldConnectionWhileScreenOff(ScreenOffMode.BALANCED, false, true, false, false, false, false, TUNNEL_MODE_VPN),
+            shouldHoldConnectionWhileScreenOff(ScreenOffMode.SAVE_BATTERY, false, true, false, false, false, false, TUNNEL_MODE_VPN),
+            shouldHoldConnectionWhileScreenOff(ScreenOffMode.HOLD_CONNECTION, true, true, false, false, false, false, TUNNEL_MODE_VPN),
+            shouldHoldConnectionWhileScreenOff(ScreenOffMode.HOLD_CONNECTION, false, false, false, false, false, false, TUNNEL_MODE_VPN),
+            shouldHoldConnectionWhileScreenOff(ScreenOffMode.HOLD_CONNECTION, false, true, true, false, false, false, TUNNEL_MODE_VPN),
+            shouldHoldConnectionWhileScreenOff(ScreenOffMode.HOLD_CONNECTION, false, true, false, true, false, false, TUNNEL_MODE_VPN),
+            shouldHoldConnectionWhileScreenOff(ScreenOffMode.HOLD_CONNECTION, false, true, false, false, true, false, TUNNEL_MODE_VPN),
+            shouldHoldConnectionWhileScreenOff(ScreenOffMode.HOLD_CONNECTION, false, true, false, false, false, true, TUNNEL_MODE_VPN),
+        )
+        assertEquals(List(blocked.size) { false }, blocked)
+    }
+
+    @Test
+    fun hardHoldKeepsWifiForItsTransportWithoutDependingOnInternetValidation() {
+        assertEquals(true, shouldHoldBackgroundWifiRadio(true, true))
+        assertEquals(false, shouldHoldBackgroundWifiRadio(true, false))
+        assertEquals(false, shouldHoldBackgroundWifiRadio(false, true))
+    }
+
+    @Test
+    fun hardHoldPreparesCpuLockBeforeScreenOffAndReleasesForStopStates() {
+        assertTrue(
+            shouldKeepHoldModeCpuLock(
+                ScreenOffMode.HOLD_CONNECTION,
+                tunnelRunning = true,
+                tunnelPaused = false,
+                trustedWifiWaiting = false,
+                stopRequested = false,
+                vpnSlotYieldRequested = false,
+                tunnelMode = TUNNEL_MODE_VPN,
+            )
+        )
+        assertTrue(
+            shouldKeepHoldModeCpuLock(
+                ScreenOffMode.HOLD_CONNECTION,
+                tunnelRunning = true,
+                tunnelPaused = false,
+                trustedWifiWaiting = false,
+                stopRequested = false,
+                vpnSlotYieldRequested = true,
+                tunnelMode = TUNNEL_MODE_SOCKS5,
+            )
+        )
+        val blocked = listOf(
+            shouldKeepHoldModeCpuLock(ScreenOffMode.BALANCED, true, false, false, false, false, TUNNEL_MODE_VPN),
+            shouldKeepHoldModeCpuLock(ScreenOffMode.HOLD_CONNECTION, false, false, false, false, false, TUNNEL_MODE_VPN),
+            shouldKeepHoldModeCpuLock(ScreenOffMode.HOLD_CONNECTION, true, true, false, false, false, TUNNEL_MODE_VPN),
+            shouldKeepHoldModeCpuLock(ScreenOffMode.HOLD_CONNECTION, true, false, true, false, false, TUNNEL_MODE_VPN),
+            shouldKeepHoldModeCpuLock(ScreenOffMode.HOLD_CONNECTION, true, false, false, true, false, TUNNEL_MODE_VPN),
+            shouldKeepHoldModeCpuLock(ScreenOffMode.HOLD_CONNECTION, true, false, false, false, true, TUNNEL_MODE_VPN),
+        )
+        assertEquals(List(blocked.size) { false }, blocked)
+    }
+
+    @Test
+    fun wakeStatusDoesNotDescribeUnverifiedWorkersAsUnavailable() {
+        assertEquals("Проверяем 27 потоков после сна…", wakeRecoveryStatusText(0, 27))
+        assertEquals("Проверяем потоки после сна…", wakeRecoveryStatusText(0, 0))
+        assertEquals(
+            "Восстановление после сна · доступно 9/27",
+            wakeRecoveryStatusText(9, 27),
+        )
+        assertEquals(
+            "Проверяем удержанное соединение · 27 потоков",
+            wakeRecoveryStatusText(0, 27, heldConnection = true),
+        )
+        assertEquals(
+            "Соединение удерживается · подтверждено 9/27",
+            wakeRecoveryStatusText(9, 27, heldConnection = true),
+        )
+    }
+
+    @Test
+    fun failedBackgroundAccessRefreshUsesBoundedBackoff() {
+        assertEquals(2 * 60_000L, activeProfileRefreshDelayMs(0))
+        assertEquals(4 * 60_000L, activeProfileRefreshDelayMs(1))
+        assertEquals(8 * 60_000L, activeProfileRefreshDelayMs(2))
+        assertEquals(16 * 60_000L, activeProfileRefreshDelayMs(3))
+        assertEquals(16 * 60_000L, activeProfileRefreshDelayMs(99))
+    }
+
+    @Test
+    fun repeatedFullWakeStatusDoesNotInflateCompletionLogCounter() {
+        assertEquals(true, shouldLogWakeWorkerCompletion(true, 27, 27, 4L, 3L))
+        assertEquals(false, shouldLogWakeWorkerCompletion(false, 27, 27, 4L, 3L))
+        assertEquals(false, shouldLogWakeWorkerCompletion(true, 26, 27, 4L, 3L))
+        assertEquals(false, shouldLogWakeWorkerCompletion(true, 27, 27, 4L, 4L))
+        assertEquals(true, shouldLogWakeWorkerCompletion(true, 27, 27, 5L, 4L))
+    }
+
+    @Test
+    fun peerDnsWaitDefersRecoveryOnlyForBoundedWindow() {
+        assertEquals(false, shouldDeferRecoveryForPeerDns(0L, 100_000L))
+        assertEquals(true, shouldDeferRecoveryForPeerDns(100_000L, 399_999L))
+        assertEquals(false, shouldDeferRecoveryForPeerDns(100_000L, 400_000L))
+    }
+
+    @Test
+    fun legacySleepSettingMigratesToTheMatchingThreeWayMode() {
+        assertEquals(ScreenOffMode.SAVE_BATTERY, resolveScreenOffMode(null, true))
+        assertEquals(ScreenOffMode.BALANCED, resolveScreenOffMode(null, false))
+        assertEquals(
+            ScreenOffMode.HOLD_CONNECTION,
+            resolveScreenOffMode(ScreenOffMode.HOLD_CONNECTION.storedValue, true),
         )
     }
 
@@ -884,6 +1044,42 @@ class TunnelRecoveryPolicyTest {
                 trustedWifiTransitionInProgress = true,
             ),
         )
+    }
+
+    @Test
+    fun wakeRecoveryNeverOverridesAnotherVpnPolicy() {
+        assertEquals(
+            true,
+            shouldRunWakeTransportRecovery(
+                tunnelRunning = true,
+                tunnelPaused = false,
+                trustedWifiWaiting = false,
+                sleepPausedByPolicy = false,
+                stopRequested = false,
+                captchaActive = false,
+                vpnSlotYieldRequested = false,
+                realNetworkAvailable = true,
+            ),
+        )
+
+        val blockedStates = listOf(
+            shouldRunWakeTransportRecovery(false, false, false, false, false, false, false, true),
+            shouldRunWakeTransportRecovery(true, true, false, false, false, false, false, true),
+            shouldRunWakeTransportRecovery(true, false, true, false, false, false, false, true),
+            shouldRunWakeTransportRecovery(true, false, false, true, false, false, false, true),
+            shouldRunWakeTransportRecovery(true, false, false, false, true, false, false, true),
+            shouldRunWakeTransportRecovery(true, false, false, false, false, true, false, true),
+            shouldRunWakeTransportRecovery(true, false, false, false, false, false, true, true),
+            shouldRunWakeTransportRecovery(true, false, false, false, false, false, false, false),
+        )
+        assertEquals(List(blockedStates.size) { false }, blockedStates)
+    }
+
+    @Test
+    fun activeRecoveryWaitsForARealUnderlyingNetwork() {
+        assertEquals(true, shouldRunActiveTransportRecovery(false, false, true, true, true))
+        assertEquals(false, shouldRunActiveTransportRecovery(false, false, true, true, false))
+        assertEquals(false, shouldRunActiveTransportRecovery(true, false, true, true, true))
     }
 
     @Test

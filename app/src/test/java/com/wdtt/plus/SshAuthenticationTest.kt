@@ -19,6 +19,12 @@ class SshAuthenticationTest {
     """.trimIndent()
 
     @Test
+    fun userFacingSentenceStartsWithUppercaseLetter() {
+        assertEquals("Сервер не ответил вовремя.", capitalizeUserSentence("сервер не ответил вовремя."))
+        assertEquals("SSH-сервер недоступен.", capitalizeUserSentence("SSH-сервер недоступен."))
+    }
+
+    @Test
     fun acceptsStructurallyCompleteOpenSshKey() {
         assertNull(sshPrivateKeyIssue(openSshKey))
         assertTrue(SshCredentials(privateKey = openSshKey).hasAuthentication)
@@ -123,6 +129,29 @@ class SshAuthenticationTest {
         assertEquals(
             "SSH-сервер отклонил приватный ключ. Проверьте логин SSH, наличие соответствующего публичного ключа на сервере и пароль ключа.",
             friendlySshConnectionError("Auth fail", SshCredentials(privateKey = openSshKey))
+        )
+    }
+
+    @Test
+    fun connectivityFailuresAreSeparatedFromAuthenticationAndCompatibilityErrors() {
+        assertTrue(isSshConnectivityFailure("java.net.SocketTimeoutException: connect timed out"))
+        assertTrue(isSshConnectivityFailure("java.net.UnknownHostException: server.example"))
+        assertTrue(isSshConnectivityFailure("No route to host"))
+        assertTrue(isSshConnectivityFailure("failed to connect to server after 20000ms"))
+        assertFalse(isSshConnectivityFailure("Auth fail"))
+        assertFalse(isSshConnectivityFailure("invalid privatekey"))
+        assertFalse(isSshConnectivityFailure("Algorithm negotiation fail"))
+    }
+
+    @Test
+    fun shortDirectProbeReportsItsActualTimeout() {
+        assertEquals(
+            "SSH-сервер не ответил за 4 секунды. Проверьте адрес, порт, сеть и межсетевой экран.",
+            friendlySshConnectionError(
+                "connect timeout",
+                SshCredentials(password = "secret"),
+                connectTimeoutMs = 4_000,
+            ),
         )
     }
 

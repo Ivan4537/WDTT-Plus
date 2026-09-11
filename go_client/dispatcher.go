@@ -65,42 +65,56 @@ const (
 )
 
 type WorkerSlot struct {
-	ID     int
-	SendCh chan []byte
-	WakeCh chan struct{}
+	ID        int
+	SendCh    chan []byte
+	WakeCh    chan uint64
+	SleepCh   chan struct{}
+	WakeAckCh chan uint64
+	// A worker may stay registered while its UDP/DTLS socket is stale after
+	// Android Doze. User packets must not use it until the current wake probe
+	// receives a response from the server.
+	WakeVerifiedGeneration atomic.Uint64
 }
 
 type Dispatcher struct {
-	localConn  net.PacketConn
-	clientAddr atomic.Pointer[net.Addr]
-	workers    atomic.Pointer[[]*WorkerSlot]
-	mu         sync.Mutex // Используется только для записи
-	rrIndex    int
-	rrCount    int
-	ReturnCh   chan []byte
-	ctx        context.Context
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
-	stats      *Stats
+	localConn             net.PacketConn
+	clientAddr            atomic.Pointer[net.Addr]
+	workers               atomic.Pointer[[]*WorkerSlot]
+	mu                    sync.Mutex // Используется только для записи
+	rrIndex               int
+	rrCount               int
+	ReturnCh              chan []byte
+	ctx                   context.Context
+	cancel                context.CancelFunc
+	wg                    sync.WaitGroup
+	stats                 *Stats
+	updateMetadataMu      sync.Mutex
+	updateMetadataWaiters map[string]*updateMetadataAssembly
+	updateRelayNext       atomic.Uint64
 	// firstUnansweredUserTxAt is global for the dispatcher because a reply may
 	// return through a different worker than the one that sent the request.
 	// Keeping the first (rather than latest) unanswered send also prevents a
 	// continuous stream of retries from postponing stall detection forever.
 	firstUnansweredUserTxAt atomic.Int64
 	stalledUserTraffic      atomic.Bool
-	deviceSleeping          atomic.Bool
-	wakeGeneration          atomic.Uint64
-	wakeHealthGraceUntil    atomic.Int64
+	// SOCKS5 forwards independent opt-in flows. A single silent destination is
+	// not evidence that the shared transport failed, so that mode relies on the
+	// keepalive watchdog instead of the VPN-wide unanswered-traffic watchdog.
+	unansweredUserTrafficHealthDisabled atomic.Bool
+	deviceSleeping                      atomic.Bool
+	wakeGeneration                      atomic.Uint64
+	wakeHealthGraceUntil                atomic.Int64
 }
 
 func NewDispatcher(ctx context.Context, localConn net.PacketConn, stats *Stats) *Dispatcher {
 	dctx, dcancel := context.WithCancel(ctx)
 	d := &Dispatcher{
-		localConn: localConn,
-		ReturnCh:  make(chan []byte, returnChBuf),
-		ctx:       dctx,
-		cancel:    dcancel,
-		stats:     stats,
+		localConn:             localConn,
+		ReturnCh:              make(chan []byte, returnChBuf),
+		ctx:                   dctx,
+		cancel:                dcancel,
+		stats:                 stats,
+		updateMetadataWaiters: make(map[string]*updateMetadataAssembly),
 	}
 
 	empty := make([]*WorkerSlot, 0)
@@ -119,18 +133,25 @@ func (d *Dispatcher) Shutdown() {
 
 func (d *Dispatcher) Register(w *WorkerSlot) {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	oldWorkers := d.workers.Load()
 	newWorkers := make([]*WorkerSlot, len(*oldWorkers)+1)
 	copy(newWorkers, *oldWorkers)
 	newWorkers[len(*oldWorkers)] = w
 	d.workers.Store(&newWorkers)
+	d.mu.Unlock()
 	log.Printf("[ДИСП] Воркер #%d зарегистрирован (всего: %d)", w.ID, len(newWorkers))
+
+	// A replacement worker created during wake recovery must prove its new
+	// socket before the dispatcher starts sending user traffic through it.
+	generation := d.wakeGeneration.Load()
+	if generation > 0 && !d.deviceSleeping.Load() && w.WakeCh != nil {
+		offerLatestGeneration(w.WakeCh, generation)
+		d.logWakeStatus(generation)
+	}
 }
 
 func (d *Dispatcher) Unregister(slot *WorkerSlot) {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	oldWorkers := d.workers.Load()
 	newWorkers := make([]*WorkerSlot, 0, len(*oldWorkers))
 	for _, w := range *oldWorkers {
@@ -139,16 +160,32 @@ func (d *Dispatcher) Unregister(slot *WorkerSlot) {
 		}
 	}
 	d.workers.Store(&newWorkers)
+	d.mu.Unlock()
 	log.Printf("[ДИСП] Воркер #%d отключён (осталось: %d)", slot.ID, len(newWorkers))
+	if generation := d.wakeGeneration.Load(); generation > 0 && !d.deviceSleeping.Load() {
+		d.logWakeStatus(generation)
+	}
 }
 
 func (d *Dispatcher) noteUserTrafficSent(now time.Time) {
+	if d.unansweredUserTrafficHealthDisabled.Load() {
+		return
+	}
 	d.firstUnansweredUserTxAt.CompareAndSwap(0, now.UnixNano())
 }
 
 func (d *Dispatcher) noteUserTrafficResponse() bool {
+	if d.unansweredUserTrafficHealthDisabled.Load() {
+		d.resetUserTrafficHealth()
+		return false
+	}
 	d.firstUnansweredUserTxAt.Store(0)
 	return d.stalledUserTraffic.Swap(false)
+}
+
+func (d *Dispatcher) setUnansweredUserTrafficHealthEnabled(enabled bool) {
+	d.unansweredUserTrafficHealthDisabled.Store(!enabled)
+	d.resetUserTrafficHealth()
 }
 
 func (d *Dispatcher) resetUserTrafficHealth() {
@@ -160,6 +197,20 @@ func (d *Dispatcher) noteDeviceSleep() {
 	d.deviceSleeping.Store(true)
 	d.wakeHealthGraceUntil.Store(0)
 	d.resetUserTrafficHealth()
+
+	workers := d.workers.Load()
+	if workers == nil {
+		return
+	}
+	for _, worker := range *workers {
+		if worker.SleepCh == nil {
+			continue
+		}
+		select {
+		case worker.SleepCh <- struct{}{}:
+		default:
+		}
+	}
 }
 
 func (d *Dispatcher) noteDeviceWake(now time.Time) uint64 {
@@ -170,18 +221,79 @@ func (d *Dispatcher) noteDeviceWake(now time.Time) uint64 {
 
 	workers := d.workers.Load()
 	if workers == nil {
+		d.logWakeStatus(generation)
 		return generation
 	}
+	d.logWakeStatus(generation)
 	for _, worker := range *workers {
 		if worker.WakeCh == nil {
 			continue
 		}
-		select {
-		case worker.WakeCh <- struct{}{}:
-		default:
-		}
+		offerLatestGeneration(worker.WakeCh, generation)
 	}
 	return generation
+}
+
+func workerEligibleForWakeGeneration(worker *WorkerSlot, generation uint64, deviceSleeping bool) bool {
+	if worker == nil {
+		return false
+	}
+	return generation == 0 || deviceSleeping || worker.WakeVerifiedGeneration.Load() >= generation
+}
+
+func (d *Dispatcher) wakeStatus(generation uint64) (ready int, total int) {
+	workers := d.workers.Load()
+	if workers == nil {
+		return 0, 0
+	}
+	for _, worker := range *workers {
+		if worker == nil {
+			continue
+		}
+		total++
+		if worker.WakeVerifiedGeneration.Load() >= generation {
+			ready++
+		}
+	}
+	return ready, total
+}
+
+func (d *Dispatcher) logWakeStatus(generation uint64) {
+	if generation == 0 || generation != d.wakeGeneration.Load() || d.deviceSleeping.Load() {
+		return
+	}
+	ready, total := d.wakeStatus(generation)
+	log.Printf("[WAKE_STATUS] generation=%d ready=%d total=%d", generation, ready, total)
+}
+
+func (d *Dispatcher) acknowledgeWorkerWake(worker *WorkerSlot, generation uint64) {
+	if worker == nil || generation == 0 || generation != d.wakeGeneration.Load() || d.deviceSleeping.Load() {
+		return
+	}
+	previous := worker.WakeVerifiedGeneration.Swap(generation)
+	offerLatestGeneration(worker.WakeAckCh, generation)
+	if previous < generation {
+		d.logWakeStatus(generation)
+	}
+}
+
+func offerLatestGeneration(ch chan uint64, generation uint64) {
+	if ch == nil {
+		return
+	}
+	select {
+	case ch <- generation:
+		return
+	default:
+	}
+	select {
+	case <-ch:
+	default:
+	}
+	select {
+	case ch <- generation:
+	default:
+	}
 }
 
 func (d *Dispatcher) shouldSuppressTransportHealth(now time.Time) bool {
@@ -193,6 +305,9 @@ func (d *Dispatcher) shouldSuppressTransportHealth(now time.Time) bool {
 }
 
 func (d *Dispatcher) claimStalledUserTraffic(now time.Time, timeout time.Duration) (time.Duration, bool) {
+	if d.unansweredUserTrafficHealthDisabled.Load() {
+		return 0, false
+	}
 	startedAt := d.firstUnansweredUserTxAt.Load()
 	if startedAt == 0 {
 		return 0, false
@@ -245,34 +360,39 @@ func (d *Dispatcher) readLoop() {
 
 		ws := *workersPtr
 		nw := len(ws)
+		wakeGeneration := d.wakeGeneration.Load()
+		deviceSleeping := d.deviceSleeping.Load()
 
 		sent := false
 		idx := d.rrIndex % nw
 
-		// Пробуем текущий worker (chunk affinity)
-		w := ws[idx]
-		select {
-		case w.SendCh <- pkt:
-			sent = true
-			d.rrCount++
-			if d.rrCount >= chunkSize {
-				d.rrIndex = (idx + 1) % nw
-				d.rrCount = 0
+		// After wake, a registered worker is only a candidate after its own
+		// current-generation keepalive has returned. This keeps stale sockets
+		// out of the user-data round robin while healthy workers keep carrying
+		// traffic and the remaining sessions reconnect independently.
+		for offset := 0; offset < nw; offset++ {
+			candidateIdx := (idx + offset) % nw
+			candidate := ws[candidateIdx]
+			if !workerEligibleForWakeGeneration(candidate, wakeGeneration, deviceSleeping) {
+				continue
 			}
-		default:
-			// Текущий worker перегружен — ищем свободный, начинаем новый chunk
-			for i := 1; i < nw; i++ {
-				altIdx := (idx + i) % nw
-				select {
-				case ws[altIdx].SendCh <- pkt:
-					sent = true
-					d.rrIndex = altIdx
-					d.rrCount = 1 // первый пакет нового chunk'а уже отправлен
-				default:
+			select {
+			case candidate.SendCh <- pkt:
+				sent = true
+				if offset == 0 {
+					d.rrCount++
+				} else {
+					d.rrIndex = candidateIdx
+					d.rrCount = 1
 				}
-				if sent {
-					break
+				if d.rrCount >= chunkSize {
+					d.rrIndex = (candidateIdx + 1) % nw
+					d.rrCount = 0
 				}
+			default:
+			}
+			if sent {
+				break
 			}
 		}
 

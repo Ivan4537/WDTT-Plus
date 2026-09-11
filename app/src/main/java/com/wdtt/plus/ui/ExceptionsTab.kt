@@ -47,9 +47,9 @@ import androidx.compose.material.icons.filled.FileDownload
 import androidx.compose.material.icons.filled.FileUpload
 import androidx.compose.material.icons.filled.Hub
 import androidx.compose.material.icons.filled.Language
+import androidx.compose.material.icons.filled.SettingsEthernet
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CheckboxDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -107,10 +107,12 @@ import androidx.lifecycle.compose.LifecycleResumeEffect
 import com.wdtt.plus.MAX_VPN_ADDRESS_IMPORT_BYTES
 import com.wdtt.plus.SettingsStore
 import com.wdtt.plus.TunnelManager
+import com.wdtt.plus.TUNNEL_MODE_VPN
 import com.wdtt.plus.VpnAddressRule
 import com.wdtt.plus.VpnAddressType
 import com.wdtt.plus.isAlwaysBypassedVpnPackage
 import com.wdtt.plus.normalizeVpnAddressRules
+import com.wdtt.plus.tunnelModeNeedsVpnPermission
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -174,6 +176,9 @@ fun ExceptionsTab(
     val scope = rememberCoroutineScope()
     val settingsStore = remember { SettingsStore(context) }
     val routingSettings by settingsStore.vpnRoutingSettings.collectAsStateWithLifecycle(initialValue = null)
+    val selectedTunnelMode by settingsStore.proxyMode.collectAsStateWithLifecycle(
+        initialValue = TUNNEL_MODE_VPN,
+    )
     val showSystemAppsOpt by settingsStore.showSystemApps.collectAsStateWithLifecycle(initialValue = null)
     val routingReady = routingSettings != null
     val savedPackages = routingSettings?.appPackages.orEmpty()
@@ -181,6 +186,11 @@ fun ExceptionsTab(
     val isWhitelist = routingSettings?.isWhitelist ?: false
     val visibleProfileIndex = routingSettings?.profileIndex ?: 0
     val selectedPackages = remember(savedPackages) { savedPackages.toVpnPackageSet() }
+
+    if (!tunnelModeNeedsVpnPermission(selectedTunnelMode)) {
+        Socks5RoutingUnavailable()
+        return
+    }
 
     var appsList by remember { mutableStateOf(AppCache.cachedList.orEmpty()) }
     var isLoadingApps by remember { mutableStateOf(AppCache.cachedList == null) }
@@ -648,6 +658,51 @@ fun ExceptionsTab(
         val help = runCatching { RoutingHelp.valueOf(helpName) }.getOrNull()
         if (help != null) {
             RoutingHelpDialog(help = help, onDismiss = { shownHelpName = null })
+        }
+    }
+}
+
+@Composable
+private fun Socks5RoutingUnavailable() {
+    Box(
+        modifier = Modifier.fillMaxSize().padding(24.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(22.dp),
+            color = MaterialTheme.colorScheme.surfaceContainerHighest,
+        ) {
+            Column(
+                modifier = Modifier.padding(20.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Icon(
+                    Icons.Default.SettingsEthernet,
+                    contentDescription = null,
+                    modifier = Modifier.size(34.dp),
+                    tint = MaterialTheme.colorScheme.primary,
+                )
+                Text(
+                    "Исключения задаёт клиент цепочки",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    textAlign = TextAlign.Center,
+                )
+                Text(
+                    "В режиме SOCKS5 WDTT Plus не перехватывает приложения и адреса. Настройте маршруты, исключения и прямой выход в Exclave, NekoBox или другом приложении, которое подключается к локальному прокси.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center,
+                )
+                Text(
+                    "Сохранённые списки WDTT Plus не удалены и снова появятся после выбора системного VPN.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center,
+                )
+            }
         }
     }
 }

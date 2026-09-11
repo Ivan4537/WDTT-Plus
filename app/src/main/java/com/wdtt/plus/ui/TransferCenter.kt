@@ -34,7 +34,6 @@ import androidx.compose.material.icons.filled.QrCode2
 import androidx.compose.material.icons.filled.SaveAlt
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -225,7 +224,7 @@ fun TransferCenterDialog(
                     HorizontalDivider()
                     Text("Настройки администратора", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                     Text(
-                        "Все три VPN-профиля, параметры деплоя, пароли, токен бота, исключения и настройки выхода. Данные шифруются указанным паролем. Приватные SSH-ключи и конфигурации служб на VPS не передаются.",
+                        "Все три профиля подключения, параметры деплоя, пароли, токен бота, исключения и настройки выхода. Данные шифруются указанным паролем. Приватные SSH-ключи и конфигурации служб на VPS не передаются.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -360,7 +359,7 @@ fun AdminImportDialog(
                         modifier = Modifier.fillMaxWidth().onFocusChanged { passwordFocused = it.isFocused }
                     )
                 } else {
-                    Text("Будут заменены все три VPN-профиля и локальные настройки администратора. Текущие данные приложения восстановить автоматически не получится. Приватные SSH-ключи и конфигурации служб на VPS не входят в передачу: при необходимости добавьте их отдельно.")
+                    Text("Будут заменены все три профиля подключения и локальные настройки администратора. Текущие данные приложения восстановить автоматически не получится. Приватные SSH-ключи и конфигурации служб на VPS не входят в передачу: при необходимости добавьте их отдельно.")
                 }
                 error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             }

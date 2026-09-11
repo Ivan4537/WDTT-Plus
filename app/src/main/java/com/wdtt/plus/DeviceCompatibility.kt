@@ -2,6 +2,7 @@ package com.wdtt.plus
 
 import android.Manifest
 import android.app.ActivityManager
+import android.app.ApplicationExitInfo
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -97,6 +98,215 @@ data class DeviceCompatibilityReport(
     }
 }
 
+internal enum class ProcessExitCategory {
+    SystemPolicy,
+    ExcessiveResources,
+    LowMemory,
+    Crash,
+    UserAction,
+    PackageChange,
+    NormalExit,
+    Dependency,
+    Unknown,
+}
+
+internal data class ProcessExitRecord(
+    val timestampMs: Long,
+    val reason: Int,
+    val description: String = "",
+)
+
+internal data class ProcessExitHistory(
+    val latest: ProcessExitRecord?,
+    val latestUnexpected: ProcessExitRecord?,
+)
+
+private const val PROCESS_EXIT_LOOKBACK_MS = 7L * 24L * 60L * 60L * 1000L
+private val oemKillMarkerRegex = Regex("o-kill\\(\\d+\\)", RegexOption.IGNORE_CASE)
+
+internal fun classifyProcessExit(record: ProcessExitRecord): ProcessExitCategory = when (record.reason) {
+    ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE -> ProcessExitCategory.ExcessiveResources
+    ApplicationExitInfo.REASON_LOW_MEMORY -> ProcessExitCategory.LowMemory
+    ApplicationExitInfo.REASON_CRASH,
+    ApplicationExitInfo.REASON_CRASH_NATIVE,
+    ApplicationExitInfo.REASON_ANR,
+    ApplicationExitInfo.REASON_INITIALIZATION_FAILURE -> ProcessExitCategory.Crash
+    ApplicationExitInfo.REASON_USER_REQUESTED,
+    ApplicationExitInfo.REASON_USER_STOPPED -> ProcessExitCategory.UserAction
+    ApplicationExitInfo.REASON_PACKAGE_STATE_CHANGE,
+    ApplicationExitInfo.REASON_PACKAGE_UPDATED,
+    ApplicationExitInfo.REASON_PERMISSION_CHANGE -> ProcessExitCategory.PackageChange
+    ApplicationExitInfo.REASON_EXIT_SELF -> ProcessExitCategory.NormalExit
+    ApplicationExitInfo.REASON_DEPENDENCY_DIED -> ProcessExitCategory.Dependency
+    ApplicationExitInfo.REASON_OTHER,
+    ApplicationExitInfo.REASON_FREEZER -> ProcessExitCategory.SystemPolicy
+    else -> ProcessExitCategory.Unknown
+}
+
+internal fun processExitHistory(
+    records: List<ProcessExitRecord>,
+    nowMs: Long = System.currentTimeMillis(),
+): ProcessExitHistory {
+    val recent = records
+        .filter { it.timestampMs in (nowMs - PROCESS_EXIT_LOOKBACK_MS)..nowMs }
+        .sortedByDescending(ProcessExitRecord::timestampMs)
+    val latestUnexpected = recent.firstOrNull {
+        classifyProcessExit(it) in setOf(
+            ProcessExitCategory.SystemPolicy,
+            ProcessExitCategory.ExcessiveResources,
+            ProcessExitCategory.LowMemory,
+            ProcessExitCategory.Crash,
+            ProcessExitCategory.Dependency,
+            ProcessExitCategory.Unknown,
+        )
+    }
+    return ProcessExitHistory(
+        latest = recent.firstOrNull(),
+        latestUnexpected = latestUnexpected,
+    )
+}
+
+private fun processExitTimestamp(timestampMs: Long): String =
+    SimpleDateFormat("dd.MM.yyyy HH:mm:ss", Locale.ROOT).format(Date(timestampMs))
+
+private fun recognizedSystemExitMarker(description: String): String =
+    oemKillMarkerRegex.find(description)?.value.orEmpty()
+
+internal fun backgroundRestrictionRecommendation(
+    manufacturer: String,
+    backgroundRestricted: Boolean?,
+    batteryOptimizationsIgnored: Boolean?,
+): String {
+    val systemState = when {
+        backgroundRestricted == true ->
+            "Android пометил WDTT Plus как ограниченное в фоне. Сначала разрешите фоновую работу в настройках приложения. "
+        batteryOptimizationsIgnored == false ->
+            "Для WDTT Plus ещё действует системная оптимизация батареи. Отключите её. "
+        else -> ""
+    }
+    val vendorHint = when (manufacturer.trim().lowercase(Locale.ROOT)) {
+        "xiaomi", "redmi", "poco" ->
+            "На MIUI/HyperOS выберите для приложения режим батареи «Без ограничений» и разрешите автозапуск."
+        "oneplus", "oppo", "realme" ->
+            "На OxygenOS/ColorOS/realme UI разрешите работу в фоне и проверьте оптимизацию сна или ожидания для приложения."
+        "samsung" ->
+            "На Samsung добавьте WDTT Plus в список приложений, которые не переводятся в сон."
+        "huawei", "honor" ->
+            "В настройках запуска приложений разрешите WDTT Plus автозапуск и работу в фоне."
+        else ->
+            "Откройте настройки батареи WDTT Plus и выберите неограниченную фоновую работу, если такой пункт доступен."
+    }
+    return systemState + vendorHint
+}
+
+internal fun processExitHistoryItem(
+    history: ProcessExitHistory,
+    manufacturer: String,
+    backgroundRestricted: Boolean?,
+    batteryOptimizationsIgnored: Boolean?,
+): DeviceCheckItem {
+    val unexpected = history.latestUnexpected
+    if (unexpected == null) {
+        val latest = history.latest
+        return when (latest?.let(::classifyProcessExit)) {
+            ProcessExitCategory.UserAction -> DeviceCheckItem(
+                title = "Последнее завершение приложения",
+                status = "остановлено пользователем или системой настроек",
+                details = "Android зафиксировал штатную остановку ${processExitTimestamp(latest.timestampMs)}. Это не похоже на самопроизвольное завершение во сне.",
+                severity = DeviceCheckSeverity.Info,
+            )
+            ProcessExitCategory.PackageChange -> DeviceCheckItem(
+                title = "Последнее завершение приложения",
+                status = "обновление или изменение пакета",
+                details = "Последняя запись Android от ${processExitTimestamp(latest.timestampMs)} связана с обновлением приложения, его разрешений или состояния пакета.",
+                severity = DeviceCheckSeverity.Info,
+            )
+            ProcessExitCategory.NormalExit -> DeviceCheckItem(
+                title = "Последнее завершение приложения",
+                status = "штатное",
+                details = "За последние 7 дней Android не зафиксировал неожиданного завершения основного процесса WDTT Plus.",
+                severity = DeviceCheckSeverity.Ok,
+            )
+            else -> DeviceCheckItem(
+                title = "Последнее завершение приложения",
+                status = "неожиданных завершений не найдено",
+                details = "В доступной Android истории за последние 7 дней нет системного завершения процесса или сбоя WDTT Plus.",
+                severity = DeviceCheckSeverity.Ok,
+            )
+        }
+    }
+
+    val category = classifyProcessExit(unexpected)
+    val time = processExitTimestamp(unexpected.timestampMs)
+    val marker = recognizedSystemExitMarker(unexpected.description)
+    val newerExpectedEvent = history.latest
+        ?.takeIf { it.timestampMs > unexpected.timestampMs }
+        ?.let(::classifyProcessExit)
+        ?.takeIf {
+            it == ProcessExitCategory.UserAction ||
+                it == ProcessExitCategory.PackageChange ||
+                it == ProcessExitCategory.NormalExit
+        }
+    val laterEventNote = if (newerExpectedEvent != null) {
+        " После этого Android зафиксировал более новое штатное событие, но оно не отменяет найденное неожиданное завершение."
+    } else {
+        ""
+    }
+    val markerText = if (marker.isNotBlank()) " Метка оболочки Android: $marker." else ""
+    val commonRecommendation = backgroundRestrictionRecommendation(
+        manufacturer = manufacturer,
+        backgroundRestricted = backgroundRestricted,
+        batteryOptimizationsIgnored = batteryOptimizationsIgnored,
+    )
+
+    return when (category) {
+        ProcessExitCategory.SystemPolicy -> DeviceCheckItem(
+            title = "Последнее завершение приложения",
+            status = "процесс завершён системой",
+            details = "Android завершил основной процесс WDTT Plus $time вне штатной остановки приложения.$markerText$laterEventNote",
+            recommendation = commonRecommendation,
+            severity = DeviceCheckSeverity.Warning,
+            action = DeviceCheckAction.BatterySettings,
+        )
+        ProcessExitCategory.ExcessiveResources -> DeviceCheckItem(
+            title = "Последнее завершение приложения",
+            status = "система ограничила использование ресурсов",
+            details = "Android завершил WDTT Plus $time из-за зафиксированного системой длительного использования ресурсов.$laterEventNote",
+            recommendation = "$commonRecommendation Если это повторяется в режиме «Удерживать соединение», приложите отчёт устройства и системный журнал.",
+            severity = DeviceCheckSeverity.Warning,
+            action = DeviceCheckAction.BatterySettings,
+        )
+        ProcessExitCategory.LowMemory -> DeviceCheckItem(
+            title = "Последнее завершение приложения",
+            status = "не хватило памяти",
+            details = "Android завершил WDTT Plus $time при нехватке оперативной памяти.$laterEventNote",
+            recommendation = "Закройте тяжёлые приложения и повторите проверку. Если это происходит регулярно, приложите отчёт устройства.",
+            severity = DeviceCheckSeverity.Warning,
+        )
+        ProcessExitCategory.Crash -> DeviceCheckItem(
+            title = "Последнее завершение приложения",
+            status = "обнаружен сбой приложения",
+            details = "Android зафиксировал аварийное завершение WDTT Plus $time.$laterEventNote",
+            recommendation = "Скопируйте отчёт устройства и журнал приложения после повторения проблемы.",
+            severity = DeviceCheckSeverity.Error,
+        )
+        ProcessExitCategory.Dependency -> DeviceCheckItem(
+            title = "Последнее завершение приложения",
+            status = "завершился зависимый системный компонент",
+            details = "Android остановил WDTT Plus $time после завершения связанного системного процесса.$laterEventNote",
+            recommendation = "Повторите подключение. Если проблема возвращается, приложите отчёт устройства.",
+            severity = DeviceCheckSeverity.Warning,
+        )
+        else -> DeviceCheckItem(
+            title = "Последнее завершение приложения",
+            status = "причина не распознана",
+            details = "Android сохранил запись о завершении WDTT Plus $time, но не сообщил однозначную причину.$laterEventNote",
+            recommendation = "Приложите отчёт устройства и системный журнал после повторения проблемы.",
+            severity = DeviceCheckSeverity.Warning,
+        )
+    }
+}
+
 internal enum class RtMasqueEnrollmentState {
     Missing,
     Ready,
@@ -166,58 +376,128 @@ internal fun tunnelHealthItem(
     activeWorkers: Int,
     issue: ConnectionIssue?,
     confirmedNetworkFailure: Boolean,
+    tunnelMode: String = TUNNEL_MODE_VPN,
 ): DeviceCheckItem = when {
     !running -> DeviceCheckItem(
-        title = "Текущее подключение VPN",
+        title = "Текущее соединение",
         status = "не активно",
-        details = "VPN сейчас не подключён. Это не мешает проверке устройства; пункт фиксирует текущее состояние туннеля.",
+        details = "Соединение сейчас не активно. Это не мешает проверке устройства; пункт фиксирует текущее состояние туннеля.",
         recommendation = issue?.let { "${it.title}: ${it.action}" }.orEmpty(),
         severity = DeviceCheckSeverity.Info,
     )
     confirmedNetworkFailure -> DeviceCheckItem(
-        title = "Текущее подключение VPN",
+        title = "Текущее соединение",
         status = "нет ответа на пользовательский трафик",
-        details = "VPN-интерфейс включён, активных каналов: $activeWorkers, но приложение подтвердило отсутствие ответов на переданный трафик.",
+        details = if (tunnelModeUsesLocalProxy(tunnelMode)) {
+            "Прокси ${tunnelModeStatusLabel(tunnelMode)} запущен, активных каналов: $activeWorkers, но приложение подтвердило отсутствие ответов на переданный трафик."
+        } else {
+            "VPN-интерфейс включён, активных каналов: $activeWorkers, но приложение подтвердило отсутствие ответов на переданный трафик."
+        },
         recommendation = issue?.let { "${it.title}: ${it.action}" }
-            ?: "WDTT Plus автоматически проверит восстановление и при необходимости переподключит VPN.",
+            ?: "WDTT Plus автоматически проверит восстановление и при необходимости переподключит транспорт.",
         severity = DeviceCheckSeverity.Warning,
     )
     issue != null -> DeviceCheckItem(
-        title = "Текущее подключение VPN",
+        title = "Текущее соединение",
         status = "обнаружена проблема",
-        details = "VPN-интерфейс включён, активных каналов: $activeWorkers. Приложение обнаружило состояние, требующее внимания.",
+        details = if (tunnelModeUsesLocalProxy(tunnelMode)) {
+            "Прокси ${tunnelModeStatusLabel(tunnelMode)} запущен, активных каналов: $activeWorkers. Приложение обнаружило состояние, требующее внимания."
+        } else {
+            "VPN-интерфейс включён, активных каналов: $activeWorkers. Приложение обнаружило состояние, требующее внимания."
+        },
         recommendation = "${issue.title}: ${issue.action}",
         severity = DeviceCheckSeverity.Warning,
     )
     activeWorkers <= 0 -> DeviceCheckItem(
-        title = "Текущее подключение VPN",
+        title = "Текущее соединение",
         status = "нет активных каналов",
-        details = "VPN подключён, но сейчас нет активных транспортных каналов.",
-        recommendation = "Подождите автоматического восстановления. Если каналы не появятся, переподключите VPN и приложите новый отчёт.",
+        details = "Соединение запущено, но сейчас нет активных транспортных каналов.",
+        recommendation = "Подождите автоматического восстановления. Если каналы не появятся, переподключите транспорт и приложите новый отчёт.",
         severity = DeviceCheckSeverity.Warning,
     )
     else -> DeviceCheckItem(
-        title = "Текущее подключение VPN",
+        title = "Текущее соединение",
         status = "активно",
-        details = "VPN подключён. Активных каналов: $activeWorkers.",
+        details = if (tunnelModeUsesLocalProxy(tunnelMode)) {
+            "Прокси ${tunnelModeStatusLabel(tunnelMode)} работает. Активных каналов: $activeWorkers."
+        } else {
+            "Системный VPN подключён. Активных каналов: $activeWorkers."
+        },
         severity = DeviceCheckSeverity.Ok,
     )
 }
 
+internal fun lastTunnelStopItem(
+    running: Boolean,
+    reason: TunnelStopReason?,
+): DeviceCheckItem? {
+    if (running || reason == null) return null
+    return when (reason) {
+        TunnelStopReason.User,
+        TunnelStopReason.CaptchaCancelled -> DeviceCheckItem(
+            title = "Последняя остановка соединения",
+            status = reason.displayText,
+            details = "Соединение было остановлено явным действием пользователя, а не системным завершением процесса.",
+            severity = DeviceCheckSeverity.Info,
+        )
+        TunnelStopReason.VpnSlotTransferred,
+        TunnelStopReason.VpnStoppedExternally -> DeviceCheckItem(
+            title = "Последняя остановка соединения",
+            status = reason.displayText,
+            details = "Android освободил единственный системный VPN-слот WDTT Plus. Это отдельное событие и не означает, что процесс приложения был завершён системой.",
+            recommendation = "Проверьте, не запускался ли другой VPN или его плитка быстрых настроек. Затем включите WDTT Plus снова.",
+            severity = DeviceCheckSeverity.Info,
+            action = DeviceCheckAction.VpnSettings,
+        )
+        TunnelStopReason.TrustedWifi -> DeviceCheckItem(
+            title = "Последняя остановка соединения",
+            status = reason.displayText,
+            details = "VPN намеренно остановлен автоматикой доверенной Wi-Fi сети и будет восстановлен после выхода из неё.",
+            severity = DeviceCheckSeverity.Ok,
+        )
+        else -> DeviceCheckItem(
+            title = "Последняя остановка соединения",
+            status = reason.displayText,
+            details = "WDTT Plus остановил соединение после обнаруженной ошибки или системного события. Причина выше относится к соединению; отдельный пункт о завершении приложения показывает, был ли уничтожен весь процесс.",
+            recommendation = "Если остановка повторяется, приложите отчёт устройства и журнал приложения.",
+            severity = DeviceCheckSeverity.Warning,
+        )
+    }
+}
+
 internal fun sleepBatteryModeItem(
     enabled: Boolean,
+    screenOffMode: ScreenOffMode = if (enabled) ScreenOffMode.SAVE_BATTERY else ScreenOffMode.BALANCED,
     mode: SleepBatteryMode,
     pauseDelayMinutes: Int,
     resumeDelayMinutes: Int,
     runtime: SleepBatteryRuntimeState,
     notificationsGranted: Boolean,
     batteryOptimizationsIgnored: Boolean?,
+    backgroundRestricted: Boolean? = null,
 ): DeviceCheckItem {
-    if (!enabled) {
+    if (screenOffMode == ScreenOffMode.HOLD_CONNECTION) {
+        val restricted = batteryOptimizationsIgnored == false || backgroundRestricted == true
         return DeviceCheckItem(
-            title = "Экономия батареи во сне",
-            status = "выключена",
-            details = "При выключенном экране WDTT Plus не будет намеренно останавливать VPN по сценарию сна.",
+            title = "Работа при выключенном экране",
+            status = "удерживать соединение",
+            details = "WDTT Plus старается сохранять активное соединение при выключенном экране, в том числе при работе через Wi-Fi. Android может применять собственные ограничения фоновой работы. Режим повышает надёжность, но увеличивает расход батареи.",
+            recommendation = if (backgroundRestricted == true) {
+                "Android сообщает, что WDTT Plus ограничен в фоне. Разрешите фоновую работу и снимите ограничение батареи, иначе система всё равно может остановить приложение."
+            } else if (restricted) {
+                "Снимите системное ограничение батареи с WDTT Plus, иначе Android всё равно может остановить приложение."
+            } else {
+                ""
+            },
+            severity = if (restricted) DeviceCheckSeverity.Warning else DeviceCheckSeverity.Ok,
+            action = if (restricted) DeviceCheckAction.BatterySettings else null,
+        )
+    }
+    if (screenOffMode == ScreenOffMode.BALANCED || !enabled) {
+        return DeviceCheckItem(
+            title = "Работа при выключенном экране",
+            status = "сбалансированно",
+            details = "WDTT Plus использует обычную фоновую работу Android и автоматически проверяет каналы после пробуждения.",
             severity = DeviceCheckSeverity.Info,
         )
     }
@@ -263,7 +543,7 @@ internal fun sleepBatteryModeItem(
         " Включение экрана завершает текущий сценарий."
     }
     return DeviceCheckItem(
-        title = "Экономия батареи во сне",
+        title = "Работа при выключенном экране",
         status = status,
         details = "Текущее состояние: $runtimeText.$timerNote Во время паузы интернет телефона идёт напрямую, без VPN.",
         recommendation = recommendation,
@@ -275,6 +555,54 @@ internal fun sleepBatteryModeItem(
             else -> null
         },
     )
+}
+
+internal fun connectionHoldRuntimeItem(
+    running: Boolean,
+    diagnostics: ConnectionHoldDiagnostics,
+): DeviceCheckItem {
+    val technicalDetails =
+        "Системные признаки: CPU wake lock — ${if (diagnostics.cpuWakeLockHeld) "активен" else "не активен"}; " +
+            "Wi-Fi lock — ${if (diagnostics.wifiLockHeld) "активен" else "не активен"}; " +
+            "Wi-Fi — ${if (diagnostics.wifiTransportAvailable) "используется" else "не используется"}; " +
+            "экран — ${if (diagnostics.deviceInteractive) "включён" else "выключен"}."
+    return when {
+        !diagnostics.modeSelected -> DeviceCheckItem(
+            title = "Удержание соединения",
+            status = "не выбрано",
+            details = "Сейчас используется другой режим работы при выключенном экране. $technicalDetails",
+            severity = DeviceCheckSeverity.Info,
+        )
+        !running -> DeviceCheckItem(
+            title = "Удержание соединения",
+            status = "ожидает запуска",
+            details = "Режим выбран и начнёт действовать после запуска соединения. $technicalDetails",
+            severity = DeviceCheckSeverity.Info,
+        )
+        !diagnostics.active || !diagnostics.cpuWakeLockHeld -> DeviceCheckItem(
+            title = "Удержание соединения",
+            status = "не действует",
+            details = "Соединение запущено, но системное удержание CPU не подтверждено. $technicalDetails",
+            recommendation = "Перезапустите соединение. Если состояние повторится, приложите отчёт устройства и журнал.",
+            severity = DeviceCheckSeverity.Warning,
+        )
+        !diagnostics.deviceInteractive &&
+            diagnostics.wifiTransportAvailable &&
+            !diagnostics.wifiLockHeld -> DeviceCheckItem(
+            title = "Удержание соединения",
+            status = "Wi-Fi не удерживается",
+            details = "Удержание CPU активно, но удержание используемого Wi-Fi не подтверждено. $technicalDetails",
+            recommendation = "Проверьте ограничения батареи и фоновой работы WDTT Plus. Если состояние повторится, приложите отчёт устройства и журнал.",
+            severity = DeviceCheckSeverity.Warning,
+            action = DeviceCheckAction.BatterySettings,
+        )
+        else -> DeviceCheckItem(
+            title = "Удержание соединения",
+            status = "действует",
+            details = "Режим работает. Удержание Wi-Fi включается только при выключенном экране и активном Wi-Fi. $technicalDetails",
+            severity = DeviceCheckSeverity.Ok,
+        )
+    }
 }
 
 internal fun trustedWifiModeItem(
@@ -452,14 +780,16 @@ object DeviceCompatibility {
     fun check(
         context: Context,
         includeRuntimeChecks: Boolean,
-        workersPerHash: Int? = null
+        workersPerHash: Int? = null,
+        tunnelMode: String = TUNNEL_MODE_VPN,
+        screenOffMode: ScreenOffMode? = null,
     ): DeviceCompatibilityReport {
         val appContext = context.applicationContext
         val television = isTelevisionDevice(appContext)
         val items = buildList {
             add(androidVersionItem())
             add(abiItem())
-            add(nativeComponentsItem(appContext))
+            add(nativeComponentsItem(appContext, tunnelMode))
             nativeRuntimeSafetyItem()?.let(::add)
             add(pageSizeItem())
             add(memoryClassItem(appContext, workersPerHash))
@@ -468,10 +798,27 @@ object DeviceCompatibility {
 
             if (includeRuntimeChecks) {
                 add(networkItem(appContext))
-                add(vpnPermissionItem())
-                add(tunnelStateItem())
+                if (tunnelModeNeedsVpnPermission(tunnelMode)) {
+                    add(vpnPermissionItem())
+                }
+                add(tunnelStateItem(tunnelMode))
+                add(
+                    connectionHoldRuntimeItem(
+                        running = TunnelManager.running.value,
+                        diagnostics = TunnelManager.connectionHoldDiagnostics.value.let { diagnostics ->
+                            screenOffMode?.let { mode ->
+                                diagnostics.copy(modeSelected = mode == ScreenOffMode.HOLD_CONNECTION)
+                            } ?: diagnostics
+                        },
+                    )
+                )
+                lastTunnelStopItem(
+                    running = TunnelManager.running.value,
+                    reason = TunnelManager.lastStopReason.value,
+                )?.let(::add)
                 add(notificationPermissionItem(appContext, television))
                 add(batteryItem(appContext, television))
+                add(processExitItem(appContext))
                 add(updateInstallPermissionItem(appContext))
             }
         }
@@ -578,13 +925,16 @@ object DeviceCompatibility {
         )
     }
 
-    private fun nativeComponentsItem(context: Context): DeviceCheckItem {
+    private fun nativeComponentsItem(context: Context, tunnelMode: String): DeviceCheckItem {
         val nativeLibraryDir = context.applicationInfo.nativeLibraryDir.orEmpty()
         val nativeClient = File(nativeLibraryDir, "libclient.so")
         val wireGuardBackend = File(nativeLibraryDir, "libwg-go.so")
+        val systemVpnMode = tunnelModeNeedsVpnPermission(tunnelMode)
         val missing = buildList {
             if (!nativeClient.isFile || nativeClient.length() <= 0L) add("libclient.so")
-            if (!wireGuardBackend.isFile || wireGuardBackend.length() <= 0L) add("libwg-go.so")
+            if (systemVpnMode && (!wireGuardBackend.isFile || wireGuardBackend.length() <= 0L)) {
+                add("libwg-go.so")
+            }
         }
         return when {
             missing.isNotEmpty() -> DeviceCheckItem(
@@ -593,6 +943,13 @@ object DeviceCompatibility {
                 details = "В установленном APK отсутствует или повреждён нативный клиент TURN/DTLS либо WireGuard backend системного VPN.",
                 recommendation = "Переустановите APK нужной ABI или universal APK из официального релиза WDTT Plus.",
                 severity = DeviceCheckSeverity.Error,
+                firstLaunchRelevant = true
+            )
+            !systemVpnMode -> DeviceCheckItem(
+                title = "Нативные компоненты",
+                status = "прокси-клиент найден",
+                details = "libclient.so: ${formatMiB(nativeClient.length())}. Системный WireGuard backend не требуется режиму ${tunnelModeStatusLabel(tunnelMode)}.",
+                severity = DeviceCheckSeverity.Ok,
                 firstLaunchRelevant = true
             )
             else -> DeviceCheckItem(
@@ -809,14 +1166,14 @@ object DeviceCompatibility {
         )
     }
 
-    private fun tunnelStateItem(): DeviceCheckItem {
+    private fun tunnelStateItem(tunnelMode: String): DeviceCheckItem {
         val running = TunnelManager.running.value
         val trustedWifi = TrustedWifiManager.state.value
         val activeWorkers = TunnelManager.activeWorkers.value
         val issue = TunnelManager.connectionIssue.value
         return if (trustedWifi.waiting) {
             DeviceCheckItem(
-                title = "Текущее подключение VPN",
+                title = "Текущее соединение",
                 status = "ожидание доверенной Wi-Fi сети",
                 details = "VPN сейчас выключен автоматикой доверенных сетей и восстановится после выхода из Wi-Fi.",
                 severity = DeviceCheckSeverity.Ok
@@ -827,6 +1184,7 @@ object DeviceCompatibility {
                 activeWorkers = activeWorkers,
                 issue = issue,
                 confirmedNetworkFailure = TunnelManager.hasConfirmedNetworkFailureSince(0L),
+                tunnelMode = tunnelMode,
             )
         } else {
             tunnelHealthItem(
@@ -834,6 +1192,7 @@ object DeviceCompatibility {
                 activeWorkers = activeWorkers,
                 issue = issue,
                 confirmedNetworkFailure = false,
+                tunnelMode = tunnelMode,
             )
         }
     }
@@ -896,23 +1255,42 @@ object DeviceCompatibility {
         val ignored = runCatching {
             powerManager?.isIgnoringBatteryOptimizations(context.packageName)
         }.getOrNull()
-        return when (ignored) {
-            true -> DeviceCheckItem(
+        val backgroundRestricted = runCatching {
+            context.getSystemService(ActivityManager::class.java)?.isBackgroundRestricted
+        }.getOrNull()
+        return when {
+            backgroundRestricted == true -> DeviceCheckItem(
                 title = "Фоновая работа",
-                status = "без ограничений батареи",
-                details = "Android не должен агрессивно останавливать VPN в фоне.",
+                status = "ограничена системой",
+                details = "Android сообщает, что фоновая работа WDTT Plus ограничена. Это ограничение может действовать даже при исключении из обычной оптимизации батареи.",
+                recommendation = backgroundRestrictionRecommendation(
+                    manufacturer = Build.MANUFACTURER,
+                    backgroundRestricted = true,
+                    batteryOptimizationsIgnored = ignored,
+                ),
+                severity = DeviceCheckSeverity.Warning,
+                action = DeviceCheckAction.BatterySettings,
+            )
+            ignored == true -> DeviceCheckItem(
+                title = "Фоновая работа",
+                status = "стандартная оптимизация отключена",
+                details = "Стандартная оптимизация батареи Android отключена для WDTT Plus. Производитель телефона всё равно может применять отдельные правила фоновой работы.",
                 severity = DeviceCheckSeverity.Ok,
                 action = DeviceCheckAction.BatterySettings
             )
-            false -> DeviceCheckItem(
+            ignored == false -> DeviceCheckItem(
                 title = "Фоновая работа",
                 status = "ограничения батареи могут мешать",
                 details = "Это не архитектурная ошибка, но на некоторых прошивках VPN может засыпать при выключенном экране.",
-                recommendation = "Отключите ограничения батареи для WDTT Plus, если туннель сам останавливается.",
+                recommendation = backgroundRestrictionRecommendation(
+                    manufacturer = Build.MANUFACTURER,
+                    backgroundRestricted = backgroundRestricted,
+                    batteryOptimizationsIgnored = false,
+                ),
                 severity = DeviceCheckSeverity.Warning,
                 action = DeviceCheckAction.BatterySettings
             )
-            null -> DeviceCheckItem(
+            else -> DeviceCheckItem(
                 title = "Фоновая работа",
                 status = "не удалось проверить",
                 details = "Состояние ограничений батареи не определено.",
@@ -920,6 +1298,76 @@ object DeviceCompatibility {
                 action = DeviceCheckAction.AppSettings
             )
         }
+    }
+
+    internal fun recentProcessExitHistory(context: Context): ProcessExitHistory? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
+        val activityManager = runCatching {
+            context.getSystemService(ActivityManager::class.java)
+        }.getOrNull() ?: return null
+        val records = runCatching {
+            activityManager.getHistoricalProcessExitReasons(context.packageName, 0, 16)
+        }.getOrNull() ?: return null
+        val mainProcessRecords = records
+            .filter { it.processName == context.packageName }
+            .map {
+                ProcessExitRecord(
+                    timestampMs = it.timestamp,
+                    reason = it.reason,
+                    description = it.description.orEmpty(),
+                )
+            }
+        return processExitHistory(mainProcessRecords)
+    }
+
+    internal fun recentUnexpectedProcessExitLog(context: Context): Pair<String, String>? {
+        val history = recentProcessExitHistory(context) ?: return null
+        val latest = history.latest ?: return null
+        if (history.latestUnexpected?.timestampMs != latest.timestampMs) return null
+        val category = classifyProcessExit(latest)
+        val marker = recognizedSystemExitMarker(latest.description)
+        val time = processExitTimestamp(latest.timestampMs)
+        val reason = when (category) {
+            ProcessExitCategory.SystemPolicy -> "предыдущий процесс завершён системой"
+            ProcessExitCategory.ExcessiveResources -> "предыдущий процесс остановлен из-за ограничения ресурсов"
+            ProcessExitCategory.LowMemory -> "предыдущий процесс остановлен при нехватке памяти"
+            ProcessExitCategory.Crash -> "предыдущий процесс завершился со сбоем"
+            ProcessExitCategory.Dependency -> "предыдущий процесс остановлен после завершения системного компонента"
+            ProcessExitCategory.Unknown -> "причина завершения предыдущего процесса не распознана"
+            else -> return null
+        }
+        val markerText = if (marker.isNotBlank()) " · метка оболочки: $marker" else ""
+        return "process_exit_${latest.timestampMs}" to "$reason ($time)$markerText"
+    }
+
+    private fun processExitItem(context: Context): DeviceCheckItem {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            return DeviceCheckItem(
+                title = "Последнее завершение приложения",
+                status = "история недоступна",
+                details = "Android ниже версии 11 не предоставляет приложению надёжную историю причин завершения процесса.",
+                severity = DeviceCheckSeverity.Info,
+            )
+        }
+        val history = recentProcessExitHistory(context) ?: return DeviceCheckItem(
+            title = "Последнее завершение приложения",
+            status = "не удалось проверить",
+            details = "Android не вернул историю завершений основного процесса WDTT Plus.",
+            severity = DeviceCheckSeverity.Info,
+        )
+        val powerManager = runCatching { context.getSystemService(PowerManager::class.java) }.getOrNull()
+        val batteryOptimizationsIgnored = runCatching {
+            powerManager?.isIgnoringBatteryOptimizations(context.packageName)
+        }.getOrNull()
+        val backgroundRestricted = runCatching {
+            context.getSystemService(ActivityManager::class.java)?.isBackgroundRestricted
+        }.getOrNull()
+        return processExitHistoryItem(
+            history = history,
+            manufacturer = Build.MANUFACTURER,
+            backgroundRestricted = backgroundRestricted,
+            batteryOptimizationsIgnored = batteryOptimizationsIgnored,
+        )
     }
 
     private fun updateInstallPermissionItem(context: Context): DeviceCheckItem {

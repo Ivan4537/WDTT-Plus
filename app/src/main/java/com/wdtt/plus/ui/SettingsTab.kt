@@ -1,17 +1,21 @@
 package com.wdtt.plus.ui
 
 import android.content.ClipData
+import android.content.ClipDescription
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.ContextWrapper
+import android.graphics.Bitmap
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.os.Handler
 import android.os.Looper
+import android.os.PersistableBundle
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.animateFloat
@@ -21,7 +25,10 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.focusGroup
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.detectDragGestures
@@ -36,17 +43,22 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.HelpOutline
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.PowerSettingsNew
+import androidx.compose.material.icons.filled.QrCode2
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Schedule
+import androidx.compose.material.icons.filled.SettingsEthernet
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Tag
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.Update
 import androidx.compose.material.icons.filled.WarningAmber
 import androidx.compose.material3.*
@@ -60,9 +72,14 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.pointerInput
@@ -72,15 +89,20 @@ import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.LinkAnnotation
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextLinkStyles
 import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.withLink
 import androidx.compose.ui.semantics.ProgressBarRangeInfo
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.progressBarRangeInfo
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.setProgress
@@ -90,6 +112,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -110,6 +133,9 @@ import com.wdtt.plus.CaptchaWebViewManager
 import com.wdtt.plus.ConnectionIssueKind
 import com.wdtt.plus.DEFAULT_VK_CLIENT_IDS
 import com.wdtt.plus.DEFAULT_RT_TURN_SNI
+import com.wdtt.plus.DEFAULT_SOCKS5_PORT
+import com.wdtt.plus.DEFAULT_HTTP_CONNECT_PORT
+import com.wdtt.plus.SOCKS5_LOOPBACK_HOST
 import com.wdtt.plus.ManlCaptchaWebViewManager
 import com.wdtt.plus.MainActivity
 import com.wdtt.plus.NativeClientStartupSecrets
@@ -127,18 +153,46 @@ import com.wdtt.plus.TunnelService
 import com.wdtt.plus.TunnelStopCoordinator
 import com.wdtt.plus.TunnelStopResult
 import com.wdtt.plus.TunnelTransition
+import com.wdtt.plus.TUNNEL_MODE_SOCKS5
+import com.wdtt.plus.TUNNEL_MODE_HTTP
+import com.wdtt.plus.TUNNEL_MODE_AUTO
+import com.wdtt.plus.TUNNEL_MODE_VPN
+import com.wdtt.plus.PROXY_ACCESS_BOTH
+import com.wdtt.plus.PROXY_ACCESS_DEVICE
+import com.wdtt.plus.PROXY_ACCESS_LAN
+import com.wdtt.plus.ProxyCopyOption
+import com.wdtt.plus.TransferFiles
 import com.wdtt.plus.VpnDnsSettingsSnapshot
+import com.wdtt.plus.VpnWidgetProvider
 import com.wdtt.plus.buildTunnelStartIntentFromSettings
 import com.wdtt.plus.normalizeTunnelWorkerCount
 import com.wdtt.plus.normalizeRtTurnSni
+import com.wdtt.plus.normalizeProxyPort
+import com.wdtt.plus.normalizeTunnelMode
 import com.wdtt.plus.nativeClientStartupConfigLine
+import com.wdtt.plus.tunnelModeNeedsVpnPermission
+import com.wdtt.plus.tunnelModeUsesLocalProxy
+import com.wdtt.plus.tunnelModeStatusLabel
+import com.wdtt.plus.wakeRecoveryStatusText
+import com.wdtt.plus.proxySettingsAreValid
+import com.wdtt.plus.proxyDisplayAddress
+import com.wdtt.plus.proxyCopyOptions
+import com.wdtt.plus.normalizeProxyAccess
+import com.wdtt.plus.proxyAccessIncludesDevice
+import com.wdtt.plus.proxyAccessIncludesLan
+import com.wdtt.plus.proxyAccessNeedsAuthentication
+import com.wdtt.plus.expectedProxyReadyAddresses
+import com.wdtt.plus.findProxyLanBinding
+import com.wdtt.plus.generateProxyPassword
 import com.wdtt.plus.TrustedWifiManager
 import com.wdtt.plus.VkJoinLink
 import com.wdtt.plus.WDTTColors
 import com.wdtt.plus.WdttDeepLink
 import com.wdtt.plus.WdttDeepLinkApplyPlan
+import com.wdtt.plus.WdttDeepLinkValidation
 import com.wdtt.plus.isValidVkClientId
 import com.wdtt.plus.isStandaloneUiIssue
+import com.wdtt.plus.isValidSocks5Credential
 import com.wdtt.plus.accessLifecycleDismissalSignature
 import com.wdtt.plus.accessLifecycleCanDismiss
 import com.wdtt.plus.boundContinuationAvailable
@@ -162,6 +216,8 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import kotlin.math.roundToInt
 import java.io.File
+
+internal fun proxySettingsButtonShowsLabel(availableWidthDp: Int): Boolean = availableWidthDp >= 290
 
 private const val WORKERS_PER_GROUP = 9
 private const val REMOTE_ACTION_REFRESH_MS = 10 * 60 * 1000L
@@ -250,24 +306,118 @@ internal fun shouldShowManagedHashStatusCard(
                 lifecycle.detailValue.isNotBlank()
             )
 
-internal fun isSelectedCompactConnectionReady(
+internal data class TunnelConnectionRequirements(
+    val connectionConfigured: Boolean,
+    val hashesPresent: Boolean,
+    val hashesInvalid: Boolean,
+) {
+    val canStart: Boolean
+        get() = connectionConfigured && hashesPresent && !hashesInvalid
+}
+
+private fun isStoredLinkHashIssue(message: String): Boolean =
+    message.contains("хеш", ignoreCase = true)
+
+internal fun storedLinkConnectionRequirements(
+    link: String,
+    validation: WdttDeepLinkValidation,
+): TunnelConnectionRequirements {
+    val hashIssues = validation.errors.filter(::isStoredLinkHashIssue)
+    return TunnelConnectionRequirements(
+        connectionConfigured = link.isNotBlank() &&
+            validation.errors.all(::isStoredLinkHashIssue),
+        hashesPresent = hashIssues.isEmpty(),
+        hashesInvalid = hashIssues.any {
+            it.contains("недопустим", ignoreCase = true) ||
+                it.contains("неверн", ignoreCase = true)
+        },
+    )
+}
+
+internal fun selectedTunnelConnectionRequirements(
     selectedMethod: String,
     savedMethod: String,
     storedLinkMode: Boolean,
-    linkPresent: Boolean,
-    linkValid: Boolean,
-    manualValid: Boolean,
-): Boolean = when (selectedMethod) {
-    "link" -> when {
-        storedLinkMode && linkPresent -> linkValid
-        savedMethod == "link" -> manualValid
+    storedLink: TunnelConnectionRequirements,
+    manual: TunnelConnectionRequirements,
+): TunnelConnectionRequirements {
+    val source = if (selectedMethod == "link" && storedLinkMode) storedLink else manual
+    val selectedSourceMatches = when (selectedMethod) {
+        "link" -> storedLinkMode || savedMethod == "link"
+        "manual" -> !storedLinkMode && (savedMethod == "manual" || savedMethod.isBlank())
         else -> false
     }
-    "manual" -> !storedLinkMode &&
-        (savedMethod == "manual" || savedMethod.isBlank()) &&
-        manualValid
-    else -> false
+    return source.copy(
+        connectionConfigured = selectedSourceMatches && source.connectionConfigured,
+    )
 }
+
+internal enum class TunnelStartIssueTarget {
+    CONNECTION,
+    HASHES,
+    PARAMETERS,
+    PROXY_SETTINGS,
+}
+
+internal data class TunnelStartIssue(
+    val target: TunnelStartIssueTarget,
+    val message: String,
+)
+
+internal data class TunnelStartReadiness(
+    val issues: List<TunnelStartIssue>,
+) {
+    val canStart: Boolean
+        get() = issues.isEmpty()
+
+    val primaryIssue: TunnelStartIssue?
+        get() = issues.firstOrNull()
+
+    fun needsAttention(target: TunnelStartIssueTarget): Boolean = primaryIssue?.target == target
+}
+
+internal fun resolveTunnelStartReadiness(
+    connectionConfigured: Boolean,
+    hashesPresent: Boolean,
+    hashesInvalid: Boolean,
+    rtSniValid: Boolean,
+    proxySettingsValid: Boolean,
+): TunnelStartReadiness = TunnelStartReadiness(
+    issues = buildList {
+        if (!connectionConfigured) {
+            add(
+                TunnelStartIssue(
+                    TunnelStartIssueTarget.CONNECTION,
+                    "настройте выбранный способ подключения",
+                )
+            )
+        }
+        if (!hashesPresent || hashesInvalid) {
+            add(
+                TunnelStartIssue(
+                    TunnelStartIssueTarget.HASHES,
+                    if (hashesInvalid) "исправьте ВК-хеши" else "добавьте хотя бы один ВК-хеш",
+                )
+            )
+        }
+        if (!rtSniValid) {
+            add(
+                TunnelStartIssue(
+                    TunnelStartIssueTarget.PARAMETERS,
+                    "исправьте SNI в параметрах",
+                )
+            )
+        }
+        if (!proxySettingsValid) {
+            add(
+                TunnelStartIssue(
+                    TunnelStartIssueTarget.PROXY_SETTINGS,
+                    "исправьте настройки прокси",
+                )
+            )
+        }
+    },
+)
 
 private fun isValidTunnelHost(value: String): Boolean {
     val host = value.trim()
@@ -312,7 +462,7 @@ fun SettingsTab(
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun SettingsTabContent(
     context: android.content.Context,
@@ -366,6 +516,13 @@ fun SettingsTabContent(
     val cachedRemoteAction = profileSnapshot.cachedRemoteAction
     val remoteCardDismissed = profileSnapshot.remoteCardDismissed
     val profileMaxWorkers = profileSnapshot.profileMaxWorkers
+    val savedTunnelMode = normalizeTunnelMode(profileSnapshot.proxyMode)
+    val savedSocksPort = normalizeProxyPort(profileSnapshot.proxyPort, savedTunnelMode)
+    val savedSocksUdpEnabled = profileSnapshot.proxyUdpEnabled
+    val savedProxyAccess = normalizeProxyAccess(profileSnapshot.proxyAccess)
+    val savedSocksAuthEnabled = profileSnapshot.proxyAuthEnabled
+    val savedSocksUsername = profileSnapshot.proxyUsername
+    val savedSocksPassword = profileSnapshot.proxyPassword
 
     LaunchedEffect(
         activeProfile,
@@ -381,8 +538,15 @@ fun SettingsTabContent(
 
     val tunnelRunning by TunnelManager.running.collectAsStateWithLifecycle()
     val activeWorkers by TunnelManager.activeWorkers.collectAsStateWithLifecycle()
+    val wakeRecoveryInProgress by TunnelManager.wakeRecoveryInProgress.collectAsStateWithLifecycle()
+    val wakeRecoveryReadyWorkers by TunnelManager.wakeRecoveryReadyWorkers.collectAsStateWithLifecycle()
+    val wakeRecoveryTargetWorkers by TunnelManager.wakeRecoveryTargetWorkers.collectAsStateWithLifecycle()
+    val wakeRecoveryHeldConnection by TunnelManager.wakeRecoveryHeldConnection.collectAsStateWithLifecycle()
     val vpnInterfaceUp by TunnelManager.vpnInterfaceUp.collectAsStateWithLifecycle()
-    val warpResetBlockedMessage = "Для сброса отключите VPN"
+    val activeTunnelMode by TunnelManager.activeMode.collectAsStateWithLifecycle()
+    val proxyReadyAddress by TunnelManager.proxyReadyAddress.collectAsStateWithLifecycle()
+    val proxyReadyAddresses by TunnelManager.proxyReadyAddresses.collectAsStateWithLifecycle()
+    val warpResetBlockedMessage = "Для сброса остановите соединение"
     val tunnelTransition by TunnelManager.transition.collectAsStateWithLifecycle()
     val trustedWifiState by TrustedWifiManager.state.collectAsStateWithLifecycle()
     val trustedWifiWaiting = trustedWifiState.waiting
@@ -450,6 +614,41 @@ fun SettingsTabContent(
     var showRtMasqueResetConfirm by rememberSaveable { mutableStateOf(false) }
     var showVpnDnsSettings by rememberSaveable { mutableStateOf(false) }
     var showLaunchParameters by rememberSaveable { mutableStateOf(false) }
+    var showSocksSettings by rememberSaveable { mutableStateOf(false) }
+    var showSocksHelp by rememberSaveable { mutableStateOf(false) }
+    var showProxyCopyDialog by rememberSaveable { mutableStateOf(false) }
+    var tunnelMode by remember(activeProfile, savedTunnelMode) { mutableStateOf(savedTunnelMode) }
+    var lastProxyMode by rememberSaveable(activeProfile) {
+        mutableStateOf(
+            savedTunnelMode.takeIf(::tunnelModeUsesLocalProxy) ?: TUNNEL_MODE_AUTO,
+        )
+    }
+    var socksPortInput by remember(activeProfile, savedSocksPort) {
+        mutableStateOf(savedSocksPort.toString())
+    }
+    var socksUdpEnabled by remember(activeProfile, savedSocksUdpEnabled) {
+        mutableStateOf(savedSocksUdpEnabled)
+    }
+    var proxyAccess by remember(activeProfile, savedProxyAccess) {
+        mutableStateOf(savedProxyAccess)
+    }
+    var socksAuthEnabled by remember(activeProfile, savedSocksAuthEnabled, savedProxyAccess) {
+        mutableStateOf(savedSocksAuthEnabled || proxyAccessNeedsAuthentication(savedProxyAccess))
+    }
+    var socksUsername by remember(activeProfile, savedSocksUsername, savedProxyAccess) {
+        mutableStateOf(
+            savedSocksUsername.ifBlank {
+                if (proxyAccessNeedsAuthentication(savedProxyAccess)) "wdtt" else ""
+            },
+        )
+    }
+    var socksPassword by remember(activeProfile, savedSocksPassword, savedProxyAccess) {
+        mutableStateOf(
+            savedSocksPassword.ifBlank {
+                if (proxyAccessNeedsAuthentication(savedProxyAccess)) generateProxyPassword() else ""
+            },
+        )
+    }
     var serverDtlsPortInput by remember(activeProfile, savedServerDtlsPort) {
         mutableStateOf(savedServerDtlsPort.toString())
     }
@@ -484,14 +683,12 @@ fun SettingsTabContent(
         listOf(vkHash1, vkHash2, vkHash3, vkHash4).map { stripVkUrlStatic(it) }
     }
     val validHashes = remember(allHashes) { allHashes.filter(VkJoinLink::isValidHash) }
-    val uniqueHashes = remember(validHashes) { validHashes.distinct() }
     val wdttLinkValidation = remember(wdttLink) { WdttDeepLink.validate(wdttLink) }
     val parsedWdttLink = remember(wdttLinkValidation) { wdttLinkValidation.parts }
     val parsedLinkHashes = remember(parsedWdttLink) { parsedWdttLink?.hashes?.split(",")?.filter { it.isNotBlank() } ?: emptyList() }
     val filledHashCount = remember(vkHash1, vkHash2, vkHash3, vkHash4, wdttLinkMode, parsedLinkHashes) { 
         if (wdttLinkMode) parsedLinkHashes.size else validHashes.size
     }
-    val combinedHashes = remember(vkHash1, vkHash2, vkHash3, vkHash4) { uniqueHashes.joinToString(",") }
     val hashSlotsForStorage = remember(vkHash1, vkHash2, vkHash3, vkHash4) {
         encodeVkHashSlots(vkHash1, vkHash2, vkHash3, vkHash4)
     }
@@ -509,6 +706,7 @@ fun SettingsTabContent(
     val currentWorkers = workersInput.coerceIn(WORKERS_PER_GROUP.toFloat(), dynamicMaxWorkers)
     val launchParametersSummary = remember(
         currentWorkers,
+        tunnelMode,
         vpnDnsSettings,
         vkCallsPreflight,
         autoCaptchaEnabled,
@@ -517,6 +715,7 @@ fun SettingsTabContent(
     ) {
         tunnelLaunchParametersSummary(
             workers = currentWorkers.toInt(),
+            tunnelMode = tunnelMode,
             dnsSettings = vpnDnsSettings,
             vkCallsPreflight = vkCallsPreflight,
             autoCaptchaEnabled = autoCaptchaEnabled,
@@ -594,22 +793,46 @@ fun SettingsTabContent(
     val scrollState = rememberRememberedScrollState(scrollPosition)
 
     val isPeerValid = isValidTunnelHost(peerInput)
-    val isHashesValid = combinedHashes.isNotBlank()
-    val isLinkValid = wdttLinkValidation.canStartVpn
-    val isManualValid = isPeerValid && isHashesValid && savedConnectionPassword.isNotBlank() && !hasInputHashErrors
     val linkConnectionPresent = remember(wdttLink) {
         WdttDeepLink.parse(wdttLink, allowMissingHashes = true) != null
     }
-    val selectedCompactMethodValid = isSelectedCompactConnectionReady(
+    val rtSniValid = !rtNetwork || normalizeRtTurnSni(rtTurnSniInput) != null
+    val socksSettingsValid = proxySettingsAreValid(
+        mode = tunnelMode,
+        port = socksPortInput.toIntOrNull() ?: 0,
+        access = proxyAccess,
+        authEnabled = socksAuthEnabled,
+        username = socksUsername,
+        password = socksPassword,
+    )
+    val storedLinkRequirements = storedLinkConnectionRequirements(
+        link = wdttLink,
+        validation = wdttLinkValidation,
+    )
+    val manualRequirements = TunnelConnectionRequirements(
+        connectionConfigured = isPeerValid && savedConnectionPassword.isNotBlank(),
+        hashesPresent = validHashes.isNotEmpty(),
+        hashesInvalid = hasInputHashErrors,
+    )
+    val selectedConnectionRequirements = selectedTunnelConnectionRequirements(
         selectedMethod = userConnectionMethod,
         savedMethod = savedConnectionInputMethod,
         storedLinkMode = wdttLinkMode,
-        linkPresent = linkConnectionPresent,
-        linkValid = isLinkValid,
-        manualValid = isManualValid,
+        storedLink = storedLinkRequirements,
+        manual = manualRequirements,
     )
-    val rtSniValid = !rtNetwork || normalizeRtTurnSni(rtTurnSniInput) != null
-    val isValid = selectedCompactMethodValid && rtSniValid
+    val startReadiness = resolveTunnelStartReadiness(
+        connectionConfigured = selectedConnectionRequirements.connectionConfigured,
+        hashesPresent = selectedConnectionRequirements.hashesPresent,
+        hashesInvalid = selectedConnectionRequirements.hashesInvalid,
+        rtSniValid = rtSniValid,
+        proxySettingsValid = socksSettingsValid,
+    )
+    val primaryStartIssue = startReadiness.primaryIssue
+    val connectionNeedsAttention = startReadiness.needsAttention(TunnelStartIssueTarget.CONNECTION)
+    val hashesNeedAttention = startReadiness.needsAttention(TunnelStartIssueTarget.HASHES)
+    val parametersNeedAttention = startReadiness.needsAttention(TunnelStartIssueTarget.PARAMETERS)
+    val proxySettingsNeedAttention = startReadiness.needsAttention(TunnelStartIssueTarget.PROXY_SETTINGS)
     val hasConnectionSource = hasTunnelConnectionSource(
         linkMode = wdttLinkMode,
         linkValid = linkConnectionPresent,
@@ -658,6 +881,11 @@ fun SettingsTabContent(
     }
 
     fun requestVpnAndStart(profileIndex: Int) {
+        if (!tunnelModeNeedsVpnPermission(tunnelMode)) {
+            TunnelManager.clearConnectionIssue()
+            startTunnelService(profileIndex)
+            return
+        }
         val vpnIntent = VpnService.prepare(context)
         if (vpnIntent != null) {
             pendingStartProfileAfterVpnPermission = profileIndex
@@ -680,6 +908,15 @@ fun SettingsTabContent(
                     profileMaxWorkers,
                 )
                 saveJob?.cancel()
+                settingsStore.saveProxyMode(
+                    mode = tunnelMode,
+                    port = socksPortInput.toIntOrNull() ?: normalizeProxyPort(0, tunnelMode),
+                    udpEnabled = socksUdpEnabled,
+                    access = proxyAccess,
+                    authEnabled = socksAuthEnabled,
+                    username = socksUsername,
+                    password = socksPassword,
+                )
                 settingsStore.saveTunnelOptionsBeforeStart(
                     profileIndex = requestedProfile,
                     peer = peerInput,
@@ -1042,6 +1279,7 @@ fun SettingsTabContent(
 
     if (showLaunchParameters) {
         TunnelLaunchParametersDialog(
+            tunnelMode = tunnelMode,
             vpnDnsSettings = vpnDnsSettings,
             onOpenDnsSettings = { showVpnDnsSettings = true },
             currentWorkers = currentWorkers,
@@ -1130,6 +1368,73 @@ fun SettingsTabContent(
         )
     }
 
+    if (showSocksSettings) {
+        ProxySettingsDialog(
+            mode = if (tunnelModeUsesLocalProxy(tunnelMode)) tunnelMode else lastProxyMode,
+            initialPort = socksPortInput,
+            initialUdpEnabled = socksUdpEnabled,
+            initialAccess = proxyAccess,
+            initialAuthEnabled = socksAuthEnabled,
+            initialUsername = socksUsername,
+            initialPassword = socksPassword,
+            onSave = { draft ->
+                tunnelMode = draft.mode
+                lastProxyMode = draft.mode
+                socksPortInput = draft.port.toString()
+                socksUdpEnabled = draft.udpEnabled
+                proxyAccess = draft.access
+                socksAuthEnabled = draft.authEnabled
+                socksUsername = draft.username
+                socksPassword = draft.password
+                scope.launch {
+                    settingsStore.saveProxyMode(
+                        mode = draft.mode,
+                        port = draft.port,
+                        udpEnabled = draft.udpEnabled,
+                        access = draft.access,
+                        authEnabled = draft.authEnabled,
+                        username = draft.username,
+                        password = draft.password,
+                    )
+                    VpnWidgetProvider.updateAllWidgets(context)
+                }
+                showSocksSettings = false
+            },
+            onDismiss = { showSocksSettings = false },
+        )
+    }
+
+    if (showProxyCopyDialog) {
+        ProxyCopyDialog(
+            mode = tunnelMode,
+            access = proxyAccess,
+            port = socksPortInput.toIntOrNull() ?: normalizeProxyPort(0, tunnelMode),
+            readyAddresses = proxyReadyAddresses,
+            lanBinding = findProxyLanBinding(),
+            authEnabled = socksAuthEnabled,
+            username = socksUsername,
+            password = socksPassword,
+            onDismiss = { showProxyCopyDialog = false },
+        )
+    }
+
+    if (showSocksHelp) {
+        SettingsHelpDialog(
+            title = "Режимы работы",
+            paragraphs = listOf(
+                "VPN\nWDTT Plus создаёт системный VPN Android и сам направляет трафик приложений через профиль. Это самый простой вариант, но он занимает единственный VPN-слот устройства.",
+                "ПРОКСИ\nНе занимает системный VPN-слот. Доступны SOCKS5, HTTP CONNECT и «Авто»: последний принимает оба протокола на одном порту. Адрес нужно указать во внешнем приложении вручную.",
+                "SOCKS5\nРекомендуется для внешних VPN-клиентов и программ, создающих прокси-цепочки. Например: v2rayNG, NekoBox и Exclave. TCP работает всегда, а UDP — через включаемый UDP ASSOCIATE.",
+                "HTTP CONNECT\nСовместимый TCP-прокси для браузеров и программ без SOCKS5. UDP, QUIC и ICMP он не передаёт. В VPN-клиентах системный DNS и полноценный интернет через HTTP не гарантируются — для них выберите SOCKS5 с UDP.",
+                "Доступ к прокси\n«Оба» одновременно публикует прокси на 127.0.0.1 и конкретном частном адресе телефона. «Устройство» оставляет только 127.0.0.1, а «Сеть» — только Wi-Fi или точку доступа. Любой доступ к сети ограничен ближайшей подсетью и требует логин с паролем. Прокси не шифрует участок до телефона, поэтому используйте его только в доверенной сети.",
+                "Цепочка без циклов\nОбязательно исключите WDTT Plus (com.wdtt.plus) из маршрутизации внешнего VPN-клиента. Иначе он перехватит транспорт WDTT, отправит его обратно в этот же прокси, интернет пропадёт, а счётчик быстро вырастет. При обнаружении такого цикла WDTT Plus остановит прокси. После исправления настройки запустите оба соединения снова.",
+                "Ограничения\nПрокси маршрутизируют IPv4. SOCKS5 UDP-фрагментация и raw IP/ICMP не поддерживаются; обычный UDP через UDP ASSOCIATE работает.",
+            ),
+            highlightedParagraphIndices = setOf(4),
+            onDismiss = { showSocksHelp = false },
+        )
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -1138,7 +1443,7 @@ fun SettingsTabContent(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        Column {
+        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
             TunnelRemoteActionSection(
                 settingsStore = settingsStore,
                 activeProfile = activeProfile,
@@ -1149,10 +1454,9 @@ fun SettingsTabContent(
             )
 
             Text(
-                "Настройки туннеля (${vpnProfileDisplayName(activeProfile, profileNames)})",
+                "Настройки соединения (${vpnProfileDisplayName(activeProfile, profileNames)})",
                 style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
                 color = MaterialTheme.colorScheme.onSurface,
-                modifier = Modifier.padding(bottom = 12.dp)
             )
 
             ManagedAccessLifecycleSection(
@@ -1167,6 +1471,7 @@ fun SettingsTabContent(
                     hasConnection = hasConnectionSource,
                     connectionMethod = userConnectionMethod,
                     savedConnectionMethod = savedConnectionInputMethod,
+                    needsAttention = connectionNeedsAttention,
                     onConnectionMethodChange = { method ->
                         userConnectionMethod = method
                         userLinkInput = ""
@@ -1174,28 +1479,297 @@ fun SettingsTabContent(
                     },
                     onAddLinkClick = ::openUserLinkEditor,
                     onManualClick = ::openUserManualEditor,
+                    enabled = !tunnelRunning,
                 )
-                Spacer(Modifier.height(8.dp))
             }
             AppSectionCard(
-                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 10.dp),
-                verticalArrangement = Arrangement.spacedBy(0.dp)
+                containerColor = if (proxySettingsNeedAttention) {
+                    MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.24f)
+                } else null,
+                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(3.dp),
             ) {
-                OutlinedButton(
-                    onClick = ::openHashesSettings,
-                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
-                    shape = RoundedCornerShape(16.dp),
-                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
+                val proxyModeSelected = tunnelModeUsesLocalProxy(tunnelMode)
+                val normalizedPort = socksPortInput.toIntOrNull()?.let {
+                    normalizeProxyPort(it, tunnelMode)
+                } ?: normalizeProxyPort(0, tunnelMode)
+                val proxyNeedsLanAddress = proxyModeSelected && proxyAccessIncludesLan(proxyAccess)
+                var currentLanBinding by remember(proxyAccess, activeProfile) {
+                    mutableStateOf(if (proxyNeedsLanAddress) findProxyLanBinding() else null)
+                }
+                DisposableEffect(context, proxyNeedsLanAddress, activeProfile) {
+                    if (!proxyNeedsLanAddress) {
+                        currentLanBinding = null
+                        onDispose { }
+                    } else {
+                        val connectivityManager =
+                            context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+                        var pendingRefresh: Job? = null
+                        fun scheduleRefresh() {
+                            pendingRefresh?.cancel()
+                            pendingRefresh = scope.launch {
+                                delay(350L)
+                                currentLanBinding = withContext(Dispatchers.IO) {
+                                    findProxyLanBinding()
+                                }
+                            }
+                        }
+                        val callback = object : ConnectivityManager.NetworkCallback() {
+                            override fun onAvailable(network: Network) = scheduleRefresh()
+                            override fun onLost(network: Network) = scheduleRefresh()
+                            override fun onCapabilitiesChanged(
+                                network: Network,
+                                networkCapabilities: NetworkCapabilities,
+                            ) = scheduleRefresh()
+                        }
+                        val request = NetworkRequest.Builder()
+                            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                            .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                            .build()
+                        runCatching { connectivityManager.registerNetworkCallback(request, callback) }
+                        scheduleRefresh()
+                        onDispose {
+                            pendingRefresh?.cancel()
+                            runCatching { connectivityManager.unregisterNetworkCallback(callback) }
+                        }
+                    }
+                }
+                val displayedProxyAddress = proxyDisplayAddress(
+                    lanEnabled = proxyAccess == PROXY_ACCESS_LAN,
+                    port = normalizedPort,
+                    readyAddress = proxyReadyAddress.takeIf {
+                        tunnelRunning && activeTunnelMode == tunnelMode
+                    },
+                    lanBinding = currentLanBinding,
+                )
+                BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+                    val showProxySettingsLabel = proxySettingsButtonShowsLabel(
+                        maxWidth.value.roundToInt(),
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            "Режим работы",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        Spacer(Modifier.width(3.dp))
+                        IconButton(
+                            onClick = { showSocksHelp = true },
+                            modifier = Modifier.size(34.dp).remoteHelpFocus(),
+                        ) {
+                            Icon(
+                                Icons.AutoMirrored.Filled.HelpOutline,
+                                contentDescription = "Инструкция по режимам работы",
+                                modifier = Modifier.size(19.dp),
+                            )
+                        }
+                        Spacer(Modifier.weight(1f))
+                        if (proxyModeSelected) {
+                            val settingsButtonShape = RoundedCornerShape(14.dp)
+                            Surface(
+                                onClick = {
+                                    lastProxyMode = tunnelMode
+                                    showSocksSettings = true
+                                },
+                                enabled = !tunnelRunning,
+                                modifier = Modifier
+                                    .height(34.dp)
+                                    .remoteCompactFocus(
+                                        shape = settingsButtonShape,
+                                        enabled = !tunnelRunning,
+                                    ),
+                                shape = settingsButtonShape,
+                                color = Color.Transparent,
+                                contentColor = if (tunnelRunning) {
+                                    MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+                                } else if (proxySettingsNeedAttention) {
+                                    MaterialTheme.colorScheme.error
+                                } else {
+                                    MaterialTheme.colorScheme.primary
+                                },
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.Center,
+                                ) {
+                                    Icon(
+                                        Icons.Default.SettingsEthernet,
+                                        contentDescription = "Настроить ${tunnelModeStatusLabel(tunnelMode)}",
+                                        modifier = Modifier.size(18.dp),
+                                    )
+                                    if (showProxySettingsLabel) {
+                                        Spacer(Modifier.width(6.dp))
+                                        Text(
+                                            "Настройки",
+                                            style = MaterialTheme.typography.labelLarge,
+                                            maxLines = 1,
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(IntrinsicSize.Min)
+                        .clip(RoundedCornerShape(24.dp))
+                        .alpha(if (tunnelRunning) 0.55f else 1f),
                 ) {
-                    Icon(Icons.Default.Tag, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(6.dp))
-                    FlexibleButtonText(
-                        "Настройка VK Хешей ($filledHashCount/4)",
-                        fontWeight = FontWeight.SemiBold
+                    SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                        val modes = listOf(
+                            Triple(TUNNEL_MODE_VPN, "VPN", "Системный VPN"),
+                            Triple("proxy", "Прокси", "Локальный прокси"),
+                        )
+                        modes
+                            .forEachIndexed { index, (mode, label, description) ->
+                                val selected = if (mode == TUNNEL_MODE_VPN) {
+                                    !proxyModeSelected
+                                } else {
+                                    proxyModeSelected
+                                }
+                                SegmentedButton(
+                                    selected = selected,
+                                    enabled = !tunnelRunning,
+                                    onClick = {
+                                        if (proxyModeSelected) lastProxyMode = tunnelMode
+                                        tunnelMode = if (mode == TUNNEL_MODE_VPN) {
+                                            TUNNEL_MODE_VPN
+                                        } else {
+                                            lastProxyMode
+                                        }
+                                        scope.launch {
+                                            settingsStore.saveProxyMode(
+                                                mode = tunnelMode,
+                                                port = socksPortInput.toIntOrNull()
+                                                    ?: normalizeProxyPort(0, tunnelMode),
+                                                udpEnabled = socksUdpEnabled,
+                                                access = proxyAccess,
+                                                authEnabled = socksAuthEnabled,
+                                                username = socksUsername,
+                                                password = socksPassword,
+                                            )
+                                            VpnWidgetProvider.updateAllWidgets(context)
+                                        }
+                                    },
+                                    shape = SegmentedButtonDefaults.itemShape(index, modes.size),
+                                    icon = { StableSegmentedButtonIcon(selected = selected) },
+                                ) {
+                                    Text(
+                                        label,
+                                        textAlign = TextAlign.Center,
+                                        fontWeight = if (selected) {
+                                            FontWeight.SemiBold
+                                        } else {
+                                            FontWeight.Normal
+                                        },
+                                        modifier = Modifier.semantics {
+                                            contentDescription = description
+                                        },
+                                    )
+                                }
+                            }
+                    }
+                    VerticalDivider(
+                        modifier = Modifier
+                            .align(Alignment.Center)
+                            .fillMaxHeight()
+                            .padding(vertical = 4.dp),
+                        thickness = 1.dp,
+                        color = MaterialTheme.colorScheme.outline.copy(alpha = 0.72f),
                     )
                 }
+                if (proxyModeSelected) {
+                    val runningThisMode = tunnelRunning && activeTunnelMode == tunnelMode
+                    val copyAvailable = runningThisMode && proxyReadyAddresses.isNotEmpty()
+                    val visibleProxyAddresses = if (runningThisMode) {
+                        proxyReadyAddresses
+                    } else {
+                        expectedProxyReadyAddresses(
+                            access = proxyAccess,
+                            port = normalizedPort,
+                            lanHost = currentLanBinding?.host,
+                        )
+                    }
+                    Box(modifier = Modifier.fillMaxWidth()) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(end = if (copyAvailable) 48.dp else 0.dp),
+                            verticalArrangement = Arrangement.spacedBy(1.dp),
+                        ) {
+                            Text(
+                                text = proxyTunnelAddressSummary(
+                                    mode = tunnelMode,
+                                    fallbackAddress = displayedProxyAddress,
+                                    readyAddresses = visibleProxyAddresses,
+                                    running = runningThisMode,
+                                ),
+                                modifier = Modifier.fillMaxWidth(),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (runningThisMode && proxyReadyAddress != null) {
+                                    MaterialTheme.colorScheme.primary
+                                } else {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                },
+                            )
+                            Text(
+                                text = buildString {
+                                    when (tunnelMode) {
+                                        TUNNEL_MODE_AUTO -> append("SOCKS5 TCP+UDP · HTTP TCP")
+                                        TUNNEL_MODE_SOCKS5 -> {
+                                            append("SOCKS5 TCP")
+                                            if (socksUdpEnabled) append("+UDP")
+                                        }
+                                        else -> append("HTTP TCP")
+                                    }
+                                    append(" · ")
+                                    append(
+                                        when (proxyAccess) {
+                                            PROXY_ACCESS_BOTH -> "Оба доступа"
+                                            PROXY_ACCESS_LAN -> "Сеть"
+                                            else -> "Устройство"
+                                        },
+                                    )
+                                    append(if (socksAuthEnabled) " · с паролем" else " · без пароля")
+                                },
+                                modifier = Modifier.fillMaxWidth(),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        if (copyAvailable) {
+                            IconButton(
+                                onClick = { showProxyCopyDialog = true },
+                                modifier = Modifier
+                                    .align(Alignment.BottomEnd)
+                                    .size(38.dp)
+                                    .remoteCompactFocus(shape = CircleShape),
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(
+                                        Icons.Default.ContentCopy,
+                                        contentDescription = "Выбрать параметры прокси для копирования",
+                                        modifier = Modifier.size(18.dp),
+                                        tint = MaterialTheme.colorScheme.primary,
+                                    )
+                                    Icon(
+                                        Icons.Default.ArrowDropDown,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(13.dp),
+                                        tint = MaterialTheme.colorScheme.primary,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
             }
-
             if (showManualConnectionFields) {
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     // ═══ Настройки туннеля ═══
@@ -1212,6 +1786,7 @@ fun SettingsTabContent(
                             label = { Text("IP сервера или домен (без порта)") },
                             placeholder = { Text("1.2.3.4 (или test.com)") },
                             singleLine = true,
+                            enabled = !tunnelRunning,
                             isError = !isPeerValid && peerInput.isNotEmpty(),
                             modifier = Modifier.fillMaxWidth(),
                             shape = RoundedCornerShape(16.dp),
@@ -1223,6 +1798,7 @@ fun SettingsTabContent(
 
                         OutlinedButton(
                             onClick = ::openHashesSettings,
+                            enabled = !tunnelRunning,
                             modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp),
                             shape = RoundedCornerShape(16.dp),
                             contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
@@ -1254,22 +1830,104 @@ fun SettingsTabContent(
                 }
             }
 
-            Spacer(Modifier.height(8.dp))
-
             AppSectionCard(
+                modifier = Modifier.alpha(if (tunnelRunning) 0.55f else 1f),
+                containerColor = if (hashesNeedAttention || parametersNeedAttention) {
+                    MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.24f)
+                } else null,
                 contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                OutlinedButton(
-                    onClick = { showLaunchParameters = true },
-                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
-                    shape = RoundedCornerShape(16.dp),
-                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    FlexibleButtonText("Параметры", fontWeight = FontWeight.SemiBold)
+                    OutlinedButton(
+                        onClick = ::openHashesSettings,
+                        enabled = !tunnelRunning,
+                        modifier = Modifier.weight(1f).height(48.dp),
+                        shape = RoundedCornerShape(16.dp),
+                        contentPadding = PaddingValues(horizontal = 6.dp, vertical = 4.dp),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            contentColor = if (hashesNeedAttention) {
+                                MaterialTheme.colorScheme.error
+                            } else {
+                                MaterialTheme.colorScheme.primary
+                            },
+                        ),
+                        border = BorderStroke(
+                            1.dp,
+                            if (hashesNeedAttention) MaterialTheme.colorScheme.error
+                            else MaterialTheme.colorScheme.outline,
+                        ),
+                    ) {
+                        Icon(
+                            Icons.Default.Tag,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp),
+                        )
+                        Spacer(Modifier.width(4.dp))
+                        Text(
+                            "ВК-хеши",
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                    }
+                    OutlinedButton(
+                        onClick = { showLaunchParameters = true },
+                        enabled = !tunnelRunning,
+                        modifier = Modifier.weight(1f).height(48.dp),
+                        shape = RoundedCornerShape(16.dp),
+                        contentPadding = PaddingValues(horizontal = 6.dp, vertical = 4.dp),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            contentColor = if (parametersNeedAttention) {
+                                MaterialTheme.colorScheme.error
+                            } else {
+                                MaterialTheme.colorScheme.primary
+                            },
+                        ),
+                        border = BorderStroke(
+                            1.dp,
+                            if (parametersNeedAttention) MaterialTheme.colorScheme.error
+                            else MaterialTheme.colorScheme.outline,
+                        ),
+                    ) {
+                        Icon(
+                            Icons.Default.Tune,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp),
+                        )
+                        Spacer(Modifier.width(4.dp))
+                        Text(
+                            "Параметры",
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                    }
                 }
                 Text(
-                    text = launchParametersSummary,
+                    text = buildAnnotatedString {
+                        append("ВК-хеши: ")
+                        if (hashesNeedAttention) {
+                            withStyle(
+                                SpanStyle(
+                                    color = MaterialTheme.colorScheme.error,
+                                    fontWeight = FontWeight.Bold,
+                                )
+                            ) {
+                                append("$filledHashCount из 4")
+                            }
+                        } else {
+                            append("$filledHashCount из 4")
+                        }
+                        append(" · $launchParametersSummary")
+                    },
+                    modifier = Modifier.fillMaxWidth(),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     lineHeight = 17.sp
@@ -1287,6 +1945,7 @@ fun SettingsTabContent(
             if (showManualConnectionFields) {
                 OutlinedButton(
                     onClick = { showSecretsDialog = true },
+                    enabled = !tunnelRunning,
                     modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp),
                     shape = RoundedCornerShape(16.dp),
                     contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp),
@@ -1313,7 +1972,15 @@ fun SettingsTabContent(
                 waiting = trustedWifiWaiting,
                 transition = tunnelTransition,
                 activeWorkers = activeWorkers,
-                vpnInterfaceUp = vpnInterfaceUp,
+                wakeRecoveryInProgress = wakeRecoveryInProgress,
+                wakeRecoveryReadyWorkers = wakeRecoveryReadyWorkers,
+                wakeRecoveryTargetWorkers = wakeRecoveryTargetWorkers,
+                wakeRecoveryHeldConnection = wakeRecoveryHeldConnection,
+                vpnInterfaceUp = if (tunnelModeUsesLocalProxy(activeTunnelMode)) {
+                    proxyReadyAddress != null
+                } else {
+                    vpnInterfaceUp
+                },
                 targetWorkers = currentWorkers.toInt(),
                 cooldownActive = cooldownActive,
                 underlyingNetworkAvailable = underlyingNetworkAvailable,
@@ -1321,7 +1988,21 @@ fun SettingsTabContent(
                     ?.takeIf { it.isError }
                     ?.title,
                 enabled = tunnelTransition == TunnelTransition.IDLE &&
-                    ((isValid && !cooldownActive) || tunnelRunning || trustedWifiWaiting),
+                    ((startReadiness.canStart && !cooldownActive) || tunnelRunning || trustedWifiWaiting),
+                startIssueText = primaryStartIssue?.message,
+                additionalStartIssueCount = (startReadiness.issues.size - 1).coerceAtLeast(0),
+                onStartIssueClick = {
+                    when (primaryStartIssue?.target) {
+                        TunnelStartIssueTarget.CONNECTION -> {
+                            if (userConnectionMethod == "link") openUserLinkEditor()
+                            else openUserManualEditor()
+                        }
+                        TunnelStartIssueTarget.HASHES -> openHashesSettings()
+                        TunnelStartIssueTarget.PARAMETERS -> showLaunchParameters = true
+                        TunnelStartIssueTarget.PROXY_SETTINGS -> showSocksSettings = true
+                        null -> Unit
+                    }
+                },
                 onClick = {
                     if (tunnelTransition != TunnelTransition.IDLE) return@AnimatedTunnelPowerButton
                     if (tunnelRunning || trustedWifiWaiting) {
@@ -1607,6 +2288,965 @@ fun SettingsTabContent(
                     Text("Отмена")
                 }
             },
+        )
+    }
+}
+
+private data class ProxySettingsDraft(
+    val mode: String,
+    val port: Int,
+    val udpEnabled: Boolean,
+    val access: String,
+    val authEnabled: Boolean,
+    val username: String,
+    val password: String,
+)
+
+internal fun proxyAccessInstructions(
+    access: String,
+    mode: String,
+    address: String?,
+    port: Int,
+    authEnabled: Boolean,
+): List<String> {
+    val protocol = when (normalizeTunnelMode(mode)) {
+        TUNNEL_MODE_AUTO -> "SOCKS5 или HTTP CONNECT"
+        TUNNEL_MODE_HTTP -> "HTTP CONNECT"
+        else -> "SOCKS5"
+    }
+    val credentials = if (authEnabled) {
+        "Введите показанные ниже логин и пароль."
+    } else {
+        "Аутентификацию в клиенте оставьте выключенной."
+    }
+    val protocolNote = when (normalizeTunnelMode(mode)) {
+        TUNNEL_MODE_AUTO ->
+            "Авто принимает SOCKS5 и HTTP CONNECT на одном порту; SOCKS5 TCP и UDP включены всегда, HTTP передаёт TCP."
+        TUNNEL_MODE_HTTP ->
+            "HTTP CONNECT передаёт только TCP. В VPN-клиентах системный DNS и UDP могут не работать; для полного подключения выберите SOCKS5 с UDP."
+        else -> "Для TCP и UDP оставьте UDP ASSOCIATE включённым."
+    }
+    val normalizedAccess = normalizeProxyAccess(access)
+    return when (normalizedAccess) {
+        PROXY_ACCESS_BOTH -> listOf(
+            "Прокси одновременно доступен на этом телефоне и в текущей частной сети.",
+            "Сохраните настройки и запустите режим ПРОКСИ в WDTT Plus.",
+            "На этом телефоне используйте 127.0.0.1:$port, а на втором устройстве — ${address ?: "локальный адрес телефона"}:$port.",
+            "В клиенте выберите $protocol. Изменение сетевого адреса WDTT Plus применит автоматически.",
+            credentials,
+            protocolNote,
+        )
+        PROXY_ACCESS_LAN -> listOf(
+            "Подключите второе устройство к той же Wi-Fi-сети или к точке доступа этого телефона.",
+            "Сохраните настройки и запустите режим ПРОКСИ в WDTT Plus.",
+            "На втором устройстве откройте настройки прокси нужного приложения и выберите $protocol.",
+            "Укажите адрес ${address ?: "телефона в локальной сети"} и порт $port. Не используйте 127.0.0.1 на втором устройстве.",
+            credentials,
+            protocolNote,
+        )
+        else -> listOf(
+            "Сохраните настройки и запустите режим ПРОКСИ в WDTT Plus.",
+            "Если прокси подключается к другому VPN-клиенту, исключите WDTT Plus (com.wdtt.plus) из маршрутизации этого VPN.",
+            "В нужном приложении на этом телефоне откройте его собственные настройки прокси и выберите $protocol.",
+            "Укажите адрес 127.0.0.1 и порт $port.",
+            credentials,
+            protocolNote,
+        )
+    }
+}
+
+internal fun proxySettingsClipboardText(
+    httpMode: Boolean,
+    address: String?,
+    port: Int,
+    authEnabled: Boolean,
+    username: String,
+    password: String,
+): String = buildString {
+    appendLine(if (httpMode) "HTTP CONNECT" else "SOCKS5")
+    appendLine("Адрес: ${address ?: "не определён"}")
+    append("Порт: $port")
+    if (authEnabled) {
+        appendLine()
+        appendLine("Логин: $username")
+        append("Пароль: $password")
+    }
+}
+
+internal fun proxyTunnelAddressSummary(
+    mode: String,
+    fallbackAddress: String,
+    readyAddresses: List<String>,
+    running: Boolean,
+): String = buildString {
+    append(tunnelModeStatusLabel(mode))
+    append(" · ")
+    if (readyAddresses.isNotEmpty()) {
+        if (running) append("готов: ")
+        append(readyAddresses.distinct().joinToString(" · "))
+    } else {
+        append(fallbackAddress)
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun ProxySettingsDialog(
+    mode: String,
+    initialPort: String,
+    initialUdpEnabled: Boolean,
+    initialAccess: String,
+    initialAuthEnabled: Boolean,
+    initialUsername: String,
+    initialPassword: String,
+    onSave: (ProxySettingsDraft) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val clipboardManager = LocalClipboardManager.current
+    val context = LocalContext.current
+    var port by remember(initialPort) { mutableStateOf(initialPort) }
+    var udpEnabled by remember(initialUdpEnabled) { mutableStateOf(initialUdpEnabled) }
+    var selectedAccess by remember(initialAccess) { mutableStateOf(normalizeProxyAccess(initialAccess)) }
+    var authEnabled by remember(initialAuthEnabled, initialAccess) {
+        mutableStateOf(initialAuthEnabled || proxyAccessNeedsAuthentication(initialAccess))
+    }
+    var username by remember(initialUsername) { mutableStateOf(initialUsername) }
+    var password by remember(initialPassword) { mutableStateOf(initialPassword) }
+    var passwordFocused by remember { mutableStateOf(false) }
+    val passwordFocusRequester = remember { FocusRequester() }
+    var showAccessHelp by rememberSaveable { mutableStateOf(false) }
+    var showProtocolHelp by rememberSaveable { mutableStateOf(false) }
+    var selectedMode by remember(mode) {
+        mutableStateOf(
+            normalizeTunnelMode(mode).takeIf(::tunnelModeUsesLocalProxy) ?: TUNNEL_MODE_AUTO,
+        )
+    }
+    val httpMode = selectedMode == TUNNEL_MODE_HTTP
+    val autoMode = selectedMode == TUNNEL_MODE_AUTO
+    val includesDevice = proxyAccessIncludesDevice(selectedAccess)
+    val includesLan = proxyAccessIncludesLan(selectedAccess)
+    var lanBinding by remember { mutableStateOf(findProxyLanBinding()) }
+    var lanCheckInProgress by remember { mutableStateOf(false) }
+    val lanCheckRotation = remember { Animatable(0f) }
+    val dialogScope = rememberCoroutineScope()
+    val scrollState = rememberScrollState()
+    val parsedPort = port.toIntOrNull()
+    val displayedPort = parsedPort ?: normalizeProxyPort(0, selectedMode)
+    val settingsProxyAddresses = buildList {
+        if (includesDevice) add("$SOCKS5_LOOPBACK_HOST:$displayedPort")
+        if (includesLan) lanBinding?.let { add("${it.host}:$displayedPort") }
+    }
+    val settingsProxyAddress = settingsProxyAddresses.firstOrNull()
+    val portValid = parsedPort != null && parsedPort in 1..65535
+    val authValid = !authEnabled ||
+        isValidSocks5Credential(username) && isValidSocks5Credential(password)
+    val lanValid = !includesLan || selectedAccess == PROXY_ACCESS_BOTH || lanBinding != null && authEnabled
+
+    DisposableEffect(context, includesLan) {
+        if (!includesLan) {
+            onDispose { }
+        } else {
+            val connectivity = context.getSystemService(ConnectivityManager::class.java)
+            var pendingRefresh: Job? = null
+            fun scheduleRefresh() {
+                pendingRefresh?.cancel()
+                pendingRefresh = dialogScope.launch {
+                    // События onAvailable и onCapabilitiesChanged обычно идут
+                    // рядом. Короткий debounce ждёт обновления IP интерфейса и
+                    // сводит их к одному чтению без периодического таймера.
+                    delay(350L)
+                    lanBinding = withContext(Dispatchers.IO) { findProxyLanBinding() }
+                }
+            }
+            val callback = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) = scheduleRefresh()
+                override fun onLost(network: Network) = scheduleRefresh()
+                override fun onCapabilitiesChanged(
+                    network: Network,
+                    networkCapabilities: NetworkCapabilities,
+                ) = scheduleRefresh()
+            }
+            runCatching {
+                connectivity?.registerNetworkCallback(
+                    NetworkRequest.Builder()
+                        .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                        .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                        .build(),
+                    callback,
+                )
+                scheduleRefresh()
+            }
+            onDispose {
+                pendingRefresh?.cancel()
+                runCatching { connectivity?.unregisterNetworkCallback(callback) }
+            }
+        }
+    }
+
+    if (showAccessHelp) {
+        SettingsHelpDialog(
+            title = "Доступ к прокси",
+            paragraphs = listOf(
+                "Оба — рекомендуемый вариант\nПрокси одновременно доступен приложениям телефона на 127.0.0.1 и устройствам в текущей частной сети. Если Wi-Fi или точка доступа пока не найдены, адрес телефона продолжит работать.",
+                "Устройство — для приложений на этом телефоне\nСохраните настройки, запустите ПРОКСИ, затем в самом нужном приложении выберите SOCKS5 или HTTP CONNECT и укажите 127.0.0.1 с показанным портом. Общей автоматической настройки для произвольных приложений в Android нет.",
+                "Сеть — для другого устройства\nПодключите его к той же Wi‑Fi-сети или к точке доступа телефона. Сохраните настройки и запустите ПРОКСИ. На другом устройстве укажите показанный адрес телефона, порт, логин и пароль. Адрес 127.0.0.1 там использовать нельзя.",
+                "Что приложение делает автоматически\nWDTT Plus определяет безопасный локальный адрес, создаёт пароль и позволяет скопировать весь набор настроек. Вставить их в произвольное стороннее приложение автоматически Android не позволяет.",
+                "Быстрый импорт\nПосле запуска ПРОКСИ нажмите значок копирования в карточке режима работы. Затем выберите во внешнем приложении импорт подключения из буфера обмена. Ссылка содержит адрес, порт и, если включены, логин с паролем.",
+                "Если на этом телефоне используется другой VPN\nВ его настройках приложений исключите WDTT Plus (com.wdtt.plus) из VPN-маршрутизации. Без исключения получается цикл: внешний VPN возвращает транспорт WDTT в тот же прокси. WDTT Plus распознаёт это состояние и останавливает прокси, чтобы не расходовать гигабайты трафика.",
+                "Безопасность\nДля локального доступа логин и пароль обязательны. Сам прокси не шифрует участок между другим устройством и телефоном — используйте только доверенную сеть и не передавайте пароль посторонним.",
+                "Проверка сети\nЕсли частная сеть не найдена, включите Wi‑Fi или точку доступа и нажмите маленький значок обновления рядом со статусом. Во время работы ПРОКСИ новый сетевой адрес применяется автоматически.",
+            ),
+            highlightedParagraphIndices = setOf(3),
+            onDismiss = { showAccessHelp = false },
+        )
+        return
+    }
+    if (showProtocolHelp) {
+        SettingsHelpDialog(
+            title = "Протокол прокси",
+            paragraphs = listOf(
+                "Авто — рекомендуемый вариант\nSOCKS5 и HTTP CONNECT принимаются на одном адресе и порту. Протокол выбирает клиент в своих настройках, а WDTT Plus надёжно распознаёт его рукопожатие. SOCKS5 получает TCP и UDP, HTTP — TCP.",
+                "SOCKS5\nУниверсальный и рекомендуемый вариант для внешних VPN-клиентов и программ, создающих прокси-цепочки. Например: v2rayNG, NekoBox и Exclave. Передаёт TCP, а при включённом UDP ASSOCIATE — и обычный UDP-трафик.",
+                "HTTP\nНа кнопке используется короткое название, полный режим — HTTP CONNECT. Он передаёт только TCP. Настройка удалённого DoH или DoT во внешнем VPN-клиенте сама по себе не гарантирует, что системный DNS пойдёт через этот прокси.",
+                "Что выбрать\nАвто подходит для совместного использования разными клиентами. Для строгой конфигурации выберите отдельный SOCKS5 или HTTP. В отдельном SOCKS5 можно отключить UDP ASSOCIATE.",
+                "После изменения\nОба протокола работают через WDTT без занятия системного VPN-слота Android. После смены протокола переподключите соединение.",
+            ),
+            onDismiss = { showProtocolHelp = false },
+        )
+        return
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    "Настройки прокси",
+                    modifier = Modifier.weight(1f),
+                )
+                IconButton(
+                    onClick = onDismiss,
+                    modifier = Modifier.remoteIconButtonFocus(),
+                ) {
+                    Icon(Icons.Default.Close, contentDescription = "Закрыть настройки прокси")
+                }
+            }
+        },
+        text = {
+            Column(
+                modifier = Modifier.fillMaxWidth().verticalScroll(scrollState),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        "Протокол",
+                        style = MaterialTheme.typography.titleSmall,
+                    )
+                    Spacer(Modifier.width(3.dp))
+                    IconButton(
+                        onClick = { showProtocolHelp = true },
+                        modifier = Modifier.size(32.dp).remoteHelpFocus(),
+                    ) {
+                        Icon(
+                            Icons.AutoMirrored.Filled.HelpOutline,
+                            contentDescription = "Инструкция по протоколам прокси",
+                            modifier = Modifier.size(19.dp),
+                        )
+                    }
+                    Spacer(Modifier.weight(1f))
+                }
+                SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                    listOf(
+                        TUNNEL_MODE_AUTO to "Авто",
+                        TUNNEL_MODE_SOCKS5 to "SOCKS5",
+                        TUNNEL_MODE_HTTP to "HTTP",
+                    )
+                        .forEachIndexed { index, (value, label) ->
+                            SegmentedButton(
+                                selected = selectedMode == value,
+                                onClick = {
+                                    val previousMode = selectedMode
+                                    val previousPort = port.toIntOrNull()
+                                    selectedMode = value
+                                    if (
+                                        value == TUNNEL_MODE_HTTP &&
+                                        previousMode != TUNNEL_MODE_HTTP &&
+                                        previousPort == DEFAULT_SOCKS5_PORT
+                                    ) {
+                                        port = DEFAULT_HTTP_CONNECT_PORT.toString()
+                                    } else if (
+                                        value != TUNNEL_MODE_HTTP &&
+                                        previousMode == TUNNEL_MODE_HTTP &&
+                                        previousPort == DEFAULT_HTTP_CONNECT_PORT
+                                    ) {
+                                        port = DEFAULT_SOCKS5_PORT.toString()
+                                    }
+                                },
+                                shape = SegmentedButtonDefaults.itemShape(index, 3),
+                                icon = { StableSegmentedButtonIcon(selected = selectedMode == value) },
+                            ) {
+                                Text(
+                                    label,
+                                    textAlign = TextAlign.Center,
+                                    maxLines = 1,
+                                    fontSize = 12.sp,
+                                )
+                            }
+                        }
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        "Доступ",
+                        style = MaterialTheme.typography.titleSmall,
+                    )
+                    Spacer(Modifier.width(3.dp))
+                    IconButton(
+                        onClick = { showAccessHelp = true },
+                        modifier = Modifier.size(32.dp).remoteHelpFocus(),
+                    ) {
+                        Icon(
+                            Icons.AutoMirrored.Filled.HelpOutline,
+                            contentDescription = "Инструкция по доступу к прокси",
+                            modifier = Modifier.size(19.dp),
+                        )
+                    }
+                    Spacer(Modifier.weight(1f))
+                }
+                SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                    listOf(
+                        PROXY_ACCESS_BOTH to "Оба",
+                        PROXY_ACCESS_DEVICE to "Устройство",
+                        PROXY_ACCESS_LAN to "Сеть",
+                    )
+                        .forEachIndexed { index, (value, label) ->
+                            SegmentedButton(
+                                selected = selectedAccess == value,
+                                onClick = {
+                                    selectedAccess = value
+                                    if (proxyAccessIncludesLan(value)) {
+                                        lanBinding = findProxyLanBinding()
+                                        authEnabled = true
+                                        if (username.isBlank()) username = "wdtt"
+                                        if (password.isBlank()) password = generateProxyPassword()
+                                    }
+                                },
+                                shape = SegmentedButtonDefaults.itemShape(index, 3),
+                                // Заливка уже однозначно показывает выбранный
+                                // доступ. Без галочки длинное «Устройство» не
+                                // сталкивается с краями на узких экранах.
+                                icon = {},
+                            ) {
+                                Text(
+                                    label,
+                                    textAlign = TextAlign.Center,
+                                    maxLines = 1,
+                                    fontSize = 11.sp,
+                                    letterSpacing = (-0.1).sp,
+                                )
+                            }
+                        }
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        when (selectedAccess) {
+                            PROXY_ACCESS_BOTH -> lanBinding?.let {
+                                "Два адреса: $SOCKS5_LOOPBACK_HOST:${parsedPort ?: port} и ${it.host}:${parsedPort ?: port} из ${it.allowedCidr}."
+                            } ?: "Сейчас доступен $SOCKS5_LOOPBACK_HOST:${parsedPort ?: port}; сетевой адрес добавится автоматически."
+                            PROXY_ACCESS_LAN -> lanBinding?.let {
+                                "Будет доступен на ${it.host}:${parsedPort ?: port} только из ${it.allowedCidr}."
+                            } ?: "Частная сеть Wi-Fi или точка доступа не найдена."
+                            else -> "Доступен только приложениям этого устройства на $SOCKS5_LOOPBACK_HOST:${parsedPort ?: port}."
+                        },
+                        modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (selectedAccess == PROXY_ACCESS_LAN && lanBinding == null) {
+                            MaterialTheme.colorScheme.error
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        },
+                    )
+                    if (includesLan) {
+                        IconButton(
+                            onClick = {
+                                if (!lanCheckInProgress) {
+                                    lanCheckInProgress = true
+                                    dialogScope.launch {
+                                        try {
+                                            lanCheckRotation.snapTo(0f)
+                                            val rotationJob = launch {
+                                                lanCheckRotation.animateTo(
+                                                    targetValue = 360f,
+                                                    animationSpec = tween(
+                                                        durationMillis = 650,
+                                                        easing = LinearEasing,
+                                                    ),
+                                                )
+                                            }
+                                            val checkedBinding = withContext(Dispatchers.IO) {
+                                                findProxyLanBinding()
+                                            }
+                                            rotationJob.join()
+                                            lanBinding = checkedBinding
+                                        } finally {
+                                            lanCheckInProgress = false
+                                        }
+                                    }
+                                }
+                            },
+                            enabled = !lanCheckInProgress,
+                            modifier = Modifier.size(34.dp).remoteIconButtonFocus(),
+                        ) {
+                            Icon(
+                                Icons.Default.Refresh,
+                                contentDescription = "Проверить локальную сеть снова",
+                                modifier = Modifier.size(18.dp).rotate(lanCheckRotation.value),
+                            )
+                        }
+                    }
+                }
+                if (includesDevice) {
+                    Text(
+                        "С другим VPN обязательно исключите WDTT Plus из его маршрутизации.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.tertiary,
+                    )
+                }
+                if (includesLan) {
+                    Text(
+                        "Локальный участок до телефона не шифруется прокси. Используйте только доверенную сеть.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.tertiary,
+                    )
+                }
+                OutlinedTextField(
+                    value = port,
+                    onValueChange = { value -> port = value.filter(Char::isDigit).take(5) },
+                    label = { Text("Порт") },
+                    placeholder = {
+                        Text(
+                            if (httpMode) DEFAULT_HTTP_CONNECT_PORT.toString()
+                            else DEFAULT_SOCKS5_PORT.toString(),
+                        )
+                    },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    singleLine = true,
+                    isError = port.isNotEmpty() && !portValid,
+                    supportingText = if (!portValid) {
+                        { Text("Введите порт от 1 до 65535") }
+                    } else null,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp),
+                )
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
+                    border = BorderStroke(
+                        1.dp,
+                        MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f),
+                    ),
+                ) {
+                    Column(
+                        modifier = Modifier.padding(start = 12.dp, end = 4.dp, top = 5.dp, bottom = 5.dp),
+                    ) {
+                        Text(
+                            "Адрес прокси",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        if (settingsProxyAddresses.isEmpty()) {
+                            Text(
+                                "Сначала выберите доступную локальную сеть",
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                        } else {
+                            settingsProxyAddresses.forEach { address ->
+                                val accessLabel = if (address.startsWith("$SOCKS5_LOOPBACK_HOST:")) {
+                                    "Устройство"
+                                } else {
+                                    "Сеть"
+                                }
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            accessLabel,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                        Text(
+                                            address,
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                        )
+                                    }
+                                    Surface(
+                                        modifier = Modifier
+                                            .size(36.dp)
+                                            .clip(CircleShape)
+                                            .remoteIconButtonFocus()
+                                            .combinedClickable(
+                                                role = Role.Button,
+                                                onClick = {
+                                                    clipboardManager.setText(
+                                                        androidx.compose.ui.text.AnnotatedString(address),
+                                                    )
+                                                    Toast.makeText(
+                                                        context,
+                                                        "Скопировано: адрес · $accessLabel",
+                                                        Toast.LENGTH_SHORT,
+                                                    ).show()
+                                                },
+                                                onLongClick = {
+                                                    Toast.makeText(
+                                                        context,
+                                                        "Копирует адрес: $accessLabel",
+                                                        Toast.LENGTH_SHORT,
+                                                    ).show()
+                                                },
+                                            ),
+                                        shape = CircleShape,
+                                        color = Color.Transparent,
+                                    ) {
+                                        Box(contentAlignment = Alignment.Center) {
+                                            Icon(
+                                                Icons.Default.ContentCopy,
+                                                contentDescription = "Скопировать адрес: $accessLabel",
+                                                modifier = Modifier.size(18.dp),
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if (!autoMode && settingsProxyAddresses.size == 1) OutlinedButton(
+                    enabled = settingsProxyAddress != null && (!authEnabled || authValid),
+                    onClick = {
+                        clipboardManager.setText(
+                            androidx.compose.ui.text.AnnotatedString(
+                                proxySettingsClipboardText(
+                                    httpMode = httpMode,
+                                    address = settingsProxyAddress?.substringBeforeLast(':'),
+                                    port = displayedPort,
+                                    authEnabled = authEnabled,
+                                    username = username.trim(),
+                                    password = password,
+                                ),
+                            ),
+                        )
+                        Toast.makeText(context, "Настройки прокси скопированы", Toast.LENGTH_SHORT).show()
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(14.dp),
+                ) {
+                    Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(17.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Скопировать все настройки")
+                }
+                if (selectedMode == TUNNEL_MODE_SOCKS5) {
+                    SettingsSwitchRow(
+                        title = if (udpEnabled) "TCP и UDP" else "Только TCP",
+                        subtitle = if (udpEnabled) {
+                            "UDP ASSOCIATE включён; TCP продолжает работать"
+                        } else {
+                            "UDP ASSOCIATE выключен; включите для UDP-приложений"
+                        },
+                        checked = udpEnabled,
+                        onCheckedChange = { udpEnabled = it },
+                    )
+                } else if (autoMode) {
+                    Text(
+                        "SOCKS5: TCP и UDP · HTTP: TCP.\nВ режиме «Авто» UDP ASSOCIATE включён всегда.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                } else {
+                    Text(
+                        "Только TCP. В VPN-клиентах системный DNS и UDP могут не работать; для полноценного подключения выберите SOCKS5 с UDP.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.tertiary,
+                    )
+                }
+                SettingsSwitchRow(
+                    title = "Логин и пароль",
+                    subtitle = if (includesLan) {
+                        "Обязательны для локальной сети; пароль хранится защищённо"
+                    } else {
+                        "Необязательны на устройстве; пароль хранится защищённо"
+                    },
+                    checked = authEnabled,
+                    enabled = !includesLan,
+                    onCheckedChange = { authEnabled = it },
+                )
+                if (authEnabled) {
+                    OutlinedTextField(
+                        value = username,
+                        onValueChange = { username = it.filterNot(Char::isWhitespace).take(64) },
+                        label = { Text("Логин") },
+                        singleLine = true,
+                        isError = !isValidSocks5Credential(username),
+                        trailingIcon = {
+                            IconButton(
+                                enabled = username.isNotBlank(),
+                                onClick = {
+                                    clipboardManager.setText(
+                                        androidx.compose.ui.text.AnnotatedString(username),
+                                    )
+                                    Toast.makeText(context, "Логин скопирован", Toast.LENGTH_SHORT).show()
+                                },
+                            ) {
+                                Icon(Icons.Default.ContentCopy, contentDescription = "Скопировать логин")
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(16.dp),
+                    )
+                    OutlinedTextField(
+                        value = password,
+                        onValueChange = { password = it.take(255) },
+                        label = { Text("Пароль") },
+                        singleLine = true,
+                        isError = !isValidSocks5Credential(password),
+                        visualTransformation = if (passwordFocused) {
+                            VisualTransformation.None
+                        } else {
+                            PasswordVisualTransformation()
+                        },
+                        trailingIcon = {
+                            Row {
+                                IconButton(
+                                    onClick = {
+                                        password = generateProxyPassword()
+                                        passwordFocusRequester.requestFocus()
+                                        Toast.makeText(
+                                            context,
+                                            "Новый пароль создан",
+                                            Toast.LENGTH_SHORT,
+                                        ).show()
+                                    },
+                                ) {
+                                    Icon(
+                                        Icons.Default.Refresh,
+                                        contentDescription = "Создать новый пароль",
+                                    )
+                                }
+                                IconButton(
+                                    enabled = password.isNotBlank(),
+                                    onClick = {
+                                        clipboardManager.setText(
+                                            androidx.compose.ui.text.AnnotatedString(password),
+                                        )
+                                        Toast.makeText(context, "Пароль скопирован", Toast.LENGTH_SHORT).show()
+                                    },
+                                ) {
+                                    Icon(Icons.Default.ContentCopy, contentDescription = "Скопировать пароль")
+                                }
+                            }
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 56.dp)
+                            .focusRequester(passwordFocusRequester)
+                            .onFocusChanged { passwordFocused = it.isFocused },
+                        shape = RoundedCornerShape(16.dp),
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = portValid && authValid && lanValid,
+                onClick = {
+                    onSave(
+                        ProxySettingsDraft(
+                            mode = selectedMode,
+                            port = checkNotNull(parsedPort),
+                            udpEnabled = udpEnabled,
+                            access = selectedAccess,
+                            authEnabled = authEnabled,
+                            username = username.trim(),
+                            password = password,
+                        ),
+                    )
+                },
+            ) { Text("Сохранить") }
+        },
+    )
+}
+
+@Composable
+private fun ProxyCopyDialog(
+    mode: String,
+    access: String,
+    port: Int,
+    readyAddresses: List<String>,
+    lanBinding: com.wdtt.plus.ProxyListenBinding?,
+    authEnabled: Boolean,
+    username: String,
+    password: String,
+    onDismiss: () -> Unit,
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val options = remember(mode, readyAddresses, authEnabled, username, password) {
+        proxyCopyOptions(mode, readyAddresses, authEnabled, username, password)
+    }
+    var qrDialogState by remember { mutableStateOf<Pair<ProxyCopyOption, Bitmap>?>(null) }
+    var qrInProgress by remember { mutableStateOf<String?>(null) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Подключение к прокси")
+                    Text(
+                        "Скопируйте ссылку или покажите QR-код",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                IconButton(onClick = onDismiss, modifier = Modifier.remoteIconButtonFocus()) {
+                    Icon(Icons.Default.Close, contentDescription = "Закрыть выбор прокси")
+                }
+            }
+        },
+        text = {
+            Column(
+                modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                options.forEach { option ->
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(16.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+                        border = BorderStroke(
+                            1.dp,
+                            MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.65f),
+                        ),
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    "${option.protocolLabel} · ${option.accessLabel}",
+                                    fontWeight = FontWeight.SemiBold,
+                                )
+                                Text(
+                                    option.address,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            IconButton(
+                                enabled = qrInProgress == null,
+                                onClick = {
+                                    qrInProgress = option.uri
+                                    scope.launch {
+                                        try {
+                                            val bitmap = withContext(Dispatchers.Default) {
+                                                TransferFiles.createQrBitmap(context, option.uri)
+                                            }
+                                            qrDialogState = option to bitmap
+                                        } catch (cancelled: CancellationException) {
+                                            throw cancelled
+                                        } catch (_: Exception) {
+                                            Toast.makeText(
+                                                context,
+                                                "Не удалось создать QR-код",
+                                                Toast.LENGTH_SHORT,
+                                            ).show()
+                                        } finally {
+                                            qrInProgress = null
+                                        }
+                                    }
+                                },
+                                modifier = Modifier
+                                    .size(40.dp)
+                                    .remoteIconButtonFocus(),
+                            ) {
+                                if (qrInProgress == option.uri) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(19.dp),
+                                        strokeWidth = 2.dp,
+                                    )
+                                } else {
+                                    Icon(
+                                        Icons.Default.QrCode2,
+                                        contentDescription = "Показать QR-код: ${option.protocolLabel}, ${option.accessLabel}",
+                                        tint = MaterialTheme.colorScheme.primary,
+                                    )
+                                }
+                            }
+                            IconButton(
+                                onClick = {
+                                    copySensitiveProxyLink(
+                                        context = context,
+                                        label = "WDTT-Plus ${option.protocolLabel} · ${option.accessLabel}",
+                                        value = option.uri,
+                                    )
+                                    Toast.makeText(
+                                        context,
+                                        "Скопировано: ${option.protocolLabel} · ${option.accessLabel}",
+                                        Toast.LENGTH_SHORT,
+                                    ).show()
+                                },
+                                modifier = Modifier
+                                    .size(40.dp)
+                                    .remoteIconButtonFocus(),
+                            ) {
+                                Icon(
+                                    Icons.Default.ContentCopy,
+                                    contentDescription = "Скопировать ${option.protocolLabel}, ${option.accessLabel}",
+                                    tint = MaterialTheme.colorScheme.primary,
+                                )
+                            }
+                        }
+                    }
+                }
+                if (options.isEmpty()) {
+                    Text(
+                        "Прокси ещё не сообщил готовый адрес.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                if (normalizeProxyAccess(access) == PROXY_ACCESS_BOTH &&
+                    options.none { it.accessLabel == "Сеть" }
+                ) {
+                    Text(
+                        "Локальная сеть сейчас недоступна. После подключения Wi-Fi или включения точки доступа WDTT Plus автоматически добавит сетевой адрес; 127.0.0.1 продолжает работать.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.tertiary,
+                    )
+                } else if (proxyAccessIncludesLan(access) && lanBinding != null) {
+                    Text(
+                        "Доступ из сети ограничен ${lanBinding.allowedCidr}. Порт: $port.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        },
+        confirmButton = {},
+    )
+    qrDialogState?.let { (option, bitmap) ->
+        ProxyQrDialog(
+            option = option,
+            bitmap = bitmap,
+            containsCredentials = authEnabled,
+            onDismiss = { qrDialogState = null },
+        )
+    }
+}
+
+@Composable
+private fun ProxyQrDialog(
+    option: ProxyCopyOption,
+    bitmap: Bitmap,
+    containsCredentials: Boolean,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            "${option.protocolLabel} · ${option.accessLabel}",
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.Bold,
+                        )
+                        Text(
+                            option.address,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    IconButton(
+                        onClick = onDismiss,
+                        modifier = Modifier
+                            .size(40.dp)
+                            .remoteIconButtonFocus(),
+                    ) {
+                        Icon(Icons.Default.Close, contentDescription = "Закрыть QR-код")
+                    }
+                }
+                Image(
+                    bitmap = bitmap.asImageBitmap(),
+                    contentDescription = "QR-код ${option.protocolLabel}, ${option.accessLabel}",
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .aspectRatio(1f),
+                )
+                Text(
+                    if (containsCredentials) {
+                        "QR содержит логин и пароль прокси. Показывайте его только доверенному устройству."
+                    } else {
+                        "QR содержит ссылку подключения к прокси. Показывайте его только доверенному устройству."
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (containsCredentials) {
+                        MaterialTheme.colorScheme.error
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                )
+            }
+        },
+        confirmButton = {},
+    )
+}
+
+@Composable
+private fun SettingsSwitchRow(
+    title: String,
+    subtitle: String,
+    checked: Boolean,
+    enabled: Boolean = true,
+    onCheckedChange: (Boolean) -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth().alpha(if (enabled) 1f else 0.62f),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(title, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+            Text(
+                subtitle,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Switch(
+            checked = checked,
+            enabled = enabled,
+            onCheckedChange = onCheckedChange,
         )
     }
 }
@@ -2158,6 +3798,7 @@ private fun AccessLifecycleActionButton(
 
 private fun tunnelLaunchParametersSummary(
     workers: Int,
+    tunnelMode: String,
     dnsSettings: VpnDnsSettingsSnapshot,
     vkCallsPreflight: Boolean,
     autoCaptchaEnabled: Boolean,
@@ -2171,7 +3812,9 @@ private fun tunnelLaunchParametersSummary(
     }
     return buildList {
         add("$workers потоков")
-        add("DNS: ${dnsSettings.title}")
+        if (normalizeTunnelMode(tunnelMode) == TUNNEL_MODE_VPN) {
+            add("DNS: ${dnsSettings.title}")
+        }
         add(if (vkCallsPreflight) "VKCalls вкл" else "VKCalls выкл")
         add(if (autoCaptchaEnabled) "Капча авто" else "Капча вручную")
         add(rtText)
@@ -2180,6 +3823,7 @@ private fun tunnelLaunchParametersSummary(
 
 @Composable
 private fun TunnelLaunchParametersDialog(
+    tunnelMode: String,
     vpnDnsSettings: VpnDnsSettingsSnapshot,
     onOpenDnsSettings: () -> Unit,
     currentWorkers: Float,
@@ -2228,7 +3872,7 @@ private fun TunnelLaunchParametersDialog(
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Text(
-                            "Параметры",
+                            "Параметры соединения",
                             modifier = Modifier.weight(1f),
                             style = MaterialTheme.typography.titleLarge,
                             fontWeight = FontWeight.Bold,
@@ -2249,15 +3893,17 @@ private fun TunnelLaunchParametersDialog(
                         verticalArrangement = Arrangement.spacedBy(12.dp),
                     ) {
                         Text(
-                            "Изменения сохраняются сразу и будут использованы при следующем запуске VPN.",
+                            "Изменения сохраняются сразу и будут использованы при следующем подключении.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
 
-                        VpnDnsSettingsCard(
-                            settings = vpnDnsSettings,
-                            onClick = onOpenDnsSettings,
-                        )
+                        if (normalizeTunnelMode(tunnelMode) == TUNNEL_MODE_VPN) {
+                            VpnDnsSettingsCard(
+                                settings = vpnDnsSettings,
+                                onClick = onOpenDnsSettings,
+                            )
+                        }
 
                         AppSectionCard(
                             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
@@ -2443,12 +4089,19 @@ private fun AnimatedTunnelPowerButton(
     waiting: Boolean,
     transition: TunnelTransition,
     activeWorkers: Int,
+    wakeRecoveryInProgress: Boolean,
+    wakeRecoveryReadyWorkers: Int,
+    wakeRecoveryTargetWorkers: Int,
+    wakeRecoveryHeldConnection: Boolean,
     vpnInterfaceUp: Boolean,
     targetWorkers: Int,
     cooldownActive: Boolean,
     underlyingNetworkAvailable: Boolean,
     connectionErrorTitle: String?,
     enabled: Boolean,
+    startIssueText: String?,
+    additionalStartIssueCount: Int,
+    onStartIssueClick: () -> Unit,
     onClick: () -> Unit,
 ) {
     val primary = MaterialTheme.colorScheme.primary
@@ -2547,7 +4200,16 @@ private fun AnimatedTunnelPowerButton(
             workerGrowthBurst.animateTo(1f, animationSpec = tween(durationMillis = 1_650))
         }
     }
-    val status = when (statusState) {
+    val status = if (wakeRecoveryInProgress && running) {
+        TunnelPowerStatus(
+            wakeRecoveryStatusText(
+                wakeRecoveryReadyWorkers,
+                wakeRecoveryTargetWorkers,
+                wakeRecoveryHeldConnection,
+            ),
+            primary,
+        )
+    } else when (statusState) {
         TunnelPowerVisualState.Stopping -> TunnelPowerStatus("Отключение…", primary)
         TunnelPowerVisualState.Connecting -> TunnelPowerStatus(
             if (boundedTargetWorkers > 0) "Подключение… · 0/$boundedTargetWorkers потоков"
@@ -2805,6 +4467,43 @@ private fun AnimatedTunnelPowerButton(
                 .fillMaxWidth()
                 .padding(horizontal = 16.dp),
         )
+        if (statusState == TunnelPowerVisualState.Off && !enabled && startIssueText != null) {
+            Surface(
+                onClick = onStartIssueClick,
+                modifier = Modifier
+                    .padding(top = 6.dp, start = 16.dp, end = 16.dp)
+                    .remoteCompactFocus(RoundedCornerShape(16.dp)),
+                shape = RoundedCornerShape(16.dp),
+                color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.72f),
+                contentColor = MaterialTheme.colorScheme.onErrorContainer,
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(
+                        Icons.Default.WarningAmber,
+                        contentDescription = null,
+                        modifier = Modifier.size(17.dp),
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        text = buildString {
+                            append("Для запуска: ")
+                            append(startIssueText)
+                            if (additionalStartIssueCount > 0) {
+                                append(" · ещё ")
+                                append(additionalStartIssueCount)
+                            }
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        fontWeight = FontWeight.SemiBold,
+                        textAlign = TextAlign.Center,
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -3008,18 +4707,16 @@ private fun SettingsHelpDialog(
                                     MaterialTheme.colorScheme.tertiary.copy(alpha = 0.32f),
                                 ),
                             ) {
-                                Text(
+                                SettingsHelpParagraph(
                                     paragraph,
                                     modifier = Modifier.padding(12.dp),
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    fontWeight = FontWeight.SemiBold,
+                                    highlighted = true,
                                 )
                             }
                         } else {
-                            Text(
+                            SettingsHelpParagraph(
                                 paragraph,
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                highlighted = false,
                             )
                         }
                     }
@@ -3056,6 +4753,52 @@ private fun SettingsHelpDialog(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun SettingsHelpParagraph(
+    paragraph: String,
+    highlighted: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val parts = paragraph.split('\n', limit = 2)
+    if (parts.size == 1) {
+        Text(
+            text = paragraph,
+            modifier = modifier,
+            style = MaterialTheme.typography.bodyMedium,
+            color = if (highlighted) {
+                MaterialTheme.colorScheme.onTertiaryContainer
+            } else {
+                MaterialTheme.colorScheme.onSurfaceVariant
+            },
+        )
+        return
+    }
+    Column(
+        modifier = modifier,
+        verticalArrangement = Arrangement.spacedBy(3.dp),
+    ) {
+        Text(
+            text = parts[0],
+            style = MaterialTheme.typography.titleSmall,
+            fontWeight = FontWeight.Bold,
+            color = if (highlighted) {
+                MaterialTheme.colorScheme.onTertiaryContainer
+            } else {
+                MaterialTheme.colorScheme.primary
+            },
+        )
+        Text(
+            text = parts[1],
+            style = MaterialTheme.typography.bodyMedium,
+            color = if (highlighted) {
+                MaterialTheme.colorScheme.onTertiaryContainer
+            } else {
+                MaterialTheme.colorScheme.onSurfaceVariant
+            },
+        )
     }
 }
 
@@ -3418,8 +5161,8 @@ fun ImportantInfoDialog(onDismiss: () -> Unit) {
                     Spacer(Modifier.height(16.dp))
 
                     InfoSection(
-                        "Профили VPN",
-                        "В боковых настройках доступны VPN 1, VPN 2 и VPN 3. Короткое нажатие выбирает профиль и закрывает настройки, долгое открывает переименование и полную локальную очистку профиля."
+                        "Профили подключения",
+                        "В боковых настройках доступны три профиля. Короткое нажатие выбирает профиль и закрывает настройки, долгое открывает переименование и полную локальную очистку профиля."
                     )
                     InfoSection(
                         "VK-хеши",
@@ -3620,6 +5363,17 @@ private fun copyVkHashesToClipboard(context: android.content.Context, label: Str
     Toast.makeText(context, "Скопировано", Toast.LENGTH_SHORT).show()
 }
 
+private fun copySensitiveProxyLink(context: Context, label: String, value: String) {
+    val clipboard = context.getSystemService(ClipboardManager::class.java) ?: return
+    val clip = ClipData.newPlainText(label, value)
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        clip.description.extras = PersistableBundle().apply {
+            putBoolean(ClipDescription.EXTRA_IS_SENSITIVE, true)
+        }
+    }
+    clipboard.setPrimaryClip(clip)
+}
+
 private fun Int.hashPlural(): String {
     val mod100 = this % 100
     val mod10 = this % 10
@@ -3636,66 +5390,116 @@ private fun CompactTunnelProfileCard(
     hasConnection: Boolean,
     connectionMethod: String,
     savedConnectionMethod: String,
+    needsAttention: Boolean,
     onConnectionMethodChange: (String) -> Unit,
     onAddLinkClick: () -> Unit,
     onManualClick: () -> Unit,
+    enabled: Boolean,
 ) {
-    AppSectionCard(
-        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp)
-    ) {
-        Text(
-            "Способ подключения",
-            style = MaterialTheme.typography.labelLarge,
-            fontWeight = FontWeight.SemiBold
+    val selectedMethodConfigured = hasConnection && (
+        savedConnectionMethod == connectionMethod ||
+            savedConnectionMethod.isBlank() && connectionMethod == "manual"
         )
-        SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
-            listOf("link" to "Ссылка WDTT", "manual" to "Вручную")
-                .forEachIndexed { index, (mode, label) ->
-                    SegmentedButton(
-                        selected = connectionMethod == mode,
-                        onClick = { onConnectionMethodChange(mode) },
-                        shape = SegmentedButtonDefaults.itemShape(index, 2),
-                        icon = {
-                            StableSegmentedButtonIcon(selected = connectionMethod == mode)
-                        },
-                    ) {
-                        Text(label, textAlign = TextAlign.Center)
+    val actionLabel = if (selectedMethodConfigured) "Изменить" else "Настроить"
+    val titleStyle = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold)
+    val actionStyle = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold)
+    val textMeasurer = rememberTextMeasurer()
+    val density = LocalDensity.current
+    val titleWidth = with(density) {
+        textMeasurer.measure(
+            text = "Способ подключения",
+            style = titleStyle,
+            maxLines = 1,
+            softWrap = false,
+        ).size.width.toDp()
+    }
+    val actionTextWidth = with(density) {
+        textMeasurer.measure(
+            text = actionLabel,
+            style = actionStyle,
+            maxLines = 1,
+            softWrap = false,
+        ).size.width.toDp()
+    }
+    AppSectionCard(
+        modifier = Modifier.alpha(if (enabled) 1f else 0.55f),
+        containerColor = if (needsAttention) {
+            MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.24f)
+        } else null,
+        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(2.dp)
+    ) {
+        BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+            val actionWidthWithText = maxOf(48.dp, 17.dp + 5.dp + actionTextWidth + 16.dp)
+            val showActionText = maxWidth >= titleWidth + 8.dp + actionWidthWithText
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    "Способ подключения",
+                    modifier = Modifier.weight(1f),
+                    style = titleStyle,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    color = if (needsAttention) MaterialTheme.colorScheme.error
+                    else MaterialTheme.colorScheme.onSurface,
+                )
+                TextButton(
+                    onClick = if (connectionMethod == "link") onAddLinkClick else onManualClick,
+                    enabled = enabled,
+                    modifier = Modifier.height(36.dp).remoteIconButtonFocus(enabled = enabled),
+                    contentPadding = PaddingValues(
+                        horizontal = if (showActionText) 8.dp else 4.dp,
+                        vertical = 0.dp,
+                    ),
+                    colors = ButtonDefaults.textButtonColors(
+                        contentColor = if (needsAttention) MaterialTheme.colorScheme.error
+                        else MaterialTheme.colorScheme.primary,
+                    ),
+                ) {
+                    Icon(
+                        Icons.Default.Edit,
+                        contentDescription = if (showActionText) null else actionLabel,
+                        modifier = Modifier.size(17.dp),
+                    )
+                    if (showActionText) {
+                        Spacer(Modifier.width(5.dp))
+                        Text(actionLabel, style = actionStyle)
                     }
                 }
+            }
         }
-        val selectedMethodConfigured = hasConnection && (
-            savedConnectionMethod == connectionMethod ||
-                savedConnectionMethod.isBlank() && connectionMethod == "manual"
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(IntrinsicSize.Min)
+                .clip(RoundedCornerShape(24.dp)),
+        ) {
+            SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                listOf("link" to "Ссылка WDTT", "manual" to "Вручную")
+                    .forEachIndexed { index, (mode, label) ->
+                        SegmentedButton(
+                            selected = connectionMethod == mode,
+                            enabled = enabled,
+                            onClick = { onConnectionMethodChange(mode) },
+                            shape = SegmentedButtonDefaults.itemShape(index, 2),
+                            icon = {
+                                StableSegmentedButtonIcon(selected = connectionMethod == mode)
+                            },
+                        ) {
+                            Text(label, textAlign = TextAlign.Center)
+                        }
+                    }
+            }
+            VerticalDivider(
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .fillMaxHeight()
+                    .padding(vertical = 4.dp),
+                thickness = 1.dp,
+                color = MaterialTheme.colorScheme.outline.copy(alpha = 0.72f),
             )
-        if (connectionMethod == "link") {
-            OutlinedButton(
-                onClick = onAddLinkClick,
-                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
-                shape = RoundedCornerShape(16.dp),
-                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
-            ) {
-                Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(18.dp))
-                Spacer(Modifier.width(6.dp))
-                FlexibleButtonText(
-                    if (selectedMethodConfigured) "Изменить ссылку" else "Вставить ссылку WDTT",
-                    fontWeight = FontWeight.SemiBold
-                )
-            }
-        } else {
-            OutlinedButton(
-                onClick = onManualClick,
-                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
-                shape = RoundedCornerShape(16.dp),
-                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
-            ) {
-                Icon(Icons.Default.Key, contentDescription = null, modifier = Modifier.size(18.dp))
-                Spacer(Modifier.width(6.dp))
-                FlexibleButtonText(
-                    if (selectedMethodConfigured) "Изменить настройки" else "Настроить вручную",
-                    fontWeight = FontWeight.SemiBold
-                )
-            }
         }
     }
 }
@@ -4606,15 +6410,15 @@ fun HashesDialog(
                 ) {
                     remoteActionMessage = remoteAction?.stoppingMessage
                         ?.takeIf { it.isNotBlank() }
-                        ?: "Останавливаю VPN перед продолжением..."
+                        ?: "Останавливаю соединение перед продолжением..."
                 }
                 val stopResult = TunnelStopCoordinator.stopAndAwait(context)
                 if (!stopResult.succeeded) {
                     throw IllegalStateException(
                         if (stopResult == TunnelStopResult.TIMED_OUT) {
-                            "VPN не остановился за 20 секунд. Повторите попытку."
+                            "Соединение не остановилось за 20 секунд. Повторите попытку."
                         } else {
-                            "Не удалось запросить остановку VPN. Остановите туннель и повторите попытку."
+                            "Не удалось запросить остановку соединения. Остановите его и повторите попытку."
                         }
                     )
                 }

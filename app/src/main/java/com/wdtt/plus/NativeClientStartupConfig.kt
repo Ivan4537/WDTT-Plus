@@ -10,6 +10,8 @@ internal data class NativeClientStartupSecrets(
     val connectionPassword: String = "",
     val customVkClientId: String = "",
     val customVkClientSecret: String = "",
+    val socksUsername: String = "",
+    val socksPassword: String = "",
 )
 
 internal fun nativeClientStartupConfigLine(secrets: NativeClientStartupSecrets): String {
@@ -18,6 +20,8 @@ internal fun nativeClientStartupConfigLine(secrets: NativeClientStartupSecrets):
         .put("connection_password", secrets.connectionPassword)
         .put("custom_vk_client_id", secrets.customVkClientId)
         .put("custom_vk_client_secret", secrets.customVkClientSecret)
+        .put("socks_username", secrets.socksUsername)
+        .put("socks_password", secrets.socksPassword)
         .toString()
     val encoded = Base64.getUrlEncoder()
         .withoutPadding()

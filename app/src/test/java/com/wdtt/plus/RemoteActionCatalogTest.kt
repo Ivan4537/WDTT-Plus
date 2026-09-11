@@ -157,6 +157,39 @@ class RemoteActionCatalogTest {
     }
 
     @Test
+    fun parseValidCatalog_distinguishesConfirmedEmptyCatalogFromBrokenResponse() {
+        val confirmedEmpty = RemoteActionCatalogGateway.parseValidCatalog(
+            """{"version":1,"actions":{}}"""
+        )
+
+        assertTrue(confirmedEmpty != null)
+        assertTrue(confirmedEmpty!!.actions.isEmpty())
+        assertNull(RemoteActionCatalogGateway.parseValidCatalog("service unavailable"))
+        assertNull(
+            RemoteActionCatalogGateway.parseValidCatalog(
+                """{"version":2,"actions":{}}"""
+            )
+        )
+        assertNull(
+            RemoteActionCatalogGateway.parseValidCatalog(
+                """
+                {
+                  "version": 1,
+                  "actions": {
+                    "tunnel": {
+                      "title": "Небезопасное действие",
+                      "message": "Не должно заменять исправный кэш",
+                      "label": "Открыть",
+                      "url": "custom://unsafe"
+                    }
+                  }
+                }
+                """.trimIndent()
+            )
+        )
+    }
+
+    @Test
     fun parseExecutionTarget_acceptsOnlyExactHttpsTargets() {
         val target = RemoteActionCatalogGateway.parseExecutionTarget(
             """

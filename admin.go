@@ -33,6 +33,7 @@ type adminResponse struct {
 	BackupStatus    *serverBackupStatus   `json:"backup_status,omitempty"`
 	Backup          *serverBackupSummary  `json:"backup,omitempty"`
 	BackupDocument  *serverBackupDocument `json:"backup_document,omitempty"`
+	SafeOutput      string                `json:"safe_output,omitempty"`
 }
 
 type adminClientState struct {
@@ -402,6 +403,8 @@ func executeAdminCommand(configDir string, loaded *Database, rest []string, wgDe
 		response, err = adminBackupExport(configDir, rest[1:])
 	case "backup-delete":
 		response, err = adminBackupDelete(configDir, rest[1:])
+	case "safe-inspect":
+		response, err = adminSafeInspect(configDir, rest[1:])
 	case "restart":
 		response = adminResponse{OK: true, Message: "Перезапуск сервиса", RestartRequired: true}
 	default:
@@ -647,17 +650,61 @@ func handleAdminSocketConn(conn net.Conn, configDir string, wgDev wgDevice) {
 		_ = json.NewEncoder(conn).Encode(adminResponse{OK: false, Message: "не указана admin-команда"})
 		return
 	}
-	dbMutex.Lock()
-	defer dbMutex.Unlock()
-	if strings.TrimSpace(request.MainPassword) == "" || db.MainPassword != request.MainPassword {
-		_ = json.NewEncoder(conn).Encode(adminResponse{OK: false, Message: "главный пароль администратора не совпадает"})
-		return
-	}
-	response, err := executeAdminCommand(configDir, db, request.Args, wgDev, true)
+	response, err := executeLiveAdminRequest(configDir, request, wgDev)
 	if err != nil {
 		response = adminErrorResponse(err)
 	}
 	_ = json.NewEncoder(conn).Encode(response)
+}
+
+func executeLiveAdminRequest(configDir string, request adminRequest, wgDev wgDevice) (adminResponse, error) {
+	dbMutex.Lock()
+	if strings.TrimSpace(request.MainPassword) == "" || db == nil || db.MainPassword != request.MainPassword {
+		dbMutex.Unlock()
+		return adminResponse{}, errors.New("главный пароль администратора не совпадает")
+	}
+	if isServerBackupAdminCommand(request.Args) {
+		// Backup files can be large and live on a slow VPS disk. Keep their I/O
+		// outside dbMutex so client management and the data plane are not held
+		// behind a backup status, export, verification, or snapshot write.
+		var databaseSnapshot *Database
+		var err error
+		if serverBackupCommandNeedsDatabaseSnapshot(request.Args) {
+			databaseSnapshot, err = cloneDatabaseForBackup(db)
+		}
+		dbMutex.Unlock()
+		if err != nil {
+			return adminResponse{}, fmt.Errorf("не удалось зафиксировать базу для резервного копирования: %w", err)
+		}
+		serverBackupRequestMu.Lock()
+		defer serverBackupRequestMu.Unlock()
+		return executeAdminCommand(configDir, databaseSnapshot, request.Args, wgDev, false)
+	}
+	if len(request.Args) > 0 && request.Args[0] == "safe-inspect" {
+		dbMutex.Unlock()
+		return adminSafeInspect(configDir, request.Args[1:])
+	}
+	defer dbMutex.Unlock()
+	return executeAdminCommand(configDir, db, request.Args, wgDev, true)
+}
+
+func isServerBackupAdminCommand(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	switch args[0] {
+	case "backup-status", "backup-list", "backup-configure", "backup-create", "backup-verify", "backup-export", "backup-delete":
+		return true
+	default:
+		return false
+	}
+}
+
+func serverBackupCommandNeedsDatabaseSnapshot(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	return args[0] == "backup-configure" || args[0] == "backup-create"
 }
 
 func readAdminDB(configDir string) (*Database, error) {

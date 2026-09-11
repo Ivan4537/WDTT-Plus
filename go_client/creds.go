@@ -505,7 +505,7 @@ func fetchVkCreds(ctx context.Context, link string, streamID int) (fetchedTurnCr
 				case isVKCallsFloodError(modernErr):
 					log.Printf("[STREAM %d] [VKCalls] VK временно ограничил анонимный вход; продолжаем резервную legacy-цепочку", streamID)
 				case pause == vkCallsCaptchaPause:
-					log.Printf("[STREAM %d] [VKCalls] две современные анонимные сессии запросили CAPTCHA; продолжаем одной legacy-цепочкой", streamID)
+					log.Printf("[STREAM %d] [VKCalls] основной провайдер запросил CAPTCHA; продолжаем одной legacy-цепочкой", streamID)
 				case pause > 0:
 					log.Printf("[STREAM %d] [VKCalls] preflight не сработал после безопасного повтора: %v; продолжаем резервную legacy-цепочку", streamID, modernErr)
 				default:

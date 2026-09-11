@@ -1,11 +1,111 @@
 package com.wdtt.plus
 
+import android.app.ApplicationExitInfo
 import java.nio.file.Files
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class DeviceCompatibilityTest {
+    @Test
+    fun activeHoldModeReportsExactRuntimeState() {
+        val item = connectionHoldRuntimeItem(
+            running = true,
+            diagnostics = ConnectionHoldDiagnostics(
+                modeSelected = true,
+                active = true,
+                cpuWakeLockHeld = true,
+                wifiLockHeld = true,
+                wifiTransportAvailable = true,
+                deviceInteractive = false,
+            ),
+        )
+
+        assertEquals(DeviceCheckSeverity.Ok, item.severity)
+        assertEquals("действует", item.status)
+        assertTrue(item.details.contains("CPU wake lock — активен"))
+        assertTrue(item.details.contains("Wi-Fi lock — активен"))
+    }
+
+    @Test
+    fun runningHoldModeWarnsWhenCpuHoldIsMissing() {
+        val item = connectionHoldRuntimeItem(
+            running = true,
+            diagnostics = ConnectionHoldDiagnostics(modeSelected = true),
+        )
+
+        assertEquals(DeviceCheckSeverity.Warning, item.severity)
+        assertEquals("не действует", item.status)
+    }
+
+    @Test
+    fun processExitHistoryKeepsSystemKillVisibleAfterPackageUpdate() {
+        val now = 1_800_000_000_000L
+        val systemKill = ProcessExitRecord(
+            timestampMs = now - 2_000L,
+            reason = ApplicationExitInfo.REASON_OTHER,
+            description = "o-kill(6) private-value-must-not-leak",
+        )
+        val packageUpdate = ProcessExitRecord(
+            timestampMs = now - 1_000L,
+            reason = ApplicationExitInfo.REASON_PACKAGE_UPDATED,
+        )
+
+        val history = processExitHistory(listOf(systemKill, packageUpdate), now)
+        val item = processExitHistoryItem(
+            history = history,
+            manufacturer = "OnePlus",
+            backgroundRestricted = false,
+            batteryOptimizationsIgnored = true,
+        )
+
+        assertEquals(packageUpdate, history.latest)
+        assertEquals(systemKill, history.latestUnexpected)
+        assertEquals(DeviceCheckSeverity.Warning, item.severity)
+        assertTrue(item.details.contains("o-kill(6)"))
+        assertTrue(item.details.contains("более новое штатное событие"))
+        assertTrue(!item.details.contains("private-value-must-not-leak"))
+        assertTrue(item.recommendation.contains("OxygenOS"))
+    }
+
+    @Test
+    fun userRequestedExitIsNotReportedAsSystemKill() {
+        val now = 1_800_000_000_000L
+        val history = processExitHistory(
+            records = listOf(
+                ProcessExitRecord(
+                    timestampMs = now - 1_000L,
+                    reason = ApplicationExitInfo.REASON_USER_REQUESTED,
+                )
+            ),
+            nowMs = now,
+        )
+
+        val item = processExitHistoryItem(
+            history = history,
+            manufacturer = "Samsung",
+            backgroundRestricted = false,
+            batteryOptimizationsIgnored = true,
+        )
+
+        assertEquals(null, history.latestUnexpected)
+        assertEquals(DeviceCheckSeverity.Info, item.severity)
+        assertTrue(item.status.contains("пользователем"))
+    }
+
+    @Test
+    fun backgroundRestrictionRecommendationExplainsBothAndroidAndVendorSetting() {
+        val recommendation = backgroundRestrictionRecommendation(
+            manufacturer = "Xiaomi",
+            backgroundRestricted = true,
+            batteryOptimizationsIgnored = true,
+        )
+
+        assertTrue(recommendation.contains("ограниченное в фоне"))
+        assertTrue(recommendation.contains("Без ограничений"))
+        assertTrue(recommendation.contains("автозапуск"))
+    }
+
     @Test
     fun sixteenKibPagesAreSupportedByThe64BitRelease() {
         val item = pageSizeCompatibilityItem(16L * 1024L, processIs64Bit = true)
@@ -91,6 +191,35 @@ class DeviceCompatibilityTest {
     }
 
     @Test
+    fun vpnSlotTransferIsSeparatedFromWholeProcessTermination() {
+        val item = lastTunnelStopItem(
+            running = false,
+            reason = TunnelStopReason.VpnSlotTransferred,
+        )
+
+        requireNotNull(item)
+        assertEquals(DeviceCheckSeverity.Info, item.severity)
+        assertTrue(item.details.contains("VPN-слот"))
+        assertTrue(item.details.contains("не означает"))
+        assertEquals(DeviceCheckAction.VpnSettings, item.action)
+    }
+
+    @Test
+    fun socksHealthReportDescribesLocalProxyInsteadOfVpnInterface() {
+        val item = tunnelHealthItem(
+            running = true,
+            activeWorkers = 9,
+            issue = null,
+            confirmedNetworkFailure = false,
+            tunnelMode = TUNNEL_MODE_SOCKS5,
+        )
+
+        assertEquals(DeviceCheckSeverity.Ok, item.severity)
+        assertTrue(item.details.contains("Прокси SOCKS5"))
+        assertTrue(!item.details.contains("VPN"))
+    }
+
+    @Test
     fun timedSleepResumeWarnsWhenAndroidBatteryRestrictionsRemain() {
         val item = sleepBatteryModeItem(
             enabled = true,
@@ -122,6 +251,44 @@ class DeviceCompatibilityTest {
 
         assertEquals(DeviceCheckSeverity.Ok, item.severity)
         assertTrue(item.status.contains("VPN остаётся активным"))
+    }
+
+    @Test
+    fun holdConnectionModeWarnsWhenAndroidStillRestrictsBattery() {
+        val item = sleepBatteryModeItem(
+            enabled = false,
+            screenOffMode = ScreenOffMode.HOLD_CONNECTION,
+            mode = SleepBatteryMode.DELAYED_PAUSE,
+            pauseDelayMinutes = 5,
+            resumeDelayMinutes = 5,
+            runtime = SleepBatteryRuntimeState(),
+            notificationsGranted = true,
+            batteryOptimizationsIgnored = false,
+        )
+
+        assertEquals(DeviceCheckSeverity.Warning, item.severity)
+        assertEquals(DeviceCheckAction.BatterySettings, item.action)
+        assertTrue(item.details.contains("сохранять активное соединение"))
+        assertTrue(item.details.contains("Wi-Fi"))
+    }
+
+    @Test
+    fun holdConnectionModeWarnsWhenBackgroundIsRestrictedDespiteBatteryExemption() {
+        val item = sleepBatteryModeItem(
+            enabled = false,
+            screenOffMode = ScreenOffMode.HOLD_CONNECTION,
+            mode = SleepBatteryMode.DELAYED_PAUSE,
+            pauseDelayMinutes = 5,
+            resumeDelayMinutes = 5,
+            runtime = SleepBatteryRuntimeState(),
+            notificationsGranted = true,
+            batteryOptimizationsIgnored = true,
+            backgroundRestricted = true,
+        )
+
+        assertEquals(DeviceCheckSeverity.Warning, item.severity)
+        assertEquals(DeviceCheckAction.BatterySettings, item.action)
+        assertTrue(item.recommendation.contains("ограничен в фоне"))
     }
 
     @Test

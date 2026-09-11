@@ -63,7 +63,7 @@ internal fun RtNetworkSettingsDialog(
         !rtNetwork -> "Сначала включите «Сеть РТ»"
         !rtMasque -> "Сначала включите MASQUE"
         !serverAccess.available -> "Недоступно: ${serverAccess.unavailableReason}"
-        tunnelRunning -> "Остановите VPN, чтобы изменить настройку"
+        tunnelRunning -> "Остановите соединение, чтобы изменить настройку"
         else -> "Только первая регистрация WARP · SSH из «Деплой»"
     }
     val serverTextIsError = rtNetwork && rtMasque && !serverAccess.available
@@ -149,7 +149,7 @@ internal fun RtNetworkSettingsDialog(
                                 if (!rtNetwork) {
                                     "Включите «Сеть РТ» в основном окне, чтобы изменить эти параметры."
                                 } else {
-                                    "Остановите VPN, чтобы изменить параметры режима."
+                                    "Остановите соединение, чтобы изменить параметры режима."
                                 },
                                 modifier = Modifier.padding(14.dp),
                                 style = MaterialTheme.typography.bodySmall,

@@ -23,12 +23,13 @@ ensure_utf8_locale() {
 
 ensure_utf8_locale
 
-readonly INSTALLER_VERSION="0.19.1"
+readonly INSTALLER_VERSION="0.20.0"
 readonly SUPPORTED_SERVER_VERSION="17"
 readonly DEPLOY_COMPATIBILITY_VERSION="1"
 readonly MANAGED_MARKER="Managed by WDTT Plus standalone server installer"
 readonly ANDROID_DEPLOY_MARKER="Managed by WDTT Plus Android deploy"
 readonly ANDROID_DEPLOY_COMPATIBILITY_MARKER="WDTT deploy compatibility: $DEPLOY_COMPATIBILITY_VERSION"
+readonly ANDROID_PRESERVED_MARKER="Preserved by WDTT Plus Android deploy"
 readonly STATE_MARKER="$MANAGED_MARKER state"
 readonly TRANSACTION_MARKER="$MANAGED_MARKER transaction"
 readonly FIREWALL_STATE_MARKER="$MANAGED_MARKER firewall"
@@ -83,6 +84,7 @@ readonly BINARY_PATH="$(root_path /usr/local/bin/wdtt-server)"
 readonly UNIT_PATH="$(root_path /etc/systemd/system/wdtt.service)"
 readonly CONFIG_DIR="$(root_path /etc/wdtt)"
 readonly DATABASE_PATH="$CONFIG_DIR/passwords.json"
+readonly ANDROID_PRESERVED_MARKER_PATH="$CONFIG_DIR/.android-deploy-preserved"
 readonly FIRST_INSTALL_MARKER="$CONFIG_DIR/.standalone-installing"
 readonly STATE_DIR="$(root_path /var/lib/wdtt-server-installer)"
 readonly STATE_CLAIM_PATH="$STATE_DIR/.standalone-state"
@@ -208,8 +210,9 @@ usage() {
               ранее созданной ручной установки.
   adopt-android
               Явно и транзакционно принять установку, созданную Android-
-              деплоем с совместимой меткой. Данные и WireGuard-ключи
-              сохраняются. Эта команда никогда не принимает неизвестный
+              деплоем с совместимой меткой, либо строго отмеченные данные,
+              сохранённые Android после удаления службы. Данные и WireGuard-
+              ключи сохраняются. Эта команда никогда не принимает неизвестный
               сервер и не запускается автоматически командой install.
   handoff-android
               Транзакционно передать собственную ручную установку обратно
@@ -277,10 +280,10 @@ EOF
 print_compatibility() {
     local mode="${1:-full}"
     if [[ "$COMPATIBILITY_MACHINE" == "1" ]]; then
-        printf 'contract_version=%s\nserver_version=%s\nbinary=%s\nunit=%s\nconfig=%s\ndatabase=%s\nwg_keys=%s\n' \
+        printf 'contract_version=%s\nserver_version=%s\nbinary=%s\nunit=%s\nconfig=%s\ndatabase=%s\nwg_keys=%s\npreserved_marker=%s\n' \
             "$DEPLOY_COMPATIBILITY_VERSION" "$SUPPORTED_SERVER_VERSION" \
             "/usr/local/bin/wdtt-server" "/etc/systemd/system/wdtt.service" \
-            "/etc/wdtt" "passwords.json" "wg-keys.dat"
+            "/etc/wdtt" "passwords.json" "wg-keys.dat" "$ANDROID_PRESERVED_MARKER"
         return
     fi
     cat <<EOF
@@ -294,6 +297,7 @@ print_compatibility() {
   - данные сервера: /etc/wdtt
   - база клиентов: passwords.json
   - WireGuard-ключи: wg-keys.dat
+  - метка сохранённых Android-данных: $ANDROID_PRESERVED_MARKER
 EOF
     [[ "$mode" == "summary" ]] && return
     cat <<EOF
@@ -990,7 +994,8 @@ collect_install_questions() {
 detect_port_change() {
     local kind="$1"
     PORTS_CHANGED=0
-    [[ "$kind" == "owned" || "$kind" == "android" || "$kind" == "adopt" ]] || return 0
+    [[ "$kind" == "owned" || "$kind" == "android" || "$kind" == "android-preserved" ||
+        "$kind" == "adopt" || "$kind" == "adopt-preserved" ]] || return 0
     if [[ -n "$CURRENT_DTLS_PORT" && "$DTLS_PORT" != "$CURRENT_DTLS_PORT" ]] ||
         [[ -n "$CURRENT_WG_PORT" && "$WG_PORT" != "$CURRENT_WG_PORT" ]] ||
         [[ -n "$CURRENT_CLIENT_PORT" && "$CLIENT_PORT" != "$CURRENT_CLIENT_PORT" ]]; then
@@ -1001,7 +1006,8 @@ detect_port_change() {
 validate_port_migration_choice() {
     local kind="$1"
     detect_port_change "$kind"
-    if [[ "$kind" != "owned" && "$kind" != "android" && "$kind" != "adopt" && "$MIGRATE_PORTS" == "1" ]]; then
+    if [[ "$kind" != "owned" && "$kind" != "android" && "$kind" != "android-preserved" &&
+        "$kind" != "adopt" && "$kind" != "adopt-preserved" && "$MIGRATE_PORTS" == "1" ]]; then
         die "--migrate-ports применяется только при смене портов существующей ручной установки или при явном принятии Android-установки."
     fi
     if [[ "$PORTS_CHANGED" == "1" && "$MIGRATE_PORTS" != "1" ]]; then
@@ -1127,6 +1133,24 @@ is_android_deploy_install() {
         grep -Fqx "# $ANDROID_DEPLOY_COMPATIBILITY_MARKER" "$UNIT_PATH"
 }
 
+is_preserved_android_data() {
+    local expected_owner path
+    expected_owner="$(managed_owner_pair)"
+    [[ (! -e "$STATE_DIR" || state_is_clean_claim || android_backup_state_is_safe) &&
+        ! -e "$BINARY_PATH" && ! -L "$BINARY_PATH" &&
+        ! -e "$UNIT_PATH" && ! -L "$UNIT_PATH" &&
+        -d "$CONFIG_DIR" && ! -L "$CONFIG_DIR" &&
+        "$(stat -c '%a' "$CONFIG_DIR")" == "700" &&
+        "$(stat -c '%u:%g' "$CONFIG_DIR")" == "$expected_owner" ]] || return 1
+    for path in "$DATABASE_PATH" "$CONFIG_DIR/wg-keys.dat" "$ANDROID_PRESERVED_MARKER_PATH"; do
+        [[ -f "$path" && ! -L "$path" && -s "$path" &&
+            "$(stat -c '%a' "$path")" == "600" &&
+            "$(stat -c '%u:%g' "$path")" == "$expected_owner" &&
+            "$(stat -c '%h' "$path")" == "1" ]] || return 1
+    done
+    [[ "$(<"$ANDROID_PRESERVED_MARKER_PATH")" == "$ANDROID_PRESERVED_MARKER" ]]
+}
+
 validate_owned_managed_files() {
     local expected_owner
     expected_owner="$(managed_owner_pair)"
@@ -1169,6 +1193,8 @@ detect_install_kind() {
         printf 'owned'
     elif is_android_deploy_install; then
         printf 'android'
+    elif is_preserved_android_data; then
+        printf 'android-preserved'
     elif state_is_clean_claim; then
         printf 'new'
     elif has_any_install_state; then
@@ -1183,9 +1209,11 @@ friendly_install_kind() {
         new) printf 'чистый сервер, установка ещё не выполнялась' ;;
         owned) printf 'ручная установка WDTT Plus' ;;
         android) printf 'совместимая установка из Android-деплоя' ;;
+        android-preserved) printf 'сохранённые данные Android-деплоя без установленной службы' ;;
         foreign) printf 'неизвестная или вручную изменённая установка' ;;
         interrupted) printf 'незавершённая транзакция, требуется восстановление' ;;
         adopt) printf 'передача совместимой Android-установки под ручное управление' ;;
+        adopt-preserved) printf 'восстановление сохранённых Android-данных под ручным управлением' ;;
         handoff) printf 'передача ручной установки под управление Android-деплоя' ;;
         *) printf '%s' "$1" ;;
     esac
@@ -1256,32 +1284,33 @@ load_installed_installer_version() {
 
 load_owned_runtime_defaults() {
     local line stored_ports stored_dns stored_max
-    [[ -f "$UNIT_PATH" && ! -L "$UNIT_PATH" ]] || return 0
-    load_installed_installer_version
-    line="$(grep -m1 '^ExecStart=' "$UNIT_PATH" || true)"
+    if [[ -f "$UNIT_PATH" && ! -L "$UNIT_PATH" ]]; then
+        load_installed_installer_version
+        line="$(grep -m1 '^ExecStart=' "$UNIT_PATH" || true)"
 
-    if [[ "$line" =~ -listen[[:space:]]+[^[:space:]]*:([0-9]+) ]]; then
-        CURRENT_DTLS_PORT="${BASH_REMATCH[1]}"
-        option_is_set dtls_port || DTLS_PORT="$CURRENT_DTLS_PORT"
-    fi
-    if [[ "$line" =~ -wg-port[[:space:]]+([0-9]+) ]]; then
-        CURRENT_WG_PORT="${BASH_REMATCH[1]}"
-        option_is_set wg_port || WG_PORT="${BASH_REMATCH[1]}"
-    fi
-    if [[ "$line" =~ -max-workers-per-access[[:space:]]+([0-9]+) ]]; then
-        option_is_set max_workers || MAX_WORKERS="${BASH_REMATCH[1]}"
-    fi
-    if [[ "$line" =~ -max-handshakes[[:space:]]+([0-9]+) ]]; then
-        option_is_set max_handshakes || MAX_HANDSHAKES="${BASH_REMATCH[1]}"
-    fi
-    if [[ "$line" =~ -handshake-rate[[:space:]]+([0-9]+([.][0-9]+)?) ]]; then
-        option_is_set handshake_rate || HANDSHAKE_RATE="${BASH_REMATCH[1]}"
-    fi
-    if [[ "$line" =~ -max-client-mbps[[:space:]]+([0-9]+([.][0-9]+)?) ]]; then
-        option_is_set max_client_mbps || MAX_CLIENT_MBPS="${BASH_REMATCH[1]}"
-    fi
-    if [[ "$line" =~ -wg-backend[[:space:]]+(auto|kernel|userspace) ]]; then
-        option_is_set wg_backend || WG_BACKEND="${BASH_REMATCH[1]}"
+        if [[ "$line" =~ -listen[[:space:]]+[^[:space:]]*:([0-9]+) ]]; then
+            CURRENT_DTLS_PORT="${BASH_REMATCH[1]}"
+            option_is_set dtls_port || DTLS_PORT="$CURRENT_DTLS_PORT"
+        fi
+        if [[ "$line" =~ -wg-port[[:space:]]+([0-9]+) ]]; then
+            CURRENT_WG_PORT="${BASH_REMATCH[1]}"
+            option_is_set wg_port || WG_PORT="${BASH_REMATCH[1]}"
+        fi
+        if [[ "$line" =~ -max-workers-per-access[[:space:]]+([0-9]+) ]]; then
+            option_is_set max_workers || MAX_WORKERS="${BASH_REMATCH[1]}"
+        fi
+        if [[ "$line" =~ -max-handshakes[[:space:]]+([0-9]+) ]]; then
+            option_is_set max_handshakes || MAX_HANDSHAKES="${BASH_REMATCH[1]}"
+        fi
+        if [[ "$line" =~ -handshake-rate[[:space:]]+([0-9]+([.][0-9]+)?) ]]; then
+            option_is_set handshake_rate || HANDSHAKE_RATE="${BASH_REMATCH[1]}"
+        fi
+        if [[ "$line" =~ -max-client-mbps[[:space:]]+([0-9]+([.][0-9]+)?) ]]; then
+            option_is_set max_client_mbps || MAX_CLIENT_MBPS="${BASH_REMATCH[1]}"
+        fi
+        if [[ "$line" =~ -wg-backend[[:space:]]+(auto|kernel|userspace) ]]; then
+            option_is_set wg_backend || WG_BACKEND="${BASH_REMATCH[1]}"
+        fi
     fi
 
     if [[ -f "$DATABASE_PATH" && ! -L "$DATABASE_PATH" ]] &&
@@ -1296,8 +1325,19 @@ load_owned_runtime_defaults() {
             option_is_set max_passwords || MAX_PASSWORDS="$stored_max"
         fi
         if [[ "$stored_ports" =~ ^([0-9]+),([0-9]+),([0-9]+)$ ]]; then
-            CURRENT_CLIENT_PORT="${BASH_REMATCH[3]}"
-            option_is_set client_port || CLIENT_PORT="${BASH_REMATCH[3]}"
+            local stored_dtls_port="${BASH_REMATCH[1]}"
+            local stored_wg_port="${BASH_REMATCH[2]}"
+            local stored_client_port="${BASH_REMATCH[3]}"
+            if [[ -z "$CURRENT_DTLS_PORT" ]]; then
+                CURRENT_DTLS_PORT="$stored_dtls_port"
+                option_is_set dtls_port || DTLS_PORT="$stored_dtls_port"
+            fi
+            if [[ -z "$CURRENT_WG_PORT" ]]; then
+                CURRENT_WG_PORT="$stored_wg_port"
+                option_is_set wg_port || WG_PORT="$stored_wg_port"
+            fi
+            CURRENT_CLIENT_PORT="$stored_client_port"
+            option_is_set client_port || CLIENT_PORT="$stored_client_port"
         fi
     fi
 }
@@ -1961,6 +2001,19 @@ validate_target_state() {
                 port_is_busy "$WG_PORT" && die "Новый WG-порт $WG_PORT уже занят."
             fi
             ;;
+        android-preserved)
+            [[ -z "$INITIAL_CONFIG" ]] ||
+                die "Принятие сохранённых Android-данных всегда использует текущий /etc/wdtt и не принимает --config."
+            is_preserved_android_data ||
+                die "Сохранённые Android-данные больше не соответствуют безопасной метке и структуре."
+            validate_existing_database
+            subnet_route_conflicts &&
+                die "Маршрут хоста пересекается с внутренней подсетью $WDTT_SUBNET."
+            foreign_wdtt_network_rules_exist &&
+                die "Найдены сетевые правила WDTT_MANAGED без установленной Android-службы."
+            port_is_busy "$DTLS_PORT" && die "DTLS-порт $DTLS_PORT уже занят."
+            port_is_busy "$WG_PORT" && die "WG-порт $WG_PORT уже занят."
+            ;;
         foreign)
             die "Найдены существующие файлы WDTT без полной метки ручного установщика. Автоматическая перезапись запрещена."
             ;;
@@ -1975,7 +2028,8 @@ required_space_bytes() {
     local kind="$1"
     local source_size config_size=0
     source_size="$(stat -c '%s' "$SOURCE_BINARY")"
-    if [[ "$kind" == "owned" || "$kind" == "android" || "$kind" == "adopt" || "$kind" == "handoff" ]]; then
+    if [[ "$kind" == "owned" || "$kind" == "android" || "$kind" == "android-preserved" ||
+        "$kind" == "adopt" || "$kind" == "adopt-preserved" || "$kind" == "handoff" ]]; then
         config_size="$(du -sb "$CONFIG_DIR" | awk '{print $1}')"
     fi
     printf '%s' $((MIN_FREE_BYTES + source_size * 3 + config_size * 3))
@@ -1983,16 +2037,17 @@ required_space_bytes() {
 
 validate_disk_space() {
     local kind="$1"
-    local required available probe
+    local required required_kib available_kib probe
     required="$(required_space_bytes "$kind")"
     probe="$STATE_DIR"
     [[ -d "$probe" ]] || probe="$(dirname "$STATE_DIR")"
     while [[ ! -d "$probe" && "$probe" != "/" ]]; do
         probe="$(dirname "$probe")"
     done
-    available="$(df -Pk "$probe" | awk 'NR == 2 {print $4 * 1024}')"
-    [[ "$available" =~ ^[0-9]+$ ]] || die "Не удалось проверить свободное место."
-    (( available >= required )) ||
+    available_kib="$(LC_ALL=C df -Pk -- "$probe" | awk 'NR == 2 {print $4; exit}')"
+    [[ "$available_kib" =~ ^[0-9]+$ ]] || die "Не удалось проверить свободное место."
+    required_kib=$(((required + 1023) / 1024))
+    (( available_kib >= required_kib )) ||
         die "Недостаточно свободного места для staging, полной копии и отката."
 }
 
@@ -2126,9 +2181,13 @@ EOF
 print_plan() {
     local kind="$1"
     local operation="первая установка"
-    [[ "$kind" == "owned" ]] && operation="обновление собственной установки"
-    [[ "$kind" == "android" || "$kind" == "adopt" ]] &&
-        operation="явное принятие Android-установки с сохранением данных"
+    case "$kind" in
+        owned) operation="обновление собственной установки" ;;
+        android|adopt) operation="явное принятие Android-установки с сохранением данных" ;;
+        android-preserved|adopt-preserved)
+            operation="восстановление сохранённых Android-данных под ручным управлением"
+            ;;
+    esac
     cat <<EOF
 
 План: $operation
@@ -2148,9 +2207,11 @@ print_plan() {
   скорость:    $MAX_CLIENT_MBPS Мбит/с на доступ (0 = без лимита)
   firewall:    $(friendly_firewall_mode "$FIREWALL_MODE") ($(friendly_firewall_manager "${FIREWALL_MANAGER:-none}"))
 
-Перед обновлением служба будет остановлена, а бинарник, unit, метка владения
-и весь /etc/wdtt будут скопированы в закрытую резервную копию. При любой
-ошибке они будут восстановлены.
+Перед изменением будет создана закрытая резервная копия текущего состояния и
+всего /etc/wdtt. Если служба, бинарник или unit уже существуют, служба будет
+остановлена, а эти файлы также попадут в копию. При любой ошибке будет точно
+восстановлено исходное состояние, включая отсутствие службы и бинарника после
+сохраняющего удаления из Android.
 
 Установщик не меняет SSH, пакеты, чужие службы или репозитории. Он не
 отключает и не очищает чужой firewall; отдельное согласие добавляет только
@@ -2502,7 +2563,8 @@ load_and_validate_journal() {
     [[ "$TRANSACTION_ID" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9]+-[0-9a-f]{8}$ ]] ||
         die "Идентификатор транзакции повреждён."
     [[ "$INSTALL_KIND" == "new" || "$INSTALL_KIND" == "owned" ||
-        "$INSTALL_KIND" == "adopt" || "$INSTALL_KIND" == "handoff" ]] ||
+        "$INSTALL_KIND" == "adopt" || "$INSTALL_KIND" == "adopt-preserved" ||
+        "$INSTALL_KIND" == "handoff" ]] ||
         die "Тип транзакции повреждён."
     [[ "$TRANSACTION_PHASE" =~ ^(prepared|service_stopped|backup_complete|files_replacing|files_replaced|service_started|firewall_applying|firewall_applied|committed)$ ]] ||
         die "Фаза транзакции повреждена."
@@ -2537,6 +2599,7 @@ load_and_validate_journal() {
     [[ "$STAGING_DIR" == "$STAGING_ROOT/$TRANSACTION_ID" ]] ||
         die "Путь staging в журнале выходит за управляемый каталог."
     if [[ "$INSTALL_KIND" == "owned" || "$INSTALL_KIND" == "adopt" ||
+        "$INSTALL_KIND" == "adopt-preserved" ||
         "$INSTALL_KIND" == "handoff" ]]; then
         [[ "$ACTIVE_BACKUP" == "$BACKUP_ROOT/$TRANSACTION_ID" ]] ||
             die "Путь резервной копии в журнале выходит за управляемый каталог."
@@ -2815,6 +2878,7 @@ verify_backup_manifest() {
 
 create_full_backup() {
     [[ "$INSTALL_KIND" == "owned" || "$INSTALL_KIND" == "adopt" ||
+        "$INSTALL_KIND" == "adopt-preserved" ||
         "$INSTALL_KIND" == "handoff" ]] || return 0
     [[ "$ACTIVE_BACKUP" == "$BACKUP_ROOT/$TRANSACTION_ID" ]] ||
         {
@@ -2822,8 +2886,14 @@ create_full_backup() {
             return 1
         }
     install -d -m 0700 "$BACKUP_ROOT" "$ACTIVE_BACKUP"
-    install -m 0755 "$BINARY_PATH" "$ACTIVE_BACKUP/wdtt-server"
-    install -m 0644 "$UNIT_PATH" "$ACTIVE_BACKUP/wdtt.service"
+    if [[ "$INSTALL_KIND" == "adopt-preserved" ]]; then
+        printf 'absent\n' >"$ACTIVE_BACKUP/binary.state"
+        printf 'absent\n' >"$ACTIVE_BACKUP/unit.state"
+        chmod 0600 "$ACTIVE_BACKUP/binary.state" "$ACTIVE_BACKUP/unit.state"
+    else
+        install -m 0755 "$BINARY_PATH" "$ACTIVE_BACKUP/wdtt-server"
+        install -m 0644 "$UNIT_PATH" "$ACTIVE_BACKUP/wdtt.service"
+    fi
     if [[ "$INSTALL_KIND" == "owned" || "$INSTALL_KIND" == "handoff" ]]; then
         install -m 0600 "$OWNERSHIP_PATH" "$ACTIVE_BACKUP/ownership"
         printf 'present\n' >"$ACTIVE_BACKUP/ownership.state"
@@ -2847,16 +2917,18 @@ create_full_backup() {
     chmod 0600 "$ACTIVE_BACKUP/firewall-state.state"
     cp -a "$CONFIG_DIR" "$ACTIVE_BACKUP/config"
 
-    cmp -s "$BINARY_PATH" "$ACTIVE_BACKUP/wdtt-server" ||
-        {
-            warn "Не удалось проверить резервную копию бинарника."
-            return 1
-        }
-    cmp -s "$UNIT_PATH" "$ACTIVE_BACKUP/wdtt.service" ||
-        {
-            warn "Не удалось проверить резервную копию unit."
-            return 1
-        }
+    if [[ "$INSTALL_KIND" != "adopt-preserved" ]]; then
+        cmp -s "$BINARY_PATH" "$ACTIVE_BACKUP/wdtt-server" ||
+            {
+                warn "Не удалось проверить резервную копию бинарника."
+                return 1
+            }
+        cmp -s "$UNIT_PATH" "$ACTIVE_BACKUP/wdtt.service" ||
+            {
+                warn "Не удалось проверить резервную копию unit."
+                return 1
+            }
+    fi
     if [[ "$INSTALL_KIND" == "owned" || "$INSTALL_KIND" == "handoff" ]]; then
         cmp -s "$OWNERSHIP_PATH" "$ACTIVE_BACKUP/ownership" ||
             {
@@ -2901,12 +2973,28 @@ validate_backup() {
         "$(stat -c '%a' "$ACTIVE_BACKUP/MANIFEST")" == "600" &&
         "$(stat -c '%u:%g' "$ACTIVE_BACKUP/MANIFEST")" == "$(managed_owner_pair)" ]] ||
         return 1
-    [[ -f "$ACTIVE_BACKUP/wdtt-server" && -f "$ACTIVE_BACKUP/wdtt.service" &&
-        -f "$ACTIVE_BACKUP/ownership.state" &&
+    [[ -f "$ACTIVE_BACKUP/ownership.state" &&
         -f "$ACTIVE_BACKUP/network-runtime.state" &&
         -f "$ACTIVE_BACKUP/firewall-state.state" &&
         -d "$ACTIVE_BACKUP/config" ]] ||
         return 1
+    if [[ "$INSTALL_KIND" == "adopt-preserved" ]]; then
+        [[ -f "$ACTIVE_BACKUP/binary.state" && ! -L "$ACTIVE_BACKUP/binary.state" &&
+            -f "$ACTIVE_BACKUP/unit.state" && ! -L "$ACTIVE_BACKUP/unit.state" &&
+            "$(stat -c '%a' "$ACTIVE_BACKUP/binary.state")" == "600" &&
+            "$(stat -c '%a' "$ACTIVE_BACKUP/unit.state")" == "600" &&
+            "$(stat -c '%u:%g' "$ACTIVE_BACKUP/binary.state")" == "$(managed_owner_pair)" &&
+            "$(stat -c '%u:%g' "$ACTIVE_BACKUP/unit.state")" == "$(managed_owner_pair)" &&
+            "$(stat -c '%h' "$ACTIVE_BACKUP/binary.state")" == "1" &&
+            "$(stat -c '%h' "$ACTIVE_BACKUP/unit.state")" == "1" &&
+            "$(tr -d '\r\n' <"$ACTIVE_BACKUP/binary.state")" == "absent" &&
+            "$(tr -d '\r\n' <"$ACTIVE_BACKUP/unit.state")" == "absent" &&
+            ! -e "$ACTIVE_BACKUP/wdtt-server" && ! -e "$ACTIVE_BACKUP/wdtt.service" ]] ||
+            return 1
+    else
+        [[ -f "$ACTIVE_BACKUP/wdtt-server" && -f "$ACTIVE_BACKUP/wdtt.service" ]] ||
+            return 1
+    fi
     [[ -z "$(
         find "$ACTIVE_BACKUP/config" -mindepth 1 \
             \( -type l -o ! \( -type f -o -type d \) \) \
@@ -2921,7 +3009,8 @@ validate_backup() {
 }
 
 stage_owned_database_settings() {
-    [[ "$INSTALL_KIND" == "owned" || "$INSTALL_KIND" == "adopt" ]] || return 0
+    [[ "$INSTALL_KIND" == "owned" || "$INSTALL_KIND" == "adopt" ||
+        "$INSTALL_KIND" == "adopt-preserved" ]] || return 0
     local desired_ports="${DTLS_PORT},${WG_PORT},${CLIENT_PORT}"
     local current_ports current_dns current_max
     current_ports="$(jq -r '.default_ports // ""' "$DATABASE_PATH")"
@@ -3042,7 +3131,8 @@ replace_managed_files() {
         maybe_fail_at unit_replaced || return 1
         return 0
     fi
-    if [[ "$INSTALL_KIND" == "owned" || "$INSTALL_KIND" == "adopt" ]]; then
+    if [[ "$INSTALL_KIND" == "owned" || "$INSTALL_KIND" == "adopt" ||
+        "$INSTALL_KIND" == "adopt-preserved" ]]; then
         install -d -m 0700 "$CONFIG_DIR"
     fi
     atomic_install_file "$STAGING_DIR/wdtt-server" "$BINARY_PATH" 0755
@@ -3052,6 +3142,9 @@ replace_managed_files() {
     atomic_install_file "$STAGING_DIR/wdtt.service" "$UNIT_PATH" 0644
     maybe_fail_at unit_replaced || return 1
     atomic_install_file "$STAGING_DIR/ownership" "$OWNERSHIP_PATH" 0600
+    if [[ "$INSTALL_KIND" == "adopt-preserved" ]]; then
+        rm -f "$ANDROID_PRESERVED_MARKER_PATH"
+    fi
     maybe_fail_at ownership_replaced || return 1
 
     if [[ "$INSTALL_KIND" == "new" ]]; then
@@ -3102,7 +3195,7 @@ verify_installed_files() {
 start_and_verify_service() {
     local expected_existing_keys_sha256="$EXISTING_WG_KEYS_SHA256"
     daemon_reload
-    if [[ "$INSTALL_KIND" == "new" ]]; then
+    if [[ "$INSTALL_KIND" == "new" || "$INSTALL_KIND" == "adopt-preserved" ]]; then
         enable_owned_service
     fi
     start_owned_service
@@ -3113,7 +3206,8 @@ start_and_verify_service() {
             chmod 0600 "$CONFIG_DIR/runtime-mutated"
         fi
         verify_runtime_health || return 1
-        if [[ ( "$INSTALL_KIND" == "owned" || "$INSTALL_KIND" == "adopt" || "$INSTALL_KIND" == "handoff" ) &&
+        if [[ ( "$INSTALL_KIND" == "owned" || "$INSTALL_KIND" == "adopt" ||
+            "$INSTALL_KIND" == "handoff" ) &&
             "$SERVICE_WAS_ACTIVE" == "0" &&
             "$SERVICE_WAS_ENABLED" == "0" ]]; then
             stop_owned_service
@@ -3125,7 +3219,8 @@ start_and_verify_service() {
     for attempt in {1..20}; do
         if verify_runtime_health; then
             local post_start_keys_sha256="$EXISTING_WG_KEYS_SHA256"
-            if [[ ( "$INSTALL_KIND" == "owned" || "$INSTALL_KIND" == "adopt" || "$INSTALL_KIND" == "handoff" ) &&
+            if [[ ( "$INSTALL_KIND" == "owned" || "$INSTALL_KIND" == "adopt" ||
+                "$INSTALL_KIND" == "adopt-preserved" || "$INSTALL_KIND" == "handoff" ) &&
                 -n "$expected_existing_keys_sha256" &&
                 "$expected_existing_keys_sha256" != "$post_start_keys_sha256" ]]; then
                 return 1
@@ -3144,7 +3239,8 @@ start_and_verify_service() {
                     return 1
                 verify_runtime_health || return 1
             fi
-            if [[ ( "$INSTALL_KIND" == "owned" || "$INSTALL_KIND" == "adopt" || "$INSTALL_KIND" == "handoff" ) &&
+            if [[ ( "$INSTALL_KIND" == "owned" || "$INSTALL_KIND" == "adopt" ||
+                "$INSTALL_KIND" == "handoff" ) &&
                 "$SERVICE_WAS_ACTIVE" == "0" &&
                 "$SERVICE_WAS_ENABLED" == "0" ]]; then
                 stop_owned_service
@@ -3213,8 +3309,14 @@ restore_full_backup() {
     cp -a "$ACTIVE_BACKUP/config/." "$CONFIG_DIR/" || return 1
     chown --reference="$ACTIVE_BACKUP/config" "$CONFIG_DIR" || return 1
     chmod --reference="$ACTIVE_BACKUP/config" "$CONFIG_DIR" || return 1
-    atomic_install_file "$ACTIVE_BACKUP/wdtt-server" "$BINARY_PATH" 0755 || return 1
-    atomic_install_file "$ACTIVE_BACKUP/wdtt.service" "$UNIT_PATH" 0644 || return 1
+    if [[ "$INSTALL_KIND" == "adopt-preserved" ]]; then
+        [[ "$(tr -d '\r\n' <"$ACTIVE_BACKUP/binary.state")" == "absent" &&
+            "$(tr -d '\r\n' <"$ACTIVE_BACKUP/unit.state")" == "absent" ]] || return 1
+        rm -f "$BINARY_PATH" "$UNIT_PATH"
+    else
+        atomic_install_file "$ACTIVE_BACKUP/wdtt-server" "$BINARY_PATH" 0755 || return 1
+        atomic_install_file "$ACTIVE_BACKUP/wdtt.service" "$UNIT_PATH" 0644 || return 1
+    fi
     case "$(tr -d '\r\n' <"$ACTIVE_BACKUP/ownership.state")" in
         present)
             atomic_install_file "$ACTIVE_BACKUP/ownership" "$OWNERSHIP_PATH" 0600 || return 1
@@ -3501,6 +3603,7 @@ rollback_loaded_transaction() {
     }
 
     if [[ "$INSTALL_KIND" == "owned" || "$INSTALL_KIND" == "adopt" ||
+        "$INSTALL_KIND" == "adopt-preserved" ||
         "$INSTALL_KIND" == "handoff" ]]; then
         if is_owned_install || [[ -f "$ACTIVE_BACKUP/wdtt.service" ]]; then
             stop_owned_service >/dev/null 2>&1 || true
@@ -3570,7 +3673,8 @@ rollback_loaded_transaction() {
         daemon_reload >/dev/null 2>&1 || true
     fi
 
-    if [[ "$INSTALL_KIND" == "adopt" || "$INSTALL_KIND" == "handoff" ]]; then
+    if [[ "$INSTALL_KIND" == "adopt" || "$INSTALL_KIND" == "adopt-preserved" ||
+        "$INSTALL_KIND" == "handoff" ]]; then
         [[ "$ACTIVE_BACKUP" == "$BACKUP_ROOT/$TRANSACTION_ID" ]] || return 1
         if [[ -d "$ACTIVE_BACKUP" && ! -L "$ACTIVE_BACKUP" ]]; then
             find "$ACTIVE_BACKUP" -mindepth 1 -delete 2>/dev/null || return 1
@@ -3614,6 +3718,7 @@ begin_transaction() {
     TRANSACTION_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$-$random_suffix"
     STAGING_DIR="$STAGING_ROOT/$TRANSACTION_ID"
     if [[ "$INSTALL_KIND" == "owned" || "$INSTALL_KIND" == "adopt" ||
+        "$INSTALL_KIND" == "adopt-preserved" ||
         "$INSTALL_KIND" == "handoff" ]]; then
         ACTIVE_BACKUP="$BACKUP_ROOT/$TRANSACTION_ID"
     else
@@ -3639,7 +3744,9 @@ apply_transaction() {
     stage_installation
     maybe_fail_at prepared
 
-    if [[ ( "$INSTALL_KIND" == "owned" || "$INSTALL_KIND" == "adopt" || "$INSTALL_KIND" == "handoff" ) && "$SERVICE_WAS_ACTIVE" == "1" ]]; then
+    if [[ ( "$INSTALL_KIND" == "owned" || "$INSTALL_KIND" == "adopt" ||
+        "$INSTALL_KIND" == "adopt-preserved" || "$INSTALL_KIND" == "handoff" ) &&
+        "$SERVICE_WAS_ACTIVE" == "1" ]]; then
         stop_owned_service
     fi
     TRANSACTION_PHASE="service_stopped"
@@ -3649,7 +3756,7 @@ apply_transaction() {
     create_full_backup
     TRANSACTION_PHASE="backup_complete"
     write_journal
-    if [[ "$INSTALL_KIND" == "adopt" ]]; then
+    if [[ "$INSTALL_KIND" == "adopt" || "$INSTALL_KIND" == "adopt-preserved" ]]; then
         harden_config_tree || die "Не удалось безопасно ужесточить права /etc/wdtt после резервного копирования."
     fi
     stage_owned_database_settings
@@ -3821,7 +3928,10 @@ perform_install() {
     fi
     local locked_target_kind="$locked_kind"
     INSTALL_KIND="$locked_kind"
-    [[ "$INSTALL_KIND" != "android" ]] || INSTALL_KIND="adopt"
+    case "$INSTALL_KIND" in
+        android) INSTALL_KIND="adopt" ;;
+        android-preserved) INSTALL_KIND="adopt-preserved" ;;
+    esac
     load_owned_runtime_defaults
     validate_options
     validate_network_prerequisites
@@ -3972,11 +4082,15 @@ perform_check() {
                 return 0
             fi
             ;;
-        android)
+        android|android-preserved)
             [[ -z "$INITIAL_CONFIG" ]] ||
                 die "Android-установка сохраняет текущий /etc/wdtt; --config не принимается."
             validate_target_state "$kind"
-            log "Обнаружена совместимая Android-установка. Для передачи под транзакционное управление запустите adopt-android с явным подтверждением."
+            if [[ "$kind" == "android-preserved" ]]; then
+                log "Обнаружены сохранённые Android-данные без установленной службы. Для безопасного восстановления под ручным управлением запустите adopt-android с явным подтверждением."
+            else
+                log "Обнаружена совместимая Android-установка. Для передачи под транзакционное управление запустите adopt-android с явным подтверждением."
+            fi
             ;;
         foreign)
             die "Обнаружена неизвестная или незавершённая установка; автоматические действия запрещены."
@@ -4283,7 +4397,7 @@ monitor_database() {
 perform_monitor() {
     local kind
     kind="$(detect_install_kind)"
-    if [[ "$kind" == "owned" || "$kind" == "android" ]]; then
+    if [[ "$kind" == "owned" || "$kind" == "android" || "$kind" == "android-preserved" ]]; then
         load_owned_runtime_defaults
     fi
 
@@ -4366,6 +4480,9 @@ perform_doctor() {
             ;;
         android)
             doctor_warn "состояние установки: совместимый Android-деплой; для полного ручного управления используйте adopt-android"
+            ;;
+        android-preserved)
+            doctor_warn "состояние установки: Android сохранил данные без службы; восстановите сервер во вкладке «Деплой» или используйте adopt-android"
             ;;
         new)
             doctor_warn "состояние установки: чистый сервер, WDTT Plus ещё не установлен"
@@ -4485,7 +4602,7 @@ perform_wizard() {
             die "Найдена незавершённая транзакция, но её журнал повреждён. Запустите doctor."
         fi
     fi
-    if [[ "$kind" == "owned" || "$kind" == "android" ]]; then
+    if [[ "$kind" == "owned" || "$kind" == "android" || "$kind" == "android-preserved" ]]; then
         load_owned_runtime_defaults
     fi
 
@@ -4502,16 +4619,20 @@ perform_wizard() {
 Скрипт не скачивает файлы из интернета, не меняет SSH и не трогает чужие службы.
 EOF
 
-    if [[ "$kind" == "android" ]]; then
+    if [[ "$kind" == "android" || "$kind" == "android-preserved" ]]; then
         print_compatibility_brief
+        local android_state_message="На сервере уже обнаружен совместимый Android-деплой."
+        if [[ "$kind" == "android-preserved" ]]; then
+            android_state_message="На сервере уже обнаружены сохранённые Android-данные без установленной службы."
+        fi
         cat <<EOF
 
-На сервере уже обнаружен совместимый Android-деплой.
+$android_state_message
 Мастер чистой ручной установки здесь не запускается: он не должен неявно
 захватывать установку, созданную приложением.
 
 Что можно сделать:
-  1) оставить управление из WDTT Plus для Android и обновлять сервер из вкладки «Деплой»;
+  1) оставить управление из WDTT Plus для Android и установить или обновить сервер из вкладки «Деплой»;
   2) если хотите дальше управлять сервером этим скриптом — вернитесь в меню и
      выберите «Принять совместимый Android-деплой под ручное управление».
 
@@ -5123,6 +5244,8 @@ main() {
                     fi
                 elif [[ "$journal_kind" == "adopt" ]]; then
                     RECOVERY_RESULT_KIND="android"
+                elif [[ "$journal_kind" == "adopt-preserved" ]]; then
+                    RECOVERY_RESULT_KIND="android-preserved"
                 elif [[ "$journal_kind" == "handoff" ]]; then
                     RECOVERY_RESULT_KIND="owned"
                 else
@@ -5130,15 +5253,18 @@ main() {
                 fi
                 question_kind="$RECOVERY_RESULT_KIND"
             fi
-            if [[ "$question_kind" == "owned" || "$question_kind" == "android" ]]; then
+            if [[ "$question_kind" == "owned" || "$question_kind" == "android" ||
+                "$question_kind" == "android-preserved" ]]; then
                 load_owned_runtime_defaults
             fi
             if [[ "$COMMAND" == "install" || "$COMMAND" == "adopt-android" ]]; then
-                if [[ "$COMMAND" == "install" && "$question_kind" == "android" ]]; then
-                    die "Сервер установлен Android-деплоем. Для безопасной передачи управления используйте adopt-android; обычный install не захватывает такие установки."
+                if [[ "$COMMAND" == "install" &&
+                    ( "$question_kind" == "android" || "$question_kind" == "android-preserved" ) ]]; then
+                    die "Обнаружены данные Android-деплоя. Для безопасной передачи управления используйте adopt-android; обычный install не захватывает такие установки."
                 fi
-                if [[ "$COMMAND" == "adopt-android" && "$question_kind" != "android" ]]; then
-                    die "adopt-android требует совместимую Android-установку; текущее состояние: $(friendly_install_kind "$question_kind")."
+                if [[ "$COMMAND" == "adopt-android" && "$question_kind" != "android" &&
+                    "$question_kind" != "android-preserved" ]]; then
+                    die "adopt-android требует совместимую Android-установку или строго отмеченные сохранённые Android-данные; текущее состояние: $(friendly_install_kind "$question_kind")."
                 fi
                 collect_install_questions "$question_kind"
                 perform_install "$local_kind"

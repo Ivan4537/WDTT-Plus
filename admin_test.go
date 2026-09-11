@@ -407,6 +407,91 @@ func TestAdminSocketAppliesClientChangesWithoutRestart(t *testing.T) {
 	request("delete", "--password", newPassword)
 }
 
+func TestBackupAdminCommandsRunOutsideTheLiveDatabaseCriticalSection(t *testing.T) {
+	for _, command := range []string{
+		"backup-status",
+		"backup-list",
+		"backup-configure",
+		"backup-create",
+		"backup-verify",
+		"backup-export",
+		"backup-delete",
+	} {
+		if !isServerBackupAdminCommand([]string{command}) {
+			t.Fatalf("backup command %q was not classified as an isolated operation", command)
+		}
+	}
+	for _, command := range []string{"list", "create", "update-settings", "cleanup-expired"} {
+		if isServerBackupAdminCommand([]string{command}) {
+			t.Fatalf("ordinary admin command %q was incorrectly classified as a backup operation", command)
+		}
+	}
+	if !serverBackupCommandNeedsDatabaseSnapshot([]string{"backup-create"}) ||
+		!serverBackupCommandNeedsDatabaseSnapshot([]string{"backup-configure"}) {
+		t.Fatal("backup creation and configuration must capture an immutable database snapshot")
+	}
+	if serverBackupCommandNeedsDatabaseSnapshot([]string{"backup-status"}) ||
+		serverBackupCommandNeedsDatabaseSnapshot([]string{"backup-export"}) {
+		t.Fatal("read-only backup commands must not copy or retain the live database")
+	}
+}
+
+func TestWaitingBackupRequestDoesNotBlockOrdinaryAdminDatabaseAccess(t *testing.T) {
+	configDir, loaded := backupTestConfig(t)
+	request := adminRequest{
+		MainPassword: loaded.MainPassword,
+		Args:         []string{"backup-create", "--reason", "manual"},
+	}
+
+	dbMutex.Lock()
+	db = loaded
+	dbFile = configDir + "/passwords.json"
+	serverBackupRequestMu.Lock()
+	requestMuLocked := true
+	defer func() {
+		if requestMuLocked {
+			serverBackupRequestMu.Unlock()
+		}
+	}()
+
+	backupResult := make(chan error, 1)
+	go func() {
+		_, err := executeLiveAdminRequest(configDir, request, nil)
+		backupResult <- err
+	}()
+	// Queue the backup request on dbMutex before the ordinary admin waiter.
+	time.Sleep(25 * time.Millisecond)
+	databaseAvailable := make(chan struct{})
+	go func() {
+		dbMutex.Lock()
+		dbMutex.Unlock()
+		close(databaseAvailable)
+	}()
+	dbMutex.Unlock()
+
+	select {
+	case <-databaseAvailable:
+		// The backup captured its immutable database state and released dbMutex
+		// even though the serialized filesystem phase is still waiting.
+	case <-time.After(2 * time.Second):
+		serverBackupRequestMu.Unlock()
+		requestMuLocked = false
+		<-backupResult
+		t.Fatal("backup request retained dbMutex while waiting for backup filesystem access")
+	}
+
+	serverBackupRequestMu.Unlock()
+	requestMuLocked = false
+	select {
+	case err := <-backupResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("backup request did not finish after filesystem access resumed")
+	}
+}
+
 func TestClientPasswordValidation(t *testing.T) {
 	valid := []string{"ABCDEFGHJKLMNPQR", "abcdefghjkmnpqrs", "23456789ABCDEFGH"}
 	for _, value := range valid {

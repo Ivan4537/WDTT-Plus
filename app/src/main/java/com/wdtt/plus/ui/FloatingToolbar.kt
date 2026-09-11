@@ -4,7 +4,6 @@ import android.content.Intent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.Spring
-import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
@@ -14,12 +13,12 @@ import androidx.compose.animation.scaleOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.focusGroup
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
@@ -35,24 +34,27 @@ import androidx.compose.ui.draw.scale
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalConfiguration
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.wdtt.plus.SettingsStore
+import com.wdtt.plus.ScreenOffMode
 import com.wdtt.plus.SleepBatteryMode
 import com.wdtt.plus.TunnelManager
 import com.wdtt.plus.TunnelService
 import com.wdtt.plus.TunnelStopCoordinator
 import com.wdtt.plus.TunnelStopResult
+import com.wdtt.plus.TUNNEL_MODE_VPN
+import com.wdtt.plus.tunnelModeNeedsVpnPermission
 import com.wdtt.plus.sanitizeVpnProfileNameInput
 import com.wdtt.plus.vpnProfileDefaultName
 import com.wdtt.plus.vpnProfileDisplayName
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.unit.IntOffset
 import com.wdtt.plus.R
 import android.os.Build
 import androidx.compose.ui.graphics.Color
@@ -70,6 +72,17 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 
 private const val PROFILE_RESET_TIMEOUT_MS = 10_000L
+
+internal fun floatingToolbarMaxOffset(
+    parentHeightPx: Float,
+    safeBottomPx: Float,
+    toolbarHeightPx: Float,
+    navigationReservePx: Float,
+    bottomGapPx: Float,
+    minOffsetY: Float,
+): Float = (
+    parentHeightPx - safeBottomPx - navigationReservePx - toolbarHeightPx - bottomGapPx
+    ).coerceAtLeast(minOffsetY)
 
 @OptIn(ExperimentalLayoutApi::class, ExperimentalFoundationApi::class)
 @Composable
@@ -100,19 +113,22 @@ fun FloatingToolbar(
     val trustedWifiEnabled by settingsStore.trustedWifiEnabled.collectAsStateWithLifecycle(initialValue = false)
     val trustedWifiSsids by settingsStore.trustedWifiSsids.collectAsStateWithLifecycle(initialValue = emptyList())
     val trustedWifiRuntime by com.wdtt.plus.TrustedWifiManager.state.collectAsStateWithLifecycle()
-    val pauseVpnDuringSleep by settingsStore.pauseVpnDuringSleep.collectAsStateWithLifecycle(initialValue = false)
+    val screenOffMode by settingsStore.screenOffMode.collectAsStateWithLifecycle(
+        initialValue = ScreenOffMode.BALANCED,
+    )
+    val selectedTunnelMode by settingsStore.proxyMode.collectAsStateWithLifecycle(
+        initialValue = TUNNEL_MODE_VPN,
+    )
     val pauseVpnDuringSleepDelayMinutes by
         settingsStore.pauseVpnDuringSleepDelayMinutes.collectAsStateWithLifecycle(initialValue = 5)
     val sleepBatteryMode by
         settingsStore.sleepBatteryMode.collectAsStateWithLifecycle(initialValue = SleepBatteryMode.DELAYED_PAUSE)
     val resumeVpnDuringSleepDelayMinutes by
         settingsStore.resumeVpnDuringSleepDelayMinutes.collectAsStateWithLifecycle(initialValue = 5)
-    val sleepBatterySettingsConfigured by
-        settingsStore.sleepBatterySettingsConfigured.collectAsStateWithLifecycle(initialValue = false)
     val customVkCredentialsEnabled by settingsStore.customVkCredentialsEnabled.collectAsStateWithLifecycle(initialValue = false)
     val customVkCredentialsComplete by settingsStore.customVkCredentialsComplete.collectAsStateWithLifecycle(initialValue = false)
     val savedToolbarYFraction by settingsStore.floatingToolbarYFraction.collectAsStateWithLifecycle(
-        initialValue = -2f
+        initialValue = -2f,
     )
     val tunnelRunning by TunnelManager.running.collectAsStateWithLifecycle()
     val tunnelTransition by TunnelManager.transition.collectAsStateWithLifecycle()
@@ -122,19 +138,11 @@ fun FloatingToolbar(
     val screenHeightPx = remember(configuration.screenHeightDp, density) {
         with(density) { configuration.screenHeightDp.dp.toPx() }
     }
-    val screenWidthPx = remember(configuration.screenWidthDp, density) {
-        with(density) { configuration.screenWidthDp.dp.toPx() }
-    }
-
-    var parentWidthPx by remember { mutableFloatStateOf(0f) }
     var parentHeightPx by remember { mutableFloatStateOf(0f) }
-
+    var tabHeightPx by remember { mutableFloatStateOf(0f) }
     var offsetY by remember { mutableFloatStateOf(-1f) }
     var toolbarPositionRestored by remember { mutableStateOf(false) }
-    var isRightSide by rememberSaveable { mutableStateOf(true) }
     var isExpanded by rememberSaveable { mutableStateOf(false) }
-    var tabHeightPx by remember { mutableFloatStateOf(0f) }
-    var panelHeightPx by remember { mutableFloatStateOf(0f) }
     var renamingProfile by remember { mutableStateOf<Int?>(null) }
     var resettingProfile by remember { mutableStateOf<Int?>(null) }
     var resetCountdown by remember { mutableIntStateOf(5) }
@@ -144,10 +152,11 @@ fun FloatingToolbar(
     var enableTrustedWifiAfterSetup by rememberSaveable { mutableStateOf(false) }
     var showVkClientSettings by rememberSaveable { mutableStateOf(false) }
     var showSleepTimerSettings by rememberSaveable { mutableStateOf(false) }
+    var showScreenOffModeSettings by rememberSaveable { mutableStateOf(false) }
+    var screenOffModeDraftName by rememberSaveable { mutableStateOf<String?>(null) }
 
     val tabWidthDp = 42.dp
     val tabHeightDp = 52.dp
-    val panelWidthDp = 220.dp
     // Move the thumb immediately on tap instead of waiting for the DataStore round trip.
     // The persisted value still remains the source of truth and resynchronizes this state.
     var displayedInterfaceRole by remember(interfaceRole, adminModeAllowed) {
@@ -165,32 +174,21 @@ fun FloatingToolbar(
         }
     }
 
-    val tabWidthPx = remember(density) { with(density) { tabWidthDp.toPx() } }
     val fallbackTabHeightPx = remember(density) { with(density) { tabHeightDp.toPx() } }
     val edgePaddingPx = remember(density) { with(density) { 8.dp.toPx() } }
+    val bottomGapPx = remember(density) { with(density) { 4.dp.toPx() } }
+    val navigationReservePx = remember(density) { with(density) { 96.dp.toPx() } }
     val safeTopPx = WindowInsets.safeDrawing.getTop(density).toFloat()
     val safeBottomPx = WindowInsets.safeDrawing.getBottom(density).toFloat()
-    val effectiveTabHeightPx = maxOf(tabHeightPx, fallbackTabHeightPx)
-    val floatingHeightPx = if (isExpanded && panelHeightPx > 0f) {
-        maxOf(effectiveTabHeightPx, panelHeightPx)
-    } else {
-        effectiveTabHeightPx
-    }
-    
     val currentParentHeight = if (parentHeightPx > 0f) parentHeightPx else screenHeightPx
-    val currentParentWidth = if (parentWidthPx > 0f) parentWidthPx else screenWidthPx
-
     val minOffsetY = safeTopPx + edgePaddingPx
-    val maxOffsetY = (currentParentHeight - safeBottomPx - floatingHeightPx - edgePaddingPx)
-        .coerceAtLeast(minOffsetY)
-    val defaultOffsetY = (currentParentHeight * 0.30f).coerceIn(minOffsetY, maxOffsetY)
-
-    val targetXPx = if (isRightSide) currentParentWidth - tabWidthPx else 0f
-
-    val animatedTabXPx by animateFloatAsState(
-        targetValue = targetXPx,
-        animationSpec = spring(stiffness = Spring.StiffnessLow),
-        label = "tab_shift"
+    val maxOffsetY = floatingToolbarMaxOffset(
+        parentHeightPx = currentParentHeight,
+        safeBottomPx = safeBottomPx,
+        toolbarHeightPx = maxOf(tabHeightPx, fallbackTabHeightPx),
+        navigationReservePx = navigationReservePx,
+        bottomGapPx = bottomGapPx,
+        minOffsetY = minOffsetY,
     )
 
     LaunchedEffect(savedToolbarYFraction, minOffsetY, maxOffsetY) {
@@ -199,7 +197,10 @@ fun FloatingToolbar(
             if (savedToolbarYFraction >= 0f && maxOffsetY > minOffsetY) {
                 minOffsetY + (maxOffsetY - minOffsetY) * savedToolbarYFraction
             } else {
-                defaultOffsetY
+                // A new installation starts above the bottom navigation, as
+                // shown in the main tunnel layout. The thumb remains freely
+                // movable along the right edge and its chosen position is saved.
+                maxOffsetY
             }
         } else {
             offsetY.coerceIn(minOffsetY, maxOffsetY)
@@ -218,24 +219,20 @@ fun FloatingToolbar(
         scope.launch { settingsStore.saveFloatingToolbarYFraction(fraction) }
     }
 
-    val tabShape = if (isRightSide) {
-        RoundedCornerShape(topStart = 14.dp, bottomStart = 14.dp)
-    } else {
-        RoundedCornerShape(topEnd = 14.dp, bottomEnd = 14.dp)
-    }
+    val tabShape = RoundedCornerShape(topStart = 14.dp, bottomStart = 14.dp)
 
     Box(
         modifier = modifier
             .fillMaxSize()
             .onGloballyPositioned { coordinates ->
-                parentWidthPx = coordinates.size.width.toFloat()
                 parentHeightPx = coordinates.size.height.toFloat()
             }
     ) {
         Surface(
             onClick = { isExpanded = !isExpanded },
             modifier = Modifier
-                .offset { IntOffset(animatedTabXPx.roundToInt(), offsetY.roundToInt()) }
+                .align(Alignment.TopEnd)
+                .offset { IntOffset(0, offsetY.coerceAtLeast(minOffsetY).roundToInt()) }
                 .remoteCompactFocus(tabShape)
                 .onGloballyPositioned { coordinates ->
                     tabHeightPx = coordinates.size.height.toFloat()
@@ -247,7 +244,7 @@ fun FloatingToolbar(
                         onDrag = { change, dragAmount ->
                             change.consume()
                             offsetY = (offsetY + dragAmount.y).coerceIn(minOffsetY, maxOffsetY)
-                        }
+                        },
                     )
                 },
             shape = tabShape,
@@ -375,72 +372,79 @@ fun FloatingToolbar(
                         color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
                     )
 
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 4.dp, vertical = 4.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(
+                    if (tunnelModeNeedsVpnPermission(selectedTunnelMode)) {
+                        Row(
                             modifier = Modifier
-                                .weight(1f)
-                                .remoteFocusOutline(RoundedCornerShape(8.dp))
-                                .clickable {
-                                    enableTrustedWifiAfterSetup = false
-                                    showTrustedWifiSettings = true
-                                }
-                                .padding(horizontal = 8.dp, vertical = 6.dp)
+                                .fillMaxWidth()
+                                .padding(horizontal = 4.dp, vertical = 4.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Text(
-                                "Доверенные сети Wi‑Fi",
-                                style = MaterialTheme.typography.bodyMedium,
-                                fontWeight = FontWeight.SemiBold,
-                                color = MaterialTheme.colorScheme.onSurface
-                            )
-                            Text(
-                                when {
-                                    trustedWifiRuntime.waiting -> "VPN ожидает выхода из сети"
-                                    trustedWifiSsids.isEmpty() ->
-                                        "Сети не настроены · нажмите для настройки"
-                                    trustedWifiEnabled ->
-                                        "Включено · сетей: ${trustedWifiSsids.size}"
-                                    else ->
-                                        "Выключено · сохранено сетей: ${trustedWifiSsids.size}"
-                                },
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                lineHeight = 15.sp
-                            )
-                        }
-                        Switch(
-                            checked = trustedWifiEnabled,
-                            onCheckedChange = { enabled ->
-                                if (enabled && trustedWifiSsids.isEmpty()) {
-                                    enableTrustedWifiAfterSetup = true
-                                    showTrustedWifiSettings = true
-                                } else {
-                                    scope.launch {
-                                        settingsStore.saveTrustedWifiEnabled(enabled)
-                                        if (TunnelManager.running.value || trustedWifiRuntime.waiting) {
-                                            runCatching {
-                                                context.startService(
-                                                    Intent(context, TunnelService::class.java).apply {
-                                                        action = "TRUSTED_WIFI_RECHECK"
-                                                    }
-                                                )
+                            Column(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .remoteFocusOutline(RoundedCornerShape(8.dp))
+                                    .clickable {
+                                        enableTrustedWifiAfterSetup = false
+                                        showTrustedWifiSettings = true
+                                    }
+                                    .padding(end = 8.dp, top = 6.dp, bottom = 6.dp)
+                            ) {
+                                Text(
+                                    "Доверенные сети Wi‑Fi",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                                Text(
+                                    when {
+                                        trustedWifiRuntime.waiting -> "VPN ожидает выхода из сети"
+                                        trustedWifiSsids.isEmpty() ->
+                                            "Сети не настроены · нажмите для настройки"
+                                        trustedWifiEnabled ->
+                                            "Включено · сетей: ${trustedWifiSsids.size}"
+                                        else ->
+                                            "Выключено · сохранено сетей: ${trustedWifiSsids.size}"
+                                    },
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    lineHeight = 15.sp
+                                )
+                            }
+                            Switch(
+                                checked = trustedWifiEnabled,
+                                onCheckedChange = { enabled ->
+                                    if (enabled && trustedWifiSsids.isEmpty()) {
+                                        enableTrustedWifiAfterSetup = true
+                                        showTrustedWifiSettings = true
+                                    } else {
+                                        scope.launch {
+                                            settingsStore.saveTrustedWifiEnabled(enabled)
+                                            if (TunnelManager.running.value || trustedWifiRuntime.waiting) {
+                                                runCatching {
+                                                    context.startService(
+                                                        Intent(context, TunnelService::class.java).apply {
+                                                            action = "TRUSTED_WIFI_RECHECK"
+                                                        }
+                                                    )
+                                                }
                                             }
                                         }
                                     }
-                                }
-                            },
-                            modifier = Modifier.remoteSwitchFocus().scale(0.85f)
-                        )
+                                },
+                                modifier = Modifier.remoteSwitchFocus().scale(0.85f)
+                            )
+                        }
                     }
 
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
+                            .remoteFocusOutline(RoundedCornerShape(8.dp))
+                            .clickable {
+                                screenOffModeDraftName = screenOffMode.name
+                                showScreenOffModeSettings = true
+                            }
                             .padding(horizontal = 4.dp, vertical = 4.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
@@ -448,50 +452,32 @@ fun FloatingToolbar(
                         Column(
                             modifier = Modifier
                                 .weight(1f)
-                                .remoteFocusOutline(RoundedCornerShape(8.dp))
-                                .clickable { showSleepTimerSettings = true }
-                                .padding(horizontal = 8.dp, vertical = 6.dp)
+                                .padding(end = 8.dp, top = 6.dp, bottom = 6.dp)
                         ) {
                             Text(
-                                "Экономия батареи во сне",
+                                "Работа при выключенном экране",
                                 style = MaterialTheme.typography.bodyMedium,
                                 fontWeight = FontWeight.SemiBold,
                                 color = MaterialTheme.colorScheme.onSurface
                             )
                             Text(
-                                if (pauseVpnDuringSleep) {
-                                    when (sleepBatteryMode) {
+                                when (screenOffMode) {
+                                    ScreenOffMode.BALANCED -> "Сбалансированно"
+                                    ScreenOffMode.HOLD_CONNECTION ->
+                                        "Удерживать соединение · повышенный расход батареи"
+                                    ScreenOffMode.SAVE_BATTERY -> when (sleepBatteryMode) {
                                         SleepBatteryMode.DELAYED_PAUSE ->
                                             if (pauseVpnDuringSleepDelayMinutes == 0) {
-                                                "Отключение сразу после выключения экрана"
+                                                "Экономить батарею · отключение сразу"
                                             } else {
-                                                "Отключение через ${formatSleepTimerDuration(pauseVpnDuringSleepDelayMinutes)}"
+                                                "Экономить батарею · отключение через ${formatSleepTimerDuration(pauseVpnDuringSleepDelayMinutes)}"
                                             }
                                         SleepBatteryMode.TIMED_PAUSE ->
                                             if (resumeVpnDuringSleepDelayMinutes == 0) {
-                                                "Таймер 0 мин · VPN останется активным"
+                                                "Экономить батарею · таймер выключен"
                                             } else {
-                                                "Сразу выключится · включение через ${formatSleepTimerDuration(resumeVpnDuringSleepDelayMinutes)}"
+                                                "Экономить батарею · включение через ${formatSleepTimerDuration(resumeVpnDuringSleepDelayMinutes)}"
                                             }
-                                    }
-                                } else {
-                                    if (sleepBatterySettingsConfigured) {
-                                        when (sleepBatteryMode) {
-                                            SleepBatteryMode.DELAYED_PAUSE ->
-                                                if (pauseVpnDuringSleepDelayMinutes == 0) {
-                                                    "Выключено · сохранено немедленное отключение"
-                                                } else {
-                                                    "Выключено · сохранено отключение через ${formatSleepTimerDuration(pauseVpnDuringSleepDelayMinutes)}"
-                                                }
-                                            SleepBatteryMode.TIMED_PAUSE ->
-                                                if (resumeVpnDuringSleepDelayMinutes == 0) {
-                                                    "Выключено · сохранён таймер 0 мин"
-                                                } else {
-                                                    "Выключено · сохранено включение через ${formatSleepTimerDuration(resumeVpnDuringSleepDelayMinutes)}"
-                                                }
-                                        }
-                                    } else {
-                                        "VPN остаётся активным · нажмите для настройки"
                                     }
                                 },
                                 style = MaterialTheme.typography.bodySmall,
@@ -499,33 +485,7 @@ fun FloatingToolbar(
                                 lineHeight = 15.sp
                             )
                         }
-                        Switch(
-                            checked = pauseVpnDuringSleep,
-                            onCheckedChange = { enabled ->
-                                if (enabled) {
-                                    if (sleepBatterySettingsConfigured) {
-                                        scope.launch {
-                                            settingsStore.savePauseVpnDuringSleep(true)
-                                            TunnelManager.noteSleepBatteryEvent(
-                                                "settings_enabled",
-                                                "Экономия батареи во сне включена; сохранённый сценарий применится при следующем выключении экрана.",
-                                            )
-                                        }
-                                    } else {
-                                        showSleepTimerSettings = true
-                                    }
-                                } else {
-                                    scope.launch {
-                                        settingsStore.savePauseVpnDuringSleep(false)
-                                        TunnelManager.noteSleepBatteryEvent(
-                                            "settings_disabled",
-                                            "Экономия батареи во сне выключена.",
-                                        )
-                                    }
-                                }
-                            },
-                            modifier = Modifier.remoteSwitchFocus().scale(0.85f)
-                        )
+                        Text("›", style = MaterialTheme.typography.titleLarge)
                     }
 
                     HorizontalDivider(
@@ -550,9 +510,9 @@ fun FloatingToolbar(
                                     !adminModeAllowed ->
                                         "Режим «Админ» доступен для самостоятельного профиля"
                                     isAdminRole ->
-                                        "VPN и настройка своего сервера"
+                                        "Подключение и настройка своего сервера"
                                     else ->
-                                        "Подключение и работа VPN"
+                                        "Подключение через выбранный режим"
                                 },
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -802,8 +762,8 @@ fun FloatingToolbar(
                             check(stopResult.succeeded) {
                                 when (stopResult) {
                                     TunnelStopResult.TIMED_OUT ->
-                                        "VPN не остановился за отведённое время"
-                                    else -> "Не удалось остановить VPN"
+                                        "Соединение не остановилось за отведённое время"
+                                    else -> "Не удалось остановить соединение"
                                 }
                             }
                         }
@@ -856,6 +816,38 @@ fun FloatingToolbar(
         )
     }
 
+    if (showScreenOffModeSettings) {
+        ScreenOffModeDialog(
+            initialMode = ScreenOffMode.entries.firstOrNull {
+                it.name == screenOffModeDraftName
+            } ?: screenOffMode,
+            onApply = { mode ->
+                scope.launch {
+                    settingsStore.saveScreenOffMode(mode)
+                    TunnelManager.noteSleepBatteryEvent(
+                        "screen_off_mode_saved",
+                        "Режим работы при выключенном экране: " + when (mode) {
+                            ScreenOffMode.BALANCED -> "сбалансированно"
+                            ScreenOffMode.HOLD_CONNECTION -> "удерживать соединение"
+                            ScreenOffMode.SAVE_BATTERY -> "экономить батарею"
+                        } + ".",
+                    )
+                }
+                screenOffModeDraftName = null
+                showScreenOffModeSettings = false
+            },
+            onConfigureBatterySaving = { selectedMode ->
+                screenOffModeDraftName = selectedMode.name
+                showScreenOffModeSettings = false
+                showSleepTimerSettings = true
+            },
+            onDismiss = {
+                screenOffModeDraftName = null
+                showScreenOffModeSettings = false
+            },
+        )
+    }
+
     if (showSleepTimerSettings) {
         SleepTimerDialog(
             initialMode = sleepBatteryMode,
@@ -883,9 +875,13 @@ fun FloatingToolbar(
                         "Настройки сохранены: $description.",
                     )
                 }
+                screenOffModeDraftName = null
                 showSleepTimerSettings = false
             },
-            onDismiss = { showSleepTimerSettings = false },
+            onDismiss = {
+                showSleepTimerSettings = false
+                showScreenOffModeSettings = true
+            },
         )
     }
 }
@@ -1055,7 +1051,7 @@ private fun ProfileResetDialog(
                             Text(
                                 buildString {
                                     append("На самом VPS и в других профилях ничего не удаляется.")
-                                    if (disconnectsActiveVpn) append(" Активное VPN-подключение этого профиля будет остановлено.")
+                                    if (disconnectsActiveVpn) append(" Активное соединение этого профиля будет остановлено.")
                                 },
                                 modifier = Modifier.padding(14.dp),
                                 style = MaterialTheme.typography.bodySmall,

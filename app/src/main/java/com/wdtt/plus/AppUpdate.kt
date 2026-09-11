@@ -34,6 +34,7 @@ private const val GITHUB_TAG_TREE_URL_PREFIX = "https://github.com/Ivan4537/WDTT
 private const val UPDATE_CHECK_TOTAL_TIMEOUT_MS = 25_000L
 private const val UPDATE_CHECK_REQUEST_TIMEOUT_MS = 6_000L
 private const val UPDATE_CHECK_MIN_REQUEST_TIMEOUT_MS = 1_000L
+private const val UPDATE_CHECK_DIRECT_HEDGE_TIMEOUT_MS = 3_000L
 private const val UPDATE_APK_HASH_TIMEOUT_MS = 4_000L
 private const val MAX_UPDATE_APK_BYTES = 200L * 1024L * 1024L
 private const val MAX_UPDATE_METADATA_BYTES = 1024 * 1024
@@ -95,6 +96,14 @@ data class AppUpdateDownloadProgress(
         get() = fraction?.let { (it * 100).toInt().coerceIn(0, 100) }
 }
 
+internal fun shouldFallbackSlowDirectUpdateDownload(
+    relayAvailable: Boolean,
+    downloadedBytes: Long,
+    elapsedMs: Long,
+): Boolean = relayAvailable &&
+    elapsedMs >= 8_000L &&
+    downloadedBytes * 1000L < elapsedMs * 64L * 1024L
+
 enum class RemoteVersionSource {
     Release,
     Tag
@@ -147,7 +156,11 @@ private class UpdateCheckBudget(
 }
 
 suspend fun fetchLatestReleaseInfo(localVersion: String? = null): AppReleaseInfo? = withContext(Dispatchers.IO) {
-    val budget = UpdateCheckBudget()
+    fetchLatestReleaseInfoWithBudget(localVersion, UPDATE_CHECK_TOTAL_TIMEOUT_MS)
+}
+
+private fun fetchLatestReleaseInfoWithBudget(localVersion: String?, timeoutMs: Long): AppReleaseInfo? {
+    val budget = UpdateCheckBudget(timeoutMs)
     val webRelease = fetchReleaseFromLatestWebRedirect(budget)
     val apiRelease = fetchReleaseFromLatestEndpoint(budget) ?: fetchLatestStableReleaseFromList(budget)
     val latestRelease = when {
@@ -158,12 +171,110 @@ suspend fun fetchLatestReleaseInfo(localVersion: String? = null): AppReleaseInfo
     }
     val latestTag = fetchLatestTagFromList(budget)
 
-    when {
+    return when {
         latestRelease == null -> latestTag
         latestTag == null -> latestRelease
         isNewerVersion(latestRelease.versionTag, latestTag.versionTag) -> latestTag
         else -> latestRelease
     }
+}
+
+suspend fun fetchLatestReleaseInfo(_context: Context, localVersion: String? = null): AppReleaseInfo? =
+    withContext(Dispatchers.IO) {
+        val relayAvailable = TunnelManager.isUpdateRelayAvailable()
+        val directTimeout = if (relayAvailable) {
+            UPDATE_CHECK_DIRECT_HEDGE_TIMEOUT_MS
+        } else {
+            UPDATE_CHECK_TOTAL_TIMEOUT_MS
+        }
+        val direct = runCatching {
+            fetchLatestReleaseInfoWithBudget(localVersion, directTimeout)
+        }.getOrNull()
+        if (direct != null && (!relayAvailable || selectUpdateApkAsset(direct) != null)) {
+            return@withContext direct
+        }
+        val relayed = TunnelManager.fetchUpdateMetadataThroughTunnel()
+            ?.let(::parseRelayedUpdateMetadata)
+        if (relayed != null) {
+            Log.i(UPDATE_LOG_TAG, "Update check: direct access failed, metadata received through active WDTT tunnel")
+            return@withContext when {
+                direct == null -> relayed
+                isNewerVersion(relayed.versionTag, direct.versionTag) -> direct
+                else -> relayed
+            }
+        }
+        direct
+    }
+
+internal fun parseRelayedUpdateMetadata(payload: String): AppReleaseInfo? {
+    if (payload.isBlank() || payload.length > 64 * 1024) return null
+    val json = runCatching { JSONObject(payload) }.getOrNull() ?: return null
+    val versionTag = normalizeVersionTag(json.optString("version_tag"))
+    if (versionTag.isBlank()) return null
+    val source = when (json.optString("source")) {
+        "release" -> RemoteVersionSource.Release
+        "tag" -> RemoteVersionSource.Tag
+        else -> return null
+    }
+    val releaseUrl = json.optString("release_url").trim()
+    if (!isTrustedRelayedReleaseUrl(releaseUrl, versionTag, source)) return null
+    val assets = if (source == RemoteVersionSource.Release) {
+        buildList {
+            val values = json.optJSONArray("assets") ?: JSONArray()
+            for (index in 0 until minOf(values.length(), 8)) {
+                val asset = values.optJSONObject(index) ?: continue
+                val name = asset.optString("name").trim()
+                val downloadUrl = asset.optString("download_url").trim()
+                val size = asset.optLong("size", 0L)
+                if (
+                    name.isBlank() || name.length > 200 || '/' in name || '\\' in name ||
+                    size !in 1..MAX_UPDATE_APK_BYTES ||
+                    !isTrustedUpdateDownloadUrl(downloadUrl, initialRequest = true)
+                ) {
+                    continue
+                }
+                add(
+                    AppReleaseAsset(
+                        name = name,
+                        downloadUrl = downloadUrl,
+                        sizeBytes = size,
+                        digest = asset.optString("digest").trim(),
+                    )
+                )
+            }
+        }
+    } else {
+        emptyList()
+    }
+    return AppReleaseInfo(
+        versionTag = versionTag,
+        releaseUrl = releaseUrl,
+        source = source,
+        assets = assets,
+    )
+}
+
+private fun isTrustedRelayedReleaseUrl(
+    value: String,
+    versionTag: String,
+    source: RemoteVersionSource,
+): Boolean {
+    val uri = runCatching { java.net.URI(value) }.getOrNull() ?: return false
+    if (
+        !uri.scheme.equals("https", ignoreCase = true) ||
+        !uri.host.equals("github.com", ignoreCase = true) ||
+        !uri.rawUserInfo.isNullOrBlank() ||
+        (uri.port != -1 && uri.port != 443) ||
+        !uri.rawQuery.isNullOrBlank() ||
+        !uri.rawFragment.isNullOrBlank()
+    ) {
+        return false
+    }
+    val expectedPath = when (source) {
+        RemoteVersionSource.Release -> "/Ivan4537/WDTT-Plus/releases/tag/$versionTag"
+        RemoteVersionSource.Tag -> "/Ivan4537/WDTT-Plus/tree/$versionTag"
+    }
+    return uri.path == expectedPath
 }
 
 suspend fun resolveAppUpdateCandidate(
@@ -231,7 +342,7 @@ suspend fun downloadUpdateApk(
     }
 
     val outputFile = File(updatesDir, asset.name.safeUpdateAssetName())
-    var conn: HttpURLConnection? = null
+    val relayAvailable = TunnelManager.isUpdateRelayAvailable()
 
     suspend fun emit(downloaded: Long, total: Long) {
         withContext(Dispatchers.Main) {
@@ -239,97 +350,139 @@ suspend fun downloadUpdateApk(
         }
     }
 
-    try {
-        var currentUrl = URL(asset.downloadUrl)
-        var responseCode = 0
-        for (redirect in 0..MAX_UPDATE_REDIRECTS) {
-            val currentConnection = currentUrl.openConnection() as HttpURLConnection
-            conn = currentConnection
-            applyNoCacheHeaders(currentConnection)
-            currentConnection.instanceFollowRedirects = false
-            currentConnection.requestMethod = "GET"
-            currentConnection.setRequestProperty(
-                "Accept",
-                "application/vnd.android.package-archive,application/octet-stream",
-            )
-            currentConnection.setRequestProperty(
-                "User-Agent",
-                "WDTTAndroid/${BuildConfig.VERSION_NAME}",
-            )
-            currentConnection.connectTimeout = 15_000
-            currentConnection.readTimeout = 30_000
-            responseCode = currentConnection.responseCode
-            if (responseCode !in 300..399) break
-            val location = currentConnection.getHeaderField("Location")
-                ?.takeIf { it.isNotBlank() }
-                ?: throw IOException("GitHub вернул перенаправление без адреса.")
-            if (redirect >= MAX_UPDATE_REDIRECTS) {
-                throw IOException("GitHub вернул слишком много перенаправлений.")
+    suspend fun downloadDirect(): File {
+        var conn: HttpURLConnection? = null
+        try {
+            var currentUrl = URL(asset.downloadUrl)
+            var responseCode = 0
+            for (redirect in 0..MAX_UPDATE_REDIRECTS) {
+                val currentConnection = currentUrl.openConnection() as HttpURLConnection
+                conn = currentConnection
+                applyNoCacheHeaders(currentConnection)
+                currentConnection.instanceFollowRedirects = false
+                currentConnection.requestMethod = "GET"
+                currentConnection.setRequestProperty(
+                    "Accept",
+                    "application/vnd.android.package-archive,application/octet-stream",
+                )
+                currentConnection.setRequestProperty(
+                    "User-Agent",
+                    "WDTTAndroid/${BuildConfig.VERSION_NAME}",
+                )
+                currentConnection.connectTimeout = if (relayAvailable) 3_000 else 15_000
+                currentConnection.readTimeout = if (relayAvailable) 5_000 else 30_000
+                responseCode = currentConnection.responseCode
+                if (responseCode !in 300..399) break
+                val location = currentConnection.getHeaderField("Location")
+                    ?.takeIf { it.isNotBlank() }
+                    ?: throw IOException("GitHub вернул перенаправление без адреса.")
+                if (redirect >= MAX_UPDATE_REDIRECTS) {
+                    throw IOException("GitHub вернул слишком много перенаправлений.")
+                }
+                val nextUrl = URL(currentUrl, location)
+                require(isTrustedUpdateDownloadUrl(nextUrl.toString(), initialRequest = false)) {
+                    "GitHub перенаправил загрузку на недоверенный адрес."
+                }
+                currentConnection.disconnect()
+                conn = null
+                currentUrl = nextUrl
             }
-            val nextUrl = URL(currentUrl, location)
-            require(isTrustedUpdateDownloadUrl(nextUrl.toString(), initialRequest = false)) {
-                "GitHub перенаправил загрузку на недоверенный адрес."
+            val activeConnection = conn ?: throw IOException("Не удалось открыть загрузку APK.")
+            if (responseCode !in 200..299) {
+                throw IOException("GitHub вернул HTTP $responseCode при скачивании APK")
             }
-            currentConnection.disconnect()
-            conn = null
-            currentUrl = nextUrl
-        }
-        val activeConnection = conn ?: throw IOException("Не удалось открыть загрузку APK.")
-        if (responseCode !in 200..299) {
-            throw IOException("GitHub вернул HTTP $responseCode при скачивании APK")
-        }
 
-        val responseLength = activeConnection.contentLengthLong
-        if (responseLength > MAX_UPDATE_APK_BYTES) {
-            throw IOException("APK превышает безопасный лимит размера.")
-        }
-        if (responseLength > 0L && responseLength != asset.sizeBytes) {
-            throw IOException("Размер APK не совпал с данными выпуска.")
-        }
-        val total = asset.sizeBytes
-        var downloaded = 0L
-        var lastEmitAt = 0L
-        emit(0L, total)
+            val responseLength = activeConnection.contentLengthLong
+            if (responseLength > MAX_UPDATE_APK_BYTES) {
+                throw IOException("APK превышает безопасный лимит размера.")
+            }
+            if (responseLength > 0L && responseLength != asset.sizeBytes) {
+                throw IOException("Размер APK не совпал с данными выпуска.")
+            }
+            val total = asset.sizeBytes
+            var downloaded = 0L
+            var lastEmitAt = 0L
+            val directStartedAt = System.currentTimeMillis()
+            emit(0L, total)
 
-        activeConnection.inputStream.use { input ->
-            outputFile.outputStream().use { output ->
-                val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-                while (true) {
-                    val read = input.read(buffer)
-                    if (read < 0) break
-                    output.write(buffer, 0, read)
-                    downloaded += read
-                    if (downloaded > MAX_UPDATE_APK_BYTES || downloaded > asset.sizeBytes) {
-                        throw IOException("APK превышает заявленный размер.")
-                    }
-                    val now = System.currentTimeMillis()
-                    if (now - lastEmitAt >= 250L || downloaded == total) {
-                        lastEmitAt = now
-                        emit(downloaded, total)
+            activeConnection.inputStream.use { input ->
+                outputFile.outputStream().use { output ->
+                    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read < 0) break
+                        output.write(buffer, 0, read)
+                        downloaded += read
+                        if (downloaded > MAX_UPDATE_APK_BYTES || downloaded > asset.sizeBytes) {
+                            throw IOException("APK превышает заявленный размер.")
+                        }
+                        val now = System.currentTimeMillis()
+                        val elapsed = now - directStartedAt
+                        if (shouldFallbackSlowDirectUpdateDownload(relayAvailable, downloaded, elapsed)) {
+                            throw IOException("Прямая загрузка слишком медленная; переключаюсь на WDTT Plus")
+                        }
+                        if (now - lastEmitAt >= 250L || downloaded == total) {
+                            lastEmitAt = now
+                            emit(downloaded, total)
+                        }
                     }
                 }
             }
-        }
 
-        if (asset.sizeBytes > 0L && outputFile.length() != asset.sizeBytes) {
-            outputFile.delete()
-            throw IOException("Размер APK не совпал с GitHub asset")
-        }
+            if (asset.sizeBytes > 0L && outputFile.length() != asset.sizeBytes) {
+                outputFile.delete()
+                throw IOException("Размер APK не совпал с GitHub asset")
+            }
 
+            val actual = outputFile.sha256Hex()
+            if (!actual.equals(expectedSha256, ignoreCase = true)) {
+                outputFile.delete()
+                throw SecurityException("SHA-256 скачанного APK не совпал с GitHub digest")
+            }
+            validateUpdatePackage(appContext, outputFile)
+
+            emit(outputFile.length(), total.takeIf { it > 0L } ?: outputFile.length())
+            return outputFile
+        } finally {
+            conn?.disconnect()
+        }
+    }
+
+    val directFailure = try {
+        return@withContext downloadDirect()
+    } catch (error: Exception) {
+        outputFile.delete()
+        error
+    }
+
+    Log.i(UPDATE_LOG_TAG, "Update download: direct access failed, trying active WDTT tunnel")
+    emit(0L, asset.sizeBytes)
+    val downloadedThroughTunnel = TunnelManager.downloadUpdateApkThroughTunnel(
+        downloadUrl = asset.downloadUrl,
+        sizeBytes = asset.sizeBytes,
+        sha256 = expectedSha256,
+        outputFile = outputFile,
+    ) { downloaded, total ->
+        emit(downloaded, total)
+    }
+    if (!downloadedThroughTunnel) {
+        outputFile.delete()
+        throw directFailure
+    }
+    try {
+        if (outputFile.length() != asset.sizeBytes) {
+            throw IOException("Размер APK после передачи через WDTT не совпал с данными выпуска")
+        }
         val actual = outputFile.sha256Hex()
         if (!actual.equals(expectedSha256, ignoreCase = true)) {
-            outputFile.delete()
-            throw SecurityException("SHA-256 скачанного APK не совпал с GitHub digest")
+            throw SecurityException("SHA-256 APK после передачи через WDTT не совпал с GitHub digest")
         }
         validateUpdatePackage(appContext, outputFile)
-
-        emit(outputFile.length(), total.takeIf { it > 0L } ?: outputFile.length())
+        emit(outputFile.length(), asset.sizeBytes)
         outputFile
-    } catch (e: Exception) {
+    } catch (error: Exception) {
         outputFile.delete()
-        throw e
-    } finally {
-        conn?.disconnect()
+        throw error
     }
 }
 

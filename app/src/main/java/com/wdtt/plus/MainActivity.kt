@@ -647,7 +647,7 @@ class MainActivity : ComponentActivity() {
                     )
                     return@launch
                 }
-                wdttConnectFlow = WdttConnectFlow.Progress("Доступ получен. Подготавливаем VPN-профиль...")
+                wdttConnectFlow = WdttConnectFlow.Progress("Доступ получен. Подготавливаем профиль подключения...")
                 var boundProfile: Int? = null
                 for (binding in listOf(delivery.binding, delivery.access.binding)) {
                     if (binding.isBlank()) continue
@@ -786,7 +786,7 @@ class MainActivity : ComponentActivity() {
     ) {
         lifecycleScope.launch {
             if (fromRemoteDocument) {
-                wdttConnectFlow = WdttConnectFlow.Progress("Сохраняем настройки в выбранный VPN-профиль...")
+                wdttConnectFlow = WdttConnectFlow.Progress("Сохраняем настройки в выбранный профиль...")
             }
             val store = SettingsStore(this@MainActivity)
             runCatching {
@@ -826,7 +826,7 @@ class MainActivity : ComponentActivity() {
                                 ?.hashes
                                 .isNullOrBlank()
                         ) {
-                            append(" Добавьте свой VK-хеш перед запуском VPN.")
+                            append(" Добавьте свой VK-хеш перед запуском соединения.")
                         }
                     }
                 }
@@ -925,16 +925,16 @@ class MainActivity : ComponentActivity() {
                         profile = profile,
                         continuation = continuation,
                         access = access,
-                        message = "Останавливаем VPN и ждём стабильного подключения перед входом в VK..."
+                        message = "Останавливаем соединение и ждём стабильного доступа в интернет перед входом в VK..."
                     )
                 }
                 val stopResult = TunnelStopCoordinator.stopAndAwait(this@MainActivity)
                 if (!stopResult.succeeded) {
                     throw IllegalStateException(
                         if (stopResult == TunnelStopResult.TIMED_OUT) {
-                            "VPN не остановился за 20 секунд. Вернитесь в приложение и повторите попытку."
+                            "Соединение не остановилось за 20 секунд. Вернитесь в приложение и повторите попытку."
                         } else {
-                            "Не удалось запросить остановку VPN. Остановите туннель и повторите попытку."
+                            "Не удалось запросить остановку соединения. Остановите его и повторите попытку."
                         }
                     )
                 }
@@ -956,7 +956,7 @@ class MainActivity : ComponentActivity() {
                 launchRemoteContinuation(target)
                 wdttConnectFlow = WdttConnectFlow.Complete(
                     if (tunnelStoppedForVk) {
-                        "Страница открыта. Завершите действие там; результат вернётся в нужный профиль автоматически. VPN оставлен выключенным."
+                        "Страница открыта. Завершите действие там; результат вернётся в нужный профиль автоматически. Соединение оставлено выключенным."
                     } else {
                         "Страница открыта. Завершите действие там; результат вернётся в нужный профиль автоматически."
                     }
@@ -1023,7 +1023,7 @@ class MainActivity : ComponentActivity() {
                     )
                 }
                 wdttConnectFlow = WdttConnectFlow.Complete(
-                    "VK-хеши сохранены в новом VPN-профиле."
+                    "VK-хеши сохранены в новом профиле подключения."
                 )
             }.onFailure { error ->
                 wdttConnectFlow = WdttConnectFlow.Failed(
@@ -1150,14 +1150,14 @@ private fun RoleSelectionScreen(
 
                     RoleChoiceButton(
                         title = "Я - юзер",
-                        body = "Хочу подключаться бесплатно по ссылке WDTT или вручную, управлять VPN, исключениями и смотреть логи.",
+                        body = "Хочу подключаться бесплатно по ссылке WDTT или вручную, выбирать режим, управлять исключениями и смотреть логи.",
                         icon = Icons.Filled.VpnKey,
                         onClick = { onRoleSelected("user") },
                         modifier = Modifier.focusRequester(initialFocusRequester),
                     )
                     RoleChoiceButton(
                         title = "Я - админ",
-                        body = "Хочу подключаться к VPN и дополнительно настраивать, переносить или обслуживать свой сервер.",
+                        body = "Хочу подключаться и дополнительно настраивать, переносить или обслуживать свой сервер.",
                         icon = Icons.Filled.Cloud,
                         onClick = { onRoleSelected("admin") }
                     )
@@ -1360,7 +1360,7 @@ private fun PermissionOnboardingScreen(
                             Text(
                                 if (!isNotifications && batteryFallbackVisible) "Открыть настройки" else "Разрешить",
                                 fontWeight = FontWeight.Bold,
-                                textAlign = TextAlign.Center
+                                textAlign = TextAlign.Center,
                             )
                         }
                     }
@@ -1510,6 +1510,7 @@ private fun MainScreen(
     val infoScrollPosition = rememberSaveable { mutableIntStateOf(0) }
     var dragTargetIndex by remember { mutableIntStateOf(-1) }
     var dragProgress by remember { mutableFloatStateOf(0f) }
+    var navigationDragActive by remember { mutableStateOf(false) }
     val updateCheckIntervalMinutes by settingsStore.updateCheckIntervalMinutes.collectAsStateWithLifecycle(
         initialValue = DEFAULT_UPDATE_CHECK_INTERVAL_MINUTES
     )
@@ -1701,7 +1702,7 @@ private fun MainScreen(
             var updateCandidate: AppUpdateCandidate? = null
             var errorMessage = ""
             runCatching {
-                release = fetchLatestReleaseInfo(currentVersion)
+                release = fetchLatestReleaseInfo(context, currentVersion)
                 if (release == null) {
                     errorMessage = "Не удалось проверить"
                     return@runCatching
@@ -1814,20 +1815,33 @@ private fun MainScreen(
                         detectHorizontalDragGestures(
                             onDragStart = {
                                 totalDrag = 0f
+                                navigationDragActive = true
                                 dragTargetIndex = -1
                                 dragProgress = 0f
                             },
                             onDragCancel = {
+                                navigationDragActive = false
                                 dragTargetIndex = -1
                                 dragProgress = 0f
                             },
                             onDragEnd = {
-                                if (dragTargetIndex in activeNavItems.indices && dragProgress >= 0.5f) {
-                                    selectedTab = activeNavItems[dragTargetIndex].id
-                                    if (selectedTab == 3) TunnelManager.clearUnreadErrors()
-                                }
+                                val selectedIndex = activeNavItems.indexOfFirst {
+                                    it.id == selectedTab
+                                }.coerceAtLeast(0)
+                                val destinationIndex = navigationDestinationIndex(
+                                    selectedIndex = selectedIndex,
+                                    dragTargetIndex = dragTargetIndex,
+                                    dragProgress = dragProgress,
+                                    itemCount = activeNavItems.size,
+                                )
+                                val destination = activeNavItems.getOrNull(destinationIndex)?.id
+                                navigationDragActive = false
                                 dragTargetIndex = -1
                                 dragProgress = 0f
+                                if (destination != null) {
+                                    selectedTab = destination
+                                    if (selectedTab == 3) TunnelManager.clearUnreadErrors()
+                                }
                             }
                         ) { change, dragAmount ->
                             if (change.isConsumed) return@detectHorizontalDragGestures
@@ -1929,6 +1943,7 @@ private fun MainScreen(
                     selectedTab = selectedTab,
                     dragTargetIndex = dragTargetIndex,
                     dragProgress = dragProgress,
+                    dragActive = navigationDragActive,
                     unreadErrors = unreadErrors,
                     tunnelRunning = tunnelRunning,
                     onTabSelected = { index ->
@@ -1937,6 +1952,7 @@ private fun MainScreen(
                             selectedTab = index
                             if (index == 3) TunnelManager.clearUnreadErrors()
                         }
+                        navigationDragActive = false
                         dragTargetIndex = -1
                         dragProgress = 0f
                     },
@@ -2007,7 +2023,7 @@ private fun MainScreen(
                             "Клиенты, выданные доступы и настройки сохранятся. Установку с нуля выполнять не нужно."
                     )
                     Text(
-                        "После успешной установки приложение отметит обновление для выбранного VPN-профиля.",
+                        "После успешной установки приложение отметит обновление для выбранного профиля.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -2203,10 +2219,10 @@ private fun MainScreen(
         val incomingProfileName = WdttDeepLink.parse(plan.link)?.profileName.orEmpty()
         AlertDialog(
             onDismissRequest = onCancelWdttDeepLinkOverwrite,
-            title = { Text("Профили VPN заполнены") },
+            title = { Text("Профили подключения заполнены") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text("Свободных профилей VPN нет. Выберите профиль, который можно перезаписать:")
+                    Text("Свободных профилей подключения нет. Выберите профиль, который можно перезаписать:")
                     if (incomingProfileName.isNotBlank()) {
                         Text("Название из подключения: «$incomingProfileName».")
                     }
@@ -2702,6 +2718,28 @@ private fun SharedVkHashDialog(
     )
 }
 
+internal fun navigationIndicatorTarget(
+    selectedIndex: Int,
+    dragTargetIndex: Int,
+    dragProgress: Float,
+    itemCount: Int,
+): Float {
+    val selected = selectedIndex.coerceIn(0, (itemCount - 1).coerceAtLeast(0))
+    if (dragTargetIndex !in 0 until itemCount) return selected.toFloat()
+    return selected + (dragTargetIndex - selected) * dragProgress.coerceIn(0f, 1f)
+}
+
+internal fun navigationDestinationIndex(
+    selectedIndex: Int,
+    dragTargetIndex: Int,
+    dragProgress: Float,
+    itemCount: Int,
+): Int {
+    val selected = selectedIndex.coerceIn(0, (itemCount - 1).coerceAtLeast(0))
+    if (dragTargetIndex !in 0 until itemCount) return selected
+    return if (dragProgress.coerceIn(0f, 1f) >= 0.5f) dragTargetIndex else selected
+}
+
 @OptIn(ExperimentalComposeUiApi::class)
 @Composable
 private fun ProxyNavigationBar(
@@ -2709,6 +2747,7 @@ private fun ProxyNavigationBar(
     selectedTab: Int,
     dragTargetIndex: Int,
     dragProgress: Float,
+    dragActive: Boolean,
     unreadErrors: Int,
     tunnelRunning: Boolean,
     onTabSelected: (Int) -> Unit,
@@ -2751,8 +2790,22 @@ private fun ProxyNavigationBar(
         }
     }
 
-    LaunchedEffect(selectedVisualIndex) {
-        if (dragTargetIndex !in navItems.indices) {
+    LaunchedEffect(
+        selectedVisualIndex,
+        dragTargetIndex,
+        dragProgress,
+        dragActive,
+        navItems.size,
+    ) {
+        val target = navigationIndicatorTarget(
+            selectedIndex = selectedVisualIndex,
+            dragTargetIndex = dragTargetIndex,
+            dragProgress = dragProgress,
+            itemCount = navItems.size,
+        )
+        if (dragActive) {
+            indicatorIndex.snapTo(target)
+        } else {
             indicatorIndex.animateTo(
                 targetValue = selectedVisualIndex.toFloat(),
                 animationSpec = tween(
@@ -2760,13 +2813,6 @@ private fun ProxyNavigationBar(
                     easing = CubicBezierEasing(0.2f, 0.9f, 0.24f, 1f)
                 )
             )
-        }
-    }
-
-    LaunchedEffect(selectedVisualIndex, dragTargetIndex, dragProgress) {
-        if (dragTargetIndex in navItems.indices) {
-            val target = selectedVisualIndex.toFloat() + (dragTargetIndex - selectedVisualIndex) * dragProgress
-            indicatorIndex.snapTo(target)
         }
     }
 

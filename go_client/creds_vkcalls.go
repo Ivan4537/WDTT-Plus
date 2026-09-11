@@ -144,6 +144,14 @@ func shouldRetryVKCallsPreflight(err error) bool {
 	if err == nil || isVKCallsFloodError(err) {
 		return false
 	}
+	var captchaErr *VkCaptchaError
+	if errors.As(err, &captchaErr) {
+		// A CAPTCHA response is the provider's completed verdict for this path,
+		// not a transport failure. Repeating the same method with another
+		// anonymous identity only delays the working legacy/WebView fallback and
+		// doubles VK requests when the gate is enabled for the current network.
+		return false
+	}
 	message := strings.ToUpper(err.Error())
 	return !strings.Contains(message, "INVALID_JOIN_LINK") &&
 		!strings.Contains(message, "ANON_BLOCKED") &&
@@ -163,7 +171,10 @@ func getVKCredsViaVKCalls(ctx context.Context, link string, streamID int) (strin
 
 	client, err := tlsclient.NewHttpClient(
 		tlsclient.NewNoopLogger(),
-		tlsclient.WithTimeoutSeconds(20),
+		// VKCalls normally answers in well under a second. A shorter bounded
+		// timeout prevents one degraded API path from blocking an entire group
+		// of nine channels for minutes before the compatible provider is tried.
+		tlsclient.WithTimeoutSeconds(8),
 		tlsclient.WithClientProfile(profiles.Chrome_146),
 		tlsclient.WithCookieJar(tlsclient.NewCookieJar()),
 	)

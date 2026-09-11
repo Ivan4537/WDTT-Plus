@@ -27,6 +27,12 @@ class AccessLifecycleRequestException(
 object AccessLifecycleGateway {
     private const val MAX_RESPONSE_CHARS = 32 * 1024
 
+    private data class HttpResponse(
+        val status: Int,
+        val body: String,
+        val codeHint: String,
+    )
+
     suspend fun fetch(
         capability: RemoteAccessCapability,
         device: String,
@@ -145,45 +151,90 @@ object AccessLifecycleGateway {
                 }
                 .toString()
                 .toByteArray(Charsets.UTF_8)
-            var connection: HttpURLConnection? = null
+            val relayAllowed = operation == "status" && action.isBlank() && values.isEmpty() &&
+                TunnelManager.isUpdateRelayAvailable()
             try {
-                connection = URL(capability.url).openConnection() as HttpURLConnection
-                connection.requestMethod = "POST"
-                connection.instanceFollowRedirects = false
-                connection.connectTimeout = 7_000
-                connection.readTimeout = 9_000
-                connection.doOutput = true
-                connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
-                connection.setRequestProperty("Accept", "application/json")
-                connection.outputStream.use { it.write(payload) }
-                val status = connection.responseCode
-                val body = readBody(connection, status)
-                if (status !in 200..299) {
-                    throw parseHttpFailure(
-                        status = status,
-                        body = body,
-                        operation = operation,
-                        codeHint = connection.getHeaderField("X-WDTT-Access-Code").orEmpty(),
-                    )
-                }
-                body
+                requestDirect(
+                    url = capability.url,
+                    payload = payload,
+                    connectTimeoutMs = if (relayAllowed) 2_500 else 7_000,
+                    readTimeoutMs = if (relayAllowed) 3_500 else 9_000,
+                ).bodyOrThrow(operation)
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
                 if (error is IllegalStateException) throw error
-                throw IllegalStateException(
-                    if (operation == "continue") {
-                        "Не удалось открыть страницу. Проверьте интернет и повторите попытку."
-                    } else if (action.isNotBlank()) {
-                        "Не удалось обновить сохранённые данные профиля."
-                    } else {
-                        "Не удалось проверить профиль. Проверьте интернет."
+                if (relayAllowed) {
+                    when (
+                        val relayed = TunnelManager.postOpaqueHttpsStatusThroughTunnel(
+                            capability.url,
+                            payload,
+                        )
+                    ) {
+                        is OpaqueHttpsRelayResult.Success -> HttpResponse(
+                            status = relayed.status,
+                            body = relayed.body,
+                            codeHint = relayed.codeHint,
+                        ).bodyOrThrow(operation)
+                        is OpaqueHttpsRelayResult.Unavailable -> throw IllegalStateException(
+                            "Не удалось проверить состояние доступа к профилю. " +
+                                "Сохранённые настройки подключения не изменены.",
+                        )
                     }
-                )
-            } finally {
-                connection?.disconnect()
+                } else {
+                    throw IllegalStateException(requestFailureMessage(operation, action))
+                }
             }
         }
+    }
+
+    private fun requestDirect(
+        url: String,
+        payload: ByteArray,
+        connectTimeoutMs: Int,
+        readTimeoutMs: Int,
+    ): HttpResponse {
+        var connection: HttpURLConnection? = null
+        return try {
+            connection = URL(url).openConnection() as HttpURLConnection
+            connection.requestMethod = "POST"
+            connection.instanceFollowRedirects = false
+            connection.connectTimeout = connectTimeoutMs
+            connection.readTimeout = readTimeoutMs
+            connection.doOutput = true
+            connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+            connection.setRequestProperty("Accept", "application/json")
+            connection.outputStream.use { it.write(payload) }
+            val status = connection.responseCode
+            HttpResponse(
+                status = status,
+                body = readBody(connection, status),
+                codeHint = connection.getHeaderField("X-WDTT-Access-Code").orEmpty(),
+            )
+        } finally {
+            connection?.disconnect()
+        }
+    }
+
+    private fun HttpResponse.bodyOrThrow(operation: String): String {
+        if (status !in 200..299) {
+            throw parseHttpFailure(
+                status = status,
+                body = body,
+                operation = operation,
+                codeHint = codeHint,
+            )
+        }
+        return body
+    }
+
+    private fun requestFailureMessage(operation: String, action: String): String = when {
+        operation == "continue" ->
+            "Не удалось открыть страницу. Проверьте интернет и повторите попытку."
+        action.isNotBlank() -> "Не удалось обновить сохранённые данные профиля."
+        else ->
+            "Не удалось проверить состояние доступа к профилю. " +
+                "Сохранённые настройки подключения не изменены."
     }
 
     internal fun parseHttpFailure(

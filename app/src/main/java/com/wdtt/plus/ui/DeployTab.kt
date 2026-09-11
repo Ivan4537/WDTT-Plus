@@ -100,6 +100,7 @@ import com.wdtt.plus.ServerStoredBackupDocument
 import com.wdtt.plus.ServerStoredBackupInfo
 import com.wdtt.plus.SettingsStore
 import com.wdtt.plus.SshCredentials
+import com.wdtt.plus.SshRoutePolicy
 import com.wdtt.plus.TunnelManager
 import com.wdtt.plus.VPN_DNS_PROFILE_ID
 import com.wdtt.plus.WDTTColors
@@ -109,6 +110,7 @@ import com.wdtt.plus.hasMeaningfulAdminProfileFields
 import com.wdtt.plus.hasManagedServerCredentials
 import com.wdtt.plus.latestServerMigrationLevel
 import com.wdtt.plus.createSshSession
+import com.wdtt.plus.capitalizeUserSentence
 import com.wdtt.plus.normalizeSshPrivateKey
 import com.wdtt.plus.normalizeVpnDnsSelectionId
 import com.wdtt.plus.sshPrivateKeyIssue
@@ -163,6 +165,11 @@ internal enum class DeployMode {
     FreshInstall,
     PreserveData,
     ResetAll
+}
+
+internal enum class ServerUninstallMode {
+    PreserveData,
+    RemoveAll
 }
 
 internal data class DangerousServerHoldState(
@@ -388,10 +395,23 @@ private data class OutboundSshTarget(
     val privateKey: String,
     val keyPassphrase: String,
     val allowPasswordAuthentication: Boolean,
-    val port: Int
+    val port: Int,
+    val mainPassword: String,
 ) {
     val credentials: SshCredentials
         get() = SshCredentials(pass, privateKey, keyPassphrase, allowPasswordAuthentication)
+
+    val adminTarget: ServerAdminTarget
+        get() = ServerAdminTarget(
+            host = host,
+            user = user,
+            sshPassword = pass,
+            sshPort = port,
+            mainPassword = mainPassword,
+            sshPrivateKey = privateKey,
+            sshKeyPassphrase = keyPassphrase,
+            allowPasswordAuthentication = allowPasswordAuthentication,
+        )
 }
 
 internal data class ServerBackup(
@@ -480,6 +500,7 @@ private data class ExistingInstallInfo(
     val standaloneManaged: Boolean = false,
     val androidDeployManaged: Boolean = false,
     val legacyAndroidDeployCandidate: Boolean = false,
+    val preservedAndroidData: Boolean = false,
     val incompleteAndroidDeployCandidate: Boolean = false,
     val checkError: String? = null,
     val comparison: DeployServerComparison? = null
@@ -493,6 +514,7 @@ internal enum class DeploymentOwnership {
     StandaloneInstaller,
     AndroidDeploy,
     LegacyAndroidDeploy,
+    PreservedAndroidData,
     IncompleteAndroidDeploy,
     UnknownExisting
 }
@@ -501,11 +523,13 @@ internal fun existingInstallOwnershipFromFlags(
     standaloneManaged: Boolean,
     androidDeployManaged: Boolean,
     legacyAndroidDeployCandidate: Boolean,
+    preservedAndroidData: Boolean = false,
     incompleteAndroidDeployCandidate: Boolean = false,
 ): DeploymentOwnership = when {
     standaloneManaged -> DeploymentOwnership.StandaloneInstaller
     androidDeployManaged -> DeploymentOwnership.AndroidDeploy
     legacyAndroidDeployCandidate -> DeploymentOwnership.LegacyAndroidDeploy
+    preservedAndroidData -> DeploymentOwnership.PreservedAndroidData
     incompleteAndroidDeployCandidate -> DeploymentOwnership.IncompleteAndroidDeploy
     else -> DeploymentOwnership.UnknownExisting
 }
@@ -515,7 +539,8 @@ internal fun existingInstallAllowsPreservingUpdate(
     checkSucceeded: Boolean
 ): Boolean = checkSucceeded && ownership in setOf(
     DeploymentOwnership.AndroidDeploy,
-    DeploymentOwnership.LegacyAndroidDeploy
+    DeploymentOwnership.LegacyAndroidDeploy,
+    DeploymentOwnership.PreservedAndroidData
 )
 
 internal fun existingInstallAllowsReset(
@@ -523,6 +548,7 @@ internal fun existingInstallAllowsReset(
     checkSucceeded: Boolean
 ): Boolean = checkSucceeded && ownership in setOf(
     DeploymentOwnership.AndroidDeploy,
+    DeploymentOwnership.PreservedAndroidData,
     DeploymentOwnership.IncompleteAndroidDeploy,
 )
 
@@ -1899,7 +1925,8 @@ fun DeployTab(
 	                                privateKey = request.privateKey,
 	                                keyPassphrase = request.keyPassphrase,
 	                                allowPasswordAuthentication = request.allowPasswordAuthentication,
-	                                port = request.sshPort
+	                                port = request.sshPort,
+	                                mainPassword = request.mainPass,
                             ),
                             forms = outboundProfile
                         )
@@ -1938,7 +1965,8 @@ fun DeployTab(
                         privateKeyPassphrase = request.keyPassphrase,
                         allowPasswordAuthentication = request.allowPasswordAuthentication
                     ),
-                    port = request.sshPort
+                    port = request.sshPort,
+                    mainPassword = request.mainPass,
                 )
                 if (info.hasAnyTrace) {
                     val comparison = runCatching {
@@ -1996,7 +2024,8 @@ fun DeployTab(
             privateKey = sshCredentials.privateKey,
             keyPassphrase = sshCredentials.privateKeyPassphrase,
             allowPasswordAuthentication = sshCredentials.allowPasswordAuthentication,
-            port = primarySshPort
+            port = primarySshPort,
+            mainPassword = savedMainPass,
         )
     }
 
@@ -2260,7 +2289,8 @@ fun DeployTab(
             privateKey = sshCredentials.privateKey,
             keyPassphrase = sshCredentials.privateKeyPassphrase,
             allowPasswordAuthentication = sshCredentials.allowPasswordAuthentication,
-            port = primarySshPort
+            port = primarySshPort,
+            mainPassword = savedMainPass,
         )
         serverDiagnosticsBusy = true
         Toast.makeText(context, "Выполняется диагностика сервера", Toast.LENGTH_SHORT).show()
@@ -2538,7 +2568,14 @@ fun DeployTab(
                         icon = {
                             StableSegmentedButtonIcon(selected = selectedSshAuthMode == mode)
                         },
-                    ) { Text(label) }
+                    ) {
+                        Text(
+                            label,
+                            modifier = Modifier.fillMaxWidth(),
+                            maxLines = 1,
+                            textAlign = TextAlign.Center,
+                        )
+                    }
                 }
             }
 
@@ -3629,6 +3666,7 @@ fun DeployTab(
                                 user = effectiveLogin,
                                 credentials = sshCredentials,
                                 port = sshPort,
+                                mainPassword = savedMainPass,
                                 includeWgKeys = includeKeys,
                                 localOwnerProfile = currentOwnerProfile(),
                                 localPeer = savedPeer
@@ -3797,7 +3835,7 @@ fun DeployTab(
         if (showUninstallDialog) {
             UninstallConfirmDialog(
                 onDismiss = { showUninstallDialog = false },
-                onConfirm = {
+                onConfirm = { uninstallMode ->
                     showUninstallDialog = false
                     val effectiveLogin = if (login.isBlank()) "root" else login
                     val effectiveDtlsPort = if (savedManualPorts) savedServerDtlsPort.coerceIn(1, 65535) else 56000
@@ -3808,6 +3846,7 @@ fun DeployTab(
                             performUninstall(
                                 host = ip.trim(), user = effectiveLogin, credentials = sshCredentials, port = primarySshPort,
                                 dtlsPort = effectiveDtlsPort, wgPort = effectiveWgPort,
+                                mode = uninstallMode,
                                 onProgress = { p, s -> DeployManager.updateProgress(p, s) }
                             )
                         } catch (_: Exception) {}
@@ -3874,7 +3913,7 @@ fun DeployTab(
                                 }
                                 migrationStatus = when {
                                     !ok -> "Ошибка импорта: операция не была применена, подробности записаны в лог деплоя"
-                                    importMode == ServerImportMode.Replace -> "Импорт завершён, wdtt.service перезапущен, активный VPN-профиль переключён на новый сервер"
+                                    importMode == ServerImportMode.Replace -> "Импорт завершён, wdtt.service перезапущен, активный профиль переключён на новый сервер"
                                     else -> "Импорт завершён, wdtt.service перезапущен"
                                 }
                             } catch (e: Exception) {
@@ -4216,7 +4255,7 @@ private fun OutboundRoutingSection(
                     }
                 }
                 Text(
-                    "«Загрузить настройки» читает сохранённые значения с сервера и заменяет ими только поля текущего VPN-профиля в приложении. На сервер ничего не записывается; активный режим выхода не переключается.",
+                    "«Загрузить настройки» читает сохранённые значения с сервера и заменяет ими только поля текущего профиля подключения в приложении. На сервер ничего не записывается; активный режим выхода не переключается.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -4870,7 +4909,14 @@ private fun WireGuardExitVpsDialog(
                     icon = {
                         StableSegmentedButtonIcon(selected = sshAuthMode == mode)
                     },
-                ) { Text(label) }
+                ) {
+                    Text(
+                        label,
+                        modifier = Modifier.fillMaxWidth(),
+                        maxLines = 1,
+                        textAlign = TextAlign.Center,
+                    )
+                }
             }
         }
         OutlinedTextField(
@@ -4937,7 +4983,7 @@ private fun WireGuardExitVpsDialog(
             shape = RoundedCornerShape(16.dp)
         )
         Text(
-            "Если настройка не получится, WDTT Plus восстановит прежние настройки на обоих VPS. DNS-параметры VPN-профиля здесь не применяются: DNS для клиентов задаётся в основных настройках WDTT. Приватный SSH-ключ дополнительного VPS хранится только на этом Android-устройстве; после переустановки приложения его потребуется добавить снова.",
+            "Если настройка не получится, WDTT Plus восстановит прежние настройки на обоих VPS. DNS-параметры профиля здесь не применяются: DNS для клиентов задаётся в основных настройках WDTT. Приватный SSH-ключ дополнительного VPS хранится только на этом Android-устройстве; после переустановки приложения его потребуется добавить снова.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.error
         )
@@ -5962,40 +6008,6 @@ internal fun serverDiagnosticsScript(
       done
       printf '%s' "${'$'}missing_tools"
     }
-    wdtt_diag_install_dependencies() {
-      manager="${'$'}1"
-      case "${'$'}manager" in
-        apt-get)
-          apt-get update -y >/dev/null 2>&1 || true
-          DEBIAN_FRONTEND=noninteractive apt-get install -y bash ca-certificates curl iproute2 iptables procps coreutils util-linux >/dev/null 2>&1 || return 1
-          DEBIAN_FRONTEND=noninteractive apt-get install -y nftables wireguard-tools >/dev/null 2>&1 || true
-          ;;
-        dnf)
-          dnf install -y bash ca-certificates curl iproute iptables procps-ng coreutils util-linux >/dev/null 2>&1 || return 1
-          dnf install -y nftables wireguard-tools >/dev/null 2>&1 || true
-          ;;
-        yum)
-          yum install -y bash ca-certificates curl iproute iptables procps-ng coreutils util-linux >/dev/null 2>&1 || return 1
-          yum install -y nftables wireguard-tools >/dev/null 2>&1 || true
-          ;;
-        zypper)
-          zypper --non-interactive install -y bash ca-certificates curl iproute2 iptables procps coreutils util-linux >/dev/null 2>&1 || return 1
-          zypper --non-interactive install -y nftables wireguard-tools >/dev/null 2>&1 || true
-          ;;
-        apk)
-          apk add --no-cache bash ca-certificates curl iproute2 iptables procps coreutils util-linux >/dev/null 2>&1 || return 1
-          apk add --no-cache nftables wireguard-tools >/dev/null 2>&1 || true
-          ;;
-        pacman)
-          pacman -Sy --noconfirm --needed bash ca-certificates curl iproute2 iptables procps-ng coreutils util-linux >/dev/null 2>&1 || return 1
-          pacman -Sy --noconfirm --needed nftables wireguard-tools >/dev/null 2>&1 || true
-          ;;
-        *)
-          return 1
-          ;;
-      esac
-      return 0
-    }
     wdtt_diag_os_name() {
       if [ -r /etc/os-release ]; then
         awk -F= '
@@ -6197,17 +6209,7 @@ internal fun serverDiagnosticsScript(
     elif [ -z "${'$'}MISSING_BEFORE" ]; then
       wdtt_diag_emit "OK" "Подготовка диагностики" "доустановка не нужна" "Все основные диагностические инструменты уже доступны." ""
     else
-      if wdtt_diag_install_dependencies "${'$'}PKG_MANAGER"; then
-        MISSING_AFTER="${'$'}(wdtt_diag_missing_installable_tools)"
-        if [ -z "${'$'}MISSING_AFTER" ]; then
-          wdtt_diag_emit "OK" "Подготовка диагностики" "инструменты доустановлены" "До установки отсутствовали:${'$'}MISSING_BEFORE. После установки основные инструменты доступны." ""
-        else
-          wdtt_diag_emit "WARNING" "Подготовка диагностики" "частично доустановлено" "До установки отсутствовали:${'$'}MISSING_BEFORE. После попытки установки всё ещё отсутствуют:${'$'}MISSING_AFTER." "Некоторые пакеты могут называться иначе в этом дистрибутиве или отсутствовать в репозиториях."
-        fi
-      else
-        MISSING_AFTER="${'$'}(wdtt_diag_missing_installable_tools)"
-        wdtt_diag_emit "WARNING" "Подготовка диагностики" "доустановка не удалась" "Пакетный менеджер: ${'$'}PKG_MANAGER. До установки отсутствовали:${'$'}MISSING_BEFORE. Сейчас отсутствуют:${'$'}MISSING_AFTER." "Проверьте репозитории, сеть сервера и права root/sudo; диагностика продолжится с доступными командами."
-      fi
+      wdtt_diag_emit "WARNING" "Подготовка диагностики" "часть инструментов отсутствует" "Пакетный менеджер: ${'$'}PKG_MANAGER. Отсутствуют:${'$'}MISSING_BEFORE. Диагностика ничего не устанавливала и продолжилась с доступными командами." "Установите недостающие пакеты вручную либо выполните явный деплой после проверки его плана."
     fi
 
     TOOLS=""
@@ -6308,6 +6310,9 @@ internal fun serverDiagnosticsScript(
 
     WARP_WARN=0
     WARP_DETAILS=""
+    WARP_API_HTTP="${'$'}(wdtt_diag_http_probe https://api.cloudflareclient.com/)"; WARP_API_HTTP_CODE="${'$'}?"
+    [ "${'$'}WARP_API_HTTP_CODE" = "0" ] || WARP_WARN=1
+    WARP_DETAILS="${'$'}WARP_DETAILS регистрация api.cloudflareclient.com: ${'$'}WARP_API_HTTP;"
     CF_TRACE="${'$'}(curl -4fsS --connect-timeout 6 --max-time 12 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)"
     if [ -n "${'$'}CF_TRACE" ]; then
       CF_WARP="${'$'}(printf '%s\n' "${'$'}CF_TRACE" | sed -n 's/^warp=//p' | head -n 1)"
@@ -6744,7 +6749,7 @@ private fun serverProfileDiagnosticItem(profileName: String, profileIndex: Int?)
         title = "Выбранный профиль",
         status = "профиль $number — $profileName",
         details = "Диагностика собрана строго из профиля, выбранного в приложении на момент запуска: его адреса сервера, логина, SSH-порта и способа входа.",
-        recommendation = "Если нужно проверить другой сервер, сначала переключите VPN-профиль в приложении и запустите диагностику заново.",
+        recommendation = "Если нужно проверить другой сервер, сначала переключите профиль подключения в приложении и запустите диагностику заново.",
         severity = DeviceCheckSeverity.Info
     )
 }
@@ -6793,11 +6798,17 @@ private suspend fun collectServerDiagnostics(
             severity = DeviceCheckSeverity.Ok
         )
     )
-    var session: Session? = null
-    try {
-        session = createSshSession(target.host, target.user, target.credentials, target.port)
-        val ssh = SSHClient(session, target.pass)
-        val output = ssh.exec(
+    val output = runSafeInspection(
+        target = target,
+        relayOperation = listOf(
+            "server-diagnostics",
+            expectedDtlsPort.toString(),
+            expectedWgPort.toString(),
+            expectedClientPort.toString(),
+        ),
+        timeout = 150000L,
+    ) { ssh ->
+        ssh.exec(
             rootShCommand(
                 serverDiagnosticsScript(
                     expectedDtlsPort = expectedDtlsPort,
@@ -6806,28 +6817,151 @@ private suspend fun collectServerDiagnostics(
                 )
             ),
             timeout = 150000L
-        ).trim()
-        val remoteItems = parseServerDiagnosticsItems(output)
-        if (remoteItems.isNotEmpty()) {
-            DeviceCompatibilityReport(checkedAt = checkedAt, items = localItems + remoteItems)
-        } else {
-            localItems += DeviceCheckItem(
-                title = "Root/sudo диагностика",
-                status = "не выполнена",
-                details = compactRemoteTail(output).ifBlank {
-                    "SSH подключился, но сервер не вернул диагностические строки. Вероятно, не сработали root-права, sudo, bash или выполнение удалённой команды."
-                },
-                recommendation = "Для полной диагностики и установки нужны root-права или рабочий sudo для выбранного SSH-пользователя. Серверы без bash/systemd могут потребовать ручной настройки.",
-                severity = DeviceCheckSeverity.Warning
-            )
-            DeviceCompatibilityReport(checkedAt = checkedAt, items = localItems)
-        }
-    } finally {
-        try { session?.disconnect() } catch (_: Exception) {}
+        )
+    }.trim()
+    val remoteItems = parseServerDiagnosticsItems(output)
+    if (remoteItems.isNotEmpty()) {
+        DeviceCompatibilityReport(checkedAt = checkedAt, items = localItems + remoteItems)
+    } else {
+        localItems += DeviceCheckItem(
+            title = "Root/sudo диагностика",
+            status = "не выполнена",
+            details = compactRemoteTail(output).ifBlank {
+                "Сервер не вернул диагностические строки. Вероятно, не сработали root-права, sudo, bash или безопасный канал управления."
+            },
+            recommendation = "Для полной диагностики и установки нужны root-права или рабочий sudo для выбранного SSH-пользователя. Серверы без bash/systemd могут потребовать ручной настройки.",
+            severity = DeviceCheckSeverity.Warning
+        )
+        DeviceCompatibilityReport(checkedAt = checkedAt, items = localItems)
     }
 }
 
 // ==================== SSH ====================
+
+private fun createSafeReadOnlySshSession(
+    target: OutboundSshTarget,
+    connectTimeoutMs: Int = 20_000,
+): Session = createSafeReadOnlySshSession(
+    target.host,
+    target.user,
+    target.credentials,
+    target.port,
+    connectTimeoutMs,
+)
+
+private fun createSafeReadOnlySshSession(
+    host: String,
+    user: String,
+    credentials: SshCredentials,
+    port: Int,
+    connectTimeoutMs: Int = 20_000,
+): Session = createSshSession(
+    host = host,
+    user = user,
+    credentials = credentials,
+    port = port,
+    routePolicy = SshRoutePolicy.SAFE_READ_ONLY_DIRECT,
+    connectTimeoutMs = connectTimeoutMs,
+)
+
+private fun Throwable.isDeployConnectivityFailure(): Boolean =
+    com.wdtt.plus.isSshConnectivityFailure(
+        generateSequence(this) { it.cause }
+            .mapNotNull { it.message?.takeIf(String::isNotBlank) }
+            .joinToString(": "),
+    )
+
+private suspend fun runSafeInspection(
+    target: OutboundSshTarget,
+    relayOperation: List<String>,
+    timeout: Long,
+    direct: (SSHClient) -> String,
+): String = withContext(Dispatchers.IO) {
+    val relayAvailability = if (target.mainPassword.isNotBlank()) {
+        TunnelManager.deploySafeRelayAvailability(target.host)
+    } else {
+        null
+    }
+    val relayReady = relayAvailability?.available == true
+    val fastDirectCheck = relayAvailability?.transportAvailable == true
+    var directFailure: Exception? = null
+    var session: Session? = null
+    try {
+        session = try {
+            createSafeReadOnlySshSession(
+                target,
+                connectTimeoutMs = if (fastDirectCheck) 4_000 else 20_000,
+            )
+        } catch (error: Exception) {
+            if (!fastDirectCheck || !error.isDeployConnectivityFailure()) throw error
+            directFailure = error
+            null
+        }
+        if (session != null) {
+            // Команда выполняется только после успешного подключения. После её
+            // отправки второй путь не запускается, чтобы ничего не дублировать.
+            return@withContext direct(SSHClient(session, target.pass)).trim()
+        }
+    } finally {
+        runCatching { session?.disconnect() }
+    }
+
+    if (!relayReady) {
+        throw IllegalStateException(
+            relayAvailability?.unavailableMessage()
+                ?: "Откройте «Секреты» и укажите главный пароль администратора.",
+            directFailure,
+        )
+    }
+
+    TunnelManager.noteDeployNetworkRoute(
+        key = "deploy_safe_inspect_relay",
+        message = "Прямая проверка не ответила; читаем состояние сервера через активный WDTT.",
+        warning = false,
+    )
+    try {
+        ServerAdminClient.safeInspectThroughTunnel(target.adminTarget, relayOperation, timeout).trim()
+    } catch (relayError: Exception) {
+        val relayMessage = relayError.message.orEmpty()
+        if (relayMessage.contains("ещё не поддерживает", ignoreCase = true) ||
+            relayMessage.contains("не поддерживает проверку через туннель", ignoreCase = true)
+        ) {
+            TunnelManager.noteDeployNetworkRoute(
+                key = "deploy_safe_inspect_legacy",
+                message = "Старая серверная часть не поддерживает безопасную проверку через WDTT; повторяем прямое SSH-подключение.",
+                warning = true,
+            )
+            var legacySession: Session? = null
+            try {
+                legacySession = createSafeReadOnlySshSession(target)
+                return@withContext direct(SSHClient(legacySession, target.pass)).trim()
+            } finally {
+                runCatching { legacySession?.disconnect() }
+            }
+        }
+        throw IllegalStateException(
+            "Безопасная проверка не выполнена через активный WDTT: ${relayMessage.ifBlank { "сервер не ответил" }}. " +
+                "Прямая попытка: ${directFailure?.message.orEmpty()}",
+            relayError,
+        )
+    }
+}
+
+private fun createCriticalSshSession(target: OutboundSshTarget): Session =
+    createCriticalSshSession(target.host, target.user, target.credentials, target.port)
+
+private fun createCriticalSshSession(
+    host: String,
+    user: String,
+    credentials: SshCredentials,
+    port: Int,
+): Session = createSshSession(
+    host = host,
+    user = user,
+    credentials = credentials,
+    port = port,
+    routePolicy = SshRoutePolicy.SERVER_MUTATION_DIRECT_ONLY,
+)
 
 private class SSHClient(private val session: Session, private val pass: String) {
 
@@ -6970,14 +7104,41 @@ private suspend fun runRootScript(
     context: Context,
     target: OutboundSshTarget,
     script: String,
-    timeout: Long = CMD_TIMEOUT
+    timeout: Long = CMD_TIMEOUT,
+    safeReadOnly: Boolean = false,
+    relayOperation: List<String>? = null,
 ): String = withContext(Dispatchers.IO) {
+    if (safeReadOnly && relayOperation != null) {
+        return@withContext runSafeInspection(target, relayOperation, timeout) { ssh ->
+            val directFile = File(context.cacheDir, "wdtt-outbound-${System.currentTimeMillis()}.sh")
+            val directRemotePath = "/tmp/${directFile.name}"
+            try {
+                directFile.writeText(script.trimIndent() + "\n")
+                ssh.upload(directFile, directRemotePath)
+                ssh.exec(
+                    rootCommand("chmod 700 $directRemotePath; bash $directRemotePath; code=\$?; rm -f $directRemotePath; exit \$code"),
+                    timeout = timeout,
+                )
+            } finally {
+                directFile.delete()
+            }
+        }.also { output ->
+            markerValue(output, "WDTT_ERROR")?.let { throw IllegalStateException(output.take(1200)) }
+            if (output.startsWith("error:", true) || output.contains("\nerror:", true)) {
+                throw IllegalStateException(output.take(500))
+            }
+        }
+    }
     var session: Session? = null
     val scriptFile = File(context.cacheDir, "wdtt-outbound-${System.currentTimeMillis()}.sh")
     val remotePath = "/tmp/${scriptFile.name}"
     try {
         scriptFile.writeText(script.trimIndent() + "\n")
-        session = createSshSession(target.host, target.user, target.credentials, target.port)
+        session = if (safeReadOnly) {
+            createSafeReadOnlySshSession(target)
+        } else {
+            createCriticalSshSession(target)
+        }
         val ssh = SSHClient(session, target.pass)
         ssh.upload(scriptFile, remotePath)
         val output = ssh.exec(
@@ -6998,11 +7159,27 @@ private suspend fun runRootScript(
 private suspend fun runCheckedRootScript(
     target: OutboundSshTarget,
     script: String,
-    timeout: Long = CMD_TIMEOUT
+    timeout: Long = CMD_TIMEOUT,
+    safeReadOnly: Boolean = false,
+    relayOperation: List<String>? = null,
 ): String = withContext(Dispatchers.IO) {
+    if (safeReadOnly && relayOperation != null) {
+        val output = runSafeInspection(target, relayOperation, timeout) { ssh ->
+            ssh.exec(rootCommand(script), timeout = timeout)
+        }.trim()
+        markerValue(output, "WDTT_ERROR")?.let { throw IllegalStateException(output.take(1200)) }
+        if (output.startsWith("error:", true) || output.contains("\nerror:", true)) {
+            throw IllegalStateException(output.take(1200))
+        }
+        return@withContext output
+    }
     var session: Session? = null
     try {
-        session = createSshSession(target.host, target.user, target.credentials, target.port)
+        session = if (safeReadOnly) {
+            createSafeReadOnlySshSession(target)
+        } else {
+            createCriticalSshSession(target)
+        }
         val output = SSHClient(session, target.pass)
             .exec(rootCommand(script), timeout = timeout)
             .trim()
@@ -7382,18 +7559,13 @@ internal fun outboundStatusScript(): String = shellScript(
 )
 
 private suspend fun readOutboundStatus(target: OutboundSshTarget): String = withContext(Dispatchers.IO) {
-    var session: Session? = null
-    try {
-        DeployManager.updateProgress(0.25f, "Подключаюсь к серверу и читаю текущий режим выхода...")
-        session = createSshSession(target.host, target.user, target.credentials, target.port)
-        val ssh = SSHClient(session, target.pass)
+    DeployManager.updateProgress(0.25f, "Подключаюсь к серверу и читаю текущий режим выхода...")
+    val output = runSafeInspection(target, listOf("outbound-status"), 30_000L) { ssh ->
         DeployManager.updateProgress(0.70f, "Проверяю службы прокси и WireGuard...")
-        val output = ssh.exec(rootCommand(outboundStatusScript()), timeout = 30000L).trim()
-        DeployManager.updateProgress(1f, "Статус выхода получен.")
-        output
-    } finally {
-        try { session?.disconnect() } catch (_: Exception) {}
+        ssh.exec(rootCommand(outboundStatusScript()), timeout = 30000L)
     }
+    DeployManager.updateProgress(1f, "Статус выхода получен.")
+    output
 }
 
 internal fun tunInterfaceCandidatesScript(): String = """
@@ -7431,15 +7603,10 @@ internal fun parseTunInterfaceCandidates(output: String): List<TunInterfaceCandi
 
 private suspend fun discoverTunInterfaces(target: OutboundSshTarget): List<TunInterfaceCandidate> =
     withContext(Dispatchers.IO) {
-        var session: Session? = null
-        try {
-            session = createSshSession(target.host, target.user, target.credentials, target.port)
-            val output = SSHClient(session, target.pass)
-                .exec(rootCommand(tunInterfaceCandidatesScript()), timeout = 30000L)
-            parseTunInterfaceCandidates(output)
-        } finally {
-            try { session?.disconnect() } catch (_: Exception) {}
+        val output = runSafeInspection(target, listOf("tun-candidates"), 30_000L) { ssh ->
+            ssh.exec(rootCommand(tunInterfaceCandidatesScript()), timeout = 30000L)
         }
+        parseTunInterfaceCandidates(output)
     }
 
 private fun outboundProfileSaveScript(forms: OutboundProfileForms): String {
@@ -7936,7 +8103,9 @@ private suspend fun readOutboundServerSnapshot(
         context = context,
         target = target,
         script = outboundSnapshotScript(),
-        timeout = 30000L
+        timeout = 30000L,
+        safeReadOnly = true,
+        relayOperation = listOf("outbound-snapshot"),
     )
     DeployManager.updateProgress(1f, "Настройки выходного IP прочитаны.")
     return parseOutboundServerSnapshot(output)
@@ -8051,18 +8220,14 @@ private suspend fun checkWireGuardExit(
     target: OutboundSshTarget,
     expectedMode: String
 ): String = withContext(Dispatchers.IO) {
-    var session: Session? = null
-    try {
-        DeployManager.updateProgress(0.25f, "Подключаюсь к серверу и проверяю WireGuard-выход...")
-        session = createSshSession(target.host, target.user, target.credentials, target.port)
-        val ssh = SSHClient(session, target.pass)
-        val expectedLabel = when (expectedMode) {
-            "wireguard_vps" -> "выход через другой сервер"
-            "warp_free" -> "бесплатный WARP"
-            "imported_wg" -> "VPN/WireGuard-файл"
-            else -> expectedMode
-        }
-        val script = shellScript(
+    DeployManager.updateProgress(0.25f, "Подключаюсь к серверу и проверяю WireGuard-выход...")
+    val expectedLabel = when (expectedMode) {
+        "wireguard_vps" -> "выход через другой сервер"
+        "warp_free" -> "бесплатный WARP"
+        "imported_wg" -> "VPN/WireGuard-файл"
+        else -> expectedMode
+    }
+    val script = shellScript(
             outboundShellPrelude(),
             """
             MODE="${'$'}(grep -o '"outboundMode"[[:space:]]*:[[:space:]]*"[^"]*"' /etc/wdtt/outbound.json 2>/dev/null | sed 's/.*"outboundMode"[[:space:]]*:[[:space:]]*"//;s/".*//' | head -n 1)"
@@ -8094,24 +8259,19 @@ private suspend fun checkWireGuardExit(
             wg show "${'$'}WDTT_WG_IFACE" | sed -E 's/(private key: ).*/\1(скрыт)/' || true
             """
         )
-        DeployManager.updateProgress(0.70f, "Проверяю внешний IP через WireGuard-интерфейс...")
-        val output = ssh.exec(rootCommand(script), timeout = 30000L).trim()
-        markerValue(output, "WDTT_ERROR")?.let { throw IllegalStateException(it) }
-        DeployManager.updateProgress(1f, "WireGuard-выход проверен.")
-        output
-    } finally {
-        try { session?.disconnect() } catch (_: Exception) {}
-    }
+    DeployManager.updateProgress(0.70f, "Проверяю внешний IP через WireGuard-интерфейс...")
+    val output = runSafeInspection(target, listOf("check-wireguard", expectedMode), 30_000L) { ssh ->
+        ssh.exec(rootCommand(script), timeout = 30000L)
+    }.trim()
+    markerValue(output, "WDTT_ERROR")?.let { throw IllegalStateException(it) }
+    DeployManager.updateProgress(1f, "WireGuard-выход проверен.")
+    output
 }
 
 private suspend fun readOutboundDiagnostics(target: OutboundSshTarget): String = withContext(Dispatchers.IO) {
-    var session: Session? = null
-    try {
-        DeployManager.updateProgress(0.20f, "Подключаюсь к серверу для диагностики...")
-        session = createSshSession(target.host, target.user, target.credentials, target.port)
-        val ssh = SSHClient(session, target.pass)
-        DeployManager.updateProgress(0.45f, "Читаю режим выхода, службы и внешний IP...")
-        val script = shellScript(
+    DeployManager.updateProgress(0.20f, "Подключаюсь к серверу для диагностики...")
+    DeployManager.updateProgress(0.45f, "Читаю режим выхода, службы и внешний IP...")
+    val script = shellScript(
             outboundStatusScript(),
             """
             echo
@@ -8164,13 +8324,12 @@ private suspend fun readOutboundDiagnostics(target: OutboundSshTarget): String =
             tail -n 20 /var/log/wdtt-redsocks.log 2>/dev/null || echo "Лог redsocks пуст или недоступен."
             """
         )
-        DeployManager.updateProgress(0.75f, "Собираю маршруты и правила перенаправления...")
-        val output = ssh.exec(rootCommand(script), timeout = 30000L).trim()
-        DeployManager.updateProgress(1f, "Диагностика собрана.")
-        output
-    } finally {
-        try { session?.disconnect() } catch (_: Exception) {}
-    }
+    DeployManager.updateProgress(0.75f, "Собираю маршруты и правила перенаправления...")
+    val output = runSafeInspection(target, listOf("outbound-diagnostics"), 30_000L) { ssh ->
+        ssh.exec(rootCommand(script), timeout = 30000L)
+    }.trim()
+    DeployManager.updateProgress(1f, "Диагностика собрана.")
+    output
 }
 
 internal fun disableOutboundExitScript(): String = shellScript(
@@ -8512,7 +8671,13 @@ private suspend fun checkTunInterfaceExit(
     target: OutboundSshTarget,
     interfaceName: String
 ): String = withContext(Dispatchers.IO) {
-    runCheckedRootScript(target, checkTunInterfaceExitScript(interfaceName), timeout = 30000L)
+    runCheckedRootScript(
+        target,
+        checkTunInterfaceExitScript(interfaceName),
+        timeout = 30000L,
+        safeReadOnly = true,
+        relayOperation = listOf("check-tun", interfaceName.trim()),
+    )
 }
 
 internal fun deleteTunInterfaceExitScript(): String = shellScript(
@@ -8823,7 +8988,14 @@ private suspend fun checkLocalProxy(
         echo "WDTT_PROGRESS|1.0|Прокси отвечает."
         echo "Проверка успешна: SOCKS5 на 127.0.0.1:${'$'}PROXY_PORT отвечает с указанными логином и паролем. Выходной IP: ${'$'}IP"
     """.trimIndent()
-    return runRootScript(context, target, script, timeout = 30000L)
+    return runRootScript(
+        context,
+        target,
+        script,
+        timeout = 30000L,
+        safeReadOnly = true,
+        relayOperation = listOf("check-local-proxy", port.toString(), login, proxyPassword),
+    )
 }
 
 internal fun stopLocalProxyScript(): String = """
@@ -8918,7 +9090,21 @@ private suspend fun checkExternalProxy(
         echo "WDTT_PROGRESS|1.0|Внешний TCP-прокси отвечает."
         echo "Проверка успешна: ${kind.label} отвечает, сервер смог открыть проверочный сайт через него. IP через прокси: ${'$'}IP"
     """.trimIndent()
-    return runRootScript(context, target, script, timeout = 30000L)
+    return runRootScript(
+        context,
+        target,
+        script,
+        timeout = 30000L,
+        safeReadOnly = true,
+        relayOperation = listOf(
+            "check-external-proxy",
+            kind.name,
+            host,
+            port.toString(),
+            login,
+            proxyPassword,
+        ),
+    )
 }
 
 internal fun externalProxyRoutesScript(): String = """
@@ -9321,6 +9507,27 @@ private fun wgcfToolManagementScript(): String = """
       "${'$'}candidate" register --help 2>&1 | grep -q -- '--accept-tos' || return 1
       "${'$'}candidate" generate --help 2>&1 | grep -q -- '--profile' || return 1
       "${'$'}candidate" status --help >/dev/null 2>&1 || return 1
+    }
+
+    wdtt_wgcf_registration_error() {
+      log="${'$'}1"
+      if grep -Eqi '(^|[^0-9])429([^0-9]|${'$'})|too many requests|rate.?limit' "${'$'}log"; then
+        echo warp_registration_rate_limited
+      elif grep -Eqi 'x509|certificate (has expired|is not yet valid|signed by unknown authority)|certificate verify' "${'$'}log"; then
+        echo warp_registration_certificate_failed
+      elif grep -Eqi 'tls handshake timeout|ssl connection timeout|handshake failure|remote error: tls' "${'$'}log"; then
+        echo warp_registration_tls_failed
+      elif grep -Eqi 'no such host|temporary failure in name resolution|server misbehaving|name or service not known' "${'$'}log"; then
+        echo warp_registration_dns_failed
+      elif grep -Eqi 'i/o timeout|context deadline exceeded|connection timed out|connection reset|connection refused|network is unreachable|no route to host' "${'$'}log"; then
+        echo warp_registration_network_failed
+      elif grep -Eqi '(^|[^0-9])(401|403)([^0-9]|${'$'})|forbidden|access denied|error 1020' "${'$'}log"; then
+        echo warp_registration_rejected
+      elif grep -Eqi '(^|[^0-9])5[0-9][0-9]([^0-9]|${'$'})|internal server error|bad gateway|service unavailable|gateway timeout' "${'$'}log"; then
+        echo warp_registration_service_failed
+      else
+        echo warp_registration_failed
+      fi
     }
 
     wdtt_fetch_wgcf_release() {
@@ -9746,8 +9953,9 @@ internal fun buildFreeWarpInstallScript(mtu: Int = 1280): String {
           echo "WDTT_PROGRESS|0.46|Регистрирую бесплатный профиль Cloudflare WARP..."
           if ! /usr/local/bin/wgcf --config "${'$'}ACCOUNT" register --accept-tos --name "WDTT Plus" --model "WDTT Plus Server" >/tmp/wdtt-wgcf-register.log 2>&1; then
             if [ ! -f "${'$'}ACCOUNT" ] || ! /usr/local/bin/wgcf --config "${'$'}ACCOUNT" status >/dev/null 2>&1; then
+              REGISTER_ERROR="${'$'}(wdtt_wgcf_registration_error /tmp/wdtt-wgcf-register.log)"
               rm -f /tmp/wdtt-wgcf-register.log
-              echo WDTT_ERROR=warp_registration_failed
+              echo "WDTT_ERROR=${'$'}REGISTER_ERROR"
               exit 3
             fi
             echo "Cloudflare вернул ошибку регистрации, но созданный профиль прошёл повторную проверку; продолжаю."
@@ -9817,7 +10025,17 @@ private suspend fun checkFreeWarp(
 ): String = withContext(Dispatchers.IO) {
     var session: Session? = null
     try {
-        session = createSshSession(target.host, target.user, target.credentials, target.port)
+        session = createSshSession(
+            host = target.host,
+            user = target.user,
+            credentials = target.credentials,
+            port = target.port,
+            routePolicy = if (restartOnFailure) {
+                SshRoutePolicy.SERVER_MUTATION_DIRECT_ONLY
+            } else {
+                SshRoutePolicy.SAFE_READ_ONLY_DIRECT
+            },
+        )
         val ssh = SSHClient(session, target.pass)
         val restart = if (restartOnFailure) "1" else "0"
         val script = shellScript(
@@ -9891,7 +10109,7 @@ private suspend fun checkFreeWarp(
 private suspend fun resetFreeWarpRegistration(target: OutboundSshTarget): String = withContext(Dispatchers.IO) {
     var session: Session? = null
     try {
-        session = createSshSession(target.host, target.user, target.credentials, target.port)
+        session = createCriticalSshSession(target)
         val ssh = SSHClient(session, target.pass)
         val script = shellScript(
             outboundShellPrelude(),
@@ -9961,7 +10179,7 @@ private suspend fun resetFreeWarpRegistration(target: OutboundSshTarget): String
 private suspend fun deleteFreeWarp(target: OutboundSshTarget): String = withContext(Dispatchers.IO) {
     var session: Session? = null
     try {
-        session = createSshSession(target.host, target.user, target.credentials, target.port)
+        session = createCriticalSshSession(target)
         val ssh = SSHClient(session, target.pass)
         val script = shellScript(
             outboundShellPrelude(),
@@ -10044,7 +10262,7 @@ private suspend fun enableImportedWireGuardExit(
     val configFile = File(context.cacheDir, "wdtt-imported-wg.conf")
     try {
         configFile.writeText(sanitized)
-        session = createSshSession(target.host, target.user, target.credentials, target.port)
+        session = createCriticalSshSession(target)
         val ssh = SSHClient(session, target.pass)
         ssh.upload(configFile, "/tmp/wdtt-imported-wg.conf")
         val script = shellScript(
@@ -10278,8 +10496,8 @@ private suspend fun deleteWireGuardExitVps(
     var foreignSession: Session? = null
     try {
         DeployManager.updateProgress(0.08f, "Проверяю SSH-доступ к обоим VPS...")
-        currentSession = createSshSession(current.host, current.user, current.credentials, current.port)
-        foreignSession = createSshSession(foreignHost, foreignUser, foreignCredentials, foreignPort)
+        currentSession = createCriticalSshSession(current)
+        foreignSession = createCriticalSshSession(foreignHost, foreignUser, foreignCredentials, foreignPort)
         val currentOutput = SSHClient(currentSession, current.pass)
             .exec(rootCommand(deleteWireGuardVpsCurrentScript()), timeout = 30000L)
         markerValue(currentOutput, "WDTT_ERROR")?.let {
@@ -10326,9 +10544,9 @@ private suspend fun installWireGuardExitVps(
     var currentTouched = false
     try {
         DeployManager.updateProgress(0.10f, "Подключаюсь к текущему серверу WDTT...")
-        currentSession = createSshSession(current.host, current.user, current.credentials, current.port)
+        currentSession = createCriticalSshSession(current)
         DeployManager.updateProgress(0.18f, "Подключаюсь к другому серверу для WireGuard-выхода...")
-        foreignSession = createSshSession(
+        foreignSession = createCriticalSshSession(
             foreignHost,
             foreignUser,
             foreignCredentials,
@@ -10575,7 +10793,7 @@ private suspend fun installWireGuardExitVps(
             if (!rolledBack) {
                 try { foreignSession?.disconnect() } catch (_: Exception) {}
                 foreignSession = runCatching {
-                    createSshSession(foreignHost, foreignUser, foreignCredentials, foreignPort)
+                    createCriticalSshSession(foreignHost, foreignUser, foreignCredentials, foreignPort)
                 }.getOrNull()
                 if (foreignSession?.let { rollbackForeign(it) } != true) rollbackIncomplete = true
             }
@@ -10666,7 +10884,7 @@ private suspend fun installWireGuardExitVps(
             if (!currentRollbackOk) {
                 try { currentSession?.disconnect() } catch (_: Exception) {}
                 currentSession = runCatching {
-                    createSshSession(current.host, current.user, current.credentials, current.port)
+                    createCriticalSshSession(current)
                 }.getOrNull()
                 currentRollbackOk = currentSession?.let { rollbackCurrent(it) } ?: false
             }
@@ -10714,13 +10932,22 @@ private suspend fun checkExistingInstall(
 	host: String,
 	user: String,
 	credentials: SshCredentials,
-	port: Int
+	port: Int,
+    mainPassword: String,
 ): ExistingInstallInfo = withContext(Dispatchers.IO) {
-	var session: Session? = null
-	try {
-		session = createSshSession(host, user, credentials, port)
-		val ssh = SSHClient(session, credentials.password)
-		val output = ssh.exec(
+    val target = OutboundSshTarget(
+        host = host,
+        user = user,
+        pass = credentials.password,
+        privateKey = credentials.privateKey,
+        keyPassphrase = credentials.privateKeyPassphrase,
+        allowPasswordAuthentication = credentials.allowPasswordAuthentication,
+        port = port,
+        mainPassword = mainPassword,
+    )
+	val output = runSafeInspection(target, listOf("existing-install"), 30_000L) { ssh ->
+		verifyRootAccess(ssh)
+		ssh.exec(
 			rootCommand(
 				"printf 'SERVICE=%s\\n' \"$([ -f /etc/systemd/system/wdtt.service ] && echo 1 || echo 0)\"; " +
 					"printf 'BINARY=%s\\n' \"$([ -f /usr/local/bin/wdtt-server ] && echo 1 || echo 0)\"; " +
@@ -10732,11 +10959,12 @@ private suspend fun checkExistingInstall(
 			),
 			timeout = 15000L
 		)
-		if (output.startsWith("error:", ignoreCase = true) || output.contains("\nerror:", ignoreCase = true)) {
-			throw IllegalStateException(output.trim().take(300))
-		}
+	}
+	if (output.startsWith("error:", ignoreCase = true) || output.contains("\nerror:", ignoreCase = true)) {
+		throw IllegalStateException(output.trim().take(300))
+	}
 		fun flag(name: String): Boolean = Regex("^$name=1$", RegexOption.MULTILINE).containsMatchIn(output)
-		ExistingInstallInfo(
+	ExistingInstallInfo(
 			serviceExists = flag("SERVICE"),
 			binaryExists = flag("BINARY"),
 			configDirExists = flag("CONFIG_DIR"),
@@ -10746,14 +10974,12 @@ private suspend fun checkExistingInstall(
 			standaloneManaged = markerValue(output, "WDTT_STANDALONE_MANAGED") == "1",
             androidDeployManaged = markerValue(output, "WDTT_ANDROID_DEPLOY_MANAGED") == "1",
             legacyAndroidDeployCandidate = markerValue(output, "WDTT_LEGACY_ANDROID_DEPLOY_CANDIDATE") == "1",
+            preservedAndroidData = markerValue(output, "WDTT_ANDROID_DATA_PRESERVED") == "1",
             incompleteAndroidDeployCandidate = markerValue(
                 output,
                 "WDTT_INCOMPLETE_ANDROID_DEPLOY_CANDIDATE"
             ) == "1"
-		)
-	} finally {
-		try { session?.disconnect() } catch (_: Exception) {}
-	}
+	)
 }
 
 private fun markerValue(output: String, name: String): String? =
@@ -10769,6 +10995,7 @@ internal fun standaloneInstallerOwnershipProbeScript(pathPrefix: String = ""): S
     config="${'$'}root_prefix/etc/wdtt"
     passwords="${'$'}root_prefix/etc/wdtt/passwords.json"
     wg_keys="${'$'}root_prefix/etc/wdtt/wg-keys.dat"
+    preserved_marker="${'$'}root_prefix/etc/wdtt/.android-deploy-preserved"
     marker='Managed by WDTT Plus standalone server installer'
     if [ -f "${'$'}ownership" ] && [ ! -L "${'$'}ownership" ] &&
        [ -f "${'$'}unit" ] && [ ! -L "${'$'}unit" ] &&
@@ -10778,8 +11005,22 @@ internal fun standaloneInstallerOwnershipProbeScript(pathPrefix: String = ""): S
     else
       printf 'WDTT_STANDALONE_MANAGED=0\n'
     fi
+    android_marker_present=0
     if [ -f "${'$'}unit" ] && [ ! -L "${'$'}unit" ] &&
-       grep -Fqx '# Managed by WDTT Plus Android deploy' "${'$'}unit"; then
+       grep -Fqx '# Managed by WDTT Plus Android deploy' "${'$'}unit" &&
+       grep -Fqx '# WDTT deploy compatibility: 1' "${'$'}unit"; then
+      android_marker_present=1
+    fi
+    android_deploy_managed=0
+    if [ "${'$'}android_marker_present" = "1" ] &&
+       [ -f "${'$'}binary" ] && [ ! -L "${'$'}binary" ] && [ -x "${'$'}binary" ] &&
+       [ -d "${'$'}config" ] && [ ! -L "${'$'}config" ] &&
+       [ -f "${'$'}passwords" ] && [ ! -L "${'$'}passwords" ] && [ -s "${'$'}passwords" ] &&
+       [ -f "${'$'}wg_keys" ] && [ ! -L "${'$'}wg_keys" ] && [ -s "${'$'}wg_keys" ] &&
+       grep -Eq '^ExecStart=/usr/local/bin/wdtt-server([[:space:]]|${'$'})' "${'$'}unit" &&
+       grep -Eq '(^|[[:space:]])-config-dir[[:space:]]+/etc/wdtt([[:space:]]|${'$'})' "${'$'}unit" &&
+       grep -Fq 'wdtt0' "${'$'}unit"; then
+      android_deploy_managed=1
       printf 'WDTT_ANDROID_DEPLOY_MANAGED=1\n'
     else
       printf 'WDTT_ANDROID_DEPLOY_MANAGED=0\n'
@@ -10787,8 +11028,8 @@ internal fun standaloneInstallerOwnershipProbeScript(pathPrefix: String = ""): S
     if [ -f "${'$'}unit" ] && [ ! -L "${'$'}unit" ] &&
        [ -f "${'$'}binary" ] && [ ! -L "${'$'}binary" ] && [ -x "${'$'}binary" ] &&
        [ -d "${'$'}config" ] && [ ! -L "${'$'}config" ] &&
-       [ -f "${'$'}passwords" ] && [ ! -L "${'$'}passwords" ] &&
-       [ -f "${'$'}wg_keys" ] && [ ! -L "${'$'}wg_keys" ] &&
+       [ -f "${'$'}passwords" ] && [ ! -L "${'$'}passwords" ] && [ -s "${'$'}passwords" ] &&
+       [ -f "${'$'}wg_keys" ] && [ ! -L "${'$'}wg_keys" ] && [ -s "${'$'}wg_keys" ] &&
        grep -Eq '^ExecStart=/usr/local/bin/wdtt-server([[:space:]]|${'$'})' "${'$'}unit" &&
        grep -Eq '(^|[[:space:]])-config-dir[[:space:]]+/etc/wdtt([[:space:]]|${'$'})' "${'$'}unit" &&
        grep -Fq 'wdtt0' "${'$'}unit"; then
@@ -10796,11 +11037,47 @@ internal fun standaloneInstallerOwnershipProbeScript(pathPrefix: String = ""): S
     else
       printf 'WDTT_LEGACY_ANDROID_DEPLOY_CANDIDATE=0\n'
     fi
+    preserved_extra=''
+    if [ -d "${'$'}config" ] && [ ! -L "${'$'}config" ]; then
+      preserved_extra="${'$'}(find "${'$'}config" -mindepth 1 -maxdepth 1 \
+        ! -path "${'$'}passwords" ! -path "${'$'}wg_keys" ! -path "${'$'}preserved_marker" \
+        -print -quit 2>/dev/null || true)"
+    fi
+    if [ ! -e "${'$'}ownership" ] && [ ! -L "${'$'}ownership" ] &&
+       [ ! -e "${'$'}unit" ] && [ ! -L "${'$'}unit" ] &&
+       [ ! -e "${'$'}binary" ] && [ ! -L "${'$'}binary" ] &&
+       [ -d "${'$'}config" ] && [ ! -L "${'$'}config" ] &&
+       [ -f "${'$'}passwords" ] && [ ! -L "${'$'}passwords" ] && [ -s "${'$'}passwords" ] &&
+       [ -f "${'$'}wg_keys" ] && [ ! -L "${'$'}wg_keys" ] && [ -s "${'$'}wg_keys" ] &&
+       [ "${'$'}(stat -c '%a' "${'$'}config" 2>/dev/null || true)" = "700" ] &&
+       [ "${'$'}(stat -c '%a' "${'$'}passwords" 2>/dev/null || true)" = "600" ] &&
+       [ "${'$'}(stat -c '%a' "${'$'}wg_keys" 2>/dev/null || true)" = "600" ] &&
+       { { [ -f "${'$'}preserved_marker" ] && [ ! -L "${'$'}preserved_marker" ] &&
+             [ "${'$'}(cat "${'$'}preserved_marker" 2>/dev/null)" = 'Preserved by WDTT Plus Android deploy' ]; } ||
+         { [ ! -e "${'$'}preserved_marker" ] && [ -z "${'$'}preserved_extra" ]; }; }; then
+      printf 'WDTT_ANDROID_DATA_PRESERVED=1\n'
+    else
+      printf 'WDTT_ANDROID_DATA_PRESERVED=0\n'
+    fi
     incomplete_extra=''
     if [ -d "${'$'}config" ] && [ ! -L "${'$'}config" ]; then
       incomplete_extra="${'$'}(find "${'$'}config" -mindepth 1 -maxdepth 1 ! -path "${'$'}passwords" -print -quit 2>/dev/null || true)"
     fi
-    if [ ! -e "${'$'}ownership" ] && [ ! -e "${'$'}unit" ] && [ ! -e "${'$'}binary" ] &&
+    if [ "${'$'}android_deploy_managed" = "0" ] &&
+       [ "${'$'}android_marker_present" = "1" ] &&
+       [ ! -e "${'$'}ownership" ] && [ ! -L "${'$'}ownership" ] &&
+       { { [ ! -e "${'$'}binary" ] && [ ! -L "${'$'}binary" ]; } ||
+         { [ -f "${'$'}binary" ] && [ ! -L "${'$'}binary" ]; }; } &&
+       { { [ ! -e "${'$'}config" ] && [ ! -L "${'$'}config" ]; } ||
+         { [ -d "${'$'}config" ] && [ ! -L "${'$'}config" ]; }; } &&
+       { { [ ! -e "${'$'}passwords" ] && [ ! -L "${'$'}passwords" ]; } ||
+         { [ -f "${'$'}passwords" ] && [ ! -L "${'$'}passwords" ]; }; } &&
+       { { [ ! -e "${'$'}wg_keys" ] && [ ! -L "${'$'}wg_keys" ]; } ||
+         { [ -f "${'$'}wg_keys" ] && [ ! -L "${'$'}wg_keys" ]; }; }; then
+      printf 'WDTT_INCOMPLETE_ANDROID_DEPLOY_CANDIDATE=1\n'
+    elif [ ! -e "${'$'}ownership" ] && [ ! -L "${'$'}ownership" ] &&
+       [ ! -e "${'$'}unit" ] && [ ! -L "${'$'}unit" ] &&
+       [ ! -e "${'$'}binary" ] && [ ! -L "${'$'}binary" ] &&
        [ -d "${'$'}config" ] && [ ! -L "${'$'}config" ] &&
        [ -f "${'$'}passwords" ] && [ ! -L "${'$'}passwords" ] && [ -s "${'$'}passwords" ] &&
        [ ! -e "${'$'}wg_keys" ] && [ -z "${'$'}incomplete_extra" ] &&
@@ -10824,6 +11101,7 @@ internal fun deploymentOwnershipFromProbe(output: String): DeploymentOwnership {
         "WDTT_STANDALONE_MANAGED",
         "WDTT_ANDROID_DEPLOY_MANAGED",
         "WDTT_LEGACY_ANDROID_DEPLOY_CANDIDATE",
+        "WDTT_ANDROID_DATA_PRESERVED",
         "WDTT_INCOMPLETE_ANDROID_DEPLOY_CANDIDATE",
         "WDTT_INSTALL_TRACE",
     )
@@ -10834,6 +11112,7 @@ internal fun deploymentOwnershipFromProbe(output: String): DeploymentOwnership {
         markerValue(output, "WDTT_STANDALONE_MANAGED") == "1" -> DeploymentOwnership.StandaloneInstaller
         markerValue(output, "WDTT_ANDROID_DEPLOY_MANAGED") == "1" -> DeploymentOwnership.AndroidDeploy
         markerValue(output, "WDTT_LEGACY_ANDROID_DEPLOY_CANDIDATE") == "1" -> DeploymentOwnership.LegacyAndroidDeploy
+        markerValue(output, "WDTT_ANDROID_DATA_PRESERVED") == "1" -> DeploymentOwnership.PreservedAndroidData
         markerValue(output, "WDTT_INCOMPLETE_ANDROID_DEPLOY_CANDIDATE") == "1" ->
             DeploymentOwnership.IncompleteAndroidDeploy
         markerValue(output, "WDTT_INSTALL_TRACE") == "0" -> DeploymentOwnership.NoInstall
@@ -10845,6 +11124,32 @@ internal fun deploymentOwnershipFromProbe(output: String): DeploymentOwnership {
 private fun deploymentOwnership(ssh: SSHClient): DeploymentOwnership {
     val output = ssh.exec(rootCommand(standaloneInstallerOwnershipProbeScript()), timeout = 15_000L)
     return deploymentOwnershipFromProbe(output)
+}
+
+private fun verifyRootAccess(ssh: SSHClient) {
+    val output = ssh.exec(rootCommand("printf 'WDTT_ROOT_ACCESS=ok\\n'"), timeout = 20_000L)
+    require(markerValue(output, "WDTT_ROOT_ACCESS") == "ok") {
+        "SSH-подключение установлено, но root-права не получены. Проверьте пароль sudo и права выбранного пользователя."
+    }
+}
+
+private fun markPreservedAndroidData(ssh: SSHClient) {
+    val output = ssh.exec(
+        rootCommand(
+            "set -e; " +
+                "[ -d /etc/wdtt ] && [ ! -L /etc/wdtt ]; " +
+                "[ -f /etc/wdtt/passwords.json ] && [ ! -L /etc/wdtt/passwords.json ]; " +
+                "[ -f /etc/wdtt/wg-keys.dat ] && [ ! -L /etc/wdtt/wg-keys.dat ]; " +
+                "printf '%s\\n' 'Preserved by WDTT Plus Android deploy' > /etc/wdtt/.android-deploy-preserved.new; " +
+                "chmod 600 /etc/wdtt/.android-deploy-preserved.new; " +
+                "mv -f /etc/wdtt/.android-deploy-preserved.new /etc/wdtt/.android-deploy-preserved; " +
+                "echo WDTT_PRESERVED_MARKER=ready"
+        ),
+        timeout = 15_000L
+    )
+    require(markerValue(output, "WDTT_PRESERVED_MARKER") == "ready") {
+        "не удалось безопасно отметить сохранённые данные Android-деплоя"
+    }
 }
 
 internal fun assertDeploymentMayBeUpdated(
@@ -10868,6 +11173,7 @@ internal fun assertDeploymentMayBeUpdated(
         mode == DeployMode.PreserveData && ownership !in setOf(
             DeploymentOwnership.AndroidDeploy,
             DeploymentOwnership.LegacyAndroidDeploy,
+            DeploymentOwnership.PreservedAndroidData,
         ) -> throw IllegalStateException(
             "обновление с сохранением разрешено только для подтверждённой Android-установки."
         )
@@ -10879,6 +11185,7 @@ internal fun assertDeploymentMayBeUpdated(
         }
         mode == DeployMode.ResetAll && ownership !in setOf(
             DeploymentOwnership.AndroidDeploy,
+            DeploymentOwnership.PreservedAndroidData,
             DeploymentOwnership.IncompleteAndroidDeploy,
         ) ->
             throw IllegalStateException(
@@ -10890,7 +11197,8 @@ internal fun assertDeploymentMayBeUpdated(
 
 private fun assertAndroidDeployMayManageServer(ssh: SSHClient, operation: String) {
     when (deploymentOwnership(ssh)) {
-        DeploymentOwnership.AndroidDeploy -> Unit
+        DeploymentOwnership.AndroidDeploy,
+        DeploymentOwnership.PreservedAndroidData -> Unit
         DeploymentOwnership.StandaloneInstaller -> throw IllegalStateException(
             "сервер управляется standalone-инсталлером. Для $operation используйте server-installer/install.sh на VPS; Android-деплой не будет менять эту установку."
         )
@@ -10947,6 +11255,14 @@ private fun friendlyDeployError(error: Throwable, operation: String): String {
     val hint = when {
         operation.contains("экспорт", ignoreCase = true) && "permission denied" in lower ->
             "Android не разрешил записать файл экспорта в выбранное место."
+        "адрес в «деплое» ведёт к другому серверу" in lower ||
+            "не удалось подтвердить, что адрес в «деплое»" in lower ->
+            error.message.orEmpty().take(420).ifBlank { raw.take(420) }
+        "эта операция изменяет сервер и не выполняется через активный wdtt" in lower ->
+            "Эта операция изменяет сервер и поэтому не выполняется через активный WDTT. " +
+                "При подключении к этому же серверу это защищает от обрыва управления. " +
+                "Используйте прямой интернет или временно отключите WDTT. " +
+                "Управление другим сервером через отдельный активный профиль пока не поддерживается."
         "3proxy_source_no_curl" in lower ->
             "не удалось скачать исходники 3proxy: на сервере нет curl, и пакетный менеджер не смог его поставить."
         "3proxy_source_no_tar" in lower ->
@@ -11075,8 +11391,22 @@ private fun friendlyDeployError(error: Throwable, operation: String): String {
             "не удалось получить совместимый wgcf с корректной SHA-256. Проверены свежий выпуск и закреплённая резервная версия; ни один файл не был запущен."
         "warp_wgcf_update_rolled_back" in lower ->
             "новый wgcf прошёл проверку файла, но не смог прочитать действующую WARP-регистрацию. Приложение вернуло предыдущий бинарник."
+        "warp_registration_rate_limited" in lower ->
+            "Cloudflare временно ограничил новые регистрации WARP для IP этого сервера (429). Не повторяйте попытки подряд; подождите и попробуйте позже либо используйте другой IP/VPS."
+        "warp_registration_certificate_failed" in lower ->
+            "сервер не смог проверить TLS-сертификат WARP API. Проверьте дату и время VPS, синхронизацию часов и пакет корневых CA-сертификатов."
+        "warp_registration_tls_failed" in lower ->
+            "TLS-соединение VPS с api.cloudflareclient.com не завершилось. Вероятна фильтрация или поломка маршрута для IP сервера; проверьте доступ у хостера или попробуйте другой IP/VPS."
+        "warp_registration_dns_failed" in lower ->
+            "VPS не смог определить адрес api.cloudflareclient.com. Проверьте DNS-настройки и исходящий доступ сервера."
+        "warp_registration_network_failed" in lower ->
+            "VPS не смог установить сетевое соединение с api.cloudflareclient.com. Проверьте исходящий HTTPS, маршрутизацию и ограничения хостера."
+        "warp_registration_rejected" in lower ->
+            "Cloudflare отклонил регистрацию WARP для этого запроса или IP сервера. Повторные попытки подряд не помогут; попробуйте позже или с другого IP/VPS."
+        "warp_registration_service_failed" in lower ->
+            "WARP API вернул серверную ошибку. Это может быть временный сбой Cloudflare или изменение API; повторите попытку позже."
         "warp_registration_failed" in lower ->
-            withTail("Cloudflare не принял регистрацию бесплатного WARP. Проверьте доступ сервера к api.cloudflareclient.com и повторите позже.")
+            "wgcf не завершил регистрацию бесплатного WARP, но безопасно определить причину ответа не удалось. Запустите диагностику сервера и проверьте доступ VPS к api.cloudflareclient.com."
         "warp_profile_generation_failed" in lower ->
             withTail("регистрация WARP найдена, но wgcf не смог создать WireGuard-профиль. Существующие ключи сохранены; повторите восстановление.")
         "warp_profile_invalid" in lower ->
@@ -11117,7 +11447,7 @@ private fun friendlyDeployError(error: Throwable, operation: String): String {
             "permission denied" in lower ->
             "не удалось войти по SSH. Проверьте логин, SSH-пароль или приватный ключ, пароль ключа и порт."
         "connection refused" in lower ->
-            "сервер доступен, но SSH-порт отклоняет подключение. Проверьте SSH-порт и правила межсетевого экрана."
+            "Сервер доступен, но SSH-порт отклоняет подключение. Проверьте SSH-порт и правила межсетевого экрана."
         "unknownhost" in lower ||
             "unknown host" in lower ||
             "name or service not known" in lower ||
@@ -11125,10 +11455,10 @@ private fun friendlyDeployError(error: Throwable, operation: String): String {
             "не удалось найти сервер. Проверьте IP или домен."
         "timeout" in lower ||
             "timed out" in lower ->
-            "сервер не ответил вовремя. Проверьте сеть, IP, SSH-порт и правила межсетевого экрана."
+            "Сервер не ответил вовремя. Проверьте сеть, IP, SSH-порт и правила межсетевого экрана."
         "network is unreachable" in lower ||
             "no route to host" in lower ->
-            "сервер недоступен из текущей сети. Проверьте интернет, IP и правила межсетевого экрана."
+            "Сервер недоступен из текущей сети. Проверьте интернет, IP и правила межсетевого экрана."
         "session is down" in lower ->
             "SSH-сессия оборвалась во время операции. Повторите действие после проверки соединения."
         "no_passwords_json" in lower ||
@@ -11152,7 +11482,7 @@ private fun friendlyDeployError(error: Throwable, operation: String): String {
             "импорт записан, но сервис wdtt.service не запустился. Проверьте журнал сервиса на сервере."
         else -> raw.take(180).ifBlank { "операция «$operation» завершилась с неизвестной ошибкой" }
     }
-    return hint
+    return capitalizeUserSentence(hint)
 }
 
 private fun decodeBase64Text(value: String): String =
@@ -11801,39 +12131,75 @@ private suspend fun readServerBackup(
     user: String,
     credentials: SshCredentials,
     port: Int,
+    mainPassword: String,
     includeWgKeys: Boolean,
     localOwnerProfile: ServerAdminProfileInfo?,
     localPeer: String
 ): ServerBackup = withContext(Dispatchers.IO) {
-    var session: Session? = null
-    try {
-        session = createSshSession(host, user, credentials, port)
-        val ssh = SSHClient(session, credentials.password)
-        val passwordsJson = readRemotePasswordsJson(ssh)
+    val target = OutboundSshTarget(
+        host = host,
+        user = user,
+        pass = credentials.password,
+        privateKey = credentials.privateKey,
+        keyPassphrase = credentials.privateKeyPassphrase,
+        allowPasswordAuthentication = credentials.allowPasswordAuthentication,
+        port = port,
+        mainPassword = mainPassword,
+    )
+    val documentText = runSafeInspection(
+        target,
+        listOf("config-export", includeWgKeys.toString()),
+        120_000L,
+    ) { ssh ->
+        val passwords = readRemotePasswordsJson(ssh)
             ?: throw IllegalStateException("сервер не отдал passwords.json")
         val wgKeys = if (includeWgKeys) readRemoteWgKeysDat(ssh) else null
         if (includeWgKeys && wgKeys.isNullOrBlank()) {
             throw IllegalStateException("полный экспорт невозможен: на сервере не найден корректный /etc/wdtt/wg-keys.dat. Выполните установку сервера или выберите частичный экспорт")
         }
-        val prepared = prepareServerDatabaseForBackup(
-            sourceJson = passwordsJson,
-            localOwnerProfile = localOwnerProfile,
-            localPeer = localPeer,
-            sourceHost = host
-        )
-        parseBackup(
-            passwordsJson = prepared.json,
-            wgKeysDat = wgKeys,
-            createdAt = SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault()).format(Date()),
-            sourceHost = host,
-            ownerProfileFromApp = prepared.ownerProfileFromApp,
-            outboundProfileEnv = readRemoteOutboundProfile(ssh),
-            backupPolicyJson = readRemoteBackupPolicy(ssh)
-        )
-    } finally {
-        try { session?.disconnect() } catch (_: Exception) {}
+        JSONObject()
+            .put("passwords_b64", encodeBase64Text(passwords))
+            .put("wg_keys_b64", encodeBase64Text(wgKeys.orEmpty()))
+            .put("outbound_profile_b64", encodeBase64Text(readRemoteOutboundProfile(ssh).orEmpty()))
+            .put("backup_policy_b64", encodeBase64Text(readRemoteBackupPolicy(ssh)))
+            .toString()
     }
+    val document = JSONObject(documentText)
+    fun decoded(name: String, maxEncoded: Int): String {
+        val encoded = document.optString(name, "")
+        require(encoded.length <= maxEncoded) { "сервер вернул слишком большой файл настроек" }
+        return if (encoded.isBlank()) "" else decodeBase64Text(encoded)
+    }
+    val passwordsJson = decoded("passwords_b64", 6_700_000)
+    val wgKeys = decoded("wg_keys_b64", 6_000).takeIf(String::isNotBlank)
+    val outboundProfile = decoded("outbound_profile_b64", 2_700_000).takeIf(String::isNotBlank)
+    val backupPolicy = decoded("backup_policy_b64", 88_000)
+    if (includeWgKeys && wgKeys.isNullOrBlank()) {
+        throw IllegalStateException("полный экспорт невозможен: сервер не вернул корректные WireGuard-ключи")
+    }
+    outboundProfile?.let(::validateOutboundProfileBackup)
+    validateBackupPolicyJson(backupPolicy)
+    val prepared = prepareServerDatabaseForBackup(
+        sourceJson = passwordsJson,
+        localOwnerProfile = localOwnerProfile,
+        localPeer = localPeer,
+        sourceHost = host
+    )
+    parseBackup(
+        passwordsJson = prepared.json,
+        wgKeysDat = wgKeys,
+        createdAt = SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault()).format(Date()),
+        sourceHost = host,
+        ownerProfileFromApp = prepared.ownerProfileFromApp,
+        outboundProfileEnv = outboundProfile,
+        backupPolicyJson = backupPolicy,
+    )
 }
+
+private suspend fun readServerDatabaseSafely(target: OutboundSshTarget): String =
+    runSafeInspection(target, listOf("database-snapshot"), 60_000L) { ssh ->
+        readRemotePasswordsJson(ssh) ?: throw IllegalStateException("на сервере не найдена база доступа")
+    }
 
 private fun readRemoteOutboundProfile(ssh: SSHClient): String? {
     val output = ssh.exec(
@@ -12147,6 +12513,13 @@ private fun ownerProfileInstallDiffLines(
     }
 }
 
+internal fun ownerProfileOverwriteLines(diffLines: List<String>): List<String> = when (diffLines.size) {
+    0 -> emptyList()
+    1 -> diffLines
+    else -> listOf("Поля профиля владельца («Туннель» и порты):") +
+        diffLines.map { "  $it" }
+}
+
 private fun existingConnectionDiffLines(
     connection: ExistingServerConnection,
     localPeer: String,
@@ -12270,22 +12643,17 @@ private suspend fun compareDeployWithServer(
     if (inspectDatabase) {
         runCatching {
             withContext(Dispatchers.IO) {
-                var session: Session? = null
-                try {
-                    session = createSshSession(
-                        request.host,
-                        request.user,
-                        SshCredentials(
-                            password = request.pass,
-                            privateKey = request.privateKey,
-                            privateKeyPassphrase = request.keyPassphrase,
-                            allowPasswordAuthentication = request.allowPasswordAuthentication
-                        ),
-                        request.sshPort
+                    val target = OutboundSshTarget(
+                        host = request.host,
+                        user = request.user,
+                        pass = request.pass,
+                        privateKey = request.privateKey,
+                        keyPassphrase = request.keyPassphrase,
+                        allowPasswordAuthentication = request.allowPasswordAuthentication,
+                        port = request.sshPort,
+                        mainPassword = request.mainPass,
                     )
-                    val ssh = SSHClient(session, request.pass)
-                    val raw = readRemotePasswordsJson(ssh)
-                        ?: throw IllegalStateException("на сервере не найдена база доступа")
+                    val raw = readServerDatabaseSafely(target)
                     val db = JSONObject(raw)
                     val mainPasswordNeedsRecovery =
                         validatePasswordsDbForPreserving(db, request.mainPass)
@@ -12316,16 +12684,12 @@ private suspend fun compareDeployWithServer(
                     val serverProfile = parseOwnerProfileFromDb(db.optJSONObject("admin_profile"), defaultPorts)
                     val ownerInstallDiff = ownerProfileInstallDiffLines(serverProfile, localOwnerProfile)
                     if (serverProfile.hasSavedFields && ownerInstallDiff.isNotEmpty()) {
-                        overwriteLines += "Профиль владельца («Туннель» и порты)"
-                        overwriteLines += ownerInstallDiff.map { "  $it" }
+                        overwriteLines += ownerProfileOverwriteLines(ownerInstallDiff)
                     } else if (!serverProfile.hasSavedFields && hasMeaningfulAdminProfileFields(localOwnerProfile)) {
                         notes += "На сервере ещё нет профиля владельца; установка сохранит только заданные нестандартные поля «Туннеля»."
                     } else if (serverProfile.hasSavedFields && !hasMeaningfulAdminProfileFields(localOwnerProfile)) {
                         notes += "Поля «Туннеля» в приложении пустые или стандартные — сохранённый профиль владельца на сервере не изменится."
                     }
-                } finally {
-                    try { session?.disconnect() } catch (_: Exception) {}
-                }
             }
         }.onFailure {
             errors += friendlyDeployError(it, "сверка профиля сервера")
@@ -12340,13 +12704,16 @@ private suspend fun compareDeployWithServer(
             privateKey = request.privateKey,
             keyPassphrase = request.keyPassphrase,
             allowPasswordAuthentication = request.allowPasswordAuthentication,
-            port = request.sshPort
+            port = request.sshPort,
+            mainPassword = request.mainPass,
         )
         val output = runRootScript(
             context = context,
             target = target,
             script = outboundSnapshotScript(),
-            timeout = 30000L
+            timeout = 30000L,
+            safeReadOnly = true,
+            relayOperation = listOf("outbound-snapshot"),
         )
         val snapshot = parseOutboundServerSnapshot(output)
         if (snapshot.hasProfile && outboundProfilesDiffer(snapshot, localOutboundProfile)) {
@@ -12412,15 +12779,18 @@ private suspend fun readExistingServerConnection(
     port: Int,
     adminMainPassword: String
 ): ExistingServerConnection = withContext(Dispatchers.IO) {
-    var session: Session? = null
-    try {
-        session = createSshSession(host, user, credentials, port)
-        val ssh = SSHClient(session, credentials.password)
-        val dbJson = readRemotePasswordsJson(ssh) ?: throw IllegalStateException("на сервере не найден /etc/wdtt/passwords.json")
-        selectExistingServerConnection(dbJson, host, adminMainPassword)
-    } finally {
-        try { session?.disconnect() } catch (_: Exception) {}
-    }
+    val target = OutboundSshTarget(
+        host = host,
+        user = user,
+        pass = credentials.password,
+        privateKey = credentials.privateKey,
+        keyPassphrase = credentials.privateKeyPassphrase,
+        allowPasswordAuthentication = credentials.allowPasswordAuthentication,
+        port = port,
+        mainPassword = adminMainPassword,
+    )
+    val dbJson = readServerDatabaseSafely(target)
+    selectExistingServerConnection(dbJson, host, adminMainPassword)
 }
 
 internal fun mergeServerDatabaseEntries(
@@ -12759,7 +13129,7 @@ private suspend fun performServerImportNow(
     var rollbackPrepared = false
     try {
         onProgress(0.05f, "Подключение...")
-        session = createSshSession(
+        session = createCriticalSshSession(
             request.host,
             request.user,
             SshCredentials(
@@ -13374,7 +13744,7 @@ private suspend fun performDeploy(
     var stagedDatabaseFile: File? = null
     try {
         onProgress(0.02f, "Подключение...")
-	        session = createSshSession(
+	        session = createCriticalSshSession(
 	            host,
 	            user,
 	            SshCredentials(pass, privateKey, keyPassphrase, allowPasswordAuthentication),
@@ -13384,6 +13754,8 @@ private suspend fun performDeploy(
         val ssh = SSHClient(session, pass)
         sshClient = ssh
 
+        onProgress(0.03f, "Проверяю root-права...")
+        verifyRootAccess(ssh)
         onProgress(0.04f, "Проверяю владельца установки...")
         val ownership = deploymentOwnership(ssh)
         assertDeploymentMayBeUpdated(ownership, mode)
@@ -13447,6 +13819,7 @@ private suspend fun performDeploy(
 			importPlan != null ||
 			(mode == DeployMode.ResetAll && ownership in setOf(
                 DeploymentOwnership.AndroidDeploy,
+                DeploymentOwnership.PreservedAndroidData,
                 DeploymentOwnership.IncompleteAndroidDeploy,
             ))
 		) {
@@ -13471,6 +13844,9 @@ private suspend fun performDeploy(
             }
             prepareServerUpdateRollback(ssh)
             rollbackPrepared = true
+            if (ownership == DeploymentOwnership.PreservedAndroidData) {
+                markPreservedAndroidData(ssh)
+            }
         }
 
         if (importPlan == null) {
@@ -13647,19 +14023,27 @@ private suspend fun performDeploy(
 private suspend fun performUninstall(
     host: String, user: String, credentials: SshCredentials, port: Int,
     dtlsPort: Int, wgPort: Int,
+    mode: ServerUninstallMode,
     onProgress: (Float, String) -> Unit
 ) = withContext(Dispatchers.IO) {
     var session: Session? = null
     try {
         onProgress(0.05f, "Подключение...")
-        session = createSshSession(host, user, credentials, port)
+        session = createCriticalSshSession(host, user, credentials, port)
         DeployManager.activeSession = session
         val ssh = SSHClient(session, credentials.password)
 
-        onProgress(0.10f, "Проверяю владельца установки...")
+        onProgress(0.08f, "Проверяю root-права...")
+        verifyRootAccess(ssh)
+        onProgress(0.12f, "Проверяю владельца установки...")
         assertAndroidDeployMayManageServer(ssh, "удаления")
 
-        onProgress(0.15f, "Остановка сервиса...")
+        if (mode == ServerUninstallMode.PreserveData) {
+            onProgress(0.16f, "Защищаю сохраняемые данные...")
+            markPreservedAndroidData(ssh)
+        }
+
+        onProgress(0.22f, "Остановка сервиса...")
         ssh.exec(
             rootCommand(
                 "systemctl unmask wdtt 2>/dev/null || true; " +
@@ -13671,13 +14055,10 @@ private suspend fun performUninstall(
             timeout = 15000L
         )
 
-        onProgress(0.30f, "Удаление через deploy.sh...")
-        ssh.exec(rootCommand("[ -f /tmp/deploy.sh ] && env WDTT_DTLS_PORT=$dtlsPort WDTT_WG_PORT=$wgPort WDTT_SSH_PORT=$port bash /tmp/deploy.sh uninstall 2>/dev/null || true"), timeout = 30000L)
-
-        onProgress(0.45f, "Удаление бинарника...")
+        onProgress(0.38f, "Удаление бинарника...")
         ssh.exec(rootCommand("pkill -x wdtt-server 2>/dev/null || true; rm -f /usr/local/bin/wdtt-server"), timeout = 10000L)
 
-        onProgress(0.60f, "Очистка firewall...")
+        onProgress(0.54f, "Очистка firewall...")
         ssh.exec(
             rootCommand(
                 "if command -v iptables >/dev/null 2>&1; then " +
@@ -13685,6 +14066,8 @@ private suspend fun performUninstall(
                     "for iface in $(ls /sys/class/net 2>/dev/null || true); do " +
                     "iptables -t nat -D POSTROUTING -s 10.66.66.0/24 -o \"${'$'}iface\" -m comment --comment WDTT_MANAGED -j MASQUERADE 2>/dev/null || true; " +
                     "done; " +
+                    "iptables -t mangle -D FORWARD -s 10.66.66.0/24 -p tcp -m tcp --tcp-flags SYN,RST SYN -m comment --comment WDTT_MANAGED -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true; " +
+                    "iptables -t mangle -D FORWARD -d 10.66.66.0/24 -p tcp -m tcp --tcp-flags SYN,RST SYN -m comment --comment WDTT_MANAGED -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true; " +
                     "iptables -D INPUT -p udp --dport $dtlsPort -m comment --comment WDTT_MANAGED -j ACCEPT 2>/dev/null || true; " +
                     "iptables -D INPUT -p udp --dport $wgPort -m comment --comment WDTT_MANAGED -j ACCEPT 2>/dev/null || true; " +
                     "iptables -D INPUT -p udp --dport 56000 -m comment --comment WDTT_MANAGED -j ACCEPT 2>/dev/null || true; " +
@@ -13693,7 +14076,12 @@ private suspend fun performUninstall(
                     "iptables -D INPUT -p tcp --dport 22 -m comment --comment WDTT_MANAGED -j ACCEPT 2>/dev/null || true; " +
                     "iptables -D FORWARD -i wdtt0 -m comment --comment WDTT_MANAGED -j ACCEPT 2>/dev/null || true; " +
                     "iptables -D FORWARD -o wdtt0 -m comment --comment WDTT_MANAGED -j ACCEPT 2>/dev/null || true; " +
-                    "done; fi; " +
+                    "done; " +
+                    "while rule_no=${'$'}(iptables -L INPUT --line-numbers -n 2>/dev/null | awk '/WDTT_MANAGED/ {print ${'$'}1; exit}'); [ -n \"${'$'}rule_no\" ]; do iptables -D INPUT \"${'$'}rule_no\" 2>/dev/null || break; done; " +
+                    "while rule_no=${'$'}(iptables -L FORWARD --line-numbers -n 2>/dev/null | awk '/WDTT_MANAGED/ {print ${'$'}1; exit}'); [ -n \"${'$'}rule_no\" ]; do iptables -D FORWARD \"${'$'}rule_no\" 2>/dev/null || break; done; " +
+                    "while rule_no=${'$'}(iptables -t nat -L POSTROUTING --line-numbers -n 2>/dev/null | awk '/WDTT_MANAGED/ {print ${'$'}1; exit}'); [ -n \"${'$'}rule_no\" ]; do iptables -t nat -D POSTROUTING \"${'$'}rule_no\" 2>/dev/null || break; done; " +
+                    "while rule_no=${'$'}(iptables -t mangle -L FORWARD --line-numbers -n 2>/dev/null | awk '/WDTT_MANAGED/ {print ${'$'}1; exit}'); [ -n \"${'$'}rule_no\" ]; do iptables -t mangle -D FORWARD \"${'$'}rule_no\" 2>/dev/null || break; done; " +
+                    "fi; " +
                     "if command -v nft >/dev/null 2>&1; then " +
                     "nft delete table ip wdtt 2>/dev/null || true; " +
                     "nft delete table inet wdtt 2>/dev/null || true; " +
@@ -13703,19 +14091,60 @@ private suspend fun performUninstall(
             timeout = 15000L
         )
 
-        onProgress(0.75f, "Удаление VPN-интерфейса...")
+        onProgress(0.72f, if (mode == ServerUninstallMode.PreserveData) "Сохраняю данные..." else "Удаляю данные...")
         ssh.exec(
             rootCommand(
                 "ip link show wdtt0 >/dev/null 2>&1 && ip link del wdtt0 2>/dev/null || true; " +
-                    "[ -d /etc/wdtt ] && find /etc/wdtt -mindepth 1 -maxdepth 1 ! -name passwords.json ! -name wg-keys.dat -exec rm -rf {} + 2>/dev/null || true; " +
-                    "[ -f /etc/wdtt/passwords.json ] && chmod 600 /etc/wdtt/passwords.json 2>/dev/null || true; " +
-                    "[ -f /etc/wdtt/wg-keys.dat ] && chmod 600 /etc/wdtt/wg-keys.dat 2>/dev/null || true"
+                    if (mode == ServerUninstallMode.PreserveData) {
+                        "[ -d /etc/wdtt ] && [ ! -L /etc/wdtt ]; " +
+                            "chmod 700 /etc/wdtt; " +
+                            "[ -f /etc/wdtt/passwords.json ] && chmod 600 /etc/wdtt/passwords.json; " +
+                            "[ -f /etc/wdtt/wg-keys.dat ] && chmod 600 /etc/wdtt/wg-keys.dat"
+                    } else {
+                        "[ -d /etc/wdtt ] && [ ! -L /etc/wdtt ]; " +
+                            "rm -rf /etc/wdtt; rm -rf /var/tmp/wdtt-plus-update-backup; " +
+                            "rm -f /var/log/wdtt-install.log"
+                    }
             ),
             timeout = 10000L
         )
 
-        onProgress(0.90f, "Очистка sysctl...")
-        ssh.exec(rootCommand("rm -f /etc/sysctl.d/99-wdtt.conf; sysctl --system >/dev/null 2>&1 || true"), timeout = 15000L)
+        onProgress(0.84f, "Очистка системных настроек...")
+        ssh.exec(
+            rootCommand(
+                "rm -f /etc/sysctl.d/99-wdtt.conf /tmp/deploy.sh /tmp/wdtt-server /tmp/wdtt-passwords.json.new; " +
+                    "sysctl --system >/dev/null 2>&1 || true"
+            ),
+            timeout = 15000L
+        )
+
+        onProgress(0.94f, "Проверяю результат...")
+        val verifyOutput = ssh.exec(
+            rootCommand(
+                "printf 'WDTT_UNINSTALL_SERVICE=%s\\n' \"${'$'}([ ! -e /etc/systemd/system/wdtt.service ] && echo 0 || echo 1)\"; " +
+                    "printf 'WDTT_UNINSTALL_BINARY=%s\\n' \"${'$'}([ ! -e /usr/local/bin/wdtt-server ] && echo 0 || echo 1)\"; " +
+                    "printf 'WDTT_UNINSTALL_INTERFACE=%s\\n' \"${'$'}(ip link show wdtt0 >/dev/null 2>&1 && echo 1 || echo 0)\"; " +
+                    "printf 'WDTT_UNINSTALL_PROCESS=%s\\n' \"${'$'}(pgrep -x wdtt-server >/dev/null 2>&1 && echo 1 || echo 0)\"; " +
+                    "printf 'WDTT_UNINSTALL_SYSCTL=%s\\n' \"${'$'}([ ! -e /etc/sysctl.d/99-wdtt.conf ] && echo 0 || echo 1)\"; " +
+                    "printf 'WDTT_UNINSTALL_FIREWALL=%s\\n' \"${'$'}({ { ! command -v iptables-save >/dev/null 2>&1 || ! iptables-save 2>/dev/null | grep -q WDTT_MANAGED; } && { ! command -v nft >/dev/null 2>&1 || ! nft list tables 2>/dev/null | grep -Eq '^table (ip|inet) wdtt(_mangle)?${'$'}'; }; } && echo 0 || echo 1)\"; " +
+                    if (mode == ServerUninstallMode.PreserveData) {
+                        "printf 'WDTT_UNINSTALL_DATA=%s\\n' \"${'$'}([ -f /etc/wdtt/passwords.json ] && [ -f /etc/wdtt/wg-keys.dat ] && [ -f /etc/wdtt/.android-deploy-preserved ] && echo preserved || echo invalid)\""
+                    } else {
+                        "printf 'WDTT_UNINSTALL_DATA=%s\\n' \"${'$'}([ ! -e /etc/wdtt ] && echo removed || echo present)\""
+                    }
+            ),
+            timeout = 15_000L
+        )
+        val expectedData = if (mode == ServerUninstallMode.PreserveData) "preserved" else "removed"
+        require(
+            markerValue(verifyOutput, "WDTT_UNINSTALL_SERVICE") == "0" &&
+                markerValue(verifyOutput, "WDTT_UNINSTALL_BINARY") == "0" &&
+                markerValue(verifyOutput, "WDTT_UNINSTALL_INTERFACE") == "0" &&
+                markerValue(verifyOutput, "WDTT_UNINSTALL_PROCESS") == "0" &&
+                markerValue(verifyOutput, "WDTT_UNINSTALL_SYSCTL") == "0" &&
+                markerValue(verifyOutput, "WDTT_UNINSTALL_FIREWALL") == "0" &&
+                markerValue(verifyOutput, "WDTT_UNINSTALL_DATA") == expectedData
+        ) { "удаление завершилось не полностью; проверьте состояние сервера и повторите операцию" }
 
         onProgress(1.0f, "Готово!")
         DeployManager.stopDeploy("success")
@@ -13936,6 +14365,8 @@ private fun DangerousServerHoldButton(
     enabled: Boolean,
     modifier: Modifier = Modifier,
     guardKey: Any? = Unit,
+    buttonWidthFraction: Float = 0.82f,
+    actionLabelMaxLines: Int = 1,
     onConfirmed: () -> Unit
 ) {
     val interactionSource = remember { MutableInteractionSource() }
@@ -14049,7 +14480,7 @@ private fun DangerousServerHoldButton(
                 enabled = safetyReady,
                 interactionSource = interactionSource,
                 modifier = Modifier
-                    .fillMaxWidth(0.82f)
+                    .fillMaxWidth(buttonWidthFraction.coerceIn(0.5f, 1f))
                     .heightIn(min = 52.dp),
                 shape = RoundedCornerShape(16.dp),
                 colors = ButtonDefaults.buttonColors(
@@ -14061,7 +14492,7 @@ private fun DangerousServerHoldButton(
                     actionLabel,
                     fontWeight = FontWeight.Bold,
                     textAlign = TextAlign.Center,
-                    maxLines = 1,
+                    maxLines = actionLabelMaxLines.coerceAtLeast(1),
                     overflow = TextOverflow.Ellipsis
                 )
             }
@@ -14523,7 +14954,7 @@ private fun SshPrivateKeyDialog(
                             scope.launch {
                                 runCatching {
                                     withContext(Dispatchers.IO) {
-                                        createSshSession(
+                                        createSafeReadOnlySshSession(
                                             host = host,
                                             user = user,
                                             credentials = SshCredentials(
@@ -15721,9 +16152,14 @@ private fun SelectedBackupApplyCard(
                         onClick = { onModeSelected(mode) },
                         shape = SegmentedButtonDefaults.itemShape(index, 2),
                         enabled = !busy,
-                        icon = { StableSegmentedButtonIcon(selected = selected) }
+                        icon = { StableSegmentedButtonIcon(selected = selected) },
                     ) {
-                        Text(label, maxLines = 1, textAlign = TextAlign.Center)
+                        Text(
+                            label,
+                            modifier = Modifier.fillMaxWidth(),
+                            maxLines = 1,
+                            textAlign = TextAlign.Center,
+                        )
                     }
                 }
             }
@@ -15777,6 +16213,7 @@ private fun ExistingInstallDialog(
 		standaloneManaged = info.standaloneManaged,
 		androidDeployManaged = info.androidDeployManaged,
 		legacyAndroidDeployCandidate = info.legacyAndroidDeployCandidate,
+		preservedAndroidData = info.preservedAndroidData,
 		incompleteAndroidDeployCandidate = info.incompleteAndroidDeployCandidate,
 	)
 	val preservingUpdateAllowed = existingInstallAllowsPreservingUpdate(
@@ -15871,9 +16308,15 @@ private fun ExistingInstallDialog(
 								style = MaterialTheme.typography.bodySmall,
 								color = MaterialTheme.colorScheme.primary
 							)
+						} else if (ownership == DeploymentOwnership.PreservedAndroidData) {
+							Text(
+								"Серверная часть удалена, а данные сохранены приложением. Можно переустановить сервер с сохранением клиентов, привязок, ключей и настроек либо явно начать с нуля.",
+								style = MaterialTheme.typography.bodySmall,
+								color = MaterialTheme.colorScheme.primary
+							)
 						} else if (ownership == DeploymentOwnership.IncompleteAndroidDeploy) {
 							Text(
-								"Найден точный остаток незавершённой Android-установки: защищённая база есть, но служба, бинарник и WireGuard-ключи не были созданы. Обновление с сохранением недоступно; можно только явно начать установку с нуля.",
+								"Найдена незавершённая Android-установка с подтверждённой меткой приложения, но часть обязательных файлов отсутствует. Обновление с сохранением недоступно; можно только явно начать установку с нуля.",
 								style = MaterialTheme.typography.bodySmall,
 								color = MaterialTheme.colorScheme.primary
 							)
@@ -15947,7 +16390,9 @@ private fun ExistingInstallDialog(
 					} else if (ownership == DeploymentOwnership.AndroidDeploy) {
 						"С сохранением данных: обновится бинарник, серверные настройки будут взяты из приложения, а клиентские пароли, привязки устройств, история и ключи сохранятся. Перед изменением создаётся страховочная копия.\n\nС нуля: данные WDTT Plus на сервере будут удалены, все выданные ссылки и привязки пропадут; затем сервер получит текущие поля приложения."
 					} else if (ownership == DeploymentOwnership.IncompleteAndroidDeploy) {
-						"Незавершённая установка не содержит работающего сервера. «Начать с нуля» сначала проверит базу и подготовит транзакционный откат, а затем заново установит сервер. Любые другие неизвестные следы по-прежнему блокируются."
+						"Незавершённая установка не содержит полного рабочего комплекта. «Начать с нуля» включит найденные остатки в транзакционный откат, а затем заново установит сервер. Любые другие неизвестные следы по-прежнему блокируются."
+					} else if (ownership == DeploymentOwnership.PreservedAndroidData) {
+						"С сохранением данных: сервер будет установлен заново, а сохранённые клиенты, привязки, история, настройки и WireGuard-ключи останутся на месте.\n\nС нуля: все сохранённые данные WDTT Plus будут удалены перед новой установкой."
 					} else {
 						"Владелец установки не подтверждён. Обновление, импорт, сброс и удаление заблокированы до успешной безопасной проверки."
 					},
@@ -16035,12 +16480,17 @@ private fun ServerResetConfirmDialog(
 		text = {
 			Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
 				Text(
-					"Текущая база WDTT Plus, все выданные ссылки и привязки устройств на сервере будут удалены. " +
-						"Затем сервер будет заново установлен из текущих полей приложения."
+					if (incompleteInstall) {
+						"Найденные остатки незавершённой установки WDTT Plus будут удалены. " +
+							"Затем сервер будет заново установлен из текущих полей приложения."
+					} else {
+						"Текущая база WDTT Plus, все выданные ссылки и привязки устройств на сервере будут удалены. " +
+							"Затем сервер будет заново установлен из текущих полей приложения."
+					}
 				)
 				Text(
 					(if (incompleteInstall) {
-						"База будет проверена и сохранена для отката, если новая установка не запустится. "
+						"Найденные файлы будут сохранены для отката, если новая установка не запустится. "
 					} else {
 						"Перед удалением приложение создаст проверенную страховочную копию. "
 					}) + "Для запуска непрерывно удерживайте кнопку 3 секунды.",
@@ -16089,7 +16539,12 @@ private fun InstallTraceLine(label: String, present: Boolean) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun UninstallConfirmDialog(onDismiss: () -> Unit, onConfirm: () -> Unit) {
+private fun UninstallConfirmDialog(
+    onDismiss: () -> Unit,
+    onConfirm: (ServerUninstallMode) -> Unit
+) {
+    val television = isTelevisionDevice()
+    val scrollState = rememberScrollState()
     androidx.compose.ui.window.Dialog(onDismissRequest = onDismiss) {
         BoxWithConstraints(
             modifier = Modifier.fillMaxSize().padding(8.dp),
@@ -16106,7 +16561,8 @@ fun UninstallConfirmDialog(onDismiss: () -> Unit, onConfirm: () -> Unit) {
                     modifier = Modifier
                         .padding(24.dp)
                         .fillMaxWidth()
-                        .verticalScroll(rememberScrollState()),
+                        .verticalScroll(scrollState)
+                        .tvDpadScrollable(scrollState, television),
                     verticalArrangement = Arrangement.spacedBy(16.dp)
                 ) {
                 DialogTitleWithClose(
@@ -16114,18 +16570,47 @@ fun UninstallConfirmDialog(onDismiss: () -> Unit, onConfirm: () -> Unit) {
                     onDismiss = onDismiss
                 )
                 Text(
-                    "Будут удалены: бинарник, systemd-сервис, бот, конфигурация WDTT Plus и только помеченные правила firewall/NAT для WDTT Plus.\n\n" +
-                        "Это действие необратимо. Для запуска непрерывно удерживайте кнопку 3 секунды.",
+                    "Выберите, нужно ли оставить данные для последующей установки. Каждое действие запускается только после непрерывного удержания кнопки в течение 3 секунд.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-                DangerousServerHoldButton(
-                    actionLabel = "Удалить",
-                    enabled = true,
-                    guardKey = "server-uninstall",
-                    onConfirmed = onConfirm,
-                    modifier = Modifier.fillMaxWidth()
-                )
+                ServerBackupPanel {
+                    Text("Удалить сервер, сохранить данные", fontWeight = FontWeight.Bold)
+                    Text(
+                        "Служба, бинарник, интерфейс и правила WDTT будут удалены. База клиентов, привязки, ключи и настройки останутся в защищённом каталоге и будут распознаны при следующей установке.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    DangerousServerHoldButton(
+                        actionLabel = "Удалить сервер, сохранить данные",
+                        enabled = true,
+                        guardKey = "server-uninstall-preserve",
+                        buttonWidthFraction = 1f,
+                        actionLabelMaxLines = 2,
+                        onConfirmed = { onConfirm(ServerUninstallMode.PreserveData) },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+                ServerBackupPanel {
+                    Text(
+                        "Удалить полностью",
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                    Text(
+                        "Будут безвозвратно удалены сервер WDTT Plus, база клиентов, все выданные ссылки, привязки устройств, ключи и настройки. После этого установка начнётся как на чистом сервере.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    DangerousServerHoldButton(
+                        actionLabel = "Удалить полностью",
+                        enabled = true,
+                        guardKey = "server-uninstall-all",
+                        buttonWidthFraction = 1f,
+                        onConfirmed = { onConfirm(ServerUninstallMode.RemoveAll) },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
                 Spacer(Modifier.height(4.dp))
             }
         }

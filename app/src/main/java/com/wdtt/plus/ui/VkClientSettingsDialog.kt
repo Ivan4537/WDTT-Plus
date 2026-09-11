@@ -29,7 +29,6 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.VpnKey
 import androidx.compose.material.icons.filled.WarningAmber
-import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
@@ -306,7 +305,7 @@ fun VkClientSettingsDialog(
                                 fontWeight = FontWeight.Bold
                             )
                             Text(
-                                "Настройка для текущего VPN-профиля",
+                                "Настройка для текущего профиля подключения",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )

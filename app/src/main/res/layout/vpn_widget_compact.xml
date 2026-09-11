@@ -13,7 +13,7 @@
         android:layout_width="42dp"
         android:layout_height="42dp"
         android:background="@drawable/bg_widget_button_inactive"
-        android:contentDescription="Включить или отключить VPN"
+        android:contentDescription="Включить или отключить соединение"
         android:padding="9dp"
         android:scaleType="fitCenter"
         android:src="@drawable/ic_tile_logo" />

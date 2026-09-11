@@ -31,7 +31,6 @@ import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.LocationOn
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -239,7 +238,7 @@ fun TrustedWifiSettingsDialog(
                                 fontWeight = FontWeight.Bold
                             )
                             Text(
-                                "Общая настройка для всех VPN-профилей",
+                                "Для системного VPN во всех профилях",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )

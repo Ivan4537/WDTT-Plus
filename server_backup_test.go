@@ -73,6 +73,52 @@ func TestServerBackupCreateVerifyAndExport(t *testing.T) {
 	}
 }
 
+func TestServerBackupUsesCapturedDatabaseWithoutOverwritingNewerLiveState(t *testing.T) {
+	configDir, captured := backupTestConfig(t)
+	live, err := cloneDatabaseForBackup(captured)
+	if err != nil {
+		t.Fatal(err)
+	}
+	live.Passwords["RSTUVWXYZ2345678"] = &PasswordEntry{Label: "newer client", Ports: "56000,56001,9000"}
+	if err := persistDatabaseFile(filepath.Join(configDir, "passwords.json"), live); err != nil {
+		t.Fatal(err)
+	}
+
+	created, err := createServerBackup(configDir, captured, "manual")
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := loadDatabaseFile(filepath.Join(configDir, "passwords.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(persisted.Passwords) != 2 || persisted.Passwords["RSTUVWXYZ2345678"] == nil {
+		t.Fatalf("backup overwrote newer live database state: %#v", persisted.Passwords)
+	}
+
+	document, err := readServerBackupByID(configDir, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var backedUp *Database
+	for _, file := range document.Files {
+		if file.Path != "passwords.json" {
+			continue
+		}
+		data, decodeErr := base64.StdEncoding.DecodeString(file.DataBase64)
+		if decodeErr != nil {
+			t.Fatal(decodeErr)
+		}
+		backedUp, err = decodeDatabase(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if backedUp == nil || len(backedUp.Passwords) != 1 || backedUp.Passwords["ABCDEFGHJKLMNPQR"] == nil {
+		t.Fatalf("backup did not preserve the captured database snapshot: %#v", backedUp)
+	}
+}
+
 func TestServerBackupOutboundSummaryNeverExposesProfileValues(t *testing.T) {
 	if got := summarizedBackupOutboundMode([]byte("WDTT_OUTBOUND_MODE=wireguard_vps\nWG_VPS_HOST_B64=c2VjcmV0\n")); got != "wireguard_vps" {
 		t.Fatalf("expected safe outbound mode, got %q", got)

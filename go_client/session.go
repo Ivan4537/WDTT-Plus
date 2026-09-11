@@ -31,10 +31,137 @@ const (
 	keepaliveByte                = 0xFF // DTLS-level keepalive marker
 	multipathRelayHello          = "WDTT_MUX1"
 	keepaliveInterval            = 15 * time.Second
+	workerWakeProbeRetryInterval = 3 * time.Second
+	workerWakeProbeTimeout       = 12 * time.Second
 	healthMonitorSuspendGap      = 30 * time.Second
 	defaultHandshakeTimeout      = 20 * time.Second
 	wrapHandshakeTimeout         = 8 * time.Second
 )
+
+func runWorkerWakeProbeLoop(
+	ctx context.Context,
+	slot *WorkerSlot,
+	writeKeepalive func(time.Time) bool,
+	timeout time.Duration,
+	retryInterval time.Duration,
+	onExpired func(uint64),
+) {
+	if slot == nil || slot.WakeCh == nil || writeKeepalive == nil {
+		return
+	}
+	if timeout <= 0 {
+		timeout = workerWakeProbeTimeout
+	}
+	if retryInterval <= 0 || retryInterval >= timeout {
+		retryInterval = timeout
+	}
+
+	var activeGeneration uint64
+	var timeoutTimer *time.Timer
+	var retryTicker *time.Ticker
+	var timeoutCh <-chan time.Time
+	var retryCh <-chan time.Time
+	stopProbe := func() {
+		activeGeneration = 0
+		if timeoutTimer != nil {
+			if !timeoutTimer.Stop() {
+				select {
+				case <-timeoutTimer.C:
+				default:
+				}
+			}
+			timeoutTimer = nil
+		}
+		if retryTicker != nil {
+			retryTicker.Stop()
+			retryTicker = nil
+		}
+		timeoutCh = nil
+		retryCh = nil
+	}
+	drainAcks := func() {
+		if slot.WakeAckCh == nil {
+			return
+		}
+		for {
+			select {
+			case <-slot.WakeAckCh:
+			default:
+				return
+			}
+		}
+	}
+	startProbe := func(generation uint64) bool {
+		stopProbe()
+		drainAcks()
+		activeGeneration = generation
+		if !writeKeepalive(time.Now()) {
+			return false
+		}
+		timeoutTimer = time.NewTimer(timeout)
+		timeoutCh = timeoutTimer.C
+		if retryInterval < timeout {
+			retryTicker = time.NewTicker(retryInterval)
+			retryCh = retryTicker.C
+		}
+		return true
+	}
+
+	defer stopProbe()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-slot.SleepCh:
+			// A wake probe is meaningful only while the device remains awake.
+			// Cancelling it here prevents an intentional second sleep from being
+			// misclassified as a dead transport path.
+			stopProbe()
+			drainAcks()
+		case generation := <-slot.WakeCh:
+			if generation == 0 {
+				continue
+			}
+			if !startProbe(generation) {
+				if onExpired != nil {
+					onExpired(generation)
+				}
+				return
+			}
+		case generation := <-slot.WakeAckCh:
+			if activeGeneration != 0 && generation >= activeGeneration {
+				stopProbe()
+			}
+		case now := <-retryCh:
+			if activeGeneration != 0 && !writeKeepalive(now) {
+				generation := activeGeneration
+				if onExpired != nil {
+					onExpired(generation)
+				}
+				return
+			}
+		case <-timeoutCh:
+			generation := activeGeneration
+			// If the final pong and the timeout became ready together, prefer the
+			// pong. Otherwise select could randomly discard a transport that did
+			// answer within the probe window.
+			if slot.WakeAckCh != nil {
+				select {
+				case acknowledged := <-slot.WakeAckCh:
+					if generation != 0 && acknowledged >= generation {
+						stopProbe()
+						continue
+					}
+				default:
+				}
+			}
+			if generation != 0 && onExpired != nil {
+				onExpired(generation)
+			}
+			return
+		}
+	}
+}
 
 // Handshake semaphore: limit to 3 concurrent DTLS handshakes
 var handshakeSem = make(chan struct{}, 3)
@@ -703,9 +830,11 @@ func RunSession(
 
 	// Регистрация в диспетчере
 	slot := &WorkerSlot{
-		ID:     sessionID,
-		SendCh: make(chan []byte, workerSendBuf),
-		WakeCh: make(chan struct{}, 1),
+		ID:        sessionID,
+		SendCh:    make(chan []byte, workerSendBuf),
+		WakeCh:    make(chan uint64, 1),
+		SleepCh:   make(chan struct{}, 1),
+		WakeAckCh: make(chan uint64, 1),
 	}
 	d.Register(slot)
 	defer d.Unregister(slot)
@@ -718,20 +847,21 @@ func RunSession(
 
 	// Proxy DTLS ↔ Dispatcher
 	var proxyWg sync.WaitGroup
-	proxyWg.Add(4) // writer + reader + keepalive + health monitor
+	proxyWg.Add(5) // writer + reader + keepalive + wake probe + health monitor
+
+	writeKeepalive := func(now time.Time) bool {
+		ping := []byte{keepaliveByte}
+		dtlsWriteMu.Lock()
+		defer dtlsWriteMu.Unlock()
+		_ = dtlsConn.SetWriteDeadline(now.Add(5 * time.Second))
+		_, err := dtlsConn.Write(ping)
+		return err == nil
+	}
 
 	// DTLS Keepalive: prevents TURN allocation timeout and DTLS idle disconnect
 	go func() {
 		defer proxyWg.Done()
 		defer sessCancel()
-		writeKeepalive := func(now time.Time) bool {
-			ping := []byte{keepaliveByte}
-			_ = dtlsConn.SetWriteDeadline(now.Add(5 * time.Second))
-			dtlsWriteMu.Lock()
-			_, err := dtlsConn.Write(ping)
-			dtlsWriteMu.Unlock()
-			return err == nil
-		}
 		// Проверяем каждый новый канал сразу, чтобы Android получил раннее
 		// подтверждение, что новый процесс действительно видит сервер.
 		if !writeKeepalive(time.Now()) {
@@ -743,16 +873,31 @@ func RunSession(
 			select {
 			case <-sessCtx.Done():
 				return
-			case <-slot.WakeCh:
-				if !writeKeepalive(time.Now()) {
-					return
-				}
 			case now := <-t.C:
 				if !writeKeepalive(now) {
 					return
 				}
 			}
 		}
+	}()
+
+	// A phone may keep a stale UDP/DTLS socket looking active throughout Doze.
+	// Probe each existing worker independently on wake. Healthy workers stay in
+	// place; only a worker that misses several quick pings is re-created by its
+	// WorkerGroup with the already cached TURN credentials.
+	go func() {
+		defer proxyWg.Done()
+		runWorkerWakeProbeLoop(
+			sessCtx,
+			slot,
+			writeKeepalive,
+			workerWakeProbeTimeout,
+			workerWakeProbeRetryInterval,
+			func(_ uint64) {
+				log.Printf("[ВОРКЕР #%d] [HEALTH] канал не ответил на проверки после пробуждения, переподключаем только этот воркер", sessionID)
+				sessCancel()
+			},
+		)
 	}()
 
 	// Health monitor: UDP can fail silently, so expect keepalive pongs or user traffic responses.
@@ -809,8 +954,8 @@ func RunSession(
 					return
 				}
 				userTraffic := isWireGuardUserDataPacket(pkt)
-				_ = dtlsConn.SetWriteDeadline(time.Now().Add(sessionReadTimeout))
 				dtlsWriteMu.Lock()
+				_ = dtlsConn.SetWriteDeadline(time.Now().Add(sessionReadTimeout))
 				_, writeErr := dtlsConn.Write(pkt)
 				dtlsWriteMu.Unlock()
 				putPktBuf(pkt)
@@ -832,6 +977,9 @@ func RunSession(
 		var reportedWakeGeneration uint64
 		noteKeepalivePong := func() {
 			generation := d.wakeGeneration.Load()
+			if generation > 0 {
+				d.acknowledgeWorkerWake(slot, generation)
+			}
 			firstPong := keepalivePongSeen.CompareAndSwap(0, 1)
 			if firstPong || generation > reportedWakeGeneration {
 				reportedWakeGeneration = generation
@@ -872,6 +1020,10 @@ func RunSession(
 			// Skip keepalive pong from server
 			if n == 1 && pkt[0] == keepaliveByte {
 				noteKeepalivePong()
+				putPktBuf(pkt)
+				continue
+			}
+			if d.handleUpdateMetadataResponse(pkt[:n]) {
 				putPktBuf(pkt)
 				continue
 			}

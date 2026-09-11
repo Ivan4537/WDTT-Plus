@@ -1,7 +1,9 @@
 package main
 
 import (
+	"encoding/base64"
 	"errors"
+	"reflect"
 	"testing"
 )
 
@@ -36,6 +38,39 @@ func TestParseCaptchaV2PageUsesActualScriptMetadata(t *testing.T) {
 	}
 	if page.Init == nil || page.Init.Data.ShowCaptchaType != "slider" {
 		t.Fatalf("unexpected init payload: %#v", page.Init)
+	}
+}
+
+func TestParseCaptchaV2PageAcceptsCurrentBFFBootstrap(t *testing.T) {
+	html := `
+		<script>
+			window.vk = {
+				apiConfigDomains: {"apiDomain":"api.vk.ru","note":"brace } stays in string"},
+				obfuscatedKey: "11111111-2222-4333-8444-555555555555",
+				lang: 3
+			};
+			window.other = { id: "99999999-8888-4777-8666-555555555554" };
+			window['captchaPowResult']='v2.'+encode({
+				'hash': h, 'nonce': n, 'duration_ms': d, 'telemetry': {}, 'tel_hash': t
+			});
+			}("freshInput2026",2,"pow_timeout"));
+		</script>`
+
+	page, err := parseCaptchaV2Page(html)
+	if err != nil {
+		t.Fatalf("parseCaptchaV2Page returned error: %v", err)
+	}
+	if page.Init != nil {
+		t.Fatalf("BFF page unexpectedly has legacy window.init: %#v", page.Init)
+	}
+	if page.DebugInfo != "11111111-2222-4333-8444-555555555555" || page.Lang != "3" {
+		t.Fatalf("unexpected window.vk values: debug=%q lang=%q", page.DebugInfo, page.Lang)
+	}
+	if page.ScriptURL != "" {
+		t.Fatalf("BFF page unexpectedly requires legacy script URL: %q", page.ScriptURL)
+	}
+	if page.PowInput != "freshInput2026" || page.PowDifficulty != 2 || !page.PowTelemetry || page.PowPrefix != "v2." {
+		t.Fatalf("unexpected pow settings: input=%q difficulty=%d", page.PowInput, page.PowDifficulty)
 	}
 }
 
@@ -74,10 +109,36 @@ func TestInferCaptchaV2DomainFallsBackToScriptURL(t *testing.T) {
 }
 
 func TestEncodeCaptchaPoWV2(t *testing.T) {
-	got := encodeCaptchaPoWV2("00abc", 42)
-	want := "v2.eyJoYXNoIjoiMDBhYmMiLCJub25jZSI6NDJ9"
-	if got != want {
-		t.Fatalf("unexpected PoW token: %s", got)
+	tests := []struct {
+		name string
+		page *captchaV2Page
+		want string
+	}{
+		{
+			name: "legacy",
+			page: &captchaV2Page{PowPrefix: "v2."},
+			want: `{"hash":"00abc","nonce":42,"duration_ms":17}`,
+		},
+		{
+			name: "current telemetry",
+			page: &captchaV2Page{PowPrefix: "v2.", PowTelemetry: true},
+			want: `{"hash":"00abc","nonce":42,"duration_ms":17,"telemetry":{},"tel_hash":""}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := encodeCaptchaPoWV2(test.page, "00abc", 42, 17)
+			if len(got) < 4 || got[:3] != "v2." {
+				t.Fatalf("unexpected PoW prefix: %q", got)
+			}
+			decoded, err := base64.StdEncoding.DecodeString(got[3:])
+			if err != nil {
+				t.Fatalf("decode PoW token: %v", err)
+			}
+			if string(decoded) != test.want {
+				t.Fatalf("unexpected PoW payload:\nwant %s\ngot  %s", test.want, decoded)
+			}
+		})
 	}
 }
 
@@ -145,6 +206,56 @@ func TestParseCaptchaV2SettingsAcceptsStringPayload(t *testing.T) {
 	}
 	if got.ByType["slider"] != "live" {
 		t.Fatalf("unexpected settings: %#v", got)
+	}
+}
+
+func TestParseCaptchaV2SettingsUsesInitSessionContentSettingsKey(t *testing.T) {
+	got, err := parseCaptchaV2Settings(map[string]any{
+		"response": map[string]any{
+			"show_captcha_type": "slider",
+			"content_settings": []any{
+				map[string]any{
+					"type":         "slider",
+					"settings":     "legacy",
+					"settings_key": "current-key",
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ShowType != "slider" || got.ByType["slider"] != "current-key" {
+		t.Fatalf("unexpected initSession settings: %#v", got)
+	}
+}
+
+func TestCaptchaV2InitSessionMatchesCurrentWidgetShape(t *testing.T) {
+	got := captchaV2EncodeForm(captchaV2InitSessionValues("T0K", "vk.com", "3"))
+	want := "session_token=T0K&domain=vk.com&lang=3&access_token="
+	if got != want {
+		t.Fatalf("unexpected initSession form:\nwant %s\ngot  %s", want, got)
+	}
+
+	got = captchaV2EncodeForm(captchaV2InitSessionValues("T0K", "vk.com", ""))
+	want = "session_token=T0K&domain=vk.com&lang=0&access_token="
+	if got != want {
+		t.Fatalf("unexpected initSession form without lang:\nwant %s\ngot  %s", want, got)
+	}
+}
+
+func TestCaptchaV2CheckOmitsRemovedConnectionFields(t *testing.T) {
+	values := captchaV2CheckValues("T", "vk.ru", "A", "FP", "HASH", "{}", "[]", "DBG")
+	keys := make([]string, 0, len(values))
+	for _, value := range values {
+		keys = append(keys, value[0])
+	}
+	want := []string{
+		"session_token", "domain", "adFp", "accelerometer", "gyroscope", "motion",
+		"cursor", "taps", "browser_fp", "hash", "answer", "debug_info", "access_token",
+	}
+	if !reflect.DeepEqual(keys, want) {
+		t.Fatalf("unexpected captcha check fields:\nwant %v\ngot  %v", want, keys)
 	}
 }
 

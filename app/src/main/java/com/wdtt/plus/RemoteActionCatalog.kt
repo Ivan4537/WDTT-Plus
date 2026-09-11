@@ -7,6 +7,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URI
 import java.net.URL
@@ -193,23 +194,34 @@ object RemoteActionCatalogGateway {
             connection.readTimeout = 6_000
             connection.setRequestProperty("Accept", "application/json")
             val status = connection.responseCode
-            if (status !in 200..299) return RemoteActionCatalog.Empty
-            parse(connection.inputStream.use { it.readUtf8TextLimited(MAX_RESPONSE_CHARS) })
+            if (status !in 200..299) {
+                throw IOException("Каталог действий временно недоступен: HTTP $status")
+            }
+            val body = connection.inputStream.use { it.readUtf8TextLimited(MAX_RESPONSE_CHARS) }
+            parseValidCatalog(body)
+                ?: throw IOException("Получен некорректный каталог действий")
         } finally {
             connection?.disconnect()
         }
     }
 
-    internal fun parse(body: String): RemoteActionCatalog {
-        if (body.length > MAX_RESPONSE_CHARS) return RemoteActionCatalog.Empty
+    internal fun parse(body: String): RemoteActionCatalog =
+        parseValidCatalog(body) ?: RemoteActionCatalog.Empty
+
+    internal fun parseValidCatalog(body: String): RemoteActionCatalog? {
+        if (body.length > MAX_RESPONSE_CHARS) return null
         val root = runCatching { JSONObject(body) }.getOrNull()
-            ?: return RemoteActionCatalog.Empty
-        if (root.optInt("version", 0) != 1) return RemoteActionCatalog.Empty
-        val source = root.optJSONObject("actions") ?: return RemoteActionCatalog.Empty
-        val actions = placements.mapNotNull { placement ->
-            val item = source.optJSONObject(placement) ?: return@mapNotNull null
-            parseAction(item)?.let { placement to it }
-        }.toMap()
+            ?: return null
+        if (root.optInt("version", 0) != 1) return null
+        val source = root.optJSONObject("actions") ?: return null
+        val actions = buildMap {
+            placements.forEach { placement ->
+                if (!source.has(placement)) return@forEach
+                val item = source.optJSONObject(placement) ?: return null
+                val action = parseAction(item) ?: return null
+                put(placement, action)
+            }
+        }
         return RemoteActionCatalog(actions)
     }
 

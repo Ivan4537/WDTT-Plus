@@ -47,12 +47,12 @@ private const val TUNNEL_ALERT_NOTIFICATION_ID = 2
 private const val NETWORK_CHANGE_SETTLE_MS = 90_000L
 private const val NETWORK_RETURN_SETTLE_MS = 45_000L
 private const val NETWORK_LOSS_GRACE_MS = 2 * 60_000L
-private const val WAKE_RESCUE_FIRST_CHECK_MS = 20_000L
-private const val WAKE_RESCUE_FINAL_CHECK_DELAY_MS = 25_000L
+private const val WAKE_RESCUE_CHECK_MS = 15_000L
 private const val TIMER_RESUME_TRANSPORT_CONFIRM_MS = 75_000L
 private const val TIMER_RESUME_TRANSPORT_WAKE_LOCK_TIMEOUT_MS =
     TIMER_RESUME_TRANSPORT_CONFIRM_MS + 15_000L
 private const val ACTIVE_PROFILE_REFRESH_INTERVAL_MS = 2 * 60_000L
+private const val ACTIVE_PROFILE_REFRESH_MAX_FAILURE_DELAY_MS = 16 * 60_000L
 private const val INITIAL_VPN_START_GRACE_MS = 90_000L
 private const val VPN_INTERFACE_MISSING_CONFIRM_MS = 90_000L
 private const val VPN_INTERFACE_RECOVERY_RETRY_MS = 5 * 60_000L
@@ -65,6 +65,7 @@ private const val DEPLOY_WAKE_LOCK_TIMEOUT_MS = 15 * 60_000L
 private const val WIFI_TRANSITION_LOCK_TIMEOUT_MS = 90_000L
 private const val INTERACTIVE_STATUS_REFRESH_MS = 2_000L
 private const val PASSIVE_STATUS_REFRESH_MS = 30_000L
+private const val PROXY_VPN_CAPTURE_CONFIRM_MS = 1_000L
 private const val SLEEP_WAKE_RESULT_VISIBLE_MS = 5_000L
 // Короткий таймер (например, одна минута) не должен теряться в Doze. Дольше
 // этого CPU не удерживаем: для длинных пауз работает AlarmManager.
@@ -220,6 +221,108 @@ internal fun shouldRunUnderlyingNetworkReconnect(
         realNetworkAvailable &&
         !captchaActive
 
+internal fun shouldRunWakeTransportRecovery(
+    tunnelRunning: Boolean,
+    tunnelPaused: Boolean,
+    trustedWifiWaiting: Boolean,
+    sleepPausedByPolicy: Boolean,
+    stopRequested: Boolean,
+    captchaActive: Boolean,
+    vpnSlotYieldRequested: Boolean,
+    realNetworkAvailable: Boolean,
+): Boolean =
+    tunnelRunning &&
+        !tunnelPaused &&
+        !trustedWifiWaiting &&
+        !sleepPausedByPolicy &&
+        !stopRequested &&
+        !captchaActive &&
+        !vpnSlotYieldRequested &&
+        realNetworkAvailable
+
+internal fun shouldRunActiveTransportRecovery(
+    startupWindow: Boolean,
+    captchaActive: Boolean,
+    vpnInterfaceUp: Boolean,
+    deviceInteractive: Boolean,
+    realNetworkAvailable: Boolean,
+): Boolean =
+    !startupWindow &&
+        !captchaActive &&
+        vpnInterfaceUp &&
+        deviceInteractive &&
+        realNetworkAvailable
+
+internal fun shouldHoldConnectionWhileScreenOff(
+    mode: ScreenOffMode,
+    deviceInteractive: Boolean,
+    tunnelRunning: Boolean,
+    tunnelPaused: Boolean,
+    trustedWifiWaiting: Boolean,
+    stopRequested: Boolean,
+    vpnSlotYieldRequested: Boolean,
+    tunnelMode: String,
+): Boolean =
+    mode == ScreenOffMode.HOLD_CONNECTION &&
+        !deviceInteractive &&
+        tunnelRunning &&
+        !tunnelPaused &&
+        !trustedWifiWaiting &&
+        !stopRequested &&
+        (tunnelModeUsesLocalProxy(tunnelMode) || !vpnSlotYieldRequested)
+
+internal fun shouldKeepHoldModeCpuLock(
+    mode: ScreenOffMode,
+    tunnelRunning: Boolean,
+    tunnelPaused: Boolean,
+    trustedWifiWaiting: Boolean,
+    stopRequested: Boolean,
+    vpnSlotYieldRequested: Boolean,
+    tunnelMode: String,
+): Boolean =
+    mode == ScreenOffMode.HOLD_CONNECTION &&
+        tunnelRunning &&
+        !tunnelPaused &&
+        !trustedWifiWaiting &&
+        !stopRequested &&
+        (tunnelModeUsesLocalProxy(tunnelMode) || !vpnSlotYieldRequested)
+
+internal fun shouldHoldBackgroundWifiRadio(
+    holdConnection: Boolean,
+    wifiTransportAvailable: Boolean,
+): Boolean = holdConnection && wifiTransportAvailable
+
+internal fun wakeRecoveryStatusText(
+    readyWorkers: Int,
+    targetWorkers: Int,
+    heldConnection: Boolean = false,
+): String =
+    if (heldConnection) {
+        if (readyWorkers <= 0) {
+            if (targetWorkers > 0) {
+                "Проверяем удержанное соединение · $targetWorkers потоков"
+            } else {
+                "Проверяем удержанное соединение…"
+            }
+        } else {
+            "Соединение удерживается · подтверждено $readyWorkers/$targetWorkers"
+        }
+    } else if (readyWorkers <= 0) {
+        if (targetWorkers > 0) {
+            "Проверяем $targetWorkers потоков после сна…"
+        } else {
+            "Проверяем потоки после сна…"
+        }
+    } else {
+        "Восстановление после сна · доступно $readyWorkers/$targetWorkers"
+    }
+
+internal fun activeProfileRefreshDelayMs(consecutiveFailures: Int): Long {
+    val multiplier = 1L shl consecutiveFailures.coerceIn(0, 3)
+    return (ACTIVE_PROFILE_REFRESH_INTERVAL_MS * multiplier)
+        .coerceAtMost(ACTIVE_PROFILE_REFRESH_MAX_FAILURE_DELAY_MS)
+}
+
 internal data class SleepBatteryPlan(
     val pauseAfterMinutes: Int,
     val resumeAfterMinutes: Int?,
@@ -348,10 +451,17 @@ class TunnelService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
     private var wifiLockReleaseJob: Job? = null
+    private var backgroundWakeLock: PowerManager.WakeLock? = null
+    private var backgroundWifiLock: WifiManager.WifiLock? = null
+    private var backgroundWakeLockFailureReported = false
+    private var backgroundWifiLockFailureReported = false
+    @Volatile
+    private var screenOffMode = ScreenOffMode.BALANCED
     private var trustedWifiTransitionWakeLock: PowerManager.WakeLock? = null
     private var updateJob: Job? = null
     private var profileNameJob: Job? = null
     private var networkChangeJob: Job? = null
+    private var proxyBindingRefreshJob: Job? = null
     private var lastNotificationTitle: String? = null
     private var lastNotificationText: String? = null
     private var lastNotificationSmallIcon: Int? = null
@@ -367,8 +477,10 @@ class TunnelService : Service() {
     // Network Monitoring
     private var connectivityManager: ConnectivityManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var proxyDefaultNetworkCallback: ConnectivityManager.NetworkCallback? = null
     private var lastNetworkChangeTime = 0L
     private val activeNetworks = ConcurrentHashMap.newKeySet<Network>()
+    private val wifiTransportNetworks = ConcurrentHashMap.newKeySet<Network>()
     private val trustedWifiResumeNetworks = TrustedWifiResumeNetworkTracker<Network>()
     private var isTunnelPaused = false
     private var lastValidatedNetwork: Network? = null
@@ -380,6 +492,8 @@ class TunnelService : Service() {
     private var networkPausedByLoss = false
     private var vpnInterfaceMissingSinceMs = 0L
     private var lastVpnInterfaceRecoveryAttemptAtMs = 0L
+    private var proxyVpnCaptureObservations = 0
+    private var proxyVpnCaptureConfirmationJob: Job? = null
     private var screenStateReceiver: BroadcastReceiver? = null
     private var trustedWifiStateReceiver: BroadcastReceiver? = null
     private var packageChangeReceiver: BroadcastReceiver? = null
@@ -418,6 +532,11 @@ class TunnelService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        serviceScope.launch(Dispatchers.IO) {
+            DeviceCompatibility.recentUnexpectedProcessExitLog(applicationContext)?.let { (key, message) ->
+                TunnelManager.noteSystemLifecycleEvent(key, message)
+            }
+        }
         lastKnownDeviceInteractive = isDeviceInteractive()
         if (!lastKnownDeviceInteractive) {
             TunnelManager.noteDeviceSleepStarted()
@@ -431,17 +550,51 @@ class TunnelService : Service() {
         registerTrustedWifiStateReceiver()
         registerPackageChangeReceiver()
         serviceScope.launch {
+            SettingsStore(applicationContext).screenOffMode.collect { mode ->
+                screenOffMode = mode
+                reconcileBackgroundConnectionLocks()
+            }
+        }
+        serviceScope.launch {
+            TunnelManager.running.collect {
+                // В том числе немедленно берём усиленные locks, если служба
+                // была запущена уже при погашенном экране.
+                reconcileBackgroundConnectionLocks()
+            }
+        }
+        serviceScope.launch {
+            combine(
+                TunnelManager.wakeRecoveryInProgress,
+                TunnelManager.wakeRecoveryReadyWorkers,
+                TunnelManager.wakeRecoveryTargetWorkers,
+            ) { inProgress, ready, target -> Triple(inProgress, ready, target) }
+                .collect {
+                    if (
+                        lastKnownDeviceInteractive &&
+                        TunnelManager.running.value &&
+                        !isTunnelPaused &&
+                        !trustedWifiWaiting
+                    ) {
+                        // В отличие от общего фонового опроса, прогресс ответов
+                        // воркеров должен попадать в уведомление сразу.
+                        updateNotification(buildTunnelNotificationText())
+                    }
+                }
+        }
+        serviceScope.launch {
             TunnelProfileRuntimeUpdateBus.requests.collect(::applyUpdatedTunnelProfile)
         }
         serviceScope.launch {
             TunnelManager.vpnSlotYieldRequested.collect { yieldRequested ->
                 if (
+                    TunnelManager.activeMode.value == TUNNEL_MODE_VPN &&
                     shouldYieldVpnSlot(
                         vpnSlotYieldRequested = yieldRequested,
                         tunnelRunning = TunnelManager.running.value,
                         stopRequested = requestedStopReason != null,
                     )
                 ) {
+                    releaseBackgroundConnectionLocks()
                     Log.w(
                         "TunnelService",
                         "Android остановил интерфейс WDTT Plus; уступаем VPN-слот без автоматического восстановления."
@@ -460,6 +613,10 @@ class TunnelService : Service() {
 
         when (intent.action) {
             ACTION_VPN_SLOT_REVOKED -> {
+                if (tunnelModeUsesLocalProxy(TunnelManager.activeMode.value)) {
+                    Log.i("TunnelService", "Событие VPN-слота не относится к активному прокси-режиму.")
+                    return START_STICKY
+                }
                 Log.w(
                     "TunnelService",
                     "Android передал VPN-слот другому приложению; немедленно завершаем WDTT Plus."
@@ -468,9 +625,18 @@ class TunnelService : Service() {
                 return START_NOT_STICKY
             }
             "START" -> {
+                val requestedMode = normalizeTunnelMode(intent.getStringExtra("tunnel_mode"))
+                // Это явный пользовательский старт. В SOCKS5 флаг тоже очищаем:
+                // режим не создаёт VpnService и не может отнять слот у другого приложения.
                 TunnelManager.allowVpnSlotAcquisition()
                 clearSleepWakeResult()
-                val notification = createNotification("Запуск...")
+                val notification = createNotification(
+                    if (tunnelModeUsesLocalProxy(requestedMode)) {
+                        "Запуск ${tunnelModeStatusLabel(requestedMode)}..."
+                    } else {
+                        "Запуск..."
+                    }
+                )
                 startPersistentForeground(notification)
 
                 val params = TunnelParams(
@@ -499,6 +665,23 @@ class TunnelService : Service() {
                     configFirstStart =
                         intent.getBooleanExtra(CONFIG_FIRST_START_EXTRA, true),
                     profileIndex = intent.getIntExtra(TUNNEL_PROFILE_INDEX_EXTRA, 0).coerceIn(0, 2),
+                    mode = requestedMode,
+                    socksPort = normalizeSocks5Port(
+                        intent.getIntExtra("socks_port", DEFAULT_SOCKS5_PORT)
+                    ),
+                    socksUdpEnabled = intent.getBooleanExtra("socks_udp", true),
+                    proxyAccess = normalizeProxyAccess(
+                        intent.getStringExtra("proxy_access")
+                            ?: if (intent.getBooleanExtra("proxy_lan", false)) {
+                                PROXY_ACCESS_LAN
+                            } else {
+                                PROXY_ACCESS_DEVICE
+                            },
+                    ),
+                    proxyLanEnabled = intent.getBooleanExtra("proxy_lan", false),
+                    socksAuthEnabled = intent.getBooleanExtra("socks_auth", false),
+                    socksUsername = intent.getStringExtra("socks_username") ?: "",
+                    socksPassword = intent.getStringExtra("socks_password") ?: "",
                 )
                 requestTunnelStart(params)
             }
@@ -530,6 +713,7 @@ class TunnelService : Service() {
                 val restoredState = TrustedWifiManager.state.value
                 if (!trustedWifiWaiting && restoredState.waiting) {
                     trustedWifiWaiting = true
+                    releaseBackgroundConnectionLocks()
                     trustedWifiWaitingSsid = restoredState.ssid
                     startPersistentForeground(createNotification("Проверка доверенной Wi-Fi сети..."))
                     startNotificationProfileWatcher()
@@ -654,11 +838,13 @@ class TunnelService : Service() {
                         persist = savedTunnelProfile == null
                     )
                     lastStartParams = refreshedParams
-                    val restoreWaiting = store.trustedWifiEnabled.first() &&
+                    val restoreWaiting = refreshedParams.mode == TUNNEL_MODE_VPN &&
+                        store.trustedWifiEnabled.first() &&
                         store.trustedWifiWaiting.first()
                     if (!startRequestGate.isCurrent(generation)) return@launch
                     if (restoreWaiting) {
                         trustedWifiWaiting = true
+                        releaseBackgroundConnectionLocks()
                         trustedWifiWaitingSsid = store.trustedWifiWaitingSsid.first()
                         if (!startRequestGate.isCurrent(generation)) return@launch
                         TrustedWifiManager.setWaiting(trustedWifiWaitingSsid)
@@ -693,6 +879,11 @@ class TunnelService : Service() {
         startPersistentForeground(createNotification("Восстановление состояния сна..."))
         serviceScope.launch {
             val settingsStore = SettingsStore(applicationContext)
+            if (tunnelModeUsesLocalProxy(settingsStore.proxyMode.first())) {
+                settingsStore.saveSleepBatteryRuntimeState(SleepBatteryRuntimePhase.IDLE)
+                restoreTunnel()
+                return@launch
+            }
             val runtime = settingsStore.sleepBatteryRuntimeState.first()
             val enabled = settingsStore.pauseVpnDuringSleep.first()
             val mode = settingsStore.sleepBatteryMode.first()
@@ -770,6 +961,7 @@ class TunnelService : Service() {
         sleepPausedByPolicy = true
         networkPausedByLoss = false
         isTunnelPaused = true
+        releaseBackgroundConnectionLocks()
         startNotificationProfileWatcher()
         startStatsUpdater()
         releaseWakeLock()
@@ -780,6 +972,13 @@ class TunnelService : Service() {
         val generation = startRequestGate.next()
         pendingStartJob?.cancel()
         pendingStartJob = serviceScope.launch {
+            if (
+                tunnelModeUsesLocalProxy(params.mode) &&
+                isAppDefaultNetworkAnotherVpn()
+            ) {
+                stopProxyCapturedByAnotherVpn()
+                return@launch
+            }
             val access = withContext(Dispatchers.IO) {
                 AccessLifecycleCoordinator.prepareStart(
                     applicationContext,
@@ -915,6 +1114,7 @@ class TunnelService : Service() {
     }
 
     private fun stopTunnel(reason: TunnelStopReason = TunnelStopReason.User) {
+        releaseBackgroundConnectionLocks()
         TunnelManager.noteStopRequested()
         if (stopSequenceJob?.isActive == true) return
         clearSleepWakeResult()
@@ -927,6 +1127,9 @@ class TunnelService : Service() {
         }
         isTunnelPaused = false
         networkPausedByLoss = false
+        proxyVpnCaptureObservations = 0
+        proxyVpnCaptureConfirmationJob?.cancel()
+        proxyVpnCaptureConfirmationJob = null
         invalidatePendingStart()
         val effectiveReason = requestedStopReason ?: reason
         requestedStopReason = effectiveReason
@@ -934,12 +1137,14 @@ class TunnelService : Service() {
         profileNameJob?.cancel()
         activeProfileRefreshJob?.cancel()
         networkChangeJob?.cancel()
+        proxyBindingRefreshJob?.cancel()
         wakeRescueJob?.cancel()
         cancelTimerResumeTransportConfirmation()
         cancelTrustedWifiResumeRetry(resetCount = true)
         profileNameJob = null
         activeProfileRefreshJob = null
         networkChangeJob = null
+        proxyBindingRefreshJob = null
         wakeRescueJob = null
         trustedWifiResumeInProgress = false
         trustedWifiResumeStartedAt = 0L
@@ -966,6 +1171,7 @@ class TunnelService : Service() {
         stableNetworkEvidenceSinceMs = 0L
         handoverPreviousNetwork = null
         activeNetworks.clear()
+        wifiTransportNetworks.clear()
         trustedWifiResumeNetworks.clear()
         updateNotification("Отключение…")
 
@@ -1005,8 +1211,9 @@ class TunnelService : Service() {
     private fun startActiveProfileRefresh(profileIndex: Int) {
         activeProfileRefreshJob?.cancel()
         activeProfileRefreshJob = serviceScope.launch(Dispatchers.IO) {
+            var consecutiveFailures = 0
             while (isActive) {
-                delay(ACTIVE_PROFILE_REFRESH_INTERVAL_MS)
+                delay(activeProfileRefreshDelayMs(consecutiveFailures))
                 if (
                     connectionProfileIndex != profileIndex ||
                     !TunnelManager.running.value ||
@@ -1017,11 +1224,16 @@ class TunnelService : Service() {
                 ) {
                     continue
                 }
-                AccessLifecycleCoordinator.refreshProfile(
+                val result = AccessLifecycleCoordinator.refreshProfile(
                     context = applicationContext,
                     profileIndex = profileIndex,
                     force = true,
                 )
+                consecutiveFailures = if (result is AccessLifecycleRefreshResult.Failed) {
+                    (consecutiveFailures + 1).coerceAtMost(3)
+                } else {
+                    0
+                }
             }
         }
     }
@@ -1111,6 +1323,11 @@ class TunnelService : Service() {
     private fun scheduleSleepPauseIfNeeded(startNewScreenOffCycle: Boolean) {
         cancelSleepExecution()
         if (startNewScreenOffCycle) clearSleepWakeResult()
+        if (tunnelModeUsesLocalProxy(lastStartParams?.mode)) {
+            releaseWakeLock()
+            releaseWifiLock()
+            return
+        }
         val executionGeneration = sleepExecutionGeneration
         sleepPauseJob = serviceScope.launch {
             val settingsStore = SettingsStore(applicationContext)
@@ -1309,6 +1526,7 @@ class TunnelService : Service() {
                 sleepPausedByPolicy = true
                 networkPausedByLoss = false
                 isTunnelPaused = true
+                releaseBackgroundConnectionLocks()
                 networkChangeJob?.cancel()
                 stableNetworkWasLost = false
                 val interfaceStopped = withContext(Dispatchers.IO) {
@@ -1657,6 +1875,7 @@ class TunnelService : Service() {
                 val runtimeState = TrustedWifiManager.state.value
                 if (!trustedWifiWaiting && runtimeState.waiting) {
                     trustedWifiWaiting = true
+                    releaseBackgroundConnectionLocks()
                     trustedWifiWaitingSsid = runtimeState.ssid
                 }
                 if (!trustedWifiWaiting) return
@@ -1701,48 +1920,60 @@ class TunnelService : Service() {
     }
 
     private fun scheduleWakeRescueCheck() {
-        if (!AMNEZIA_STYLE_RECOVERY || !TunnelManager.running.value || isTunnelPaused || TunnelManager.isCaptchaInProgress()) return
+        if (
+            !AMNEZIA_STYLE_RECOVERY ||
+            !shouldRunWakeTransportRecovery(
+                tunnelRunning = TunnelManager.running.value,
+                tunnelPaused = isTunnelPaused,
+                trustedWifiWaiting = trustedWifiWaiting,
+                sleepPausedByPolicy = sleepPausedByPolicy,
+                stopRequested = requestedStopReason != null,
+                captchaActive = TunnelManager.isCaptchaInProgress(),
+                vpnSlotYieldRequested = TunnelManager.vpnSlotYieldRequested.value,
+                realNetworkAvailable = hasAnyRealNetwork(),
+            )
+        ) return
         val wakeStartedAt = TunnelManager.wakeRecoveryReferenceAt()
         wakeRescueJob?.cancel()
         wakeRescueJob = TunnelManager.scope.launch(Dispatchers.Main) {
-            delay(WAKE_RESCUE_FIRST_CHECK_MS)
-            var finalCheck = false
-            while (isActive) {
-                if (!TunnelManager.running.value || isTunnelPaused || TunnelManager.isCaptchaInProgress()) return@launch
-                val action = decideWakeRescueAction(
-                    freshTransportPath = TunnelManager.hasFreshTransportPathSince(wakeStartedAt),
-                    activeWorkers = TunnelManager.activeWorkers.value,
-                    confirmedNetworkFailure = TunnelManager.hasConfirmedNetworkFailureSince(wakeStartedAt),
-                    finalCheck = finalCheck,
+            delay(WAKE_RESCUE_CHECK_MS)
+            if (
+                !shouldRunWakeTransportRecovery(
+                    tunnelRunning = TunnelManager.running.value,
+                    tunnelPaused = isTunnelPaused,
+                    trustedWifiWaiting = trustedWifiWaiting,
+                    sleepPausedByPolicy = sleepPausedByPolicy,
+                    stopRequested = requestedStopReason != null,
+                    captchaActive = TunnelManager.isCaptchaInProgress(),
+                    vpnSlotYieldRequested = TunnelManager.vpnSlotYieldRequested.value,
+                    realNetworkAvailable = hasAnyRealNetwork(),
                 )
-                when (action) {
-                    WakeRescueAction.HEALTHY -> {
-                        TunnelManager.noteWakeRescueHealthy()
-                        updateNotification(buildTunnelNotificationText())
-                        return@launch
-                    }
-                    WakeRescueAction.WAIT_FOR_PROBE -> {
-                        // Положительное число воркеров после Doze может быть
-                        // устаревшим. Даём немедленному native keepalive ещё одно
-                        // короткое окно, но больше не откладываем решение навсегда.
-                        TunnelManager.noteWakeRescueDeferred()
-                        updateNotification(buildTunnelNotificationText())
-                        finalCheck = true
-                        delay(WAKE_RESCUE_FINAL_CHECK_DELAY_MS)
-                    }
-                    WakeRescueAction.RECONNECT -> {
-                        TunnelManager.noteWakeRescueReconnect()
-                        updateNotification("Восстановление транспорта после сна...")
-                        TunnelManager.restartTransport(
-                            reason = "[СОН] После пробуждения сервер не подтвердил свежий двусторонний канал. Мягко переподключаем транспорт без пересоздания VPN.",
-                            minIntervalMs = WAKE_RESCUE_FIRST_CHECK_MS + WAKE_RESCUE_FINAL_CHECK_DELAY_MS,
-                            force = true,
-                        )
-                        updateNotification(buildTunnelNotificationText())
-                        return@launch
-                    }
+            ) return@launch
+            val ready = TunnelManager.wakeRecoveryReadyWorkers.value
+            val total = TunnelManager.wakeRecoveryTargetWorkers.value
+            when (
+                decideWakeRescueAction(
+                    freshTransportPath = TunnelManager.hasFreshTransportPathSince(wakeStartedAt),
+                    readyWorkers = ready,
+                    targetWorkers = total,
+                    confirmedNetworkFailure = TunnelManager.hasConfirmedNetworkFailureSince(wakeStartedAt),
+                )
+            ) {
+                WakeRescueAction.HEALTHY -> TunnelManager.noteWakeRescueHealthy()
+                WakeRescueAction.PARTIALLY_AVAILABLE ->
+                    TunnelManager.noteWakeRescuePartial(ready, total)
+                WakeRescueAction.RECONNECT -> {
+                    TunnelManager.noteWakeRescueReconnect()
+                    updateNotification("Восстановление транспорта после сна...")
+                    TunnelManager.restartTransport(
+                        reason = "[СОН] За 15 секунд ни один канал не подтвердил работу. Мягко переподключаем транспорт без пересоздания VPN.",
+                        minIntervalMs = WAKE_RESCUE_CHECK_MS,
+                        force = true,
+                        resetNetworkRecovery = true,
+                    )
                 }
             }
+            updateNotification(buildTunnelNotificationText())
         }
     }
 
@@ -1752,6 +1983,18 @@ class TunnelService : Service() {
     // не пересоздавая системный VPN-интерфейс и не трогая здоровое idle-соединение.
     private fun scheduleTimerResumeTransportConfirmation() {
         cancelTimerResumeTransportConfirmation()
+        if (
+            !shouldRunWakeTransportRecovery(
+                tunnelRunning = TunnelManager.running.value,
+                tunnelPaused = isTunnelPaused,
+                trustedWifiWaiting = trustedWifiWaiting,
+                sleepPausedByPolicy = sleepPausedByPolicy,
+                stopRequested = requestedStopReason != null,
+                captchaActive = TunnelManager.isCaptchaInProgress(),
+                vpnSlotYieldRequested = TunnelManager.vpnSlotYieldRequested.value,
+                realNetworkAvailable = hasAnyRealNetwork(),
+            )
+        ) return
         val startedAtMs = System.currentTimeMillis()
         val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         val lock = powerManager.newWakeLock(
@@ -1765,7 +2008,18 @@ class TunnelService : Service() {
         timerResumeTransportJob = serviceScope.launch {
             try {
                 delay(TIMER_RESUME_TRANSPORT_CONFIRM_MS)
-                if (!TunnelManager.running.value || isTunnelPaused || TunnelManager.isCaptchaInProgress()) return@launch
+                if (
+                    !shouldRunWakeTransportRecovery(
+                        tunnelRunning = TunnelManager.running.value,
+                        tunnelPaused = isTunnelPaused,
+                        trustedWifiWaiting = trustedWifiWaiting,
+                        sleepPausedByPolicy = sleepPausedByPolicy,
+                        stopRequested = requestedStopReason != null,
+                        captchaActive = TunnelManager.isCaptchaInProgress(),
+                        vpnSlotYieldRequested = TunnelManager.vpnSlotYieldRequested.value,
+                        realNetworkAvailable = hasAnyRealNetwork(),
+                    )
+                ) return@launch
                 if (TunnelManager.hasFreshTransportPathSince(startedAtMs)) {
                     TunnelManager.noteSleepTimerTransportHealthy()
                 } else {
@@ -1775,6 +2029,7 @@ class TunnelService : Service() {
                         reason = "[СОН] После включения по таймеру сервер не ответил. Мягко переподключаем транспорт до включения экрана.",
                         minIntervalMs = TIMER_RESUME_TRANSPORT_CONFIRM_MS,
                         force = true,
+                        resetNetworkRecovery = true,
                     )
                 }
             } finally {
@@ -1802,6 +2057,10 @@ class TunnelService : Service() {
         params: TunnelParams,
         restoreSessionTraffic: Boolean = false,
     ) {
+        if (tunnelModeUsesLocalProxy(params.mode)) {
+            startTunnel(params, restoreSessionTraffic = restoreSessionTraffic)
+            return
+        }
         val store = SettingsStore(applicationContext)
         val enabled = store.trustedWifiEnabled.first()
         val trustedSsids = store.trustedWifiSsids.first().toSet()
@@ -2034,6 +2293,7 @@ class TunnelService : Service() {
                 SleepBatteryRuntimePhase.IDLE,
             )
             trustedWifiWaiting = true
+            releaseBackgroundConnectionLocks()
             trustedWifiWaitingSsid = cleanSsid
             isTunnelPaused = false
             networkPausedByLoss = false
@@ -2041,6 +2301,7 @@ class TunnelService : Service() {
             networkChangeJob?.cancel()
             stableNetworkWasLost = false
             wakeRescueJob?.cancel()
+            cancelTimerResumeTransportConfirmation()
             activeProfileRefreshJob?.cancel()
             activeProfileRefreshJob = null
             cancelTrustedWifiResumeRetry(resetCount = true)
@@ -2174,6 +2435,7 @@ class TunnelService : Service() {
     private fun setupNetworkCallback() {
         connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         activeNetworks.clear()
+        wifiTransportNetworks.clear()
         trustedWifiResumeNetworks.clear()
         
         networkCallback = object : ConnectivityManager.NetworkCallback() {
@@ -2184,6 +2446,8 @@ class TunnelService : Service() {
                 }
                 val wasEmpty = activeNetworks.isEmpty()
                 activeNetworks.add(network)
+                reconcileBackgroundConnectionLocks()
+                scheduleProxyBindingRefresh()
                 if (AMNEZIA_STYLE_RECOVERY) {
                     if (shouldScheduleAvailableNetworkHandover(
                             previousNetworkWasLost = stableNetworkWasLost,
@@ -2211,7 +2475,10 @@ class TunnelService : Service() {
                 super.onLost(network)
                 val networkLostAt = System.currentTimeMillis()
                 activeNetworks.remove(network)
+                wifiTransportNetworks.remove(network)
                 trustedWifiResumeNetworks.lost(network)
+                reconcileBackgroundConnectionLocks()
+                scheduleProxyBindingRefresh()
                 if (trustedWifiWaiting) {
                     acquireTrustedWifiTransitionWakeLock()
                     scheduleTrustedWifiEvaluation(delayMs = 0L)
@@ -2272,6 +2539,18 @@ class TunnelService : Service() {
                     networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
                         networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN) &&
                         networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+                // В усиленном режиме важен сам Wi-Fi транспорт. Системный
+                // VALIDATED может временно исчезать во сне или при сетевых
+                // ограничениях, когда Wi-Fi lock особенно нельзя отпускать.
+                if (
+                    networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                    networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN) &&
+                    networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+                ) {
+                    wifiTransportNetworks.add(network)
+                } else {
+                    wifiTransportNetworks.remove(network)
+                }
                 trustedWifiResumeNetworks.update(
                     network = network,
                     internetCapable = networkCapabilities.hasCapability(
@@ -2282,6 +2561,8 @@ class TunnelService : Service() {
                     validated = usableRealNetwork,
                     wifi = networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
                 )
+                reconcileBackgroundConnectionLocks()
+                scheduleProxyBindingRefresh()
                 if (trustedWifiWaiting) {
                     if (usableRealNetwork) {
                         acquireTrustedWifiTransitionWakeLock()
@@ -2313,6 +2594,30 @@ class TunnelService : Service() {
             .build()
             
         connectivityManager?.registerNetworkCallback(request, networkCallback!!)
+
+        proxyDefaultNetworkCallback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                scheduleProxyVpnCaptureConfirmation()
+            }
+
+            override fun onLost(network: Network) {
+                scheduleProxyVpnCaptureConfirmation()
+            }
+
+            override fun onCapabilitiesChanged(
+                network: Network,
+                networkCapabilities: NetworkCapabilities,
+            ) {
+                scheduleProxyVpnCaptureConfirmation()
+            }
+        }
+        runCatching {
+            connectivityManager?.registerDefaultNetworkCallback(
+                checkNotNull(proxyDefaultNetworkCallback),
+            )
+        }.onFailure {
+            proxyDefaultNetworkCallback = null
+        }
     }
 
     private fun handleStableNetworkCapabilities(network: Network, networkCapabilities: NetworkCapabilities) {
@@ -2475,12 +2780,33 @@ class TunnelService : Service() {
         if (lastKnownDeviceInteractive == interactive) return
         lastKnownDeviceInteractive = interactive
         if (interactive) {
-            TunnelManager.noteDeviceWakeStarted()
+            // В усиленном режиме CPU-lock уже подготовлен до гашения экрана.
+            // При включённом экране Wi-Fi-lock больше не нужен.
+            reconcileBackgroundConnectionLocks()
+            TunnelManager.noteDeviceWakeStarted(
+                heldConnection = screenOffMode == ScreenOffMode.HOLD_CONNECTION,
+            )
+            if (TunnelManager.running.value && !isTunnelPaused && !trustedWifiWaiting) {
+                updateNotification(buildTunnelNotificationText())
+            }
         } else {
             TunnelManager.noteDeviceSleepStarted()
+            val policy = when (screenOffMode) {
+                ScreenOffMode.BALANCED -> "Сбалансированно"
+                ScreenOffMode.HOLD_CONNECTION -> "Удерживать соединение"
+                ScreenOffMode.SAVE_BATTERY -> "Экономить батарею"
+            }
+            TunnelManager.noteSleepBatteryEvent(
+                "screen_off_policy",
+                "Экран выключен; применяется режим «$policy».",
+            )
             // Low-latency Wi-Fi lock нужен только для короткого запуска.
             // При гашении экрана его нельзя оставлять до конца VPN-сессии.
             releaseWifiLock()
+            reconcileBackgroundConnectionLocks()
+            if (TunnelManager.running.value && !isTunnelPaused && !trustedWifiWaiting) {
+                updateNotification(buildTunnelNotificationText())
+            }
         }
     }
 
@@ -2525,6 +2851,36 @@ class TunnelService : Service() {
         }
     }
 
+    private fun scheduleProxyBindingRefresh() {
+        if (!TunnelManager.running.value ||
+            !tunnelModeUsesLocalProxy(TunnelManager.activeMode.value)
+        ) return
+        proxyBindingRefreshJob?.cancel()
+        proxyBindingRefreshJob = serviceScope.launch {
+            // Android может прислать callback чуть раньше обновления адресов
+            // интерфейса. Debounce также объединяет соседние network events.
+            delay(1_200L)
+            repeat(45) {
+                if (!TunnelManager.running.value ||
+                    !tunnelModeUsesLocalProxy(TunnelManager.activeMode.value)
+                ) return@launch
+                if (TunnelManager.proxyReadyAddresses.value.isNotEmpty()) {
+                    if (TunnelManager.proxyBindingsNeedRefresh()) {
+                        TunnelManager.restartTransport(
+                            reason = "[ПРОКСИ] Адрес локальной сети изменился. Обновляю доступные адреса прокси.",
+                            minIntervalMs = 0L,
+                            force = true,
+                        )
+                    }
+                    return@launch
+                }
+                // Сетевое событие могло прийти во время рукопожатия WDTT.
+                // Дожидаемся PROXY_READY, чтобы не потерять новый LAN-адрес.
+                delay(1_000L)
+            }
+        }
+    }
+
     private fun scheduleNetworkLossPause() {
         val now = System.currentTimeMillis()
         lastNetworkChangeTime = now
@@ -2542,6 +2898,7 @@ class TunnelService : Service() {
             if (lastNetworkChangeTime != now) return@launch
             if (!TunnelManager.running.value || isTunnelPaused || hasAnyRealNetwork()) return@launch
             isTunnelPaused = true
+            releaseBackgroundConnectionLocks()
             networkPausedByLoss = true
             Log.d("TunnelService", "Сети долго нет, приостанавливаем транспорт без переподключений к VK")
             TunnelManager.pause()
@@ -2587,6 +2944,174 @@ class TunnelService : Service() {
             "wv" -> "wv"
             else -> "auto"
         }
+    }
+
+    private fun isWifiTransportActive(): Boolean {
+        return wifiTransportNetworks.isNotEmpty()
+    }
+
+    @Synchronized
+    private fun reconcileBackgroundConnectionLocks() {
+        val wakeWasHeld = backgroundWakeLock?.isHeld == true
+        val wifiWasHeld = backgroundWifiLock?.isHeld == true
+        val shouldHoldCpu = shouldKeepHoldModeCpuLock(
+            mode = screenOffMode,
+            tunnelRunning = TunnelManager.running.value,
+            tunnelPaused = isTunnelPaused,
+            trustedWifiWaiting = trustedWifiWaiting,
+            stopRequested = requestedStopReason != null,
+            vpnSlotYieldRequested = TunnelManager.vpnSlotYieldRequested.value,
+            tunnelMode = TunnelManager.activeMode.value,
+        )
+        val shouldHoldWhileScreenOff = shouldHoldConnectionWhileScreenOff(
+            mode = screenOffMode,
+            deviceInteractive = lastKnownDeviceInteractive,
+            tunnelRunning = TunnelManager.running.value,
+            tunnelPaused = isTunnelPaused,
+            trustedWifiWaiting = trustedWifiWaiting,
+            stopRequested = requestedStopReason != null,
+            vpnSlotYieldRequested = TunnelManager.vpnSlotYieldRequested.value,
+            tunnelMode = TunnelManager.activeMode.value,
+        )
+        if (!shouldHoldCpu) {
+            releaseBackgroundConnectionLocks()
+            if (wakeWasHeld || wifiWasHeld) {
+                TunnelManager.noteSleepBatteryEvent(
+                    "hold_connection_released",
+                    "Усиленное удержание освобождено: соединение остановлено, приостановлено или режим изменён.",
+                )
+            }
+            return
+        }
+
+        if (backgroundWakeLock?.isHeld != true) {
+            acquireBackgroundWakeLock()
+        }
+
+        if (shouldHoldBackgroundWifiRadio(shouldHoldWhileScreenOff, isWifiTransportActive())) {
+            if (backgroundWifiLock?.isHeld != true) {
+                @Suppress("DEPRECATION")
+                // LOW_LATENCY может быть isHeld=true, но не действует при
+                // выключенном экране. HIGH_PERF поддерживает фоновую работу
+                // до Android 14; с API 34 Android сам заменяет его LOW_LATENCY.
+                // Не выдаём факт захвата lock за гарантию работы радиомодуля.
+                val lockMode = WifiManager.WIFI_MODE_FULL_HIGH_PERF
+                val wifiManager = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
+                backgroundWifiLock = runCatching {
+                    wifiManager.createWifiLock(
+                        lockMode,
+                        "wdtt:screen_off_connection_wifi",
+                    ).apply {
+                        setReferenceCounted(false)
+                        acquire()
+                    }
+                }.getOrNull()
+            }
+        } else {
+            releaseBackgroundWifiLock()
+        }
+        val wakeIsHeld = backgroundWakeLock?.isHeld == true
+        val wifiIsHeld = backgroundWifiLock?.isHeld == true
+        if (!wakeIsHeld && !backgroundWakeLockFailureReported) {
+            backgroundWakeLockFailureReported = true
+            TunnelManager.noteSleepBatteryEvent(
+                "hold_connection_cpu_unavailable",
+                "Не удалось включить удержание соединения. Android может остановить его при выключенном экране.",
+                warning = true,
+            )
+        } else if (wakeIsHeld) {
+            backgroundWakeLockFailureReported = false
+        }
+        val wifiHoldRequired = shouldHoldBackgroundWifiRadio(
+            shouldHoldWhileScreenOff,
+            isWifiTransportActive(),
+        )
+        if (wifiHoldRequired && !wifiIsHeld && !backgroundWifiLockFailureReported) {
+            backgroundWifiLockFailureReported = true
+            TunnelManager.noteSleepBatteryEvent(
+                "hold_connection_wifi_unavailable",
+                "Удержание соединения активно, но Android не подтвердил удержание Wi-Fi.",
+                warning = true,
+            )
+        } else if (!wifiHoldRequired || wifiIsHeld) {
+            backgroundWifiLockFailureReported = false
+        }
+        if (!wakeWasHeld && wakeIsHeld) {
+            TunnelManager.noteSleepBatteryEvent(
+                "hold_connection_active",
+                if (wifiIsHeld) {
+                    "Режим «Удерживать соединение» включён, в том числе для Wi-Fi."
+                } else {
+                    "Режим «Удерживать соединение» включён."
+                },
+            )
+        } else if (!wifiWasHeld && wifiIsHeld) {
+            TunnelManager.noteSleepBatteryEvent(
+                "hold_connection_wifi_acquired",
+                "Обнаружен Wi-Fi; усиленное удержание применено и к нему.",
+            )
+        } else if (wifiWasHeld && !wifiIsHeld && wakeIsHeld) {
+            TunnelManager.noteSleepBatteryEvent(
+                "hold_connection_wifi_released",
+                "Wi-Fi больше не используется; усиленное удержание соединения продолжается.",
+            )
+        }
+        if (!wifiWasHeld && wifiIsHeld && Build.VERSION.SDK_INT >= 34) {
+            TunnelManager.noteSleepBatteryEvent(
+                "hold_connection_wifi_system_limit",
+                "Android 14 и новее может ограничивать Wi-Fi при выключенном экране независимо от выбранного режима.",
+            )
+        }
+        TunnelManager.connectionHoldDiagnostics.value = ConnectionHoldDiagnostics(
+            modeSelected = screenOffMode == ScreenOffMode.HOLD_CONNECTION,
+            active = wakeIsHeld,
+            cpuWakeLockHeld = wakeIsHeld,
+            wifiLockHeld = wifiIsHeld,
+            wifiTransportAvailable = isWifiTransportActive(),
+            deviceInteractive = lastKnownDeviceInteractive,
+        )
+    }
+
+    @Synchronized
+    private fun releaseBackgroundWifiLock() {
+        backgroundWifiLock?.let { lock ->
+            runCatching { if (lock.isHeld) lock.release() }
+        }
+        backgroundWifiLock = null
+    }
+
+    @Synchronized
+    private fun releaseBackgroundConnectionLocks() {
+        releaseBackgroundWifiLock()
+        backgroundWakeLock?.let { lock ->
+            runCatching { if (lock.isHeld) lock.release() }
+        }
+        backgroundWakeLock = null
+        backgroundWakeLockFailureReported = false
+        backgroundWifiLockFailureReported = false
+        TunnelManager.connectionHoldDiagnostics.value = ConnectionHoldDiagnostics(
+            modeSelected = screenOffMode == ScreenOffMode.HOLD_CONNECTION,
+            wifiTransportAvailable = isWifiTransportActive(),
+            deviceInteractive = lastKnownDeviceInteractive,
+        )
+    }
+
+    @Synchronized
+    private fun acquireBackgroundWakeLock() {
+        if (backgroundWakeLock?.isHeld == true) return
+        val powerManager = getSystemService(POWER_SERVICE) as PowerManager
+        backgroundWakeLock = runCatching {
+            powerManager.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK,
+                "wdtt:tunnel_cpu",
+            ).apply {
+                setReferenceCounted(false)
+                // Это явный усиленный режим: lock берётся один раз и
+                // освобождается всеми состояниями выхода, а не переполучается
+                // таймером во сне.
+                acquire()
+            }
+        }.getOrNull()
     }
 
     /**
@@ -2693,6 +3218,7 @@ class TunnelService : Service() {
         updateJob = TunnelManager.scope.launch(Dispatchers.Main) {
             delay(1000)
             while (isActive) {
+                if (observeProxyVpnCapture()) break
                 if (
                     shouldYieldVpnSlot(
                         vpnSlotYieldRequested = TunnelManager.vpnSlotYieldRequested.value,
@@ -2721,6 +3247,7 @@ class TunnelService : Service() {
                             trustedWifiResumeInProgress = false
                             trustedWifiResumeStartedAt = 0L
                             trustedWifiWaiting = true
+                            releaseBackgroundConnectionLocks()
                             val status = "VPN не запустился, повторяем восстановление"
                             Log.w("TunnelService", status)
                             CaptchaWebViewManager.onTunnelStop()
@@ -2763,6 +3290,7 @@ class TunnelService : Service() {
                 val deviceInteractive = isDeviceInteractive()
                 if (TunnelManager.running.value && !isTunnelPaused) {
                     releaseTransitionLocksAfterTunnelStart()
+                    reconcileBackgroundConnectionLocks()
                     val helper = WireGuardHelper(applicationContext)
                     val startupWindow = System.currentTimeMillis() - TunnelManager.processStartedAtMs < INITIAL_VPN_START_GRACE_MS
                     val captchaActive = TunnelManager.isCaptchaInProgress()
@@ -2770,7 +3298,8 @@ class TunnelService : Service() {
                     // итерация службы иногда выполняется раньше ACTION_SCREEN_ON.
                     observeDeviceInteractiveState(deviceInteractive)
                     val shouldInspectVpnInterface =
-                        deviceInteractive && !startupWindow && !captchaActive
+                        TunnelManager.activeMode.value == TUNNEL_MODE_VPN &&
+                            deviceInteractive && !startupWindow && !captchaActive
                     val vpnInterfaceUp = !shouldInspectVpnInterface || helper.isTunnelUp()
                     if (vpnInterfaceUp) {
                         vpnInterfaceMissingSinceMs = 0L
@@ -2810,7 +3339,15 @@ class TunnelService : Service() {
                             TunnelManager.recreateVpnTunnel()
                         }
                     }
-                    if (!startupWindow && !captchaActive && vpnInterfaceUp && deviceInteractive) {
+                    if (
+                        shouldRunActiveTransportRecovery(
+                            startupWindow = startupWindow,
+                            captchaActive = captchaActive,
+                            vpnInterfaceUp = vpnInterfaceUp,
+                            deviceInteractive = deviceInteractive,
+                            realNetworkAvailable = hasAnyRealNetwork(),
+                        )
+                    ) {
                         when (TunnelManager.pollNetworkRecoveryAction()) {
                             NetworkRecoveryAction.SoftRestart -> {
                                 Log.w("TunnelService", "Сетевая ошибка туннеля. Мягко перезапускаем транспорт.")
@@ -2821,11 +3358,13 @@ class TunnelService : Service() {
                                 )
                             }
                             NetworkRecoveryAction.StopVpn -> {
-                                Log.w("TunnelService", "Автовосстановление не помогло. Останавливаем VPN, чтобы вернуть интернет.")
+                                Log.w("TunnelService", "Автовосстановление не помогло. Безопасно останавливаем соединение.")
                                 TunnelManager.markStoppedAfterFailedRecovery()
+                                val issue = TunnelManager.connectionIssue.value
                                 showTunnelAlertNotification(
-                                    "WDTT Plus остановил VPN",
-                                    "Связь не восстановилась автоматически, поэтому VPN выключен и интернет телефона возвращён напрямую."
+                                    issue?.title ?: "WDTT Plus остановил соединение",
+                                    issue?.action
+                                        ?: "Связь не восстановилась автоматически. Проверьте сеть и включите соединение снова."
                                 )
                                 stopTunnel(TunnelStopReason.NetworkRecoveryFailed)
                                 break
@@ -2849,6 +3388,58 @@ class TunnelService : Service() {
         }
     }
 
+    private fun isAppDefaultNetworkAnotherVpn(): Boolean {
+        val manager = connectivityManager ?: return false
+        val network = runCatching { manager.activeNetwork }.getOrNull() ?: return false
+        val capabilities = runCatching { manager.getNetworkCapabilities(network) }.getOrNull()
+            ?: return false
+        return capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+    }
+
+    private fun observeProxyVpnCapture(): Boolean {
+        proxyVpnCaptureObservations = nextProxyVpnCaptureObservationCount(
+            tunnelMode = TunnelManager.activeMode.value,
+            appDefaultNetworkIsVpn = isAppDefaultNetworkAnotherVpn(),
+            previousCount = proxyVpnCaptureObservations,
+        )
+        if (!proxyVpnCaptureConfirmed(proxyVpnCaptureObservations)) return false
+        stopProxyCapturedByAnotherVpn()
+        return true
+    }
+
+    private fun scheduleProxyVpnCaptureConfirmation() {
+        serviceScope.launch {
+            val proxyRunning = TunnelManager.running.value &&
+                tunnelModeUsesLocalProxy(TunnelManager.activeMode.value)
+            if (!proxyRunning || !isAppDefaultNetworkAnotherVpn()) {
+                proxyVpnCaptureConfirmationJob?.cancel()
+                proxyVpnCaptureConfirmationJob = null
+                proxyVpnCaptureObservations = 0
+                return@launch
+            }
+            if (proxyVpnCaptureConfirmationJob?.isActive == true) return@launch
+            proxyVpnCaptureObservations = nextProxyVpnCaptureObservationCount(
+                tunnelMode = TunnelManager.activeMode.value,
+                appDefaultNetworkIsVpn = true,
+                previousCount = 0,
+            )
+            proxyVpnCaptureConfirmationJob = serviceScope.launch {
+                delay(PROXY_VPN_CAPTURE_CONFIRM_MS)
+                observeProxyVpnCapture()
+            }
+        }
+    }
+
+    private fun stopProxyCapturedByAnotherVpn() {
+        proxyVpnCaptureObservations = 0
+        TunnelManager.noteProxyCapturedByVpn()
+        showTunnelAlertNotification(
+            "Прокси WDTT Plus остановлен",
+            "Исключите WDTT Plus из маршрутизации внешнего VPN, чтобы убрать цикл и вернуть интернет.",
+        )
+        stopTunnel(TunnelStopReason.ProxyCapturedByVpn)
+    }
+
     private fun buildTunnelNotificationText(): String {
         val issueTitle = TunnelManager.connectionIssueTitleForNotification()
         if (issueTitle != null) return issueTitle
@@ -2859,7 +3450,21 @@ class TunnelService : Service() {
             sleepWakeResultText = null
             sleepWakeResultVisibleUntilMs = 0L
         }
+        if (TunnelManager.wakeRecoveryInProgress.value) {
+            val ready = TunnelManager.wakeRecoveryReadyWorkers.value
+            val total = TunnelManager.wakeRecoveryTargetWorkers.value
+            return wakeRecoveryStatusText(
+                readyWorkers = ready,
+                targetWorkers = total,
+                heldConnection = TunnelManager.wakeRecoveryHeldConnection.value,
+            )
+        }
         val statsText = TunnelManager.stats.value.trim()
+        if (tunnelModeUsesLocalProxy(TunnelManager.activeMode.value)) {
+            val modeLabel = tunnelModeStatusLabel(TunnelManager.activeMode.value)
+            val address = TunnelManager.proxyReadyAddress.value
+            return if (address == null) "$modeLabel запускается…" else "$modeLabel · $address"
+        }
         return when {
             statsText.isEmpty() -> "Туннель активен"
             statsText == "Ожидание данных..." -> "Туннель активен"
@@ -3068,6 +3673,7 @@ class TunnelService : Service() {
         wakeRescueJob?.cancel()
         cancelTimerResumeTransportConfirmation()
         networkChangeJob?.cancel()
+        proxyBindingRefreshJob?.cancel()
         screenStateReceiver?.let {
             runCatching { unregisterReceiver(it) }
         }
@@ -3083,6 +3689,9 @@ class TunnelService : Service() {
         networkCallback?.let {
             connectivityManager?.unregisterNetworkCallback(it)
         }
+        proxyDefaultNetworkCallback?.let {
+            runCatching { connectivityManager?.unregisterNetworkCallback(it) }
+        }
         trustedWifiNetworkCallback?.let {
             runCatching { connectivityManager?.unregisterNetworkCallback(it) }
         }
@@ -3092,6 +3701,7 @@ class TunnelService : Service() {
         releaseTrustedWifiTransitionWakeLock()
         releaseShortSleepPauseWakeLock()
         releaseShortSleepResumeWakeLock()
+        releaseBackgroundConnectionLocks()
         if (trustedWifiWaiting || trustedWifiResumeInProgress) {
             releaseWakeLock()
             releaseWifiLock()

@@ -1,15 +1,30 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"io"
 	"net"
+	"net/http"
+	"net/netip"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+type updateRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn updateRoundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return fn(request)
+}
 
 type singlePacketConn struct {
 	packet []byte
@@ -423,5 +438,327 @@ func TestLinuxRuntimeReaders(t *testing.T) {
 	}
 	if _, err := readProcUDPDrops(); err != nil {
 		t.Fatalf("readProcUDPDrops: %v", err)
+	}
+}
+
+func TestParseUpdateMetadataRequest(t *testing.T) {
+	requestID, ok := parseUpdateMetadataRequest([]byte("WDTT_UPDATE1|request-1234"))
+	if !ok || requestID != "request-1234" {
+		t.Fatalf("request = %q, %t", requestID, ok)
+	}
+	for _, invalid := range []string{
+		"ordinary WireGuard packet",
+		"WDTT_UPDATE1|short",
+		"WDTT_UPDATE1|request/with/slash",
+	} {
+		if _, accepted := parseUpdateMetadataRequest([]byte(invalid)); accepted {
+			t.Fatalf("accepted invalid request %q", invalid)
+		}
+	}
+}
+
+func TestEncodeUpdateMetadataResponseChunksRoundTrip(t *testing.T) {
+	payload := []byte(strings.Repeat("metadata", 300))
+	frames := encodeUpdateMetadataResponse("request-1234", payload, nil)
+	if len(frames) < 2 {
+		t.Fatalf("frames = %d, want fragmentation", len(frames))
+	}
+	var restored []byte
+	for _, frame := range frames {
+		parts := strings.Split(string(frame), "|")
+		if len(parts) != 6 || parts[0] != "WDTT_UPDATE1_RESULT" || parts[1] != "request-1234" || parts[2] != "OK" {
+			t.Fatalf("unexpected frame %q", frame)
+		}
+		chunk, err := base64.RawURLEncoding.DecodeString(parts[5])
+		if err != nil {
+			t.Fatal(err)
+		}
+		restored = append(restored, chunk...)
+	}
+	if string(restored) != string(payload) {
+		t.Fatal("fragmented response did not round-trip")
+	}
+}
+
+func TestEncodeUpdateAPKChunkResponsePreservesBinaryPayload(t *testing.T) {
+	payload := make([]byte, updateAPKFrameBytes*2+17)
+	for index := range payload {
+		payload[index] = byte(index % 256)
+	}
+	frames := encodeUpdateAPKChunkResponse("request-1234", payload, nil)
+	if len(frames) != 3 {
+		t.Fatalf("frames = %d, want 3", len(frames))
+	}
+	restored := make([]byte, 0, len(payload))
+	for _, frame := range frames {
+		parts := bytes.SplitN(frame, []byte("|"), 6)
+		if len(parts) != 6 || string(parts[0]) != "WDTT_UPDATE_APK1_RESULT" || string(parts[2]) != "OK" {
+			t.Fatalf("unexpected APK frame header %q", frame[:min(len(frame), 100)])
+		}
+		restored = append(restored, parts[5]...)
+	}
+	if !bytes.Equal(restored, payload) {
+		t.Fatal("binary APK response did not round-trip")
+	}
+}
+
+func TestParseUpdateAPKChunkRequest(t *testing.T) {
+	assetURL := "https://github.com/Ivan4537/WDTT-Plus/releases/download/v18/app.apk"
+	encodedAssetURL := base64.RawURLEncoding.EncodeToString([]byte(assetURL))
+	digest := strings.Repeat("a", 64)
+	packet := "WDTT_UPDATE_APK1|request-1234|32768|1024|65536|" + digest + "|" +
+		encodedAssetURL
+	request, ok := parseUpdateAPKChunkRequest([]byte(packet))
+	if !ok || request.offset != 32768 || request.length != 1024 || request.size != 65536 || request.downloadURL != assetURL {
+		t.Fatalf("unexpected request: %#v, %t", request, ok)
+	}
+	for _, invalid := range []string{
+		strings.Replace(packet, "|1024|", "|65537|", 1),
+		strings.Replace(packet, encodedAssetURL, base64.RawURLEncoding.EncodeToString([]byte("https://example.com/app.apk")), 1),
+		strings.Replace(packet, digest, "bad", 1),
+	} {
+		if _, accepted := parseUpdateAPKChunkRequest([]byte(invalid)); accepted {
+			t.Fatalf("accepted invalid APK request %q", invalid)
+		}
+	}
+}
+
+func TestDownloadOfficialUpdateAPKVerifiesContent(t *testing.T) {
+	payload := []byte(strings.Repeat("apk-data", 512))
+	digest := sha256.Sum256(payload)
+	request := updateAPKChunkRequest{
+		requestID:   "request-1234",
+		offset:      0,
+		length:      len(payload),
+		size:        int64(len(payload)),
+		sha256:      hex.EncodeToString(digest[:]),
+		downloadURL: "https://github.com/Ivan4537/WDTT-Plus/releases/download/v18/app.apk",
+	}
+	client := &http.Client{Transport: updateRoundTripFunc(func(httpRequest *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			ContentLength: int64(len(payload)),
+			Body:          io.NopCloser(strings.NewReader(string(payload))),
+			Header:        make(http.Header),
+			Request:       httpRequest,
+		}, nil
+	})}
+	path, err := downloadOfficialUpdateAPK(context.Background(), client, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(path) })
+	stored, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(stored) != string(payload) {
+		t.Fatal("cached APK content changed")
+	}
+	if info, err := os.Stat(path); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("cached APK mode = %v, %v", info, err)
+	}
+}
+
+func TestConvertGitHubReleaseKeepsOnlyOfficialAPKs(t *testing.T) {
+	release := githubUpdateRelease{TagName: "17", HTMLURL: "https://github.com/Ivan4537/WDTT-Plus/releases/tag/v17"}
+	release.Assets = append(release.Assets,
+		struct {
+			Name               string `json:"name"`
+			BrowserDownloadURL string `json:"browser_download_url"`
+			Size               int64  `json:"size"`
+			Digest             string `json:"digest"`
+		}{"WDTT-Plus-v17-arm64-v8a-release.apk", "https://github.com/Ivan4537/WDTT-Plus/releases/download/v17/app.apk", 123, "sha256:abc"},
+		struct {
+			Name               string `json:"name"`
+			BrowserDownloadURL string `json:"browser_download_url"`
+			Size               int64  `json:"size"`
+			Digest             string `json:"digest"`
+		}{"server.tar.gz", "https://github.com/Ivan4537/WDTT-Plus/releases/download/v17/server.tar.gz", 456, "sha256:def"},
+		struct {
+			Name               string `json:"name"`
+			BrowserDownloadURL string `json:"browser_download_url"`
+			Size               int64  `json:"size"`
+			Digest             string `json:"digest"`
+		}{"evil.apk", "https://example.com/evil.apk", 789, "sha256:bad"},
+	)
+	metadata := convertGitHubRelease(release)
+	if metadata.VersionTag != "v17" || len(metadata.Assets) != 1 {
+		t.Fatalf("metadata = %#v", metadata)
+	}
+}
+
+func TestParseDeploySafeStartRequestChecksDigest(t *testing.T) {
+	payload := []byte(`{"main_password":"secret","args":["list"]}`)
+	sum := sha256.Sum256(payload)
+	digest := hex.EncodeToString(sum[:])
+	packet := []byte(deploySafeRequestPrefix + "request-1234|" + digest + "|" + base64.RawURLEncoding.EncodeToString(payload))
+	request, ok := parseDeploySafeStartRequest(packet)
+	if !ok || request.requestID != "request-1234" || string(request.payload) != string(payload) {
+		t.Fatalf("valid request rejected: %#v, ok=%v", request, ok)
+	}
+	packet[len(packet)-1] ^= 1
+	if _, ok := parseDeploySafeStartRequest(packet); ok {
+		t.Fatal("corrupted request accepted")
+	}
+}
+
+func TestRelayedDeployAdminAllowlist(t *testing.T) {
+	allowed := [][]string{
+		{"list"},
+		{"details", "--password", "client-secret"},
+		{"backup-status"},
+		{"backup-verify", "--id", "20260909T010203Z-012345abcdef"},
+		{"backup-export", "--id", "20260909T010203Z-012345abcdef"},
+		{"backup-create", "--reason", "manual"},
+		{"safe-inspect", "outbound-status"},
+		{"safe-inspect", "server-diagnostics", "56000", "56001", "9000"},
+		{"safe-inspect", "check-tun", "tun0"},
+		{"safe-inspect", "check-local-proxy", "1080", "login", "password"},
+		{"safe-inspect", "check-external-proxy", "Socks5", "proxy.example", "1080", "", ""},
+		{"safe-inspect", "database-snapshot"},
+		{"safe-inspect", "config-export", "true"},
+	}
+	for _, args := range allowed {
+		if !isRelayedDeployAdminCommandAllowed(args) {
+			t.Fatalf("safe command rejected: %#v", args)
+		}
+	}
+	blocked := [][]string{
+		{"restart"},
+		{"delete", "--password", "client-secret"},
+		{"backup-delete", "--id", "20260909T010203Z-012345abcdef"},
+		{"backup-create", "--reason", "pre_restore"},
+		{"backup-verify", "--id", "../../etc/shadow"},
+		{"safe-inspect", "run", "rm", "-rf", "/"},
+		{"safe-inspect", "check-tun", "tun0;reboot"},
+		{"safe-inspect", "check-external-proxy", "Socks5", "https://proxy.example", "1080", "", ""},
+		{"safe-inspect", "config-export", "yes"},
+	}
+	for _, args := range blocked {
+		if isRelayedDeployAdminCommandAllowed(args) {
+			t.Fatalf("unsafe command accepted: %#v", args)
+		}
+	}
+}
+
+func TestRelayedDeployReadOnlyCardsReturnCurrentServerState(t *testing.T) {
+	configDir := t.TempDir()
+	if err := os.WriteFile(
+		filepath.Join(configDir, "passwords.json"),
+		[]byte(`{"main_password":"owner-secret","passwords":{},"devices":{}}`),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"list"},
+		{"backup-status"},
+		{"safe-inspect", "database-snapshot"},
+		{"safe-inspect", "config-export", "false"},
+	} {
+		request, err := json.Marshal(adminRequest{MainPassword: "owner-secret", Args: args})
+		if err != nil {
+			t.Fatal(err)
+		}
+		response, err := executeDeploySafeAdminRequest(configDir, nil, request)
+		if err != nil {
+			t.Fatalf("args=%v: %v", args, err)
+		}
+		var decoded adminResponse
+		if err := json.Unmarshal(response, &decoded); err != nil {
+			t.Fatalf("args=%v response=%q: %v", args, response, err)
+		}
+		if !decoded.OK {
+			t.Fatalf("args=%v response=%+v", args, decoded)
+		}
+	}
+}
+
+func TestParseOpaqueHTTPSRequest(t *testing.T) {
+	packet := strings.Join([]string{
+		"WDTT_HTTPS_POST1",
+		"request-1234",
+		base64.RawURLEncoding.EncodeToString([]byte("https://example.org/status")),
+		base64.RawURLEncoding.EncodeToString([]byte(`{"operation":"status"}`)),
+	}, "|")
+	request, ok := parseOpaqueHTTPSRequest([]byte(packet))
+	if !ok || request.requestID != "request-1234" || request.url != "https://example.org/status" {
+		t.Fatalf("request rejected: %#v, ok=%v", request, ok)
+	}
+}
+
+func TestParseOpaqueHTTPSRequestRejectsOversizedPacket(t *testing.T) {
+	if _, ok := parseOpaqueHTTPSRequest([]byte("WDTT_HTTPS_POST1|request-1234|" + strings.Repeat("a", 1500))); ok {
+		t.Fatal("oversized request accepted")
+	}
+}
+
+func TestOpaqueHTTPSAddressPolicyRejectsLocalNetworks(t *testing.T) {
+	for _, value := range []string{
+		"127.0.0.1",
+		"10.0.0.1",
+		"100.64.0.1",
+		"169.254.1.1",
+		"192.168.1.1",
+		"198.18.0.1",
+		"::1",
+		"fc00::1",
+		"fe80::1",
+		"2001:db8::1",
+	} {
+		if isPublicOpaqueHTTPSAddress(netip.MustParseAddr(value)) {
+			t.Fatalf("local or reserved address accepted: %s", value)
+		}
+	}
+	if !isPublicOpaqueHTTPSAddress(netip.MustParseAddr("1.1.1.1")) {
+		t.Fatal("public address rejected")
+	}
+}
+
+func TestParseDeploySafeChunkRequestRejectsBounds(t *testing.T) {
+	digest := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	valid := []byte(deploySafeChunkRequestPrefix + "chunk-1234|request-1234|0|16384|" + digest)
+	if request, ok := parseDeploySafeChunkRequest(valid); !ok || request.length != 16384 {
+		t.Fatalf("valid chunk request rejected: %#v, ok=%v", request, ok)
+	}
+	tooLarge := []byte(deploySafeChunkRequestPrefix + "chunk-1234|request-1234|0|32769|" + digest)
+	if _, ok := parseDeploySafeChunkRequest(tooLarge); ok {
+		t.Fatal("oversized chunk request accepted")
+	}
+}
+
+func TestDeploySafeConfigExportReadsOnlyBoundedRegularFiles(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "passwords.json"), []byte(`{"main_password":"secret","passwords":{},"devices":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "wg-keys.dat"), []byte("private\npublic\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := deploySafeConfigExport(dir, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]string
+	if err := json.Unmarshal([]byte(payload), &document); err != nil {
+		t.Fatal(err)
+	}
+	if document["passwords_b64"] == "" || document["wg_keys_b64"] == "" || document["backup_policy_b64"] == "" {
+		t.Fatalf("incomplete export: %#v", document)
+	}
+
+	outside := filepath.Join(t.TempDir(), "outside.json")
+	if err := os.WriteFile(outside, []byte(`{"main_password":"leak"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dir, "passwords.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(dir, "passwords.json")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := deploySafeConfigExport(dir, false); err == nil {
+		t.Fatal("symbolic-link database was accepted")
 	}
 }

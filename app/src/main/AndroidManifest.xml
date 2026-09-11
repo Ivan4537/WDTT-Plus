@@ -132,7 +132,7 @@
             android:stopWithTask="false">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="persistent_vpn_tunnel_transport" />
+                android:value="persistent_encrypted_tunnel_transport_or_local_socks_proxy" />
         </service>
 
         <!-- SafeGoBackend retains upstream wg-go but does not probe ownership
@@ -176,7 +176,7 @@
 
         <receiver
             android:name=".VpnWidgetProvider"
-            android:label="WDTT Plus ВПН Виджет"
+            android:label="WDTT Plus — подключение"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />

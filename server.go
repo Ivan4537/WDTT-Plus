@@ -16,10 +16,15 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1679,7 +1684,7 @@ func main() {
 		go func(c net.Conn) {
 			defer wg.Done()
 			defer c.Close()
-			handleConn(ctx, c, wgEndpoint, wgDev, keys)
+			handleConn(ctx, c, wgEndpoint, wgDev, keys, *configDir)
 		}(dtlsConn)
 	}
 }
@@ -1709,7 +1714,7 @@ func denyExpiredAccess(clientConn net.Conn, identity accessIdentity) {
 	_, _ = clientConn.Write([]byte("DENIED:expired"))
 }
 
-func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgDev wgDevice, keys *wgKeys) {
+func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgDev wgDevice, keys *wgKeys, configDir string) {
 	atomic.AddInt64(&totalConns, 1)
 
 	var connDevice *ClientDevice
@@ -2094,6 +2099,16 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 
 	pctx, pcancel := context.WithCancel(ctx)
 	defer pcancel()
+	var clientWriteMu sync.Mutex
+	writeClientPacket := func(packet []byte) error {
+		clientWriteMu.Lock()
+		defer clientWriteMu.Unlock()
+		clientConn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		_, err := clientConn.Write(packet)
+		clientConn.SetWriteDeadline(time.Time{})
+		return err
+	}
+	updateRelayGate := make(chan struct{}, 16)
 
 	if _, limited := accessIdentityExpiryUnix(identity); limited {
 		go func() {
@@ -2155,11 +2170,184 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 			}
 			// Reply to DTLS keepalive packets so clients can detect silent UDP stalls.
 			if nn == 1 && (*b)[0] == dtlsKeepaliveByte {
-				clientConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-				_, err := clientConn.Write([]byte{dtlsKeepaliveByte})
-				clientConn.SetWriteDeadline(time.Time{})
-				if err != nil {
+				if err := writeClientPacket([]byte{dtlsKeepaliveByte}); err != nil {
 					return
+				}
+				continue
+			}
+			if requestID, ok := parseUpdateMetadataRequest((*b)[:nn]); ok {
+				if err := writeClientPacket([]byte(updateMetadataResponsePrefix + requestID + "|ACK|")); err != nil {
+					return
+				}
+				select {
+				case updateRelayGate <- struct{}{}:
+					go func() {
+						defer func() { <-updateRelayGate }()
+						requestCtx, requestCancel := context.WithTimeout(pctx, 10*time.Second)
+						defer requestCancel()
+						payload, fetchErr := cachedOfficialUpdateMetadata(requestCtx)
+						for _, frame := range encodeUpdateMetadataResponse(requestID, payload, fetchErr) {
+							if writeClientPacket(frame) != nil {
+								return
+							}
+						}
+					}()
+				default:
+					for _, frame := range encodeUpdateMetadataResponse(
+						requestID,
+						nil,
+						errors.New("проверка обновления уже выполняется"),
+					) {
+						if writeClientPacket(frame) != nil {
+							return
+						}
+					}
+				}
+				continue
+			}
+			if request, ok := parseOpaqueHTTPSRequest((*b)[:nn]); ok {
+				if err := writeClientPacket([]byte(opaqueHTTPSResponsePrefix + request.requestID + "|ACK|")); err != nil {
+					return
+				}
+				select {
+				case updateRelayGate <- struct{}{}:
+					go func() {
+						defer func() { <-updateRelayGate }()
+						requestCtx, requestCancel := context.WithTimeout(pctx, 10*time.Second)
+						defer requestCancel()
+						payload, relayErr := executeOpaqueHTTPSPost(requestCtx, request)
+						for _, frame := range encodeOpaqueHTTPSResponse(request.requestID, payload, relayErr) {
+							if writeClientPacket(frame) != nil {
+								return
+							}
+						}
+					}()
+				default:
+					for _, frame := range encodeOpaqueHTTPSResponse(
+						request.requestID,
+						nil,
+						errors.New("защищённый HTTPS-канал занят"),
+					) {
+						if writeClientPacket(frame) != nil {
+							return
+						}
+					}
+				}
+				continue
+			}
+			if request, ok := parseUpdateAPKChunkRequest((*b)[:nn]); ok {
+				if err := writeClientPacket([]byte(updateMetadataResponsePrefix + request.requestID + "|ACK|")); err != nil {
+					return
+				}
+				select {
+				case updateRelayGate <- struct{}{}:
+					go func() {
+						defer func() { <-updateRelayGate }()
+						requestCtx, requestCancel := context.WithTimeout(pctx, 3*time.Minute)
+						defer requestCancel()
+						payload, fetchErr := cachedOfficialUpdateAPKChunk(requestCtx, request)
+						if fetchErr == nil {
+							if writeClientPacket([]byte(updateAPKChunkResponsePrefix+request.requestID+"|READY|")) != nil {
+								return
+							}
+						}
+						for _, frame := range encodeUpdateAPKChunkResponse(request.requestID, payload, fetchErr) {
+							if err := runtimeLease.download.wait(pctx, len(frame)); err != nil {
+								return
+							}
+							if writeClientPacket(frame) != nil {
+								return
+							}
+							atomic.AddInt64(&totalBytesToClient, int64(len(frame)))
+							time.Sleep(100 * time.Microsecond)
+						}
+					}()
+				default:
+					for _, frame := range encodeUpdateAPKChunkResponse(
+						request.requestID,
+						nil,
+						errors.New("канал загрузки обновления занят"),
+					) {
+						if writeClientPacket(frame) != nil {
+							return
+						}
+					}
+				}
+				continue
+			}
+			if request, ok := parseDeploySafeStartRequest((*b)[:nn]); ok {
+				if err := writeClientPacket([]byte(updateMetadataResponsePrefix + request.requestID + "|ACK|")); err != nil {
+					return
+				}
+				select {
+				case updateRelayGate <- struct{}{}:
+					go func() {
+						defer func() { <-updateRelayGate }()
+						payload, digest, relayErr := executeCachedDeploySafeRequest(
+							configDir,
+							wgDev,
+							identity,
+							request,
+						)
+						metadata := []byte(fmt.Sprintf("%d|%s", len(payload), digest))
+						for _, frame := range encodeUpdateMetadataResponse(request.requestID, metadata, relayErr) {
+							if err := runtimeLease.download.wait(pctx, len(frame)); err != nil {
+								return
+							}
+							if writeClientPacket(frame) != nil {
+								return
+							}
+							atomic.AddInt64(&totalBytesToClient, int64(len(frame)))
+						}
+					}()
+				default:
+					for _, frame := range encodeUpdateMetadataResponse(
+						request.requestID,
+						nil,
+						errors.New("канал безопасных операций занят"),
+					) {
+						if writeClientPacket(frame) != nil {
+							return
+						}
+					}
+				}
+				continue
+			}
+			if request, ok := parseDeploySafeChunkRequest((*b)[:nn]); ok {
+				if err := writeClientPacket([]byte(updateMetadataResponsePrefix + request.requestID + "|ACK|")); err != nil {
+					return
+				}
+				select {
+				case updateRelayGate <- struct{}{}:
+					go func() {
+						defer func() { <-updateRelayGate }()
+						payload, relayErr := readDeploySafeChunk(identity, request)
+						if relayErr == nil {
+							if writeClientPacket([]byte(updateAPKChunkResponsePrefix+request.requestID+"|READY|")) != nil {
+								return
+							}
+						}
+						for _, frame := range encodeUpdateAPKChunkResponse(request.requestID, payload, relayErr) {
+							if err := runtimeLease.download.wait(pctx, len(frame)); err != nil {
+								return
+							}
+							if writeClientPacket(frame) != nil {
+								return
+							}
+							atomic.AddInt64(&totalBytesToClient, int64(len(frame)))
+							time.Sleep(100 * time.Microsecond)
+						}
+					}()
+				default:
+					for _, frame := range encodeUpdateAPKChunkResponse(
+						request.requestID,
+						nil,
+						errors.New("канал безопасных операций занят"),
+					) {
+						if writeClientPacket(frame) != nil {
+							return
+						}
+					}
 				}
 				continue
 			}
@@ -2227,7 +2415,7 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 			if err := runtimeLease.download.wait(pctx, nn); err != nil {
 				return
 			}
-			if _, err := clientConn.Write(packet); err != nil {
+			if err := writeClientPacket(packet); err != nil {
 				return
 			}
 			atomic.AddInt64(&totalBytesToClient, int64(nn))
@@ -2607,3 +2795,1538 @@ func (c *wrapPacketConn) LocalAddr() net.Addr                { return c.inner.Lo
 func (c *wrapPacketConn) SetDeadline(t time.Time) error      { return c.inner.SetDeadline(t) }
 func (c *wrapPacketConn) SetReadDeadline(t time.Time) error  { return c.inner.SetReadDeadline(t) }
 func (c *wrapPacketConn) SetWriteDeadline(t time.Time) error { return c.inner.SetWriteDeadline(t) }
+
+const (
+	updateMetadataRequestPrefix  = "WDTT_UPDATE1|"
+	updateMetadataResponsePrefix = "WDTT_UPDATE1_RESULT|"
+	updateAPKChunkRequestPrefix  = "WDTT_UPDATE_APK1|"
+	updateAPKChunkResponsePrefix = "WDTT_UPDATE_APK1_RESULT|"
+	updateMetadataMaxBodyBytes   = 1024 * 1024
+	updateMetadataChunkBytes     = 700
+	updateMetadataCacheTTL       = 5 * time.Minute
+	updateAPKMaxBytes            = 200 * 1024 * 1024
+	updateAPKChunkMaxBytes       = 32 * 1024
+	updateAPKFrameBytes          = 1100
+	updateAPKCacheTTL            = 6 * time.Hour
+)
+
+var updateMetadataVersionPattern = regexp.MustCompile(`(?i)^v?(\d+)$`)
+
+type relayedUpdateAsset struct {
+	Name        string `json:"name"`
+	DownloadURL string `json:"download_url"`
+	SizeBytes   int64  `json:"size"`
+	Digest      string `json:"digest,omitempty"`
+}
+
+type relayedUpdateMetadata struct {
+	VersionTag string               `json:"version_tag"`
+	ReleaseURL string               `json:"release_url"`
+	Source     string               `json:"source"`
+	Assets     []relayedUpdateAsset `json:"assets,omitempty"`
+}
+
+type githubUpdateRelease struct {
+	TagName    string `json:"tag_name"`
+	HTMLURL    string `json:"html_url"`
+	Draft      bool   `json:"draft"`
+	Prerelease bool   `json:"prerelease"`
+	Assets     []struct {
+		Name               string `json:"name"`
+		BrowserDownloadURL string `json:"browser_download_url"`
+		Size               int64  `json:"size"`
+		Digest             string `json:"digest"`
+	} `json:"assets"`
+}
+
+type githubUpdateTag struct {
+	Name string `json:"name"`
+}
+
+var updateMetadataRelayCache = struct {
+	sync.Mutex
+	payload   []byte
+	expiresAt time.Time
+}{}
+
+var updateMetadataHTTPClient = &http.Client{Timeout: 8 * time.Second}
+
+type updateAPKChunkRequest struct {
+	requestID   string
+	offset      int64
+	length      int
+	size        int64
+	sha256      string
+	downloadURL string
+}
+
+var updateAPKRelayCache = struct {
+	sync.Mutex
+	path        string
+	downloadURL string
+	size        int64
+	sha256      string
+	expiresAt   time.Time
+}{}
+
+var updateAPKHTTPClient = &http.Client{
+	Timeout: 3 * time.Minute,
+	CheckRedirect: func(request *http.Request, via []*http.Request) error {
+		if len(via) >= 5 || !isTrustedUpdateRedirectURL(request.URL) {
+			return errors.New("GitHub перенаправил APK на недоверенный адрес")
+		}
+		return nil
+	},
+}
+
+func parseUpdateMetadataRequest(packet []byte) (string, bool) {
+	value := string(packet)
+	if !strings.HasPrefix(value, updateMetadataRequestPrefix) {
+		return "", false
+	}
+	requestID := strings.TrimPrefix(value, updateMetadataRequestPrefix)
+	if len(requestID) < 8 || len(requestID) > 64 {
+		return "", false
+	}
+	for _, char := range requestID {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') || char == '-' || char == '_' {
+			continue
+		}
+		return "", false
+	}
+	return requestID, true
+}
+
+func parseUpdateAPKChunkRequest(packet []byte) (updateAPKChunkRequest, bool) {
+	value := string(packet)
+	if !strings.HasPrefix(value, updateAPKChunkRequestPrefix) {
+		return updateAPKChunkRequest{}, false
+	}
+	parts := strings.SplitN(value, "|", 7)
+	if len(parts) != 7 {
+		return updateAPKChunkRequest{}, false
+	}
+	requestID := normalizeUpdateRelayRequestID(parts[1])
+	offset, offsetErr := strconv.ParseInt(parts[2], 10, 64)
+	length64, lengthErr := strconv.ParseInt(parts[3], 10, 32)
+	size, sizeErr := strconv.ParseInt(parts[4], 10, 64)
+	digest := strings.ToLower(parts[5])
+	decodedURL, decodeErr := base64.RawURLEncoding.DecodeString(parts[6])
+	request := updateAPKChunkRequest{
+		requestID:   requestID,
+		offset:      offset,
+		length:      int(length64),
+		size:        size,
+		sha256:      digest,
+		downloadURL: string(decodedURL),
+	}
+	validDigest := len(digest) == 64
+	if validDigest {
+		_, decodeErr := hex.DecodeString(digest)
+		validDigest = decodeErr == nil
+	}
+	if requestID == "" || offsetErr != nil || lengthErr != nil || sizeErr != nil || decodeErr != nil ||
+		offset < 0 || length64 < 1 || length64 > updateAPKChunkMaxBytes || size < 1 || size > updateAPKMaxBytes ||
+		offset >= size || int64(length64) > size-offset || !validDigest || !isOfficialUpdateAssetURL(request.downloadURL) {
+		return updateAPKChunkRequest{}, false
+	}
+	return request, true
+}
+
+func normalizeUpdateRelayRequestID(value string) string {
+	if len(value) < 8 || len(value) > 64 {
+		return ""
+	}
+	for _, char := range value {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') || char == '-' || char == '_' {
+			continue
+		}
+		return ""
+	}
+	return value
+}
+
+const (
+	opaqueHTTPSRequestPrefix    = "WDTT_HTTPS_POST1|"
+	opaqueHTTPSResponsePrefix   = "WDTT_HTTPS_POST1_RESULT|"
+	opaqueHTTPSMaxPayloadBytes  = 768
+	opaqueHTTPSMaxResponseBytes = 32 * 1024
+	opaqueHTTPSMaxPacketBytes   = 1400
+)
+
+type opaqueHTTPSRequest struct {
+	requestID string
+	url       string
+	payload   []byte
+}
+
+type opaqueHTTPSResponse struct {
+	Status   int    `json:"status"`
+	Body     string `json:"body"`
+	CodeHint string `json:"code_hint,omitempty"`
+}
+
+func parseOpaqueHTTPSRequest(packet []byte) (opaqueHTTPSRequest, bool) {
+	if len(packet) > opaqueHTTPSMaxPacketBytes {
+		return opaqueHTTPSRequest{}, false
+	}
+	value := string(packet)
+	if !strings.HasPrefix(value, opaqueHTTPSRequestPrefix) {
+		return opaqueHTTPSRequest{}, false
+	}
+	parts := strings.SplitN(value, "|", 4)
+	if len(parts) != 4 {
+		return opaqueHTTPSRequest{}, false
+	}
+	requestID := normalizeUpdateRelayRequestID(parts[1])
+	decodedURL, urlErr := base64.RawURLEncoding.DecodeString(parts[2])
+	payload, payloadErr := base64.RawURLEncoding.DecodeString(parts[3])
+	request := opaqueHTTPSRequest{
+		requestID: requestID,
+		url:       strings.TrimSpace(string(decodedURL)),
+		payload:   payload,
+	}
+	if requestID == "" || urlErr != nil || payloadErr != nil ||
+		len(request.url) < 12 || len(request.url) > 2048 ||
+		len(payload) == 0 || len(payload) > opaqueHTTPSMaxPayloadBytes || !json.Valid(payload) {
+		return opaqueHTTPSRequest{}, false
+	}
+	return request, true
+}
+
+func executeOpaqueHTTPSPost(ctx context.Context, request opaqueHTTPSRequest) ([]byte, error) {
+	target, addresses, err := validateOpaqueHTTPSTarget(ctx, request.url)
+	if err != nil {
+		return nil, err
+	}
+	dialer := &net.Dialer{Timeout: 4 * time.Second, KeepAlive: -1}
+	transport := &http.Transport{
+		Proxy:                 nil,
+		DisableKeepAlives:     true,
+		TLSHandshakeTimeout:   5 * time.Second,
+		ResponseHeaderTimeout: 6 * time.Second,
+		DialContext: func(dialCtx context.Context, network, _ string) (net.Conn, error) {
+			var lastErr error
+			for _, address := range addresses {
+				conn, dialErr := dialer.DialContext(
+					dialCtx,
+					network,
+					net.JoinHostPort(address.String(), "443"),
+				)
+				if dialErr == nil {
+					return conn, nil
+				}
+				lastErr = dialErr
+			}
+			return nil, lastErr
+		},
+	}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   9 * time.Second,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return errors.New("HTTPS-служба вернула перенаправление")
+		},
+	}
+	httpRequest, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		target.String(),
+		bytes.NewReader(request.payload),
+	)
+	if err != nil {
+		return nil, errors.New("некорректный HTTPS-запрос")
+	}
+	httpRequest.Header.Set("Content-Type", "application/json; charset=utf-8")
+	httpRequest.Header.Set("Accept", "application/json")
+	response, err := client.Do(httpRequest)
+	if err != nil {
+		return nil, fmt.Errorf("HTTPS-служба не ответила: %w", err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(response.Body, opaqueHTTPSMaxResponseBytes+1))
+	if err != nil {
+		return nil, errors.New("не удалось прочитать ответ HTTPS-службы")
+	}
+	if len(body) > opaqueHTTPSMaxResponseBytes {
+		return nil, errors.New("ответ HTTPS-службы слишком большой")
+	}
+	result, err := json.Marshal(opaqueHTTPSResponse{
+		Status: response.StatusCode,
+		Body:   string(body),
+		CodeHint: truncateOpaqueHTTPSValue(
+			strings.TrimSpace(response.Header.Get("X-WDTT-Access-Code")),
+			128,
+		),
+	})
+	if err != nil {
+		return nil, errors.New("не удалось подготовить ответ HTTPS-службы")
+	}
+	return result, nil
+}
+
+func truncateOpaqueHTTPSValue(value string, limit int) string {
+	if len(value) <= limit {
+		return value
+	}
+	return value[:limit]
+}
+
+func validateOpaqueHTTPSTarget(ctx context.Context, rawURL string) (*url.URL, []netip.Addr, error) {
+	target, err := url.ParseRequestURI(strings.TrimSpace(rawURL))
+	if err != nil || target.Scheme != "https" || target.Hostname() == "" ||
+		target.User != nil || target.RawQuery != "" || target.Fragment != "" ||
+		(target.Port() != "" && target.Port() != "443") || net.ParseIP(target.Hostname()) != nil {
+		return nil, nil, errors.New("разрешён только публичный HTTPS-адрес без перенаправлений")
+	}
+	host := strings.TrimSuffix(strings.ToLower(target.Hostname()), ".")
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") ||
+		strings.HasSuffix(host, ".local") || !strings.Contains(host, ".") {
+		return nil, nil, errors.New("локальный HTTPS-адрес запрещён")
+	}
+	resolved, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil || len(resolved) == 0 {
+		return nil, nil, errors.New("не удалось определить адрес HTTPS-службы")
+	}
+	addresses := make([]netip.Addr, 0, len(resolved))
+	for _, item := range resolved {
+		address, ok := netip.AddrFromSlice(item.IP)
+		if !ok || !isPublicOpaqueHTTPSAddress(address.Unmap()) {
+			return nil, nil, errors.New("HTTPS-служба разрешилась в непубличную сеть")
+		}
+		addresses = append(addresses, address.Unmap())
+	}
+	return target, addresses, nil
+}
+
+func isPublicOpaqueHTTPSAddress(address netip.Addr) bool {
+	if !address.IsValid() || !address.IsGlobalUnicast() || address.IsPrivate() ||
+		address.IsLoopback() || address.IsLinkLocalUnicast() || address.IsUnspecified() ||
+		address.IsMulticast() {
+		return false
+	}
+	for _, prefix := range []netip.Prefix{
+		netip.MustParsePrefix("100.64.0.0/10"),
+		netip.MustParsePrefix("192.0.0.0/24"),
+		netip.MustParsePrefix("198.18.0.0/15"),
+		netip.MustParsePrefix("2001:db8::/32"),
+	} {
+		if prefix.Contains(address) {
+			return false
+		}
+	}
+	return true
+}
+
+func encodeUpdateMetadataResponse(requestID string, payload []byte, fetchErr error) [][]byte {
+	return encodeControlResponse(updateMetadataResponsePrefix, requestID, payload, fetchErr)
+}
+
+func encodeOpaqueHTTPSResponse(requestID string, payload []byte, fetchErr error) [][]byte {
+	return encodeControlResponse(opaqueHTTPSResponsePrefix, requestID, payload, fetchErr)
+}
+
+func encodeControlResponse(responsePrefix, requestID string, payload []byte, fetchErr error) [][]byte {
+	if fetchErr != nil {
+		message := fetchErr.Error()
+		if len(message) > 240 {
+			message = message[:240]
+		}
+		encoded := base64.RawURLEncoding.EncodeToString([]byte(message))
+		return [][]byte{[]byte(responsePrefix + requestID + "|ERR|" + encoded)}
+	}
+	if len(payload) == 0 {
+		return [][]byte{[]byte(responsePrefix + requestID + "|ERR|empty")}
+	}
+	total := (len(payload) + updateMetadataChunkBytes - 1) / updateMetadataChunkBytes
+	frames := make([][]byte, 0, total)
+	for sequence, offset := 0, 0; offset < len(payload); sequence, offset = sequence+1, offset+updateMetadataChunkBytes {
+		end := offset + updateMetadataChunkBytes
+		if end > len(payload) {
+			end = len(payload)
+		}
+		encoded := base64.RawURLEncoding.EncodeToString(payload[offset:end])
+		frames = append(frames, []byte(fmt.Sprintf(
+			"%s%s|OK|%d|%d|%s",
+			responsePrefix,
+			requestID,
+			sequence,
+			total,
+			encoded,
+		)))
+	}
+	return frames
+}
+
+func encodeUpdateAPKChunkResponse(requestID string, payload []byte, fetchErr error) [][]byte {
+	if fetchErr != nil {
+		message := fetchErr.Error()
+		if len(message) > 240 {
+			message = message[:240]
+		}
+		encoded := base64.RawURLEncoding.EncodeToString([]byte(message))
+		return [][]byte{[]byte(updateAPKChunkResponsePrefix + requestID + "|ERR|" + encoded)}
+	}
+	if len(payload) == 0 || len(payload) > updateAPKChunkMaxBytes {
+		return [][]byte{[]byte(updateAPKChunkResponsePrefix + requestID + "|ERR|empty")}
+	}
+	total := (len(payload) + updateAPKFrameBytes - 1) / updateAPKFrameBytes
+	frames := make([][]byte, 0, total)
+	for sequence, offset := 0, 0; offset < len(payload); sequence, offset = sequence+1, offset+updateAPKFrameBytes {
+		end := offset + updateAPKFrameBytes
+		if end > len(payload) {
+			end = len(payload)
+		}
+		header := fmt.Sprintf("%s%s|OK|%d|%d|", updateAPKChunkResponsePrefix, requestID, sequence, total)
+		frame := make([]byte, 0, len(header)+end-offset)
+		frame = append(frame, header...)
+		frame = append(frame, payload[offset:end]...)
+		frames = append(frames, frame)
+	}
+	return frames
+}
+
+func cachedOfficialUpdateMetadata(ctx context.Context) ([]byte, error) {
+	updateMetadataRelayCache.Lock()
+	defer updateMetadataRelayCache.Unlock()
+	if len(updateMetadataRelayCache.payload) > 0 && time.Now().Before(updateMetadataRelayCache.expiresAt) {
+		return append([]byte(nil), updateMetadataRelayCache.payload...), nil
+	}
+	metadata, err := fetchOfficialUpdateMetadata(ctx, updateMetadataHTTPClient)
+	if err != nil {
+		return nil, err
+	}
+	payload, err := json.Marshal(metadata)
+	if err != nil {
+		return nil, err
+	}
+	updateMetadataRelayCache.payload = append(updateMetadataRelayCache.payload[:0], payload...)
+	updateMetadataRelayCache.expiresAt = time.Now().Add(updateMetadataCacheTTL)
+	return append([]byte(nil), payload...), nil
+}
+
+func cachedOfficialUpdateAPKChunk(ctx context.Context, request updateAPKChunkRequest) ([]byte, error) {
+	updateAPKRelayCache.Lock()
+	defer updateAPKRelayCache.Unlock()
+
+	cacheMatches := updateAPKRelayCache.path != "" &&
+		updateAPKRelayCache.downloadURL == request.downloadURL &&
+		updateAPKRelayCache.size == request.size &&
+		updateAPKRelayCache.sha256 == request.sha256 &&
+		time.Now().Before(updateAPKRelayCache.expiresAt)
+	if cacheMatches {
+		if info, err := os.Stat(updateAPKRelayCache.path); err == nil && info.Mode().IsRegular() && info.Size() == request.size {
+			return readUpdateAPKChunk(updateAPKRelayCache.path, request.offset, request.length)
+		}
+	}
+
+	newPath, err := downloadOfficialUpdateAPK(ctx, updateAPKHTTPClient, request)
+	if err != nil {
+		return nil, err
+	}
+	oldPath := updateAPKRelayCache.path
+	updateAPKRelayCache.path = newPath
+	updateAPKRelayCache.downloadURL = request.downloadURL
+	updateAPKRelayCache.size = request.size
+	updateAPKRelayCache.sha256 = request.sha256
+	updateAPKRelayCache.expiresAt = time.Now().Add(updateAPKCacheTTL)
+	if oldPath != "" && oldPath != newPath {
+		_ = os.Remove(oldPath)
+	}
+	return readUpdateAPKChunk(newPath, request.offset, request.length)
+}
+
+func downloadOfficialUpdateAPK(
+	ctx context.Context,
+	client *http.Client,
+	request updateAPKChunkRequest,
+) (resultPath string, resultErr error) {
+	if !isOfficialUpdateAssetURL(request.downloadURL) || request.size < 1 || request.size > updateAPKMaxBytes {
+		return "", errors.New("некорректные данные APK")
+	}
+	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, request.downloadURL, nil)
+	if err != nil {
+		return "", err
+	}
+	httpRequest.Header.Set("Accept", "application/vnd.android.package-archive,application/octet-stream")
+	httpRequest.Header.Set("User-Agent", "WDTT-Server/update-relay")
+	response, err := client.Do(httpRequest)
+	if err != nil {
+		return "", err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode > 299 {
+		_, _ = io.CopyN(io.Discard, response.Body, 4096)
+		return "", fmt.Errorf("GitHub вернул HTTP %d при скачивании APK", response.StatusCode)
+	}
+	if response.ContentLength > 0 && response.ContentLength != request.size {
+		return "", errors.New("размер APK не совпал с данными выпуска")
+	}
+
+	temporary, err := os.CreateTemp("", "wdtt-update-*.apk")
+	if err != nil {
+		return "", err
+	}
+	resultPath = temporary.Name()
+	defer func() {
+		if closeErr := temporary.Close(); resultErr == nil && closeErr != nil {
+			resultErr = closeErr
+		}
+		if resultErr != nil {
+			_ = os.Remove(resultPath)
+			resultPath = ""
+		}
+	}()
+	if err := temporary.Chmod(0o600); err != nil {
+		return "", err
+	}
+	digest := sha256.New()
+	written, err := io.Copy(io.MultiWriter(temporary, digest), io.LimitReader(response.Body, request.size+1))
+	if err != nil {
+		return "", err
+	}
+	if written != request.size {
+		return "", errors.New("размер скачанного APK не совпал с данными выпуска")
+	}
+	if actual := hex.EncodeToString(digest.Sum(nil)); actual != request.sha256 {
+		return "", errors.New("SHA-256 скачанного APK не совпал с данными выпуска")
+	}
+	if err := temporary.Sync(); err != nil {
+		return "", err
+	}
+	return resultPath, nil
+}
+
+func readUpdateAPKChunk(path string, offset int64, length int) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	payload := make([]byte, length)
+	if _, err := file.ReadAt(payload, offset); err != nil {
+		return nil, err
+	}
+	return payload, nil
+}
+
+func isTrustedUpdateRedirectURL(value *url.URL) bool {
+	if value == nil || value.Scheme != "https" || value.User != nil || (value.Port() != "" && value.Port() != "443") {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSuffix(value.Hostname(), "."))
+	return host == "objects.githubusercontent.com" ||
+		host == "release-assets.githubusercontent.com" ||
+		strings.HasSuffix(host, ".release-assets.githubusercontent.com")
+}
+
+func fetchOfficialUpdateMetadata(ctx context.Context, client *http.Client) (relayedUpdateMetadata, error) {
+	latestRelease, releaseErr := fetchLatestStableGitHubRelease(ctx, client)
+	latestTag, tagErr := fetchLatestGitHubTag(ctx, client)
+
+	var releaseMetadata *relayedUpdateMetadata
+	if releaseErr == nil {
+		converted := convertGitHubRelease(latestRelease)
+		releaseMetadata = &converted
+	}
+	if releaseMetadata == nil && latestTag == "" {
+		return relayedUpdateMetadata{}, errors.Join(releaseErr, tagErr)
+	}
+	if latestTag == "" {
+		return *releaseMetadata, nil
+	}
+	if releaseMetadata == nil || updateVersionNumber(releaseMetadata.VersionTag) < updateVersionNumber(latestTag) {
+		return relayedUpdateMetadata{
+			VersionTag: latestTag,
+			ReleaseURL: "https://github.com/Ivan4537/WDTT-Plus/tree/" + latestTag,
+			Source:     "tag",
+		}, nil
+	}
+	return *releaseMetadata, nil
+}
+
+func fetchLatestStableGitHubRelease(ctx context.Context, client *http.Client) (githubUpdateRelease, error) {
+	var releases []githubUpdateRelease
+	if err := fetchGitHubUpdateJSON(
+		ctx,
+		client,
+		"https://api.github.com/repos/Ivan4537/WDTT-Plus/releases?per_page=30",
+		&releases,
+	); err != nil {
+		return githubUpdateRelease{}, err
+	}
+	var best githubUpdateRelease
+	bestVersion := -1
+	for _, release := range releases {
+		version := updateVersionNumber(release.TagName)
+		if release.Draft || release.Prerelease || version < 0 || version <= bestVersion {
+			continue
+		}
+		best = release
+		bestVersion = version
+	}
+	if bestVersion < 0 {
+		return githubUpdateRelease{}, errors.New("GitHub не вернул стабильный выпуск")
+	}
+	return best, nil
+}
+
+func fetchLatestGitHubTag(ctx context.Context, client *http.Client) (string, error) {
+	var tags []githubUpdateTag
+	if err := fetchGitHubUpdateJSON(
+		ctx,
+		client,
+		"https://api.github.com/repos/Ivan4537/WDTT-Plus/tags?per_page=100",
+		&tags,
+	); err != nil {
+		return "", err
+	}
+	best := -1
+	for _, tag := range tags {
+		if version := updateVersionNumber(tag.Name); version > best {
+			best = version
+		}
+	}
+	if best < 0 {
+		return "", errors.New("GitHub не вернул подходящий тег")
+	}
+	return "v" + strconv.Itoa(best), nil
+}
+
+func fetchGitHubUpdateJSON(ctx context.Context, client *http.Client, rawURL string, target any) error {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Accept", "application/vnd.github+json")
+	request.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	request.Header.Set("User-Agent", "WDTT-Server/update-relay")
+	response, err := client.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode > 299 {
+		_, _ = io.CopyN(io.Discard, response.Body, 4096)
+		return fmt.Errorf("GitHub API вернул HTTP %d", response.StatusCode)
+	}
+	limited := io.LimitReader(response.Body, updateMetadataMaxBodyBytes+1)
+	payload, err := io.ReadAll(limited)
+	if err != nil {
+		return err
+	}
+	if len(payload) > updateMetadataMaxBodyBytes {
+		return errors.New("ответ GitHub превышает допустимый размер")
+	}
+	if err := json.Unmarshal(payload, target); err != nil {
+		return fmt.Errorf("некорректный ответ GitHub: %w", err)
+	}
+	return nil
+}
+
+func convertGitHubRelease(release githubUpdateRelease) relayedUpdateMetadata {
+	metadata := relayedUpdateMetadata{
+		VersionTag: normalizeUpdateVersionTag(release.TagName),
+		ReleaseURL: release.HTMLURL,
+		Source:     "release",
+	}
+	for _, asset := range release.Assets {
+		if len(metadata.Assets) >= 8 || !strings.HasSuffix(strings.ToLower(asset.Name), ".apk") {
+			continue
+		}
+		if !isOfficialUpdateAssetURL(asset.BrowserDownloadURL) {
+			continue
+		}
+		metadata.Assets = append(metadata.Assets, relayedUpdateAsset{
+			Name:        asset.Name,
+			DownloadURL: asset.BrowserDownloadURL,
+			SizeBytes:   asset.Size,
+			Digest:      asset.Digest,
+		})
+	}
+	return metadata
+}
+
+func isOfficialUpdateAssetURL(rawURL string) bool {
+	parsed, err := url.Parse(rawURL)
+	return err == nil && parsed.Scheme == "https" && parsed.Hostname() == "github.com" && parsed.User == nil &&
+		(parsed.Port() == "" || parsed.Port() == "443") && parsed.RawQuery == "" && parsed.Fragment == "" &&
+		strings.HasPrefix(parsed.EscapedPath(), "/Ivan4537/WDTT-Plus/releases/download/")
+}
+
+func updateVersionNumber(value string) int {
+	match := updateMetadataVersionPattern.FindStringSubmatch(strings.TrimSpace(value))
+	if len(match) != 2 {
+		return -1
+	}
+	version, err := strconv.Atoi(match[1])
+	if err != nil {
+		return -1
+	}
+	return version
+}
+
+func normalizeUpdateVersionTag(value string) string {
+	version := updateVersionNumber(value)
+	if version < 0 {
+		return ""
+	}
+	return "v" + strconv.Itoa(version)
+}
+
+const (
+	deploySafeRequestPrefix      = "WDTT_DEPLOY1|"
+	deploySafeChunkRequestPrefix = "WDTT_DEPLOY_CHUNK1|"
+	deploySafeRequestMaxBytes    = 64 * 1024
+	deploySafeResponseMaxBytes   = 12 * 1024 * 1024
+	deploySafeChunkMaxBytes      = 32 * 1024
+	deploySafeCacheTTL           = 5 * time.Minute
+)
+
+type deploySafeStartRequest struct {
+	requestID string
+	digest    string
+	payload   []byte
+}
+
+type deploySafeChunkRequest struct {
+	requestID string
+	baseID    string
+	offset    int
+	length    int
+	digest    string
+}
+
+type deploySafeCacheEntry struct {
+	requestDigest string
+	createdAt     time.Time
+	ready         chan struct{}
+	payload       []byte
+	digest        string
+	err           error
+}
+
+var deploySafeRelayCache = struct {
+	sync.Mutex
+	entries map[string]*deploySafeCacheEntry
+}{entries: make(map[string]*deploySafeCacheEntry)}
+
+var deploySafeBackupIDPattern = regexp.MustCompile(`^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$`)
+
+func parseDeploySafeStartRequest(packet []byte) (deploySafeStartRequest, bool) {
+	value := string(packet)
+	if !strings.HasPrefix(value, deploySafeRequestPrefix) {
+		return deploySafeStartRequest{}, false
+	}
+	parts := strings.SplitN(value, "|", 4)
+	if len(parts) != 4 {
+		return deploySafeStartRequest{}, false
+	}
+	requestID := normalizeUpdateRelayRequestID(parts[1])
+	digest := strings.ToLower(parts[2])
+	payload, decodeErr := base64.RawURLEncoding.DecodeString(parts[3])
+	if requestID == "" || !validHexDigest(digest) || decodeErr != nil || len(payload) == 0 || len(payload) > deploySafeRequestMaxBytes {
+		return deploySafeStartRequest{}, false
+	}
+	actual := sha256.Sum256(payload)
+	if hex.EncodeToString(actual[:]) != digest {
+		return deploySafeStartRequest{}, false
+	}
+	return deploySafeStartRequest{requestID: requestID, digest: digest, payload: payload}, true
+}
+
+func parseDeploySafeChunkRequest(packet []byte) (deploySafeChunkRequest, bool) {
+	value := string(packet)
+	if !strings.HasPrefix(value, deploySafeChunkRequestPrefix) {
+		return deploySafeChunkRequest{}, false
+	}
+	parts := strings.SplitN(value, "|", 6)
+	if len(parts) != 6 {
+		return deploySafeChunkRequest{}, false
+	}
+	requestID := normalizeUpdateRelayRequestID(parts[1])
+	baseID := normalizeUpdateRelayRequestID(parts[2])
+	offset64, offsetErr := strconv.ParseInt(parts[3], 10, 32)
+	length64, lengthErr := strconv.ParseInt(parts[4], 10, 32)
+	digest := strings.ToLower(parts[5])
+	if requestID == "" || baseID == "" || offsetErr != nil || lengthErr != nil ||
+		offset64 < 0 || length64 < 1 || length64 > deploySafeChunkMaxBytes || !validHexDigest(digest) {
+		return deploySafeChunkRequest{}, false
+	}
+	return deploySafeChunkRequest{
+		requestID: requestID,
+		baseID:    baseID,
+		offset:    int(offset64),
+		length:    int(length64),
+		digest:    digest,
+	}, true
+}
+
+func validHexDigest(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
+func deploySafeCacheKey(identity accessIdentity, requestID string) string {
+	return identity.id + ":" + requestID
+}
+
+func executeCachedDeploySafeRequest(
+	configDir string,
+	wgDev wgDevice,
+	identity accessIdentity,
+	request deploySafeStartRequest,
+) ([]byte, string, error) {
+	key := deploySafeCacheKey(identity, request.requestID)
+	now := time.Now()
+	deploySafeRelayCache.Lock()
+	for cacheKey, entry := range deploySafeRelayCache.entries {
+		if now.Sub(entry.createdAt) > deploySafeCacheTTL {
+			delete(deploySafeRelayCache.entries, cacheKey)
+		}
+	}
+	entry := deploySafeRelayCache.entries[key]
+	if entry != nil {
+		if entry.requestDigest != request.digest {
+			deploySafeRelayCache.Unlock()
+			return nil, "", errors.New("идентификатор безопасного запроса уже использован")
+		}
+		ready := entry.ready
+		deploySafeRelayCache.Unlock()
+		select {
+		case <-ready:
+			return append([]byte(nil), entry.payload...), entry.digest, entry.err
+		case <-time.After(3 * time.Minute):
+			return nil, "", errors.New("безопасная операция на сервере не завершилась вовремя")
+		}
+	}
+	entry = &deploySafeCacheEntry{
+		requestDigest: request.digest,
+		createdAt:     now,
+		ready:         make(chan struct{}),
+	}
+	deploySafeRelayCache.entries[key] = entry
+	deploySafeRelayCache.Unlock()
+
+	payload, err := executeDeploySafeAdminRequest(configDir, wgDev, request.payload)
+	digest := ""
+	if err == nil {
+		if len(payload) == 0 || len(payload) > deploySafeResponseMaxBytes {
+			err = errors.New("ответ безопасной операции имеет недопустимый размер")
+		} else {
+			sum := sha256.Sum256(payload)
+			digest = hex.EncodeToString(sum[:])
+		}
+	}
+	deploySafeRelayCache.Lock()
+	entry.payload = append([]byte(nil), payload...)
+	entry.digest = digest
+	entry.err = err
+	close(entry.ready)
+	deploySafeRelayCache.Unlock()
+	return append([]byte(nil), payload...), digest, err
+}
+
+func executeDeploySafeAdminRequest(configDir string, wgDev wgDevice, payload []byte) ([]byte, error) {
+	var request adminRequest
+	decoder := json.NewDecoder(strings.NewReader(string(payload)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		return nil, errors.New("некорректный безопасный запрос управления")
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return nil, errors.New("некорректный безопасный запрос управления")
+	}
+	if !isRelayedDeployAdminCommandAllowed(request.Args) {
+		return nil, errors.New("операция недоступна через активный VPN")
+	}
+	response, err := executeLiveAdminRequest(configDir, request, wgDev)
+	if err != nil {
+		response = adminErrorResponse(err)
+	}
+	encoded, marshalErr := json.Marshal(response)
+	if marshalErr != nil {
+		return nil, fmt.Errorf("не удалось сформировать ответ управления: %w", marshalErr)
+	}
+	return encoded, nil
+}
+
+func isRelayedDeployAdminCommandAllowed(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	switch args[0] {
+	case "list":
+		return len(args) == 1
+	case "details":
+		return len(args) == 3 && args[1] == "--password" && strings.TrimSpace(args[2]) != ""
+	case "backup-status":
+		return len(args) == 1
+	case "backup-verify", "backup-export":
+		return len(args) == 3 && args[1] == "--id" && deploySafeBackupIDPattern.MatchString(args[2])
+	case "backup-create":
+		return len(args) == 3 && args[1] == "--reason" && args[2] == "manual"
+	case "safe-inspect":
+		return validateDeploySafeInspectArgs(args[1:]) == nil
+	default:
+		return false
+	}
+}
+
+func readDeploySafeChunk(identity accessIdentity, request deploySafeChunkRequest) ([]byte, error) {
+	key := deploySafeCacheKey(identity, request.baseID)
+	deploySafeRelayCache.Lock()
+	entry := deploySafeRelayCache.entries[key]
+	if entry == nil {
+		deploySafeRelayCache.Unlock()
+		return nil, errors.New("результат безопасной операции больше недоступен")
+	}
+	ready := entry.ready
+	deploySafeRelayCache.Unlock()
+	select {
+	case <-ready:
+	case <-time.After(3 * time.Minute):
+		return nil, errors.New("безопасная операция на сервере не завершилась вовремя")
+	}
+	deploySafeRelayCache.Lock()
+	defer deploySafeRelayCache.Unlock()
+	if entry.err != nil {
+		return nil, entry.err
+	}
+	if entry.digest != request.digest || request.offset > len(entry.payload) || request.length > len(entry.payload)-request.offset {
+		return nil, errors.New("запрошена недопустимая часть ответа")
+	}
+	return append([]byte(nil), entry.payload[request.offset:request.offset+request.length]...), nil
+}
+
+const deploySafeInspectOutputMaxBytes = 11 * 1024 * 1024
+
+var deploySafeInterfacePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:-]{0,14}$`)
+
+func validateDeploySafeInspectArgs(args []string) error {
+	if len(args) == 0 {
+		return errors.New("не указан вид безопасной проверки")
+	}
+	switch args[0] {
+	case "outbound-status", "outbound-diagnostics", "outbound-snapshot", "tun-candidates", "existing-install", "database-snapshot":
+		if len(args) != 1 {
+			return errors.New("у безопасной проверки есть лишние параметры")
+		}
+	case "server-diagnostics":
+		if len(args) != 4 {
+			return errors.New("не указаны ожидаемые порты диагностики")
+		}
+		for _, value := range args[1:] {
+			port, err := strconv.Atoi(value)
+			if err != nil || port < 1 || port > 65535 {
+				return errors.New("некорректный ожидаемый порт диагностики")
+			}
+		}
+	case "check-wireguard":
+		if len(args) != 2 || (args[1] != "wireguard_vps" && args[1] != "warp_free" && args[1] != "imported_wg") {
+			return errors.New("некорректный режим WireGuard-проверки")
+		}
+	case "check-tun":
+		if len(args) != 2 || !deploySafeInterfacePattern.MatchString(args[1]) {
+			return errors.New("некорректное имя TUN-интерфейса")
+		}
+	case "check-local-proxy":
+		if len(args) != 4 || !deploySafePort(args[1]) || !deploySafePlainValue(args[2], 128, false) || !deploySafePlainValue(args[3], 256, false) {
+			return errors.New("некорректные параметры локального прокси")
+		}
+	case "check-external-proxy":
+		if len(args) != 6 || (args[1] != "Socks5" && args[1] != "Http") ||
+			!deploySafeHost(args[2]) || !deploySafePort(args[3]) ||
+			!deploySafePlainValue(args[4], 128, true) || !deploySafePlainValue(args[5], 256, true) {
+			return errors.New("некорректные параметры внешнего прокси")
+		}
+	case "config-export":
+		if len(args) != 2 || (args[1] != "true" && args[1] != "false") {
+			return errors.New("некорректный режим экспорта настроек")
+		}
+	default:
+		return errors.New("неизвестная безопасная проверка")
+	}
+	return nil
+}
+
+func adminSafeInspect(configDir string, args []string) (adminResponse, error) {
+	if err := validateDeploySafeInspectArgs(args); err != nil {
+		return adminResponse{}, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+	defer cancel()
+	var output string
+	var err error
+	switch args[0] {
+	case "outbound-status":
+		output = deploySafeOutboundStatus(ctx, configDir)
+	case "outbound-diagnostics":
+		output = deploySafeOutboundDiagnostics(ctx, configDir)
+	case "outbound-snapshot":
+		output, err = deploySafeOutboundSnapshot(ctx, configDir)
+	case "tun-candidates":
+		output, err = deploySafeTunCandidates()
+	case "existing-install":
+		output = deploySafeExistingInstall(ctx, configDir)
+	case "database-snapshot":
+		output, err = deploySafeReadRegularFile(filepath.Join(configDir, "passwords.json"), 5_000_000, true)
+	case "server-diagnostics":
+		output = deploySafeServerDiagnostics(ctx, configDir, args[1], args[2], args[3])
+	case "check-wireguard":
+		output, err = deploySafeCheckWireGuard(ctx, configDir, args[1])
+	case "check-tun":
+		output, err = deploySafeCheckTun(ctx, args[1])
+	case "check-local-proxy":
+		output, err = deploySafeCheckLocalProxy(ctx, args[1], args[2], args[3])
+	case "check-external-proxy":
+		output, err = deploySafeCheckExternalProxy(ctx, args[1], args[2], args[3], args[4], args[5])
+	case "config-export":
+		output, err = deploySafeConfigExport(configDir, args[1] == "true")
+	}
+	if err != nil {
+		if strings.HasPrefix(err.Error(), "WDTT_ERROR=") {
+			return adminResponse{OK: true, SafeOutput: err.Error()}, nil
+		}
+		return adminResponse{}, err
+	}
+	if len(output) == 0 || len(output) > deploySafeInspectOutputMaxBytes {
+		return adminResponse{}, errors.New("ответ безопасной проверки имеет недопустимый размер")
+	}
+	return adminResponse{OK: true, SafeOutput: output}, nil
+}
+
+func deploySafeReadRegularFile(path string, limit int64, required bool) (string, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) && !required {
+			return "", nil
+		}
+		return "", err
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() < 1 || info.Size() > limit {
+		return "", fmt.Errorf("небезопасный или слишком большой файл настроек: %s", filepath.Base(path))
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func deploySafeConfigExport(configDir string, includeWGKeys bool) (string, error) {
+	database, err := deploySafeReadRegularFile(filepath.Join(configDir, "passwords.json"), 5_000_000, true)
+	if err != nil {
+		return "", err
+	}
+	wgKeys := ""
+	if includeWGKeys {
+		wgKeys, err = deploySafeReadRegularFile(filepath.Join(configDir, "wg-keys.dat"), 4096, true)
+		if err != nil {
+			return "", err
+		}
+	}
+	outbound, err := deploySafeReadRegularFile(filepath.Join(configDir, "outbound-profile.env"), 2*1024*1024, false)
+	if err != nil {
+		return "", err
+	}
+	policy, err := deploySafeReadRegularFile(filepath.Join(configDir, "backup-policy.json"), 64*1024, false)
+	if err != nil {
+		return "", err
+	}
+	if policy == "" {
+		policy = `{"enabled":false,"interval_hours":24,"retention_count":14}`
+	}
+	document := map[string]string{
+		"passwords_b64":        deploySafeB64(database),
+		"wg_keys_b64":          deploySafeB64(wgKeys),
+		"outbound_profile_b64": deploySafeB64(outbound),
+		"backup_policy_b64":    deploySafeB64(policy),
+	}
+	encoded, err := json.Marshal(document)
+	if err != nil {
+		return "", err
+	}
+	return string(encoded), nil
+}
+
+func deploySafePort(value string) bool {
+	port, err := strconv.Atoi(value)
+	return err == nil && port >= 1 && port <= 65535
+}
+
+func deploySafePlainValue(value string, limit int, allowEmpty bool) bool {
+	if (!allowEmpty && value == "") || len(value) > limit || strings.ContainsAny(value, "\x00\r\n") {
+		return false
+	}
+	return true
+}
+
+func deploySafeHost(value string) bool {
+	if !deploySafePlainValue(value, 253, false) || strings.ContainsAny(value, "/:@[] ") {
+		return false
+	}
+	if net.ParseIP(value) != nil {
+		return true
+	}
+	if strings.HasPrefix(value, ".") || strings.HasSuffix(value, ".") {
+		return false
+	}
+	for _, label := range strings.Split(value, ".") {
+		if label == "" || len(label) > 63 || strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+			return false
+		}
+		for _, char := range label {
+			if (char < 'a' || char > 'z') && (char < 'A' || char > 'Z') && (char < '0' || char > '9') && char != '-' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func deploySafeCommand(ctx context.Context, name string, args ...string) string {
+	command := exec.CommandContext(ctx, name, args...)
+	output, err := command.CombinedOutput()
+	if err != nil && len(output) == 0 {
+		return ""
+	}
+	if len(output) > 128*1024 {
+		output = output[:128*1024]
+	}
+	return strings.TrimSpace(string(output))
+}
+
+func deploySafeCommandOK(ctx context.Context, name string, args ...string) (string, error) {
+	command := exec.CommandContext(ctx, name, args...)
+	output, err := command.Output()
+	if err != nil {
+		return "", err
+	}
+	if len(output) > 128*1024 {
+		return "", errors.New("ответ системной проверки слишком большой")
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+func deploySafeServiceState(ctx context.Context, unit string, enabled bool) string {
+	verb := "is-active"
+	if enabled {
+		verb = "is-enabled"
+	}
+	state := strings.TrimSpace(deploySafeCommand(ctx, "systemctl", verb, unit))
+	if state == "" {
+		return "неизвестно"
+	}
+	return strings.Split(state, "\n")[0]
+}
+
+func deploySafeReadJSON(path string) map[string]any {
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) > 2*1024*1024 {
+		return nil
+	}
+	var value map[string]any
+	if json.Unmarshal(data, &value) != nil {
+		return nil
+	}
+	return value
+}
+
+func deploySafeJSONText(value map[string]any, key string) string {
+	if value == nil {
+		return ""
+	}
+	text, _ := value[key].(string)
+	return strings.TrimSpace(text)
+}
+
+func deploySafeOutboundMode(configDir string) (string, string, string) {
+	value := deploySafeReadJSON(filepath.Join(configDir, "outbound.json"))
+	mode := deploySafeJSONText(value, "outboundMode")
+	if mode == "" {
+		mode = "direct"
+	}
+	return mode, deploySafeJSONText(value, "detail"), deploySafeJSONText(value, "updatedAt")
+}
+
+func deploySafeModeLabel(mode string) string {
+	switch mode {
+	case "direct":
+		return "прямой выход"
+	case "external_proxy":
+		return "внешний TCP-прокси"
+	case "tun_interface":
+		return "существующий TUN-интерфейс"
+	case "warp_free":
+		return "бесплатный WARP"
+	case "imported_wg":
+		return "VPN/WireGuard-файл"
+	case "wireguard_vps":
+		return "выход через другой сервер"
+	default:
+		return mode
+	}
+}
+
+func deploySafeWDTTSource(ctx context.Context) string {
+	output := deploySafeCommand(ctx, "ip", "-4", "-o", "addr", "show", "dev", "wdtt0", "scope", "global")
+	for _, field := range strings.Fields(output) {
+		if ip, _, err := net.ParseCIDR(field); err == nil && ip.To4() != nil {
+			return ip.String()
+		}
+	}
+	return ""
+}
+
+func deploySafePublicIP(ctx context.Context, source string) string {
+	args := []string{"-4fsS", "--connect-timeout", "4", "--max-time", "10"}
+	if source != "" {
+		args = append(args, "--interface", source)
+	}
+	args = append(args, "https://api.ipify.org")
+	output, err := deploySafeCommandOK(ctx, "curl", args...)
+	if err != nil || net.ParseIP(output) == nil {
+		return ""
+	}
+	return output
+}
+
+func deploySafeOutboundStatus(ctx context.Context, configDir string) string {
+	mode, _, _ := deploySafeOutboundMode(configDir)
+	serverIP := deploySafePublicIP(ctx, "")
+	if serverIP == "" {
+		serverIP = "не удалось определить"
+	}
+	source := deploySafeWDTTSource(ctx)
+	exitIP := serverIP
+	if mode != "direct" && mode != "external_proxy" {
+		exitIP = deploySafePublicIP(ctx, source)
+		if exitIP == "" {
+			exitIP = "не удалось проверить"
+		}
+	}
+	lines := []string{
+		"Текущий выход WDTT: " + deploySafeModeLabel(mode),
+		"Интерфейс клиентов: wdtt0",
+		"Внешний IP самого сервера: " + serverIP,
+		"Проверочный выход WDTT: " + exitIP,
+		"Прокси на этом VPS: " + deploySafeServiceState(ctx, "wdtt-3proxy.service", false),
+		"Автозапуск прокси на этом VPS: " + deploySafeServiceState(ctx, "wdtt-3proxy.service", true),
+		"Внешний TCP-прокси WDTT: " + deploySafeServiceState(ctx, "wdtt-redsocks.service", false),
+		"WireGuard-выход: " + deploySafeServiceState(ctx, "wdtt-wg-exit.service", false),
+		"TUN-выход: " + deploySafeServiceState(ctx, "wdtt-tun-exit.service", false),
+	}
+	if rules := deploySafeCommand(ctx, "ip", "rule", "show"); rules != "" {
+		if strings.Contains(rules, "lookup 100") || strings.Contains(rules, "lookup wdtt-exit") {
+			lines = append(lines, "Правило маршрутизации подсети WDTT: применено")
+		} else {
+			lines = append(lines, "Правило маршрутизации подсети WDTT: отсутствует")
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func deploySafeOutboundDiagnostics(ctx context.Context, configDir string) string {
+	sections := []string{deploySafeOutboundStatus(ctx, configDir)}
+	for _, command := range [][]string{
+		{"ip", "rule", "show"},
+		{"ip", "route", "show", "table", "100"},
+		{"ip", "route", "show", "table", "110"},
+		{"iptables", "-t", "nat", "-S"},
+		{"iptables", "-S", "FORWARD"},
+	} {
+		output := deploySafeCommand(ctx, command[0], command[1:]...)
+		if output != "" {
+			sections = append(sections, strings.Join(command, " ")+":\n"+output)
+		}
+	}
+	return strings.Join(sections, "\n\n")
+}
+
+func deploySafeCheckWireGuard(ctx context.Context, configDir, expectedMode string) (string, error) {
+	mode, _, _ := deploySafeOutboundMode(configDir)
+	if _, err := deploySafeCommandOK(ctx, "wg", "show", "wg-wdtt-exit"); err != nil {
+		return "", errors.New("WDTT_ERROR=wireguard_not_active")
+	}
+	source := deploySafeWDTTSource(ctx)
+	if source == "" {
+		return "", errors.New("WDTT_ERROR=wdtt_test_source_missing")
+	}
+	ip := deploySafePublicIP(ctx, source)
+	if ip == "" {
+		return "", errors.New("WDTT_ERROR=wireguard_exit_check_failed")
+	}
+	message := fmt.Sprintf("Проверка успешна: WDTT-пользователи выходят через WireGuard. Проверочный IP: %s", ip)
+	if mode != expectedMode {
+		message = fmt.Sprintf("Предупреждение: активен режим %s, ожидался %s.\n%s", deploySafeModeLabel(mode), deploySafeModeLabel(expectedMode), message)
+	}
+	return message, nil
+}
+
+func deploySafeCheckTun(ctx context.Context, interfaceName string) (string, error) {
+	if deploySafeFileFirstLine("/etc/wdtt-plus/tun-exit/owner") != "WDTT_TUN_EXIT_V1" ||
+		deploySafeFileFirstLine("/etc/wdtt-plus/tun-exit/interface") != interfaceName {
+		return "", errors.New("WDTT_ERROR=tun_exit_not_owned")
+	}
+	if !deploySafeActive(ctx, "wdtt-tun-exit.service") {
+		return "", errors.New("WDTT_ERROR=tun_exit_service_inactive")
+	}
+	source := deploySafeWDTTSource(ctx)
+	if source == "" {
+		return "", errors.New("WDTT_ERROR=wdtt_test_source_missing")
+	}
+	ip := deploySafePublicIP(ctx, source)
+	if ip == "" {
+		return "", errors.New("WDTT_ERROR=tun_exit_check_failed")
+	}
+	return fmt.Sprintf("Проверка успешна: WDTT-пользователи выходят через TUN-интерфейс %s. Проверочный IP: %s", interfaceName, ip), nil
+}
+
+func deploySafeCheckLocalProxy(ctx context.Context, port, login, password string) (string, error) {
+	if state := deploySafeServiceState(ctx, "wdtt-3proxy.service", false); state != "active" && state != "неизвестно" {
+		return "", errors.New("WDTT_ERROR=local_proxy_service_inactive")
+	}
+	proxy := "127.0.0.1:" + port
+	ip, commandErr := deploySafeCommandOK(ctx, "curl", "--proxy-user", login+":"+password, "--socks5-hostname", proxy, "-4fsS", "--connect-timeout", "4", "--max-time", "15", "https://api.ipify.org")
+	if commandErr != nil || net.ParseIP(ip) == nil {
+		return "", errors.New("WDTT_ERROR=local_proxy_check_failed")
+	}
+	return fmt.Sprintf("Проверка успешна: SOCKS5 на %s отвечает с указанными логином и паролем. Выходной IP: %s", proxy, ip), nil
+}
+
+func deploySafeCheckExternalProxy(ctx context.Context, kind, host, port, login, password string) (string, error) {
+	scheme := "http"
+	if kind == "Socks5" {
+		scheme = "socks5h"
+	}
+	args := []string{"--proxy", scheme + "://" + host + ":" + port}
+	if login != "" {
+		args = append(args, "--proxy-user", login+":"+password)
+	}
+	args = append(args, "-4fsS", "--connect-timeout", "5", "--max-time", "18", "https://api.ipify.org")
+	ip, commandErr := deploySafeCommandOK(ctx, "curl", args...)
+	if commandErr != nil || net.ParseIP(ip) == nil {
+		return "", errors.New("WDTT_ERROR=external_proxy_check_failed")
+	}
+	return fmt.Sprintf("Проверка успешна: внешний TCP-прокси отвечает. IP через прокси: %s", ip), nil
+}
+
+func deploySafeReadEnv(path string) map[string]string {
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) > 2*1024*1024 {
+		return map[string]string{}
+	}
+	result := make(map[string]string)
+	for _, line := range strings.Split(string(data), "\n") {
+		name, value, ok := strings.Cut(line, "=")
+		if !ok || !regexp.MustCompile(`^[A-Z0-9_]+$`).MatchString(name) {
+			continue
+		}
+		result[name] = strings.TrimSpace(value)
+	}
+	return result
+}
+
+func deploySafeFlag(value bool) string {
+	if value {
+		return "1"
+	}
+	return "0"
+}
+
+func deploySafeActive(ctx context.Context, unit string) bool {
+	return deploySafeServiceState(ctx, unit, false) == "active"
+}
+
+func deploySafeEnabled(ctx context.Context, unit string) bool {
+	state := deploySafeServiceState(ctx, unit, true)
+	return state == "enabled" || state == "static"
+}
+
+func deploySafeFileFirstLine(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) > 64*1024 {
+		return ""
+	}
+	return strings.TrimSpace(strings.SplitN(string(data), "\n", 2)[0])
+}
+
+func deploySafeB64(value string) string {
+	return base64.StdEncoding.EncodeToString([]byte(value))
+}
+
+func deploySafeOutboundSnapshot(ctx context.Context, configDir string) (string, error) {
+	mode, detail, updatedAt := deploySafeOutboundMode(configDir)
+	profilePath := filepath.Join(configDir, "outbound-profile.env")
+	profile := deploySafeReadEnv(profilePath)
+	warpSelection := deploySafeReadEnv("/etc/wdtt-plus/warp/selected.env")
+	line := func(name, value string) string {
+		return name + "=" + strings.ReplaceAll(strings.ReplaceAll(value, "\n", ""), "\r", "")
+	}
+	localJSON := deploySafeReadJSON(filepath.Join(configDir, "local-proxy.json"))
+	localPort := profile["LOCAL_PROXY_PORT"]
+	if localPort == "" && localJSON != nil {
+		if number, ok := localJSON["socks5Port"].(float64); ok {
+			localPort = strconv.Itoa(int(number))
+		}
+	}
+	localLoginB64 := profile["LOCAL_PROXY_LOGIN_B64"]
+	localPasswordB64 := profile["LOCAL_PROXY_PASSWORD_B64"]
+	if localLoginB64 == "" {
+		localLoginB64 = deploySafeB64(deploySafeJSONText(localJSON, "login"))
+	}
+	if localPasswordB64 == "" {
+		localPasswordB64 = deploySafeB64(deploySafeJSONText(localJSON, "password"))
+	}
+	tunInterface := ""
+	if encoded := profile["TUN_INTERFACE_B64"]; encoded != "" {
+		if decoded, err := base64.StdEncoding.DecodeString(encoded); err == nil {
+			tunInterface = string(decoded)
+		}
+	}
+	if tunInterface == "" {
+		tunInterface = deploySafeFileFirstLine("/etc/wdtt-plus/tun-exit/interface")
+	}
+	ipRules := deploySafeCommand(ctx, "ip", "rule", "show")
+	route100 := deploySafeCommand(ctx, "ip", "route", "show", "table", "100")
+	route110 := deploySafeCommand(ctx, "ip", "route", "show", "table", "110")
+	iptablesNat := deploySafeCommand(ctx, "iptables", "-t", "nat", "-S")
+	iptablesForward := deploySafeCommand(ctx, "iptables", "-S", "FORWARD")
+	wgOwner := deploySafeFileFirstLine("/etc/wdtt-plus/wg-exit/owner")
+	wgConfigOwner := deploySafeFileFirstLine("/etc/wdtt-plus/wg-exit/config-owner")
+	localPresent := localJSON != nil
+	if _, err := os.Stat(filepath.Join(configDir, "3proxy.cfg")); err == nil {
+		localPresent = true
+	}
+	externalPresent := profile["EXTERNAL_PROXY_HOST_B64"] != "" || mode == "external_proxy"
+	wgPresent := profile["IMPORTED_WG_CONFIG_B64"] != "" || mode == "warp_free" || mode == "wireguard_vps" || mode == "imported_wg"
+	tunPresent := tunInterface != "" || mode == "tun_interface"
+	values := []string{
+		line("WDTT_OUTBOUND_MODE", mode), line("WDTT_OUTBOUND_DETAIL_B64", deploySafeB64(detail)), line("WDTT_OUTBOUND_UPDATED_AT", updatedAt),
+		line("WDTT_HAS_PROFILE", deploySafeFlag(len(profile) > 0)),
+		line("WDTT_LOCAL_PROXY_PRESENT", deploySafeFlag(localPresent)), line("WDTT_LOCAL_PROXY_ACTIVE", deploySafeFlag(deploySafeActive(ctx, "wdtt-3proxy.service"))),
+		line("WDTT_LOCAL_PROXY_PORT", localPort), line("WDTT_LOCAL_PROXY_LOGIN_B64", localLoginB64), line("WDTT_LOCAL_PROXY_PASSWORD_B64", localPasswordB64),
+		line("WDTT_LOCAL_PROXY_SERVICE_ENABLED", deploySafeFlag(deploySafeEnabled(ctx, "wdtt-3proxy.service"))),
+		line("WDTT_EXTERNAL_PROXY_PRESENT", deploySafeFlag(externalPresent)), line("WDTT_EXTERNAL_PROXY_ACTIVE", deploySafeFlag(deploySafeActive(ctx, "wdtt-redsocks.service") && strings.Contains(iptablesNat, "WDTT_PROXY_OUT"))),
+		line("WDTT_EXTERNAL_PROXY_KIND_NAME", profile["EXTERNAL_PROXY_KIND"]), line("WDTT_EXTERNAL_PROXY_HOST_B64", profile["EXTERNAL_PROXY_HOST_B64"]), line("WDTT_EXTERNAL_PROXY_PORT", profile["EXTERNAL_PROXY_PORT"]),
+		line("WDTT_EXTERNAL_PROXY_LOGIN_B64", profile["EXTERNAL_PROXY_LOGIN_B64"]), line("WDTT_EXTERNAL_PROXY_PASSWORD_B64", profile["EXTERNAL_PROXY_PASSWORD_B64"]),
+		line("WDTT_EXTERNAL_PROXY_PROFILE_SAVED", deploySafeFlag(profile["EXTERNAL_PROXY_HOST_B64"] != "")), line("WDTT_EXTERNAL_PROXY_SERVICE_ACTIVE", deploySafeFlag(deploySafeActive(ctx, "wdtt-redsocks.service"))),
+		line("WDTT_EXTERNAL_PROXY_ROUTE_ACTIVE", deploySafeFlag(strings.Contains(iptablesNat, "WDTT_PROXY_OUT"))), line("WDTT_EXTERNAL_PROXY_SERVICE_ENABLED", deploySafeFlag(deploySafeEnabled(ctx, "wdtt-redsocks.service"))),
+		line("WDTT_WG_PRESENT", deploySafeFlag(wgPresent)), line("WDTT_WG_ACTIVE", deploySafeFlag(deploySafeActive(ctx, "wdtt-wg-exit.service") && strings.Contains(route100, "default"))),
+		line("WDTT_WG_VPS_HOST_B64", profile["WG_VPS_HOST_B64"]), line("WDTT_WG_VPS_SSH_PORT", profile["WG_VPS_SSH_PORT"]), line("WDTT_WG_VPS_USER_B64", profile["WG_VPS_USER_B64"]),
+		line("WDTT_WG_VPS_PASSWORD_B64", ""), line("WDTT_WG_VPS_PORT", profile["WG_VPS_PORT"]), line("WDTT_WG_VPS_DNS_B64", profile["WG_VPS_DNS_B64"]),
+		line("WDTT_WARP_PRESENT", deploySafeFlag(mode == "warp_free" || fileExists("/etc/wdtt-plus/warp/wgcf-profile.conf"))), line("WDTT_WARP_MTU", warpSelection["WARP_MTU"]), line("WDTT_IMPORTED_WG_CONFIG_B64", profile["IMPORTED_WG_CONFIG_B64"]),
+		line("WDTT_WG_INTERFACE_ACTIVE", deploySafeFlag(deploySafeCommand(ctx, "wg", "show", "wg-wdtt-exit") != "")), line("WDTT_WG_SERVICE_ACTIVE", deploySafeFlag(deploySafeActive(ctx, "wdtt-wg-exit.service"))),
+		line("WDTT_WG_POLICY_RULE_ACTIVE", deploySafeFlag(strings.Contains(ipRules, "lookup 100") || strings.Contains(ipRules, "lookup wdtt-exit"))),
+		line("WDTT_WG_DEFAULT_ROUTE_ACTIVE", deploySafeFlag(strings.Contains(route100, "default") && strings.Contains(route100, "wg-wdtt-exit"))),
+		line("WDTT_WG_NAT_ACTIVE", deploySafeFlag(strings.Contains(iptablesNat, "WDTT_EXIT") && strings.Contains(iptablesNat, "MASQUERADE"))),
+		line("WDTT_WG_OWNER_MODE", wgOwner), line("WDTT_WG_CONFIG_OWNER_MODE", wgConfigOwner), line("WDTT_WG_MATCHES_WARP", deploySafeFlag(mode == "warp_free" && wgPresent)),
+		line("WDTT_WG_SERVICE_ENABLED", deploySafeFlag(deploySafeEnabled(ctx, "wdtt-wg-exit.service"))),
+		line("WDTT_TUN_INTERFACE_B64", deploySafeB64(tunInterface)), line("WDTT_TUN_PROFILE_SAVED", deploySafeFlag(profile["TUN_INTERFACE_B64"] != "")), line("WDTT_TUN_PRESENT", deploySafeFlag(tunPresent)),
+		line("WDTT_TUN_INTERFACE_ACTIVE", deploySafeFlag(tunInterface != "" && deploySafeFileFirstLine(filepath.Join("/sys/class/net", tunInterface, "operstate")) == "up")),
+		line("WDTT_TUN_SERVICE_ACTIVE", deploySafeFlag(deploySafeActive(ctx, "wdtt-tun-exit.service"))), line("WDTT_TUN_SERVICE_ENABLED", deploySafeFlag(deploySafeEnabled(ctx, "wdtt-tun-exit.service"))),
+		line("WDTT_TUN_POLICY_RULE_ACTIVE", deploySafeFlag(strings.Contains(ipRules, "lookup 110"))), line("WDTT_TUN_DEFAULT_ROUTE_ACTIVE", deploySafeFlag(strings.Contains(route110, "default") && (tunInterface == "" || strings.Contains(route110, tunInterface)))),
+		line("WDTT_TUN_FAIL_CLOSED_ACTIVE", deploySafeFlag(strings.Contains(route110, "unreachable default"))), line("WDTT_TUN_FORWARD_RULES_ACTIVE", deploySafeFlag(strings.Contains(iptablesForward, "WDTT_TUN_EXIT"))),
+		line("WDTT_TUN_IP_FORWARD_ACTIVE", deploySafeFlag(deploySafeFileFirstLine("/proc/sys/net/ipv4/ip_forward") == "1")),
+	}
+	return strings.Join(values, "\n"), nil
+}
+
+func deploySafeTunCandidates() (string, error) {
+	entries, err := os.ReadDir("/sys/class/net")
+	if err != nil {
+		return "", err
+	}
+	lines := make([]string, 0)
+	for _, entry := range entries {
+		name := entry.Name()
+		if name == "lo" || name == "wdtt0" || name == "wg-wdtt-exit" || !deploySafeInterfacePattern.MatchString(name) {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join("/sys/class/net", name, "tun_flags")); err != nil {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("WDTT_TUN_CANDIDATE=%s|%s", name, deploySafeFlag(deploySafeFileFirstLine(filepath.Join("/sys/class/net", name, "operstate")) == "up")))
+	}
+	sort.Strings(lines)
+	if len(lines) == 0 {
+		return "WDTT_TUN_CANDIDATES_EMPTY=1", nil
+	}
+	return strings.Join(lines, "\n"), nil
+}
+
+func deploySafeExistingInstall(ctx context.Context, configDir string) string {
+	flag := func(path string, directory bool) string {
+		info, err := os.Stat(path)
+		return deploySafeFlag(err == nil && info.IsDir() == directory)
+	}
+	active := deploySafeServiceState(ctx, "wdtt.service", false)
+	standaloneManaged := false
+	ownership, ownershipErr := os.ReadFile("/var/lib/wdtt-server-installer/ownership")
+	unit, unitErr := os.ReadFile("/etc/systemd/system/wdtt.service")
+	if ownershipErr == nil && unitErr == nil &&
+		strings.Contains(string(ownership), "Managed by WDTT Plus standalone server installer") &&
+		strings.Contains(string(unit), "# Managed by WDTT Plus standalone server installer") {
+		standaloneManaged = true
+	}
+	androidManaged := unitErr == nil &&
+		strings.Contains(string(unit), "# Managed by WDTT Plus Android deploy") &&
+		strings.Contains(string(unit), "# WDTT deploy compatibility: 1")
+	return strings.Join([]string{
+		"SERVICE=" + flag("/etc/systemd/system/wdtt.service", false),
+		"BINARY=" + flag("/usr/local/bin/wdtt-server", false),
+		"CONFIG_DIR=" + flag(configDir, true),
+		"ACCESS_DB=" + flag(filepath.Join(configDir, "passwords.json"), false),
+		"WG_KEYS=" + flag(filepath.Join(configDir, "wg-keys.dat"), false),
+		"ACTIVE=" + active,
+		"WDTT_STANDALONE_MANAGED=" + deploySafeFlag(standaloneManaged),
+		"WDTT_ANDROID_DEPLOY_MANAGED=" + deploySafeFlag(androidManaged),
+		"WDTT_LEGACY_ANDROID_DEPLOY_CANDIDATE=0",
+		"WDTT_ANDROID_DATA_PRESERVED=" + deploySafeFlag(fileExists(filepath.Join(configDir, ".android-deploy-preserved"))),
+		"WDTT_INCOMPLETE_ANDROID_DEPLOY_CANDIDATE=0",
+	}, "\n")
+}
+
+func deploySafeDiagLine(severity, title, status, details, recommendation string) string {
+	clean := func(value string) string {
+		value = strings.NewReplacer("\n", " ", "\r", " ", "|", " ").Replace(value)
+		value = strings.Join(strings.Fields(value), " ")
+		if len(value) > 700 {
+			value = value[:700]
+		}
+		return value
+	}
+	return strings.Join([]string{"WDTT_SERVER_DIAG", severity, clean(title), clean(status), clean(details), clean(recommendation)}, "|")
+}
+
+func deploySafeServerDiagnostics(ctx context.Context, configDir, dtlsPort, wgPort, clientPort string) string {
+	service := deploySafeServiceState(ctx, "wdtt.service", false)
+	severity := "WARNING"
+	if service == "active" {
+		severity = "OK"
+	}
+	lines := []string{
+		deploySafeDiagLine(severity, "WDTT сервер", "служба "+service,
+			fmt.Sprintf("Бинарный файл=%t, каталог настроек=%t, база доступа=%t.", fileExists("/usr/local/bin/wdtt-server"), fileExists(configDir), fileExists(filepath.Join(configDir, "passwords.json"))),
+			"Если служба не активна, проверьте журнал wdtt.service или обновите сервер с сохранением данных."),
+		deploySafeDiagLine("INFO", "Порты активного профиля", "проверка без изменений",
+			fmt.Sprintf("Ожидаются DTLS UDP %s, WireGuard UDP %s; локальный Android-порт %s проверяется на телефоне.", dtlsPort, wgPort, clientPort),
+			"При несовпадении портов проверьте настройки профиля и серверной службы."),
+		deploySafeDiagLine("INFO", "Выходной IP / прокси", deploySafeModeLabel(func() string { mode, _, _ := deploySafeOutboundMode(configDir); return mode }()),
+			strings.ReplaceAll(deploySafeOutboundStatus(ctx, configDir), "\n", "; "), "Откройте выбранный режим для отдельной функциональной проверки."),
+	}
+	return strings.Join(lines, "\n")
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}

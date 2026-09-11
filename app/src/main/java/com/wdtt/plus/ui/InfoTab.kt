@@ -67,7 +67,6 @@ import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Update
-import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilledTonalIconButton
@@ -121,6 +120,7 @@ import com.wdtt.plus.RemoteUiActionLauncher
 import com.wdtt.plus.RT_MASQUE_CONFIG_FILE_NAME
 import com.wdtt.plus.RtMasqueEnrollmentState
 import com.wdtt.plus.SettingsStore
+import com.wdtt.plus.ScreenOffMode
 import com.wdtt.plus.SleepBatteryMode
 import com.wdtt.plus.SleepBatteryRuntimePhase
 import com.wdtt.plus.SleepBatteryRuntimeState
@@ -134,6 +134,8 @@ import com.wdtt.plus.trustedWifiModeItem
 import com.wdtt.plus.vpnRoutingModeItem
 import com.wdtt.plus.vpnProfileDisplayName
 import com.wdtt.plus.inspectRtMasqueEnrollment
+import com.wdtt.plus.normalizeTunnelMode
+import com.wdtt.plus.tunnelModeNeedsVpnPermission
 import com.wdtt.plus.UPDATE_DIALOG_ACTION_POSTPONED
 import com.wdtt.plus.UPDATE_DIALOG_ACTION_UPDATE
 import com.wdtt.plus.WDTTColors
@@ -325,6 +327,13 @@ fun InfoTab(
     LaunchedEffect(Unit) {
         actionCatalog = RemoteActionCatalogGateway.fetch()
     }
+    LaunchedEffect(showSupportDialog) {
+        if (showSupportDialog) {
+            // Каталог общий для всех режимов соединения. Обновляем его при каждом
+            // открытии окна, сохраняя последний корректный кэш при сетевом сбое.
+            actionCatalog = RemoteActionCatalogGateway.fetch(force = true)
+        }
+    }
     LaunchedEffect(Unit) {
         questionActionLoading = true
         questionAction = RemoteActionCatalogGateway.fetchQuestionAction()
@@ -357,7 +366,7 @@ fun InfoTab(
 
     suspend fun buildDeviceCheckReportWithVersion(): com.wdtt.plus.DeviceCompatibilityReport {
         val latestCheckedAt = System.currentTimeMillis()
-        val latestRelease = fetchLatestReleaseInfo(currentVersion)
+        val latestRelease = fetchLatestReleaseInfo(context, currentVersion)
         settingsStore.saveUpdateState(
             lastCheckAt = latestCheckedAt,
             latestVersion = latestRelease?.versionTag ?: "",
@@ -384,6 +393,8 @@ fun InfoTab(
         val tunnelProfile = runCatching {
             settingsStore.tunnelProfileSnapshot(diagnosticProfile)
         }.getOrNull()
+        val diagnosticTunnelMode = normalizeTunnelMode(tunnelProfile?.proxyMode)
+        val systemVpnMode = tunnelModeNeedsVpnPermission(diagnosticTunnelMode)
         val workers = tunnelProfile?.workersPerHash
             ?: runCatching { settingsStore.workersPerHash.first() }.getOrNull()
         val routingSnapshot = runCatching {
@@ -410,6 +421,8 @@ fun InfoTab(
             null
         }
         val sleepEnabled = runCatching { settingsStore.pauseVpnDuringSleep.first() }.getOrDefault(false)
+        val screenOffMode = runCatching { settingsStore.screenOffMode.first() }
+            .getOrDefault(ScreenOffMode.BALANCED)
         val sleepMode = runCatching { settingsStore.sleepBatteryMode.first() }
             .getOrDefault(SleepBatteryMode.DELAYED_PAUSE)
         val sleepPauseDelay = runCatching {
@@ -427,8 +440,15 @@ fun InfoTab(
             context.getSystemService(PowerManager::class.java)
                 ?.isIgnoringBatteryOptimizations(context.packageName)
         }.getOrNull()
+        val backgroundRestricted = runCatching {
+            context.getSystemService(ActivityManager::class.java)?.isBackgroundRestricted
+        }.getOrNull()
         val diagnosticsSummary = withContext(Dispatchers.Default) {
-            buildSupportReportSummary(context.applicationContext, settingsStore)
+            buildSupportReportSummary(
+                context.applicationContext,
+                settingsStore,
+                diagnosticTunnelMode,
+            )
         }
         val clientNetworkDiagnostics = try {
             collectClientNetworkDiagnostics(context.applicationContext)
@@ -449,7 +469,7 @@ fun InfoTab(
                 )
             )
         }
-        val vpnDnsRuntimeItem = vpnDnsSnapshot?.let { settings ->
+        val vpnDnsRuntimeItem = vpnDnsSnapshot?.takeIf { systemVpnMode }?.let { settings ->
             try {
                 com.wdtt.plus.collectVpnDnsRuntimeDiagnostic(
                     context = context.applicationContext,
@@ -473,11 +493,19 @@ fun InfoTab(
             DeviceCompatibility.check(
                 context = context.applicationContext,
                 includeRuntimeChecks = true,
-                workersPerHash = workers
+                workersPerHash = workers,
+                tunnelMode = diagnosticTunnelMode,
+                screenOffMode = screenOffMode,
             )
         }
+        val relevantNetworkSummary = clientNetworkDiagnostics.summaryLines.filterNot { line ->
+            !systemVpnMode && line.contains("DNS внутри VPN", ignoreCase = true)
+        }
+        val relevantNetworkItems = clientNetworkDiagnostics.items.filterNot { item ->
+            !systemVpnMode && item.title.contains("DNS внутри VPN", ignoreCase = true)
+        }
         return report.copy(
-            summaryLines = diagnosticsSummary + clientNetworkDiagnostics.summaryLines +
+            summaryLines = diagnosticsSummary + relevantNetworkSummary +
                 listOfNotNull(vpnDnsRuntimeItem?.let { "DNS внутри VPN: ${it.status}" }),
             items = listOf(versionItem) +
                 report.items.filterNot {
@@ -487,28 +515,32 @@ fun InfoTab(
                     tunnelProfile?.let { DeviceCompatibility.rtNetworkModeItem(context, it) },
                     sleepBatteryModeItem(
                         enabled = sleepEnabled,
+                        screenOffMode = screenOffMode,
                         mode = sleepMode,
                         pauseDelayMinutes = sleepPauseDelay,
                         resumeDelayMinutes = sleepResumeDelay,
                         runtime = sleepRuntime,
                         notificationsGranted = notificationsGranted,
                         batteryOptimizationsIgnored = batteryOptimizationsIgnored,
-                    ),
+                        backgroundRestricted = backgroundRestricted,
+                    ).takeIf {
+                        systemVpnMode || screenOffMode == ScreenOffMode.HOLD_CONNECTION
+                    },
                     trustedWifiModeItem(
                         enabled = trustedWifiEnabled,
                         savedNetworkCount = trustedWifiSsids.size,
                         waiting = trustedWifiWaiting,
                         waitingSsid = trustedWifiWaitingSsid,
                         accessProblem = trustedWifiProblem,
-                    ),
-                    routingSnapshot?.let {
+                    ).takeIf { systemVpnMode },
+                    routingSnapshot?.takeIf { systemVpnMode }?.let {
                         vpnRoutingModeItem(
                             snapshot = it,
                             installedPackages = installedPackages,
                             ownPackageName = context.packageName,
                         )
                     },
-                    vpnDnsSnapshot?.let {
+                    vpnDnsSnapshot?.takeIf { systemVpnMode }?.let {
                         com.wdtt.plus.vpnDnsModeItem(
                             settings = it,
                             tunnelRunning = TunnelManager.running.value,
@@ -518,7 +550,7 @@ fun InfoTab(
                     },
                     vpnDnsRuntimeItem,
                 ) +
-                clientNetworkDiagnostics.items
+                relevantNetworkItems
         )
     }
 
@@ -637,7 +669,7 @@ fun InfoTab(
 
             WideActionTile(
                 title = "Справка",
-                subtitle = "Коротко про VPN, исключения, капчу и запуск",
+                subtitle = "Коротко про режимы, цепочки, исключения и запуск",
                 onClick = { showHelpDialog = true },
                 icon = {
                     Icon(
@@ -662,7 +694,7 @@ fun InfoTab(
                         var errorMessage = ""
                         try {
                             runCatching {
-                                release = fetchLatestReleaseInfo(currentVersion)
+                                release = fetchLatestReleaseInfo(context, currentVersion)
                                 if (release == null) {
                                     errorMessage = "Не удалось проверить"
                                     return@runCatching
@@ -903,7 +935,7 @@ fun InfoTab(
         DeviceCompatibilityDialog(
             report = report,
             title = "Проверка устройства",
-            subtitle = "Расширенная проверка не запускает VPN, но безопасно проверяет системный DNS, DNS-путь клиента и доступность узлов VK/OK.",
+            subtitle = "Расширенная проверка не запускает соединение, но безопасно проверяет системный DNS, сетевой путь клиента и доступность узлов VK/OK.",
             note = "Кнопка «Скопировать отчёт» повторит сетевые пробы и добавит их результат без VK-хешей, паролей, токенов и локальных IP-адресов телефона.",
             onDismiss = { deviceCheckReport = null },
             onCopy = {
@@ -1123,6 +1155,11 @@ private fun AdditionalActionsDialog(
     onProjectFallbackClick: () -> Unit,
 	onDonateOriginalClick: () -> Unit
 ) {
+	var originalAuthorExpanded by rememberSaveable { mutableStateOf(false) }
+	val supportScrollState = rememberScrollState()
+	val supportScope = rememberCoroutineScope()
+	val topRevealOffsetPx = with(LocalDensity.current) { 10.dp.toPx() }
+	var originalAuthorSectionY by remember { mutableStateOf(0f) }
 	Dialog(
 		onDismissRequest = onDismiss,
 		properties = DialogProperties(usePlatformDefaultWidth = false)
@@ -1145,7 +1182,7 @@ private fun AdditionalActionsDialog(
 					modifier = Modifier
 						.fillMaxWidth()
 						.padding(20.dp)
-						.verticalScroll(rememberScrollState()),
+						.verticalScroll(supportScrollState),
 					verticalArrangement = Arrangement.spacedBy(16.dp)
 				) {
 					Row(
@@ -1209,14 +1246,113 @@ private fun AdditionalActionsDialog(
                         )
                     }
 
-					ExternalSupportBlock(
-						title = "Автор оригинального приложения",
-						body = "Оригинальная основа проекта создана amurcanov. Можно отдельно поддержать автора исходного приложения.",
-						buttonText = "ЮMoney",
+					OriginalAuthorSupportBlock(
+						expanded = originalAuthorExpanded,
+						onToggle = {
+							val willExpand = !originalAuthorExpanded
+							originalAuthorExpanded = willExpand
+							if (willExpand) {
+								supportScope.launch {
+									delay(80)
+									supportScrollState.animateScrollTo(
+										(originalAuthorSectionY - topRevealOffsetPx)
+											.toInt()
+											.coerceAtLeast(0),
+									)
+								}
+							}
+						},
 						onClick = onDonateOriginalClick,
-						emphasized = false
+						modifier = Modifier.onGloballyPositioned {
+							originalAuthorSectionY = it.positionInParent().y
+						},
 					)
 					Spacer(Modifier.height(4.dp))
+				}
+			}
+		}
+	}
+}
+
+@Composable
+private fun OriginalAuthorSupportBlock(
+	expanded: Boolean,
+	onToggle: () -> Unit,
+	onClick: () -> Unit,
+	modifier: Modifier = Modifier,
+) {
+	val arrowRotation by animateFloatAsState(
+		targetValue = if (expanded) 180f else 0f,
+		label = "original_author_arrow_rotation",
+	)
+	Surface(
+		modifier = modifier,
+		shape = RoundedCornerShape(22.dp),
+		color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
+		border = BorderStroke(
+			1.dp,
+			MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f),
+		),
+	) {
+		Column(modifier = Modifier.fillMaxWidth()) {
+			Row(
+				modifier = Modifier
+					.fillMaxWidth()
+					.clip(RoundedCornerShape(22.dp))
+					.remoteFocusOutline(RoundedCornerShape(22.dp))
+					.clickable(onClick = onToggle)
+					.padding(horizontal = 16.dp, vertical = 14.dp),
+				horizontalArrangement = Arrangement.spacedBy(10.dp),
+				verticalAlignment = Alignment.CenterVertically,
+			) {
+				Icon(
+					Icons.Default.Person,
+					contentDescription = null,
+					tint = MaterialTheme.colorScheme.primary,
+					modifier = Modifier.size(20.dp),
+				)
+				Text(
+					"Автор оригинального приложения",
+					modifier = Modifier.weight(1f),
+					style = MaterialTheme.typography.titleSmall,
+					fontWeight = FontWeight.Bold,
+				)
+				Icon(
+					Icons.Default.KeyboardArrowDown,
+					contentDescription = if (expanded) "Свернуть" else "Развернуть",
+					modifier = Modifier.size(24.dp).rotate(arrowRotation),
+					tint = MaterialTheme.colorScheme.onSurfaceVariant,
+				)
+			}
+			AnimatedVisibility(
+				visible = expanded,
+				enter = expandVertically() + fadeIn(),
+				exit = shrinkVertically() + fadeOut(),
+			) {
+				Column(
+					modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 16.dp),
+					verticalArrangement = Arrangement.spacedBy(12.dp),
+				) {
+					HorizontalDivider(
+						color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.30f),
+					)
+					Text(
+						"Оригинальная основа проекта создана amurcanov. Можно отдельно поддержать автора исходного приложения.",
+						style = MaterialTheme.typography.bodySmall,
+						color = MaterialTheme.colorScheme.onSurfaceVariant,
+						lineHeight = 18.sp,
+					)
+					Button(
+						onClick = onClick,
+						shape = RoundedCornerShape(18.dp),
+						colors = ButtonDefaults.buttonColors(
+							containerColor = MaterialTheme.colorScheme.primary,
+							contentColor = Color.White,
+						),
+						modifier = Modifier.fillMaxWidth().heightIn(min = 46.dp),
+					) {
+						Text("ЮMoney", fontWeight = FontWeight.Bold)
+					}
 				}
 			}
 		}
@@ -2056,7 +2192,12 @@ internal fun sleepBatteryRuntimeDiagnosticText(
     return "$phase, осталось ${formatSleepTimerDuration(boundedMinutes)}"
 }
 
-private suspend fun buildSupportReportSummary(context: Context, settingsStore: SettingsStore): List<String> {
+private suspend fun buildSupportReportSummary(
+    context: Context,
+    settingsStore: SettingsStore,
+    tunnelMode: String,
+): List<String> {
+    val systemVpnMode = tunnelModeNeedsVpnPermission(tunnelMode)
     val androidVersion = Build.VERSION.RELEASE ?: "?"
     val sdkInt = Build.VERSION.SDK_INT
     val primaryAbi = Build.SUPPORTED_ABIS.firstOrNull().orEmpty().ifBlank { "unknown" }
@@ -2146,7 +2287,8 @@ private suspend fun buildSupportReportSummary(context: Context, settingsStore: S
     val powerManager = runCatching { context.getSystemService(PowerManager::class.java) }.getOrNull()
     val powerSummary = diagnosticText {
         "экономия=${powerManager?.isPowerSaveMode}, " +
-            "без ограничений батареи=${powerManager?.isIgnoringBatteryOptimizations(context.packageName)}"
+            "без ограничений батареи=${powerManager?.isIgnoringBatteryOptimizations(context.packageName)}, " +
+            "ограничено в фоне=${activityManager?.isBackgroundRestricted}"
     }
 
     val webViewInfo = diagnosticText {
@@ -2155,8 +2297,14 @@ private suspend fun buildSupportReportSummary(context: Context, settingsStore: S
     val nativeComponentsInfo = runCatching {
         val nativeClient = File(appInfo?.nativeLibraryDir.orEmpty(), "libclient.so")
         val wireGuardBackend = File(appInfo?.nativeLibraryDir.orEmpty(), "libwg-go.so")
-        "libclient.so=${if (nativeClient.isFile) formatMiB(nativeClient.length()) else "не найден"}, " +
-            "libwg-go.so=${if (wireGuardBackend.isFile) formatMiB(wireGuardBackend.length()) else "не найден"}"
+        buildString {
+            append("libclient.so=${if (nativeClient.isFile) formatMiB(nativeClient.length()) else "не найден"}")
+            if (systemVpnMode) {
+                append(", libwg-go.so=${if (wireGuardBackend.isFile) formatMiB(wireGuardBackend.length()) else "не найден"}")
+            } else {
+                append(", libwg-go.so не требуется для SOCKS5")
+            }
+        }
     }.getOrDefault("недоступно")
 
     val notificationPermission = diagnosticText {
@@ -2204,7 +2352,6 @@ private suspend fun buildSupportReportSummary(context: Context, settingsStore: S
         .split(Regex("[,\\s\\n]+"))
         .count { it.isNotBlank() }
         .coerceAtMost(4)
-    val hasSecondaryHash = runCatching { settingsStore.secondaryVkHash.first().isNotBlank() }.getOrNull()
     val vkCallsEnabled = runCatching { settingsStore.vkCallsPreflight.first() }.getOrNull()
     val rtNetworkEnabled = runCatching { settingsStore.rtNetwork.first() }.getOrNull()
     val rtMasqueEnabled = runCatching { settingsStore.rtMasque.first() }.getOrNull()
@@ -2233,6 +2380,7 @@ private suspend fun buildSupportReportSummary(context: Context, settingsStore: S
     val trustedWifiEnabled = runCatching { settingsStore.trustedWifiEnabled.first() }.getOrNull()
     val trustedWifiCount = runCatching { settingsStore.trustedWifiSsids.first().size }.getOrNull()
     val sleepBatteryEnabled = runCatching { settingsStore.pauseVpnDuringSleep.first() }.getOrNull()
+    val screenOffMode = runCatching { settingsStore.screenOffMode.first() }.getOrNull()
     val sleepBatteryPauseDelay = runCatching { settingsStore.pauseVpnDuringSleepDelayMinutes.first() }.getOrNull()
     val sleepBatteryMode = runCatching { settingsStore.sleepBatteryMode.first() }.getOrNull()
     val sleepBatteryResumeDelay = runCatching { settingsStore.resumeVpnDuringSleepDelayMinutes.first() }.getOrNull()
@@ -2293,36 +2441,62 @@ private suspend fun buildSupportReportSummary(context: Context, settingsStore: S
         appendLine("Экран: $screenSummary")
         appendLine("Разрешение уведомлений: $notificationPermission")
         appendLine("Установка обновлений APK: $updateInstallPermission")
-        appendLine("VPN-разрешение: $vpnPermission")
+        appendLine("Режим соединения: ${if (systemVpnMode) "системный VPN" else "локальный SOCKS5"}")
+        if (systemVpnMode) {
+            appendLine("VPN-разрешение: $vpnPermission")
+            appendLine(
+                "Доверенные Wi-Fi: включено=${trustedWifiEnabled ?: "недоступно"}, " +
+                    "сетей=${trustedWifiCount ?: "недоступно"}, ожидание=$trustedWifiWaiting, доступ=$trustedWifiAccess"
+            )
+        }
         appendLine(
-            "Доверенные Wi-Fi: включено=${trustedWifiEnabled ?: "недоступно"}, " +
-                "сетей=${trustedWifiCount ?: "недоступно"}, ожидание=$trustedWifiWaiting, доступ=$trustedWifiAccess"
-        )
-        appendLine(
-            "Экономия батареи во сне: включено=${sleepBatteryEnabled ?: "недоступно"}, " +
+            "Работа при выключенном экране: режим=${screenOffMode?.let { mode ->
+                when (mode) {
+                    ScreenOffMode.BALANCED -> "сбалансированно"
+                    ScreenOffMode.HOLD_CONNECTION -> "удерживать соединение"
+                    ScreenOffMode.SAVE_BATTERY -> "экономить батарею"
+                }
+            } ?: "недоступно"}, " +
+                "экономия включена=${sleepBatteryEnabled ?: "недоступно"}, " +
                 "режим=${sleepBatteryMode?.let(::sleepBatteryModeDiagnosticText) ?: "недоступно"}, " +
                 "отключение через=${sleepBatteryPauseDelay?.let(::formatSleepTimerDuration) ?: "недоступно"}, " +
                 "включение через=${sleepBatteryResumeDelay?.let(::formatSleepTimerDuration) ?: "недоступно"}, " +
                 "состояние=${sleepBatteryRuntime?.let(::sleepBatteryRuntimeDiagnosticText) ?: "недоступно"}"
         )
+        TunnelManager.connectionHoldDiagnostics.value.let { hold ->
+            appendLine(
+                "Диагностика удержания: выбрано=${hold.modeSelected}, активно=${hold.active}, " +
+                    "CPU wake lock=${hold.cpuWakeLockHeld}, Wi-Fi lock=${hold.wifiLockHeld}, " +
+                    "Wi-Fi доступен=${hold.wifiTransportAvailable}, экран активен=${hold.deviceInteractive}"
+            )
+        }
         appendLine("Локаль: ${diagnosticText { Locale.getDefault().toLanguageTag() }}")
         appendLine("Часовой пояс: ${diagnosticText { TimeZone.getDefault().id }}")
         appendLine("Туннель: запущен=${TunnelManager.running.value}, активных=${TunnelManager.activeWorkers.value}")
         appendLine("Последняя проблема: $tunnelIssue")
+        appendLine(
+            "Последняя остановка соединения: " +
+                (TunnelManager.lastStopReason.value?.displayText ?: "не зафиксирована в текущем процессе")
+        )
         appendLine("Профиль: ${activeProfile ?: "недоступно"}")
-        appendLine(
-            "Маршрутизация профиля: режим=${routingSettings?.let { if (it.isWhitelist) "БС" else "ЧС" } ?: "недоступно"}, " +
-                "приложений=${routingSettings?.let { routingPackages.size } ?: "недоступно"}, " +
-                "адресов=${routingSettings?.addressRules?.size ?: "недоступно"}, " +
-                "доменов=${routingDomains ?: "недоступно"}"
-        )
-        appendLine(
-            "DNS внутри VPN: ${vpnDnsSettings?.title ?: "недоступно"}, " +
-                "адреса=${vpnDnsSettings?.configuredServers?.joinToString(", ")?.ifBlank { "из WireGuard-профиля" } ?: "недоступно"}, " +
-                "smart=${vpnDnsSettings?.isSmartDns ?: "недоступно"}"
-        )
+        if (systemVpnMode) {
+            appendLine(
+                "Маршрутизация профиля: режим=${routingSettings?.let { if (it.isWhitelist) "БС" else "ЧС" } ?: "недоступно"}, " +
+                    "приложений=${routingSettings?.let { routingPackages.size } ?: "недоступно"}, " +
+                    "адресов=${routingSettings?.addressRules?.size ?: "недоступно"}, " +
+                    "доменов=${routingDomains ?: "недоступно"}"
+            )
+            appendLine(
+                "DNS внутри VPN: ${vpnDnsSettings?.title ?: "недоступно"}, " +
+                    "адреса=${vpnDnsSettings?.configuredServers?.joinToString(", ")?.ifBlank { "из WireGuard-профиля" } ?: "недоступно"}, " +
+                    "smart=${vpnDnsSettings?.isSmartDns ?: "недоступно"}"
+            )
+        }
         appendLine("Потоки: ${workers ?: "недоступно"}")
-        appendLine("VK-хеши: заполнено $hashCount, запасной=${hasSecondaryHash ?: "недоступно"}")
+        appendLine(
+            "VK-хеши: заполнено $hashCount, " +
+                "автоматический резерв между хешами=${if (hashCount > 1) "включён" else "недоступен"}"
+        )
         appendLine("Быстрый VKCalls: ${vkCallsEnabled ?: "недоступно"}")
         appendLine("Сеть РТ (TURN stream-first): ${rtNetworkEnabled ?: "недоступно"}")
         appendLine(

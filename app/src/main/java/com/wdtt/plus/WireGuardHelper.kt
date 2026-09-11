@@ -51,6 +51,11 @@ class WireGuardHelper(context: Context) {
                 TunnelManager.noteVpnInterfaceState(false)
             }
             if (isCurrentTunnel && !suppressDownCallback) {
+                TunnelManager.noteVpnInterfaceLifecycle(
+                    "unexpected_down",
+                    "Системный VPN-интерфейс отключён вне штатной остановки приложения. Проверяем причину и возможность восстановления.",
+                    warning = true,
+                )
                 onExternalDown?.invoke()
             }
         }
@@ -267,6 +272,14 @@ class WireGuardHelper(context: Context) {
             sharedTunnel = nextTunnel
             sharedConfigFingerprint = wireGuardConfigFingerprint(finalConfig)
             TunnelManager.noteVpnInterfaceState(true)
+            TunnelManager.noteVpnInterfaceLifecycle(
+                "established",
+                if (previousTunnel != null) {
+                    "Системный VPN-интерфейс пересоздан для изменившихся настроек. Android может повторно показать уведомление о VPN."
+                } else {
+                    "Создан системный VPN-интерфейс. Восстановление отдельных каналов само по себе его не пересоздаёт."
+                },
+            )
             Log.d("WG", "WireGuard tunnel started successfully")
         } catch (e: Exception) {
             val stillUp = sharedTunnel?.let { tunnel ->

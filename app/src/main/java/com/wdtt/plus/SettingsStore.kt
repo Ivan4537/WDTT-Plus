@@ -49,6 +49,27 @@ enum class SleepBatteryMode(val storedValue: String) {
     }
 }
 
+enum class ScreenOffMode(val storedValue: String) {
+    BALANCED("balanced"),
+    HOLD_CONNECTION("hold_connection"),
+    SAVE_BATTERY("save_battery");
+
+    companion object {
+        fun fromStoredValue(value: String?): ScreenOffMode? =
+            entries.firstOrNull { it.storedValue == value }
+    }
+}
+
+internal fun resolveScreenOffMode(
+    storedValue: String?,
+    legacyPauseVpnDuringSleep: Boolean,
+): ScreenOffMode = ScreenOffMode.fromStoredValue(storedValue)
+    ?: if (legacyPauseVpnDuringSleep) {
+        ScreenOffMode.SAVE_BATTERY
+    } else {
+        ScreenOffMode.BALANCED
+    }
+
 internal enum class SleepBatteryRuntimePhase(val storedValue: String) {
     IDLE("idle"),
     WAITING_TO_PAUSE("waiting_to_pause"),
@@ -121,9 +142,9 @@ data class WdttDeepLinkValidation(
         return if (parts != null && errors.isEmpty()) {
             buildString {
                 if (parts.hashes.isBlank()) {
-                    append("Ссылка wdtt:// распознана. Добавьте свой VK-хеш перед запуском VPN.")
+                    append("Ссылка wdtt:// распознана. Добавьте свой VK-хеш перед запуском соединения.")
                 } else {
-                    append("Ссылка wdtt:// корректна. VPN сможет использовать эти данные для подключения.")
+                    append("Ссылка wdtt:// корректна. WDTT Plus сможет использовать эти данные для подключения.")
                 }
                 parts?.profileName?.takeIf { it.isNotBlank() }?.let {
                     append("\nНазвание профиля: «")
@@ -137,7 +158,7 @@ data class WdttDeepLinkValidation(
             }
         } else {
             buildString {
-                append("VPN не запустится по этой ссылке, потому что в ней есть ошибки:\n")
+                append("Соединение не запустится по этой ссылке, потому что в ней есть ошибки:\n")
                 append(errors.joinToString("\n") { "• $it" })
                 append("\n\n")
                 append(supportedWdttLinkFormats)
@@ -226,6 +247,14 @@ data class TunnelProfileSnapshot(
     val customVkCredentialsEnabled: Boolean,
     val customVkClientId: String,
     val customVkClientSecret: String,
+    val proxyMode: String = TUNNEL_MODE_VPN,
+    val proxyPort: Int = DEFAULT_SOCKS5_PORT,
+    val proxyUdpEnabled: Boolean = true,
+    val proxyAccess: String = PROXY_ACCESS_BOTH,
+    val proxyLanEnabled: Boolean = false,
+    val proxyAuthEnabled: Boolean = false,
+    val proxyUsername: String = "",
+    val proxyPassword: String = "",
 )
 
 data class RemoteAttachmentCandidate(
@@ -336,6 +365,14 @@ data class ActiveTunnelProfileUiSnapshot(
     val accessLifecycle: AccessLifecycleUiState,
     val accessLifecycleDismissedSignature: String,
     val profileMaxWorkers: Int,
+    val proxyMode: String = TUNNEL_MODE_VPN,
+    val proxyPort: Int = DEFAULT_SOCKS5_PORT,
+    val proxyUdpEnabled: Boolean = true,
+    val proxyAccess: String = PROXY_ACCESS_BOTH,
+    val proxyLanEnabled: Boolean = false,
+    val proxyAuthEnabled: Boolean = false,
+    val proxyUsername: String = "",
+    val proxyPassword: String = "",
 )
 
 data class ActiveTunnelAccessUiSnapshot(
@@ -453,7 +490,7 @@ object WdttDeepLink {
             if (invalidHashesProvided) {
                 errors += "VK-хеш содержит недопустимые символы. Используйте латинские буквы, цифры, _ и - либо ссылку VK-звонка."
             } else if (allowMissingHashes) {
-                warnings += "VK-хеши ещё не заполнены. Добавьте их в WDTT Plus перед запуском VPN."
+                warnings += "VK-хеши ещё не заполнены. Добавьте их в WDTT Plus перед запуском соединения."
             } else {
                 errors += "Нет рабочего VK-хеша. Нужен хеш из латинских букв, цифр, _ или - либо ссылка VK-звонка."
             }
@@ -576,6 +613,7 @@ class SettingsStore(context: Context) {
         private val TRUSTED_WIFI_WAITING = booleanPreferencesKey("trusted_wifi_waiting")
         private val TRUSTED_WIFI_WAITING_SSID = stringPreferencesKey("trusted_wifi_waiting_ssid")
         private val PAUSE_VPN_DURING_SLEEP = booleanPreferencesKey("pause_vpn_during_sleep")
+        private val SCREEN_OFF_MODE = stringPreferencesKey("screen_off_mode")
         private val PAUSE_VPN_DURING_SLEEP_DELAY_MINUTES =
             intPreferencesKey("pause_vpn_during_sleep_delay_minutes")
         private val PAUSE_VPN_DURING_SLEEP_MODE =
@@ -713,9 +751,16 @@ class SettingsStore(context: Context) {
         private val DEPLOY_BOT_TOKEN_ENCRYPTED = stringPreferencesKey("deploy_bot_token_encrypted")
 
         // ═══ Proxy Mode ═══
-        private val PROXY_MODE = stringPreferencesKey("proxy_mode") // "tun" or "socks5"
+        private val PROXY_MODE = stringPreferencesKey("proxy_mode") // "vpn", "socks5" or "http"
         private val PROXY_HOST = stringPreferencesKey("proxy_host")
         private val PROXY_PORT = intPreferencesKey("proxy_port")
+        private val PROXY_UDP_ENABLED = booleanPreferencesKey("proxy_udp_enabled")
+        private val PROXY_ACCESS = stringPreferencesKey("proxy_access")
+        private val PROXY_LAN_ENABLED = booleanPreferencesKey("proxy_lan_enabled")
+        private val PROXY_AUTH_ENABLED = booleanPreferencesKey("proxy_auth_enabled")
+        private val PROXY_MODE_ACTIVATED = booleanPreferencesKey("proxy_mode_activated")
+        private val PROXY_USERNAME = stringPreferencesKey("proxy_username")
+        private val PROXY_PASSWORD_ENCRYPTED = stringPreferencesKey("proxy_password_encrypted")
 
         // ═══ Captcha Solve Mode ═══
         private val VKCALLS_PREFLIGHT = booleanPreferencesKey("vkcalls_preflight")
@@ -856,7 +901,10 @@ class SettingsStore(context: Context) {
             DEPLOY_BOT_TOKEN,
             DEPLOY_BOT_TOKEN_ENCRYPTED,
             PROXY_MODE,
+            PROXY_ACCESS,
             PROXY_HOST,
+            PROXY_USERNAME,
+            PROXY_PASSWORD_ENCRYPTED,
             CAPTCHA_MODE,
             CAPTCHA_SOLVE_METHOD,
             CAPTCHA_WBV_SOLVE_METHOD,
@@ -906,6 +954,10 @@ class SettingsStore(context: Context) {
             ACCESS_DISMISSIBLE,
             PROFILE_VALUES_SYNC_PENDING,
             PROFILE_EXCHANGE_ACTION_AVAILABLE,
+            PROXY_UDP_ENABLED,
+            PROXY_LAN_ENABLED,
+            PROXY_AUTH_ENABLED,
+            PROXY_MODE_ACTIVATED,
         )
 
         internal fun resettableProfilePreferenceNames(): Set<String> =
@@ -1019,6 +1071,33 @@ class SettingsStore(context: Context) {
                     profileMaxWorkers =
                         (it[getProfileKey(PROFILE_MAX_WORKERS, profile)] ?: 0)
                             .coerceIn(0, APP_MAX_WORKERS),
+                    proxyMode = resolveStoredTunnelMode(
+                        it[getProfileKey(PROXY_MODE, profile)],
+                        it[getProfileKey(PROXY_MODE_ACTIVATED, profile)] == true,
+                    ),
+                    proxyPort = normalizeSocks5Port(
+                        it[getProfileKey(PROXY_PORT, profile)] ?: DEFAULT_SOCKS5_PORT
+                    ),
+                    proxyUdpEnabled = it[getProfileKey(PROXY_UDP_ENABLED, profile)] ?: true,
+                    proxyAccess = resolveStoredProxyAccess(
+                        it[getProfileKey(PROXY_ACCESS, profile)],
+                        it[getProfileKey(PROXY_LAN_ENABLED, profile)] ?: false,
+                        it[getProfileKey(PROXY_MODE_ACTIVATED, profile)] == true,
+                    ),
+                    proxyLanEnabled = proxyAccessIncludesLan(
+                        resolveStoredProxyAccess(
+                            it[getProfileKey(PROXY_ACCESS, profile)],
+                            it[getProfileKey(PROXY_LAN_ENABLED, profile)] ?: false,
+                            it[getProfileKey(PROXY_MODE_ACTIVATED, profile)] == true,
+                        ),
+                    ),
+                    proxyAuthEnabled = it[getProfileKey(PROXY_AUTH_ENABLED, profile)] ?: false,
+                    proxyUsername = truncateSocks5Credential(
+                        it[getProfileKey(PROXY_USERNAME, profile)].orEmpty(),
+                    ),
+                    proxyPassword = truncateSocks5Credential(
+                        readProtectedSecret(it, PROXY_PASSWORD_ENCRYPTED, profile),
+                    ),
                 )
             }
         }.distinctUntilChanged()
@@ -1119,9 +1198,15 @@ class SettingsStore(context: Context) {
     val trustedWifiWaitingSsid: Flow<String> = preferencesFlow.map {
         sanitizeTrustedWifiSsid(it[TRUSTED_WIFI_WAITING_SSID].orEmpty())
     }
-    val pauseVpnDuringSleep: Flow<Boolean> = preferencesFlow.map {
-        it[PAUSE_VPN_DURING_SLEEP] ?: false
-    }
+    val screenOffMode: Flow<ScreenOffMode> = preferencesFlow.map { prefs ->
+        resolveScreenOffMode(
+            storedValue = prefs[SCREEN_OFF_MODE],
+            legacyPauseVpnDuringSleep = prefs[PAUSE_VPN_DURING_SLEEP] ?: false,
+        )
+    }.distinctUntilChanged()
+    val pauseVpnDuringSleep: Flow<Boolean> = screenOffMode.map {
+        it == ScreenOffMode.SAVE_BATTERY
+    }.distinctUntilChanged()
     val pauseVpnDuringSleepDelayMinutes: Flow<Int> = preferencesFlow.map {
         normalizeSleepPauseDelayMinutes(
             it[PAUSE_VPN_DURING_SLEEP_DELAY_MINUTES] ?: DEFAULT_SLEEP_PAUSE_DELAY_MINUTES
@@ -1401,7 +1486,10 @@ class SettingsStore(context: Context) {
     // ═══ Proxy Mode ═══
     val proxyMode: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
-        prefs[getProfileKey(PROXY_MODE, profile)] ?: "tun"
+        resolveStoredTunnelMode(
+            prefs[getProfileKey(PROXY_MODE, profile)],
+            prefs[getProfileKey(PROXY_MODE_ACTIVATED, profile)] == true,
+        )
     }
     val proxyHost: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
@@ -1409,8 +1497,42 @@ class SettingsStore(context: Context) {
     }
     val proxyPort: Flow<Int> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
-        prefs[getProfileKey(PROXY_PORT, profile)] ?: 1080
+        normalizeSocks5Port(prefs[getProfileKey(PROXY_PORT, profile)] ?: DEFAULT_SOCKS5_PORT)
     }
+    val proxyUdpEnabled: Flow<Boolean> = preferencesFlow.map { prefs ->
+        val profile = prefs[ACTIVE_PROFILE] ?: 0
+        prefs[getProfileKey(PROXY_UDP_ENABLED, profile)] ?: true
+    }
+    val proxyAccess: Flow<String> = preferencesFlow.map { prefs ->
+        val profile = prefs[ACTIVE_PROFILE] ?: 0
+        resolveStoredProxyAccess(
+            prefs[getProfileKey(PROXY_ACCESS, profile)],
+            prefs[getProfileKey(PROXY_LAN_ENABLED, profile)] ?: false,
+            prefs[getProfileKey(PROXY_MODE_ACTIVATED, profile)] == true,
+        )
+    }
+    val proxyLanEnabled: Flow<Boolean> = preferencesFlow.map { prefs ->
+        val profile = prefs[ACTIVE_PROFILE] ?: 0
+        proxyAccessIncludesLan(
+            resolveStoredProxyAccess(
+                prefs[getProfileKey(PROXY_ACCESS, profile)],
+                prefs[getProfileKey(PROXY_LAN_ENABLED, profile)] ?: false,
+                prefs[getProfileKey(PROXY_MODE_ACTIVATED, profile)] == true,
+            ),
+        )
+    }
+    val proxyAuthEnabled: Flow<Boolean> = preferencesFlow.map { prefs ->
+        val profile = prefs[ACTIVE_PROFILE] ?: 0
+        prefs[getProfileKey(PROXY_AUTH_ENABLED, profile)] ?: false
+    }
+    val proxyUsername: Flow<String> = preferencesFlow.map { prefs ->
+        val profile = prefs[ACTIVE_PROFILE] ?: 0
+        truncateSocks5Credential(prefs[getProfileKey(PROXY_USERNAME, profile)].orEmpty())
+    }
+    val proxyPassword: Flow<String> = preferencesFlow.map { prefs ->
+        val profile = prefs[ACTIVE_PROFILE] ?: 0
+        truncateSocks5Credential(readProtectedSecret(prefs, PROXY_PASSWORD_ENCRYPTED, profile))
+    }.flowOn(Dispatchers.IO)
 
     // ═══ Captcha Solve Mode ═══
     val vkCallsPreflight: Flow<Boolean> = preferencesFlow.map { prefs ->
@@ -1902,6 +2024,20 @@ class SettingsStore(context: Context) {
     suspend fun savePauseVpnDuringSleep(enabled: Boolean) {
         dataStore.edit { prefs ->
             prefs[PAUSE_VPN_DURING_SLEEP] = enabled
+            prefs[SCREEN_OFF_MODE] = if (enabled) {
+                ScreenOffMode.SAVE_BATTERY.storedValue
+            } else {
+                ScreenOffMode.BALANCED.storedValue
+            }
+        }
+    }
+
+    suspend fun saveScreenOffMode(mode: ScreenOffMode) {
+        dataStore.edit { prefs ->
+            prefs[SCREEN_OFF_MODE] = mode.storedValue
+            // Старые версии приложения знают только этот флаг. Поддерживаем его
+            // синхронно, чтобы откат APK не включил противоположный сценарий сна.
+            prefs[PAUSE_VPN_DURING_SLEEP] = mode == ScreenOffMode.SAVE_BATTERY
         }
     }
 
@@ -1913,6 +2049,11 @@ class SettingsStore(context: Context) {
     ) {
         dataStore.edit { prefs ->
             prefs[PAUSE_VPN_DURING_SLEEP] = enabled
+            prefs[SCREEN_OFF_MODE] = if (enabled) {
+                ScreenOffMode.SAVE_BATTERY.storedValue
+            } else {
+                ScreenOffMode.BALANCED.storedValue
+            }
             prefs[PAUSE_VPN_DURING_SLEEP_DELAY_MINUTES] =
                 normalizeSleepPauseDelayMinutes(pauseDelayMinutes)
             prefs[PAUSE_VPN_DURING_SLEEP_MODE] = mode.storedValue
@@ -2037,6 +2178,33 @@ class SettingsStore(context: Context) {
                     CUSTOM_VK_CLIENT_SECRET_ENCRYPTED,
                     CUSTOM_VK_CLIENT_SECRET,
                     profile
+                ),
+                proxyMode = resolveStoredTunnelMode(
+                    prefs[getProfileKey(PROXY_MODE, profile)],
+                    prefs[getProfileKey(PROXY_MODE_ACTIVATED, profile)] == true,
+                ),
+                proxyPort = normalizeSocks5Port(
+                    prefs[getProfileKey(PROXY_PORT, profile)] ?: DEFAULT_SOCKS5_PORT
+                ),
+                proxyUdpEnabled = prefs[getProfileKey(PROXY_UDP_ENABLED, profile)] ?: true,
+                proxyAccess = resolveStoredProxyAccess(
+                    prefs[getProfileKey(PROXY_ACCESS, profile)],
+                    prefs[getProfileKey(PROXY_LAN_ENABLED, profile)] ?: false,
+                    prefs[getProfileKey(PROXY_MODE_ACTIVATED, profile)] == true,
+                ),
+                proxyLanEnabled = proxyAccessIncludesLan(
+                    resolveStoredProxyAccess(
+                        prefs[getProfileKey(PROXY_ACCESS, profile)],
+                        prefs[getProfileKey(PROXY_LAN_ENABLED, profile)] ?: false,
+                        prefs[getProfileKey(PROXY_MODE_ACTIVATED, profile)] == true,
+                    ),
+                ),
+                proxyAuthEnabled = prefs[getProfileKey(PROXY_AUTH_ENABLED, profile)] ?: false,
+                proxyUsername = truncateSocks5Credential(
+                    prefs[getProfileKey(PROXY_USERNAME, profile)].orEmpty(),
+                ),
+                proxyPassword = truncateSocks5Credential(
+                    readProtectedSecret(prefs, PROXY_PASSWORD_ENCRYPTED, profile),
                 ),
             )
         }.first()
@@ -2243,8 +2411,26 @@ class SettingsStore(context: Context) {
                 put("deployAdminId", readSecret(prefs, DEPLOY_ADMIN_ID_ENCRYPTED, DEPLOY_ADMIN_ID, profile))
                 put("deployBotToken", readSecret(prefs, DEPLOY_BOT_TOKEN_ENCRYPTED, DEPLOY_BOT_TOKEN, profile))
                 put("proxyMode", prefs[getProfileKey(PROXY_MODE, profile)] ?: "tun")
+                put("proxyModeActivated", prefs[getProfileKey(PROXY_MODE_ACTIVATED, profile)] ?: false)
                 put("proxyHost", prefs[getProfileKey(PROXY_HOST, profile)] ?: "127.0.0.1")
                 put("proxyPort", prefs[getProfileKey(PROXY_PORT, profile)] ?: 1080)
+                put("proxyUdpEnabled", prefs[getProfileKey(PROXY_UDP_ENABLED, profile)] ?: true)
+                val exportedProxyAccess = resolveStoredProxyAccess(
+                    prefs[getProfileKey(PROXY_ACCESS, profile)],
+                    prefs[getProfileKey(PROXY_LAN_ENABLED, profile)] ?: false,
+                    prefs[getProfileKey(PROXY_MODE_ACTIVATED, profile)] == true,
+                )
+                put("proxyAccess", exportedProxyAccess)
+                put("proxyLanEnabled", proxyAccessIncludesLan(exportedProxyAccess))
+                put("proxyAuthEnabled", prefs[getProfileKey(PROXY_AUTH_ENABLED, profile)] ?: false)
+                put(
+                    "proxyUsername",
+                    truncateSocks5Credential(prefs[getProfileKey(PROXY_USERNAME, profile)].orEmpty()),
+                )
+                put(
+                    "proxyPassword",
+                    truncateSocks5Credential(readProtectedSecret(prefs, PROXY_PASSWORD_ENCRYPTED, profile)),
+                )
                 put("vkCallsPreflight", prefs[getProfileKey(VKCALLS_PREFLIGHT, profile)] ?: true)
                 put("rtNetwork", prefs[getProfileKey(RT_NETWORK, profile)] ?: false)
                 put("rtMasque", prefs[getProfileKey(RT_MASQUE, profile)] ?: false)
@@ -2400,9 +2586,29 @@ class SettingsStore(context: Context) {
                 prefs.putSecret(DEPLOY_MAIN_PASSWORD_ENCRYPTED, DEPLOY_MAIN_PASSWORD, item.optString("deployMainPassword"), profile)
                 prefs.putSecret(DEPLOY_ADMIN_ID_ENCRYPTED, DEPLOY_ADMIN_ID, item.optString("deployAdminId"), profile)
                 prefs.putSecret(DEPLOY_BOT_TOKEN_ENCRYPTED, DEPLOY_BOT_TOKEN, item.optString("deployBotToken"), profile)
-                prefs[getProfileKey(PROXY_MODE, profile)] = item.optString("proxyMode", "tun")
-                prefs[getProfileKey(PROXY_HOST, profile)] = item.optString("proxyHost", "127.0.0.1")
+                prefs[getProfileKey(PROXY_MODE, profile)] = normalizeTunnelMode(item.optString("proxyMode"))
+                prefs[getProfileKey(PROXY_MODE_ACTIVATED, profile)] =
+                    item.optBoolean("proxyModeActivated", false)
+                prefs[getProfileKey(PROXY_HOST, profile)] = SOCKS5_LOOPBACK_HOST
                 prefs[getProfileKey(PROXY_PORT, profile)] = item.safePort("proxyPort", 1080)
+                prefs[getProfileKey(PROXY_UDP_ENABLED, profile)] = item.optBoolean("proxyUdpEnabled", true)
+                val importedProxyAccess = resolveStoredProxyAccess(
+                    item.optString("proxyAccess").takeIf { it.isNotBlank() },
+                    item.optBoolean("proxyLanEnabled", false),
+                    item.optBoolean("proxyModeActivated", false),
+                )
+                prefs[getProfileKey(PROXY_ACCESS, profile)] = importedProxyAccess
+                prefs[getProfileKey(PROXY_LAN_ENABLED, profile)] =
+                    proxyAccessIncludesLan(importedProxyAccess)
+                prefs[getProfileKey(PROXY_AUTH_ENABLED, profile)] = item.optBoolean("proxyAuthEnabled", false)
+                prefs[getProfileKey(PROXY_USERNAME, profile)] = truncateSocks5Credential(
+                    item.optString("proxyUsername").take(64),
+                )
+                prefs.putProtectedSecret(
+                    PROXY_PASSWORD_ENCRYPTED,
+                    truncateSocks5Credential(item.optString("proxyPassword")),
+                    profile,
+                )
                 prefs[getProfileKey(VKCALLS_PREFLIGHT, profile)] = item.optBoolean("vkCallsPreflight", true)
                 prefs[getProfileKey(RT_NETWORK, profile)] = item.optBoolean("rtNetwork", false)
                 prefs[getProfileKey(RT_MASQUE, profile)] = item.optBoolean("rtMasque", false)
@@ -3637,12 +3843,35 @@ class SettingsStore(context: Context) {
     }
 
     // ═══ Сохранение proxy mode ═══
-    suspend fun saveProxyMode(mode: String, host: String, port: Int) {
+    suspend fun saveProxyMode(
+        mode: String,
+        port: Int,
+        udpEnabled: Boolean = true,
+        access: String = PROXY_ACCESS_BOTH,
+        authEnabled: Boolean = false,
+        username: String = "",
+        password: String = "",
+    ) {
         dataStore.edit { prefs ->
             val profile = prefs[ACTIVE_PROFILE] ?: 0
-            prefs[getProfileKey(PROXY_MODE, profile)] = mode
-            prefs[getProfileKey(PROXY_HOST, profile)] = host
-            prefs[getProfileKey(PROXY_PORT, profile)] = port
+            prefs[getProfileKey(PROXY_MODE, profile)] = normalizeTunnelMode(mode)
+            prefs[getProfileKey(PROXY_MODE_ACTIVATED, profile)] = true
+            prefs[getProfileKey(PROXY_HOST, profile)] = SOCKS5_LOOPBACK_HOST
+            prefs[getProfileKey(PROXY_PORT, profile)] = normalizeProxyPort(port, mode)
+            prefs[getProfileKey(PROXY_UDP_ENABLED, profile)] = udpEnabled
+            val normalizedAccess = normalizeProxyAccess(access)
+            prefs[getProfileKey(PROXY_ACCESS, profile)] = normalizedAccess
+            prefs[getProfileKey(PROXY_LAN_ENABLED, profile)] =
+                proxyAccessIncludesLan(normalizedAccess)
+            prefs[getProfileKey(PROXY_AUTH_ENABLED, profile)] = authEnabled
+            prefs[getProfileKey(PROXY_USERNAME, profile)] = truncateSocks5Credential(
+                username.trim().take(64),
+            )
+            prefs.putProtectedSecret(
+                PROXY_PASSWORD_ENCRYPTED,
+                truncateSocks5Credential(password),
+                profile,
+            )
         }
     }
 
@@ -4045,6 +4274,9 @@ class SettingsStore(context: Context) {
         val url = prefs[getProfileKey(ACCESS_LIFECYCLE_URL, profile)].orEmpty()
         val binding = prefs[getProfileKey(ACCESS_LIFECYCLE_BINDING, profile)].orEmpty()
         val capability = RemoteAccessCapability(
+            // Дополнительная удалённая возможность может быть прикреплена к
+            // обычному локальному профилю (например, после отдельного действия),
+            // не передавая backend владение самим подключением.
             available = key.isNotBlank() && url.isNotBlank() && binding.isNotBlank(),
             key = key,
             url = url,

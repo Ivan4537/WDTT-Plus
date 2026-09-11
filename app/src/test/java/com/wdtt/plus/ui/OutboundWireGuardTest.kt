@@ -60,6 +60,14 @@ class OutboundWireGuardTest {
         assertTrue("checksums.txt" in script)
         assertTrue("sha256sum" in script)
         assertTrue("--accept-tos" in script)
+        assertTrue("wdtt_wgcf_registration_error" in script)
+        assertTrue("warp_registration_rate_limited" in script)
+        assertTrue("warp_registration_certificate_failed" in script)
+        assertTrue("warp_registration_tls_failed" in script)
+        assertTrue("warp_registration_dns_failed" in script)
+        assertTrue("warp_registration_network_failed" in script)
+        assertTrue("warp_registration_rejected" in script)
+        assertTrue("warp_registration_service_failed" in script)
         assertTrue("wdtt-warp-watchdog.timer" in script)
         assertTrue("wdtt_warp_autotune" in script)
         assertTrue("WARP_ENDPOINT_CANDIDATES" in script)
@@ -70,6 +78,43 @@ class OutboundWireGuardTest {
         assertTrue("WDTT_ERROR=wireguard_exit_service_inactive" in script)
         assertTrue("ip link delete \"${'$'}WDTT_WG_IFACE\"" in script)
         assertShellSyntax(script)
+    }
+
+    @Test
+    fun freeWarpRegistrationErrorClassifier_distinguishesSafeFailureReasons() {
+        val script = buildFreeWarpInstallScript()
+        val classifier = Regex(
+            "(?ms)^wdtt_wgcf_registration_error\\(\\) \\{.*?^\\}",
+        ).find(script)?.value.orEmpty()
+        assertTrue("классификатор должен присутствовать в скрипте установки", classifier.isNotBlank())
+
+        fun classify(error: String): String {
+            val log = Files.createTempFile("wdtt-wgcf-error-", ".log").toFile()
+            return try {
+                log.writeText(error)
+                val process = ProcessBuilder(
+                    "bash",
+                    "-c",
+                    "$classifier\nwdtt_wgcf_registration_error \"${'$'}1\"",
+                    "classifier",
+                    log.absolutePath,
+                ).redirectErrorStream(true).start()
+                val output = process.inputStream.bufferedReader().use { it.readText() }.trim()
+                assertEquals(0, process.waitFor())
+                output
+            } finally {
+                log.delete()
+            }
+        }
+
+        assertEquals("warp_registration_rate_limited", classify("429 Too Many Requests"))
+        assertEquals("warp_registration_tls_failed", classify("net/http: TLS handshake timeout"))
+        assertEquals("warp_registration_dns_failed", classify("dial tcp: lookup api.cloudflareclient.com: no such host"))
+        assertEquals("warp_registration_network_failed", classify("dial tcp: i/o timeout"))
+        assertEquals("warp_registration_rejected", classify("403 Forbidden error 1020"))
+        assertEquals("warp_registration_service_failed", classify("500 Internal Server Error"))
+        assertEquals("warp_registration_certificate_failed", classify("x509: certificate has expired"))
+        assertEquals("warp_registration_failed", classify("unexpected enrollment response"))
     }
 
     @Test
@@ -263,13 +308,13 @@ class OutboundWireGuardTest {
 
         assertTrue("WDTT_SERVER_DIAG" in script)
         assertTrue("apt-get dnf yum zypper apk pacman" in script)
-        assertTrue("wdtt_diag_install_dependencies" in script)
-        assertTrue("DEBIAN_FRONTEND=noninteractive apt-get install" in script)
-        assertTrue("dnf install -y" in script)
-        assertTrue("yum install -y" in script)
-        assertTrue("zypper --non-interactive install" in script)
-        assertTrue("apk add --no-cache" in script)
-        assertTrue("pacman -Sy --noconfirm --needed" in script)
+        assertFalse("diagnostics must not install packages", "apt-get install" in script)
+        assertFalse("diagnostics must not install packages", "dnf install" in script)
+        assertFalse("diagnostics must not install packages", "yum install" in script)
+        assertFalse("diagnostics must not install packages", "zypper --non-interactive install" in script)
+        assertFalse("diagnostics must not install packages", "apk add" in script)
+        assertFalse("diagnostics must not install packages", "pacman -Sy" in script)
+        assertTrue("Диагностика ничего не устанавливала" in script)
         assertTrue("systemctl" in script)
         assertTrue("iptables" in script)
         assertTrue("nft" in script)
@@ -283,6 +328,8 @@ class OutboundWireGuardTest {
         assertFalse("обязательным узлам VK в зоне .ru" in script)
         assertTrue("api.telegram.org" in script)
         assertTrue("Бесплатный WARP" in script)
+        assertTrue("api.cloudflareclient.com" in script)
+        assertTrue("регистрация api.cloudflareclient.com" in script)
         assertTrue("engage.cloudflareclient.com" in script)
         assertTrue("wdtt_diag_wg_exit_probe" in script)
         assertTrue("Cloudflare подтвердил warp=" in script)
@@ -321,7 +368,9 @@ class OutboundWireGuardTest {
         assertTrue("WDTT_STANDALONE_MANAGED=0" in script)
         assertTrue("WDTT_ANDROID_DEPLOY_MANAGED=1" in script)
         assertTrue("Managed by WDTT Plus Android deploy" in script)
+        assertTrue("WDTT deploy compatibility: 1" in script)
         assertTrue("WDTT_LEGACY_ANDROID_DEPLOY_CANDIDATE=1" in script)
+        assertTrue("WDTT_ANDROID_DATA_PRESERVED=1" in script)
         assertTrue("WDTT_INCOMPLETE_ANDROID_DEPLOY_CANDIDATE=1" in script)
         assertTrue("WDTT_INSTALL_TRACE=1" in script)
         assertTrue("-config-dir[[:space:]]+/etc/wdtt" in script)
@@ -338,6 +387,7 @@ class OutboundWireGuardTest {
         assertEquals(1, Regex("(?m)^WDTT_STANDALONE_MANAGED=[01]$").findAll(output).count())
         assertEquals(1, Regex("(?m)^WDTT_ANDROID_DEPLOY_MANAGED=[01]$").findAll(output).count())
         assertEquals(1, Regex("(?m)^WDTT_LEGACY_ANDROID_DEPLOY_CANDIDATE=[01]$").findAll(output).count())
+        assertEquals(1, Regex("(?m)^WDTT_ANDROID_DATA_PRESERVED=[01]$").findAll(output).count())
         assertEquals(1, Regex("(?m)^WDTT_INCOMPLETE_ANDROID_DEPLOY_CANDIDATE=[01]$").findAll(output).count())
         assertEquals(1, Regex("(?m)^WDTT_INSTALL_TRACE=[01]$").findAll(output).count())
         deploymentOwnershipFromProbe(output)
@@ -407,6 +457,16 @@ class OutboundWireGuardTest {
         assertEquals(DeploymentOwnership.AndroidDeploy, android)
         assertTrue(existingInstallAllowsReset(ownership = android, checkSucceeded = true))
         assertFalse(existingInstallAllowsReset(ownership = android, checkSucceeded = false))
+
+        val preserved = existingInstallOwnershipFromFlags(
+            standaloneManaged = false,
+            androidDeployManaged = false,
+            legacyAndroidDeployCandidate = false,
+            preservedAndroidData = true
+        )
+        assertEquals(DeploymentOwnership.PreservedAndroidData, preserved)
+        assertTrue(existingInstallAllowsPreservingUpdate(preserved, checkSucceeded = true))
+        assertTrue(existingInstallAllowsReset(preserved, checkSucceeded = true))
     }
 
     @Test
@@ -491,6 +551,106 @@ class OutboundWireGuardTest {
     }
 
     @Test
+    fun ownershipProbe_markedPartialAndroidInstallCanOnlyBeReset() {
+        val root = Files.createTempDirectory("wdtt-marked-partial-owner-probe").toFile()
+        try {
+            val unit = File(root, "etc/systemd/system/wdtt.service")
+            requireNotNull(unit.parentFile).mkdirs()
+            unit.writeText(
+                """
+                # Managed by WDTT Plus Android deploy
+                # WDTT deploy compatibility: 1
+                [Service]
+                ExecStartPre=-/usr/bin/env bash -c "ip link show wdtt0 >/dev/null 2>&1 && ip link del wdtt0 || true"
+                ExecStart=/usr/local/bin/wdtt-server -listen 0.0.0.0:56000 -wg-port 56001 -config-dir /etc/wdtt
+                """.trimIndent()
+            )
+
+            fun probe(): DeploymentOwnership {
+                val process = ProcessBuilder(
+                    "bash",
+                    "-c",
+                    standaloneInstallerOwnershipProbeScript(root.absolutePath)
+                ).redirectErrorStream(true).start()
+                val output = process.inputStream.bufferedReader().use { it.readText() }
+                assertEquals(0, process.waitFor())
+                return deploymentOwnershipFromProbe(output)
+            }
+
+            val incomplete = probe()
+            assertEquals(DeploymentOwnership.IncompleteAndroidDeploy, incomplete)
+            assertFalse(existingInstallAllowsPreservingUpdate(incomplete, checkSucceeded = true))
+            assertTrue(existingInstallAllowsReset(incomplete, checkSucceeded = true))
+
+            val binary = File(root, "usr/local/bin/wdtt-server")
+            requireNotNull(binary.parentFile).mkdirs()
+            Files.createSymbolicLink(binary.toPath(), File(root, "foreign-server").toPath())
+            assertEquals(DeploymentOwnership.UnknownExisting, probe())
+            Files.delete(binary.toPath())
+
+            binary.writeText("#!/bin/sh\nexit 0\n")
+            assertTrue(binary.setExecutable(true))
+            val config = File(root, "etc/wdtt")
+            config.mkdirs()
+            File(config, "wg-keys.dat").writeText("test-only\n")
+            assertEquals(DeploymentOwnership.IncompleteAndroidDeploy, probe())
+
+            File(config, "passwords.json").writeText("{\"passwords\":{},\"devices\":{}}\n")
+            assertEquals(DeploymentOwnership.AndroidDeploy, probe())
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun ownershipProbe_recognizesPreservedAndroidDataAndExactV17RemovalFootprint() {
+        val root = Files.createTempDirectory("wdtt-preserved-owner-probe").toFile()
+        try {
+            val config = File(root, "etc/wdtt")
+            config.mkdirs()
+            assertTrue(config.setReadable(false, false))
+            assertTrue(config.setWritable(false, false))
+            assertTrue(config.setExecutable(false, false))
+            assertTrue(config.setReadable(true, true))
+            assertTrue(config.setWritable(true, true))
+            assertTrue(config.setExecutable(true, true))
+            listOf("passwords.json", "wg-keys.dat").forEach { name ->
+                File(config, name).apply {
+                    writeText("test-only\n")
+                    assertTrue(setReadable(false, false))
+                    assertTrue(setWritable(false, false))
+                    assertTrue(setExecutable(false, false))
+                    assertTrue(setReadable(true, true))
+                    assertTrue(setWritable(true, true))
+                }
+            }
+
+            fun probe(): DeploymentOwnership {
+                val process = ProcessBuilder(
+                    "bash",
+                    "-c",
+                    standaloneInstallerOwnershipProbeScript(root.absolutePath)
+                ).redirectErrorStream(true).start()
+                val output = process.inputStream.bufferedReader().use { it.readText() }
+                assertEquals(0, process.waitFor())
+                return deploymentOwnershipFromProbe(output)
+            }
+
+            assertEquals(DeploymentOwnership.PreservedAndroidData, probe())
+            File(config, ".android-deploy-preserved")
+                .writeText("Preserved by WDTT Plus Android deploy\n")
+            File(config, "backup-policy.json").writeText("{}\n")
+            assertEquals(DeploymentOwnership.PreservedAndroidData, probe())
+
+            File(config, ".android-deploy-preserved")
+                .writeText("foreign marker\n")
+            assertEquals(DeploymentOwnership.UnknownExisting, probe())
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
     fun deploymentOwnership_allowsOnlyStrictLegacyAndroidShapeForPreserveMigration() {
         assertEquals(
             DeploymentOwnership.LegacyAndroidDeploy,
@@ -499,6 +659,7 @@ class OutboundWireGuardTest {
                 WDTT_STANDALONE_MANAGED=0
                 WDTT_ANDROID_DEPLOY_MANAGED=0
                 WDTT_LEGACY_ANDROID_DEPLOY_CANDIDATE=1
+                WDTT_ANDROID_DATA_PRESERVED=0
                 WDTT_INCOMPLETE_ANDROID_DEPLOY_CANDIDATE=0
                 WDTT_INSTALL_TRACE=1
                 """.trimIndent()
@@ -511,6 +672,7 @@ class OutboundWireGuardTest {
                 WDTT_STANDALONE_MANAGED=0
                 WDTT_ANDROID_DEPLOY_MANAGED=0
                 WDTT_LEGACY_ANDROID_DEPLOY_CANDIDATE=0
+                WDTT_ANDROID_DATA_PRESERVED=0
                 WDTT_INCOMPLETE_ANDROID_DEPLOY_CANDIDATE=0
                 WDTT_INSTALL_TRACE=1
                 """.trimIndent()
@@ -523,6 +685,7 @@ class OutboundWireGuardTest {
                 WDTT_STANDALONE_MANAGED=0
                 WDTT_ANDROID_DEPLOY_MANAGED=0
                 WDTT_LEGACY_ANDROID_DEPLOY_CANDIDATE=0
+                WDTT_ANDROID_DATA_PRESERVED=0
                 WDTT_INCOMPLETE_ANDROID_DEPLOY_CANDIDATE=0
                 WDTT_INSTALL_TRACE=0
                 """.trimIndent()

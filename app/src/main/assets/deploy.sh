@@ -2,19 +2,20 @@
 # ==============================================================================
 #  WDTT Plus Server — Универсальный установщик для VPS
 #  Поддержка: Debian 11+, Ubuntu 20.04+, CentOS/RHEL/Fedora/AlmaLinux/Rocky
-#  Версия: 3.10  |  Дата: 2026-09-04
+#  Версия: 3.11  |  Дата: 2026-09-06
 #  NAT:  MASQUERADE через iptables
 #  WG:   порт 56001 (не конфликтует с существующим WG на 51820)
 #  DTLS: порт 56000
 # ==============================================================================
 set -euo pipefail
 
-readonly SCRIPT_VERSION="3.10"
+readonly SCRIPT_VERSION="3.11"
 readonly WDTT_DEPLOY_CONTRACT_VERSION="1"
 readonly WDTT_SERVER_VERSION="17"
 readonly WDTT_SERVER_BINARY_PATH="/usr/local/bin/wdtt-server"
 readonly WDTT_SYSTEMD_UNIT_PATH="/etc/systemd/system/wdtt.service"
 readonly WDTT_ANDROID_DEPLOY_MARKER="Managed by WDTT Plus Android deploy"
+readonly WDTT_ANDROID_PRESERVED_MARKER="Preserved by WDTT Plus Android deploy"
 readonly WDTT_ANDROID_CONTRACT_MARKER="WDTT deploy compatibility: 1"
 readonly WDTT_STANDALONE_MARKER="Managed by WDTT Plus standalone server installer"
 readonly WDTT_STANDALONE_OWNERSHIP_PATH="/var/lib/wdtt-server-installer/ownership"
@@ -406,17 +407,27 @@ validate_deploy_data_mode() {
                grep -Fqx "${WDTT_STANDALONE_MARKER}" "$WDTT_STANDALONE_OWNERSHIP_PATH"; then
                 die "Обновление остановлено: сервер управляется standalone-инсталлером"
             fi
-            [ -f "$WDTT_SYSTEMD_UNIT_PATH" ] && [ ! -L "$WDTT_SYSTEMD_UNIT_PATH" ] &&
-              [ -x "$WDTT_SERVER_BINARY_PATH" ] && [ ! -L "$WDTT_SERVER_BINARY_PATH" ] &&
-              [ -d "$WDTT_CONFIG_DIR" ] && [ ! -L "$WDTT_CONFIG_DIR" ] ||
-                die "Обновление остановлено: признаки Android-установки изменились после проверки"
-            if ! grep -Fqx "# ${WDTT_ANDROID_DEPLOY_MARKER}" "$WDTT_SYSTEMD_UNIT_PATH"; then
+            [ -d "$WDTT_CONFIG_DIR" ] && [ ! -L "$WDTT_CONFIG_DIR" ] ||
+                die "Обновление остановлено: каталог данных Android-установки изменился после проверки"
+            if [ -f "$WDTT_CONFIG_DIR/.android-deploy-preserved" ] &&
+               [ ! -L "$WDTT_CONFIG_DIR/.android-deploy-preserved" ] &&
+               grep -Fqx "$WDTT_ANDROID_PRESERVED_MARKER" "$WDTT_CONFIG_DIR/.android-deploy-preserved"; then
+                [ ! -e "$WDTT_SYSTEMD_UNIT_PATH" ] && [ ! -e "$WDTT_SERVER_BINARY_PATH" ] &&
+                  [ -f "$WDTT_CONFIG_DIR/$WDTT_ACCESS_DB" ] && [ ! -L "$WDTT_CONFIG_DIR/$WDTT_ACCESS_DB" ] &&
+                  [ -f "$WDTT_CONFIG_DIR/$WDTT_WG_KEYS" ] && [ ! -L "$WDTT_CONFIG_DIR/$WDTT_WG_KEYS" ] ||
+                    die "Обновление остановлено: сохранённые данные Android-деплоя изменились после проверки"
+            else
+              [ -f "$WDTT_SYSTEMD_UNIT_PATH" ] && [ ! -L "$WDTT_SYSTEMD_UNIT_PATH" ] &&
+                [ -x "$WDTT_SERVER_BINARY_PATH" ] && [ ! -L "$WDTT_SERVER_BINARY_PATH" ] ||
+                  die "Обновление остановлено: признаки Android-установки изменились после проверки"
+              if ! grep -Fqx "# ${WDTT_ANDROID_DEPLOY_MARKER}" "$WDTT_SYSTEMD_UNIT_PATH"; then
                 [ -f "$WDTT_CONFIG_DIR/$WDTT_WG_KEYS" ] &&
                   [ ! -L "$WDTT_CONFIG_DIR/$WDTT_WG_KEYS" ] &&
                   grep -Eq '^ExecStart=/usr/local/bin/wdtt-server([[:space:]]|$)' "$WDTT_SYSTEMD_UNIT_PATH" &&
                   grep -Eq '(^|[[:space:]])-config-dir[[:space:]]+/etc/wdtt([[:space:]]|$)' "$WDTT_SYSTEMD_UNIT_PATH" &&
                   grep -Fq 'wdtt0' "$WDTT_SYSTEMD_UNIT_PATH" ||
                     die "Обновление остановлено: не удалось подтвердить старую Android-установку"
+              fi
             fi
             ;;
         reset)
@@ -646,6 +657,7 @@ start_wdtt() {
     echo "══════════════════════════════════════════════════════════════"
 
     if [ "$status" = "active" ]; then
+        rm -f "$WDTT_CONFIG_DIR/.android-deploy-preserved"
         echo "✅ Деплой успешно завершён!"
         echo "   NAT:  MASQUERADE (стандартный)"
         echo "   DTLS: порт ${DTLS_PORT}"

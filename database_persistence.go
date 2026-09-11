@@ -103,15 +103,9 @@ func decodeSingleJSONDocument(data []byte, target any) error {
 }
 
 func persistDatabaseFile(path string, value *Database) error {
-	if value == nil {
-		return errors.New("нельзя сохранить пустую базу WDTT")
-	}
-	data, err := json.MarshalIndent(value, "", "  ")
+	data, err := marshalDatabase(value)
 	if err != nil {
-		return fmt.Errorf("не удалось подготовить базу WDTT: %w", err)
-	}
-	if _, err := decodeDatabase(data); err != nil {
-		return fmt.Errorf("отказ от сохранения некорректной базы WDTT: %w", err)
+		return err
 	}
 
 	dir := filepath.Dir(path)
@@ -144,6 +138,20 @@ func persistDatabaseFile(path string, value *Database) error {
 		return fmt.Errorf("не удалось атомарно сохранить базу WDTT: %w", err)
 	}
 	return syncDirectory(dir)
+}
+
+func marshalDatabase(value *Database) ([]byte, error) {
+	if value == nil {
+		return nil, errors.New("нельзя сохранить пустую базу WDTT")
+	}
+	data, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("не удалось подготовить базу WDTT: %w", err)
+	}
+	if _, err := decodeDatabase(data); err != nil {
+		return nil, fmt.Errorf("база WDTT не прошла проверку: %w", err)
+	}
+	return data, nil
 }
 
 func ensurePrivateDatabaseDirectory(dir string) error {

@@ -13,6 +13,8 @@ func TestDecodeNativeStartupSecrets(t *testing.T) {
 		ConnectionPassword:   "connection-secret",
 		CustomVKClientID:     "1234567",
 		CustomVKClientSecret: "client-secret",
+		SocksUsername:        "local-user",
+		SocksPassword:        "local-password",
 	}
 	raw, err := json.Marshal(want)
 	if err != nil {

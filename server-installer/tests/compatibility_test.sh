@@ -53,13 +53,15 @@ for key in \
     WDTT_ACCESS_DATABASE \
     WDTT_WG_KEYS_FILE \
     WDTT_ANDROID_DEPLOY_MARKER \
-    WDTT_ANDROID_CONTRACT_MARKER; do
+    WDTT_ANDROID_CONTRACT_MARKER \
+    WDTT_ANDROID_PRESERVED_MARKER; do
     [[ -n "${!key:-}" ]] || fail "в контракте пустое поле $key"
 done
 
 require_exact_line "$INSTALLER" "readonly SUPPORTED_SERVER_VERSION=\"$WDTT_SERVER_VERSION\""
 require_exact_line "$INSTALLER" "readonly DEPLOY_COMPATIBILITY_VERSION=\"$WDTT_DEPLOY_CONTRACT_VERSION\""
 require_exact_line "$INSTALLER" "readonly ANDROID_DEPLOY_MARKER=\"$WDTT_ANDROID_DEPLOY_MARKER\""
+require_exact_line "$INSTALLER" "readonly ANDROID_PRESERVED_MARKER=\"$WDTT_ANDROID_PRESERVED_MARKER\""
 require_exact_line "$INSTALLER" \
     "readonly ANDROID_DEPLOY_COMPATIBILITY_MARKER=\"WDTT deploy compatibility: \$DEPLOY_COMPATIBILITY_VERSION\""
 require_text "$INSTALLER" 'install.sh handoff-android [--dry-run] [--yes]'
@@ -86,6 +88,7 @@ require_exact_line "$DEPLOY" "readonly WDTT_ACCESS_DB=\"$WDTT_ACCESS_DATABASE\""
 require_exact_line "$DEPLOY" "readonly WDTT_WG_KEYS=\"$WDTT_WG_KEYS_FILE\""
 require_exact_line "$DEPLOY" "readonly WDTT_ANDROID_DEPLOY_MARKER=\"$WDTT_ANDROID_DEPLOY_MARKER\""
 require_exact_line "$DEPLOY" "readonly WDTT_ANDROID_CONTRACT_MARKER=\"$WDTT_ANDROID_CONTRACT_MARKER\""
+require_exact_line "$DEPLOY" "readonly WDTT_ANDROID_PRESERVED_MARKER=\"$WDTT_ANDROID_PRESERVED_MARKER\""
 
 grep -Fq 'ExecStart=${WDTT_SERVER_BINARY_PATH} -listen ' "$DEPLOY" ||
     fail "Android unit не запускает бинарник из контракта"
@@ -154,7 +157,12 @@ require_text "$DEPLOY_TAB" 'assertAndroidDeployMayManageServer(ssh, "удале�
 require_text "$DEPLOY_TAB" 'enabled = resetAllowed'
 require_text "$DEPLOY_TAB" 'checkSucceeded && ownership in setOf('
 require_text "$DEPLOY_TAB" 'DeploymentOwnership.IncompleteAndroidDeploy'
+require_text "$DEPLOY_TAB" 'DeploymentOwnership.PreservedAndroidData'
+require_text "$DEPLOY_TAB" "'Preserved by WDTT Plus Android deploy'"
 require_text "$DEPLOY_TAB" 'incompleteAndroidDeployCandidate'
+require_text "$INSTALLER" 'is_preserved_android_data()'
+require_text "$INSTALLER" 'android-preserved)'
+require_text "$INSTALLER" 'adopt-preserved'
 
 probe_source="$(
     sed -n \
@@ -182,6 +190,8 @@ grep -Fxq "database=$WDTT_ACCESS_DATABASE" <<<"$actual_contract" ||
     fail "standalone сообщает другую базу"
 grep -Fxq "wg_keys=$WDTT_WG_KEYS_FILE" <<<"$actual_contract" ||
     fail "standalone сообщает другой файл ключей"
+grep -Fxq "preserved_marker=$WDTT_ANDROID_PRESERVED_MARKER" <<<"$actual_contract" ||
+    fail "standalone сообщает другую метку сохранённых Android-данных"
 
 printf 'Контракт совместимости %s согласован: Android-деплой, standalone-установщик и wdtt-server v%s.\n' \
     "$WDTT_DEPLOY_CONTRACT_VERSION" "$WDTT_SERVER_VERSION"
