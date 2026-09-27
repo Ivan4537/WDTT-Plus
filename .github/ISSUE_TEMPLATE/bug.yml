@@ -1,25 +1,23 @@
 name: Баг приложения
 description: Ошибка интерфейса, обновлений, кнопок, настроек или поведения APK.
-title: "[Баг]: "
+title: '[Баг]: '
 labels:
   - bug
 body:
   - type: markdown
     attributes:
-      value: |
-        Спасибо, что помогаете улучшать WDTT Plus. Заполните поля ниже — так проблему получится разобрать быстрее.
+      value: |-
+        Для ошибок интерфейса и работы приложения используйте эту форму. Для отсутствия интернета или проблем с сервером удобнее форма «Проблема подключения».
 
-        Issue будет виден всем. Не публикуйте пароли, ключи SSH/WireGuard, токены, VK-хеши и ссылки VK Звонков, полные ссылки подключения или другие секретные данные.
-
+        Обращение будет видно всем. Не публикуйте пароли, SSH- и WireGuard-ключи, токены, ВК-хеши, ссылки ВК Звонков и полные ссылки подключения. Проверьте также скриншоты и диагностические подробности; при необходимости скройте IP-адреса и личные данные.
   - type: input
     id: app_version
     attributes:
       label: Версия WDTT Plus
       description: Посмотреть можно во вкладке «Инфо» → «О проекте».
-      placeholder: "Например: 12"
+      placeholder: 'Например: 18 или 19; для своей сборки — также дата или коммит'
     validations:
       required: true
-
   - type: dropdown
     id: apk_abi
     attributes:
@@ -32,24 +30,24 @@ body:
         - Не знаю
     validations:
       required: true
-
   - type: dropdown
     id: app_area
     attributes:
       label: Где возникла ошибка?
       options:
-        - Туннель
-        - Деплой
+        - Туннель и параметры подключения
+        - ВК-хеши и капча
+        - Деплой и собственный сервер
+        - Выходной IP и прокси
         - Исключения
         - Логи
-        - Инфо
-        - Настройки профиля
+        - Инфо и диагностика
+        - Получить или передать профиль
         - Установка или обновление приложения
         - Виджет, плитка или уведомление Android
         - Другое
     validations:
       required: true
-
   - type: dropdown
     id: install_source
     attributes:
@@ -57,38 +55,35 @@ body:
       options:
         - GitHub Releases
         - Обновление внутри WDTT Plus
+        - Локальная сборка для проверки
         - Собрано из исходников
         - Другой источник
         - Не знаю
     validations:
       required: true
-
   - type: input
     id: device
     attributes:
-      label: Телефон и Android
-      description: Модель телефона, версия Android, прошивка/ROM, если знаете.
-      placeholder: "Например: OnePlus 13, Android 15, OxygenOS"
+      label: Устройство и Android
+      description: Модель телефона, планшета или Android TV, версия Android и оболочки.
+      placeholder: 'Например: OnePlus 13, Android 16, OxygenOS 16'
     validations:
       required: true
-
   - type: textarea
     id: problem
     attributes:
       label: Что произошло?
       description: Опишите баг простыми словами.
-      placeholder: "Что сломалось, где это видно, какая кнопка/экран/действие?"
+      placeholder: Что сломалось, где это видно, какая кнопка/экран/действие?
     validations:
       required: true
-
   - type: textarea
     id: expected
     attributes:
       label: Что должно было произойти?
-      placeholder: "Какое поведение ожидалось?"
+      placeholder: Какое поведение ожидалось?
     validations:
       required: false
-
   - type: textarea
     id: steps
     attributes:
@@ -100,28 +95,35 @@ body:
         3. Увидеть ...
     validations:
       required: false
-
   - type: textarea
     id: screenshots
     attributes:
       label: Скриншоты или видео
-      description: Перетащите сюда скриншоты/запись экрана, если они помогают понять проблему.
+      description: Приложите скриншот или запись экрана. Для обрезанных окон укажите ориентацию экрана, масштаб интерфейса и размер шрифта Android. Скройте секретные и личные данные.
     validations:
       required: false
-
   - type: textarea
     id: support_report
     attributes:
       label: Отчёт о проверке устройства
-      description: Если проблема зависит от устройства, выберите «Инфо» → «Действия» → «Проверить устройство» → «Скопировать отчёт».
+      description: «Инфо» → «Действия» → «Проверить устройство» → «Скопировать отчёт». Желательно сохранить отчёт сразу после сбоя. Старая запись о завершении процесса сама по себе не подтверждает текущую неисправность; не меняйте уже выданные разрешения только из-за неё. Перед публикацией проверьте содержимое.
       render: text
     validations:
       required: false
-
+  - type: textarea
+    id: logs
+    attributes:
+      label: Журнал событий и подробности ошибки
+      description: Перед отправкой откройте «Логи», включите «Записывать события», повторите проблему, выберите «Все» и нажмите значок копирования. Вставьте журнал ниже и укажите время сбоя. Для ошибки действия дополнительно скопируйте технические подробности из его результата. Удалите секретные данные.
+      render: text
+    validations:
+      required: true
   - type: checkboxes
     id: privacy
     attributes:
       label: Проверка перед отправкой
       options:
+        - label: Я включил запись событий, повторил проблему и приложил журнал.
+          required: true
         - label: Я проверил текст и вложения и удалил из них секретные данные.
           required: true

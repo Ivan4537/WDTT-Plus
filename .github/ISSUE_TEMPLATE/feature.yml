@@ -1,46 +1,55 @@
 name: Предложение
 description: Идея, улучшение интерфейса, новая функция или изменение поведения.
-title: "[Предложение]: "
+title: '[Предложение]: '
 labels:
   - enhancement
 body:
   - type: markdown
     attributes:
-      value: |
-        Опишите идею и зачем она нужна. Даже короткие предложения полезны, если понятен сценарий.
+      value: |-
+        Опишите сценарий, который хотите упростить, и ожидаемое поведение. Для существующей ошибки используйте форму «Баг приложения» или «Проблема подключения».
 
+        Обращение будет видно всем. Не публикуйте пароли, SSH- и WireGuard-ключи, токены, ВК-хеши, ссылки ВК Звонков и полные ссылки подключения. Проверьте также скриншоты и диагностические подробности; при необходимости скройте IP-адреса и личные данные.
+  - type: input
+    id: app_version
+    attributes:
+      label: Версия WDTT Plus
+      description: Если предложение связано с существующим экраном, укажите версию приложения.
+      placeholder: 'Например: 18 или 19'
+    validations:
+      required: false
   - type: dropdown
     id: app_area
     attributes:
       label: К какой части относится предложение?
       options:
-        - Туннель и профили
-        - Деплой и собственный сервер
+        - Туннель, UDP/TCP/TLS и DNS
+        - Профили и передача настроек
+        - ВК-хеши и капча
+        - Деплой, клиенты и собственный сервер
+        - Выходной IP и прокси
         - Исключения
         - Логи и диагностика
         - Инфо и обновления
-        - Интерфейс и доступность
+        - Интерфейс, Android TV и доступность
         - Другое
     validations:
       required: true
-
   - type: textarea
     id: idea
     attributes:
       label: Что предлагаете?
-      placeholder: "Опишите идею или изменение."
+      placeholder: Опишите идею или изменение.
     validations:
       required: true
-
   - type: textarea
     id: why
     attributes:
       label: Зачем это нужно?
       description: Какая проблема решится или что станет удобнее?
-      placeholder: "Какой сценарий станет проще?"
+      placeholder: Какой сценарий станет проще?
     validations:
       required: true
-
   - type: textarea
     id: details
     attributes:
@@ -48,7 +57,6 @@ body:
       description: Скриншоты, примеры интерфейса, похожие приложения, ограничения.
     validations:
       required: false
-
   - type: dropdown
     id: priority
     attributes:

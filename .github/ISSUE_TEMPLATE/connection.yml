@@ -1,25 +1,23 @@
 name: Проблема подключения
-description: VPN, сервер, деплой, VKCalls, капча, DNS, WireGuard или пропал интернет.
-title: "[Подключение]: "
+description: VPN или прокси не подключается, нет интернета, обрывы, DNS, ВК-хеши или свой сервер.
+title: '[Подключение]: '
 labels:
   - connection
 body:
   - type: markdown
     attributes:
-      value: |
-        Эта форма для проблем с подключением. Чем больше логов и контекста, тем быстрее получится понять причину.
+      value: |-
+        Эта форма для проблем с VPN, прокси, сетью и собственным сервером. Укажите момент сбоя и приложите доступную диагностику. Не выполняйте сброс настроек или переустановку сервера только ради заполнения формы.
 
-        Issue будет виден всем. Не публикуйте пароли, ключи SSH/WireGuard, токены, VK-хеши и ссылки VK Звонков, полные ссылки подключения или другие секретные данные.
-
+        Обращение будет видно всем. Не публикуйте пароли, SSH- и WireGuard-ключи, токены, ВК-хеши, ссылки ВК Звонков и полные ссылки подключения. Проверьте также скриншоты и диагностические подробности; при необходимости скройте IP-адреса и личные данные.
   - type: input
     id: app_version
     attributes:
       label: Версия WDTT Plus
       description: Посмотреть можно во вкладке «Инфо» → «О проекте».
-      placeholder: "Например: 12"
+      placeholder: 'Например: 18 или 19; для своей сборки — также дата или коммит'
     validations:
       required: true
-
   - type: dropdown
     id: apk_abi
     attributes:
@@ -32,15 +30,27 @@ body:
         - Не знаю
     validations:
       required: true
-
+  - type: dropdown
+    id: install_source
+    attributes:
+      label: Откуда установлено приложение?
+      options:
+        - GitHub Releases
+        - Обновление внутри WDTT Plus
+        - Локальная сборка для проверки
+        - Собрано из исходников
+        - Другой источник
+        - Не знаю
+    validations:
+      required: true
   - type: input
     id: device
     attributes:
-      label: Телефон и Android
-      placeholder: "Например: OnePlus 13, Android 15, OxygenOS"
+      label: Устройство и Android
+      placeholder: 'Например: OnePlus 13, Android 16, OxygenOS 16'
+      description: Модель телефона, планшета или Android TV, версия Android и оболочки.
     validations:
       required: true
-
   - type: dropdown
     id: profile_type
     attributes:
@@ -53,26 +63,57 @@ body:
         - Не знаю
     validations:
       required: true
-
+  - type: dropdown
+    id: work_mode
+    attributes:
+      label: Режим работы приложения
+      description: Смотрите выбранный режим на вкладке «Туннель».
+      options:
+        - VPN
+        - SOCKS5-прокси
+        - HTTP-прокси
+        - Другой режим в моей версии
+        - Не знаю
+    validations:
+      required: true
+  - type: dropdown
+    id: connection_mode
+    attributes:
+      label: Режим подключения
+      description: «Туннель» → параметры соединения → «Подключение». Укажите выбранную настройку; фактический путь может отличаться и виден в журнале.
+      options:
+        - UDP
+        - TCP/TLS
+        - Другое название в моей версии
+        - Не знаю
+    validations:
+      required: true
+  - type: textarea
+    id: connection_settings
+    attributes:
+      label: Дополнительные настройки подключения
+      description: 'Если меняли: MASQUE, внешний SNI, DNS внутри VPN, мощность, быстрые ВК Звонки и авто капча. Не вставляйте конфигурацию целиком; достаточно названий настроек и значений без секретов.'
+    validations:
+      required: false
   - type: checkboxes
     id: area
     attributes:
       label: Где проблема?
       options:
-        - label: VPN не подключается
-        - label: VPN подключился, но нет интернета
-        - label: Проблема после сна телефона
-        - label: Проблема после смены Wi‑Fi/LTE
-        - label: VKCalls
+        - label: VPN или прокси не подключается
+        - label: Подключение есть, но интернет не работает
+        - label: Низкая скорость или обрывы
+        - label: Проблема после выключения экрана или сна
+        - label: Проблема после смены сети
+        - label: ВК-хеши или ВК Звонки
         - label: Капча
-        - label: Деплой сервера
-        - label: Подключение импортированного или полученного профиля
-        - label: Перенос сервера
-        - label: Выходной IP / прокси / WireGuard exit
+        - label: DNS внутри VPN
+        - label: Установка или обновление собственного сервера
+        - label: Клиенты и сервер
+        - label: Перенос собственного сервера
+        - label: Выходной IP и прокси
+        - label: Импорт или получение профиля
         - label: Другое
-    validations:
-      required: true
-
   - type: checkboxes
     id: network
     attributes:
@@ -83,9 +124,25 @@ body:
         - label: Проблема повторяется в разных сетях
         - label: Проверялось только в одной сети
         - label: Не знаю
+  - type: input
+    id: network_context
+    attributes:
+      label: Оператор и регион
+      description: 'Для мобильной сети: оператор и город или регион, время сбоя. Для Wi-Fi достаточно указать тип сети; точный адрес не нужен.'
+    validations:
+      required: false
+  - type: dropdown
+    id: without_vpn
+    attributes:
+      label: Работает ли интернет при выключенном VPN или прокси?
+      description: Укажите уже известный результат. Если интернет не работает вообще, отметьте, открываются ли обычно доступные сайты и приложение оператора.
+      options:
+        - Работает
+        - Не работает вообще
+        - Открываются только некоторые сайты
+        - Не проверялось
     validations:
       required: true
-
   - type: dropdown
     id: frequency
     attributes:
@@ -99,25 +156,22 @@ body:
         - Не знаю
     validations:
       required: true
-
   - type: textarea
     id: problem
     attributes:
       label: Что происходит?
       description: Опишите проблему и когда она началась.
-      placeholder: "Что нажимаете, что пишет приложение, на каком этапе всё ломается?"
+      placeholder: Что нажимаете, что пишет приложение, на каком этапе всё ломается?
     validations:
       required: true
-
   - type: textarea
     id: logs
     attributes:
-      label: Логи WDTT Plus
-      description: Приложите относящийся к сбою фрагмент вкладки «Логи» или скриншот. Перед отправкой удалите секретные данные.
+      label: Журнал событий WDTT Plus
+      description: Перед отправкой откройте «Логи», включите «Записывать события», повторите проблему, выберите «Все» и нажмите значок копирования. Вставьте журнал ниже и укажите время сбоя. Для ошибки действия дополнительно скопируйте технические подробности из его результата. Удалите секретные данные.
       render: text
     validations:
       required: true
-
   - type: textarea
     id: attempted
     attributes:
@@ -125,31 +179,34 @@ body:
       description: Например, остановить и заново включить VPN, сменить сеть, перезапустить приложение или сервер.
     validations:
       required: false
-
   - type: textarea
     id: server
     attributes:
       label: Информация о собственном сервере
       description: Заполните только для своего сервера и укажите то, что можно опубликовать.
-      placeholder: |
-        Новый деплой или старый сервер?
-        ОС сервера, если знаете:
-        Используется ли прокси/WireGuard exit:
-        Менялись ли DNS/порты:
+      placeholder: |-
+        Новая установка или обновление с сохранением данных?
+        ОС и версия своего сервера, если знаете:
+        Какой вариант выбран в «Выходной IP и прокси»:
+        Для внешнего TCP-прокси: SOCKS5 или HTTP, успешна ли отдельная проверка:
+        Менялись ли DNS или порты:
     validations:
       required: false
-
   - type: textarea
     id: server_diagnostics
     attributes:
       label: Диагностика собственного сервера из «Деплой»
-      description: |
-        Для проблем с собственным сервером: «Деплой» → «Установка на сервер» → значок лупы рядом с адресом сервера → «Скопировать отчёт».
-        Отчёт может содержать адрес сервера, SSH-логин, порты и сведения о системе. Удалите всё, что не хотите показывать в публичном issue.
+      description: 'Для своего сервера: «Деплой» → «Установка на сервер» → лупа «Проверить сервер» → «Скопировать отчёт». SSH-доступ нужен только к серверу, которым вы управляете. Для полученного профиля без такого доступа поле можно пропустить. Перед публикацией проверьте адреса, логины, порты и сведения о системе.'
       render: text
     validations:
       required: false
-
+  - type: textarea
+    id: action_details
+    attributes:
+      label: Результат действия и технические подробности
+      description: 'При ошибке «Проверить», «Включить», установки или смены выходного IP: скопируйте понятное сообщение и технические подробности из блока результата. Укажите выбранный вариант и кнопку; успешная отдельная проверка и успешное включение — разные результаты.'
+    validations:
+      required: false
   - type: textarea
     id: screenshots
     attributes:
@@ -157,20 +214,20 @@ body:
       description: Приложите скриншоты вкладок «Туннель», «Логи», «Деплой» или ошибок Android.
     validations:
       required: false
-
   - type: textarea
     id: support_report
     attributes:
       label: Отчёт о проверке устройства
-      description: «Инфо» → «Действия» → «Проверить устройство» → «Скопировать отчёт».
+      description: «Инфо» → «Действия» → «Проверить устройство» → «Скопировать отчёт». Желательно сохранить отчёт сразу после сбоя. Старая запись о завершении процесса сама по себе не подтверждает текущую неисправность; не меняйте уже выданные разрешения только из-за неё. Перед публикацией проверьте содержимое.
       render: text
     validations:
       required: false
-
   - type: checkboxes
     id: privacy
     attributes:
       label: Проверка перед отправкой
       options:
+        - label: Я включил запись событий, повторил проблему и приложил журнал.
+          required: true
         - label: Я проверил текст и вложения и удалил из них секретные данные.
           required: true
