@@ -46,7 +46,8 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
-val appVersionName = "18"
+val appVersionName = "19"
+val appVersionCode = 19
 val releaseApkBaseName = "WDTT-Plus"
 
 val localProperties = Properties()
@@ -81,6 +82,20 @@ val releaseCredentialsComplete =
         .all { !localProperties.getProperty(it).isNullOrBlank() }
 val localReleaseAuditRequired = rootProject.file("release.keystore").exists()
 val localReleaseAudit = rootProject.file("release-audit")
+val localClientModeProperties = Properties()
+val localClientModeFile = rootProject.file(".codex-local/android-build/client-mode.properties")
+if (localClientModeFile.isFile) {
+    localClientModeProperties.load(localClientModeFile.inputStream())
+}
+val localReleaseLike = localClientModeProperties.getProperty("release_like")
+    ?.trim()
+    ?.toBooleanStrictOrNull()
+    ?: false
+val localDiagnostics = localClientModeProperties.getProperty("diagnostics")
+    ?.trim()?.toBooleanStrictOrNull() ?: false
+// High-volume per-path measurements are opt-in even in local diagnostic builds.
+val transportDiagnostics = localDiagnostics && providers.gradleProperty("TRANSPORT_METRICS")
+    .map { it.toBooleanStrict() }.getOrElse(false)
 
 android {
     namespace = "com.wdtt.plus"
@@ -90,9 +105,10 @@ android {
         applicationId = "com.wdtt.plus"
         minSdk = 28
         targetSdk = 35
-        versionCode = 18
+        versionCode = 19
         versionName = appVersionName
-        buildConfigField("String", "MOD_RELEASE_DATE", "\"11.09.2026\"")
+        buildConfigField("String", "MOD_RELEASE_DATE", "\"29.09.2026\"")
+        buildConfigField("boolean", "TRANSPORT_DIAGNOSTICS", transportDiagnostics.toString())
         buildConfigField("String", "WDTT_PLUS_DOMAIN", buildConfigString(wdttPlusDomain))
         manifestPlaceholders["wdttPlusDomain"] = wdttPlusDomain
         manifestPlaceholders["appLabel"] = "WDTT Plus"
@@ -151,9 +167,12 @@ android {
         }
         create("preview") {
             initWith(getByName("release"))
-            versionNameSuffix = "-preview-ui2"
-            manifestPlaceholders["appLabel"] = "WDTT Plus Preview"
-            buildConfigField("boolean", "REMOTE_ACTION_PREVIEW", "true")
+            if (!localReleaseLike) {
+                versionNameSuffix = "-preview-ui2"
+            }
+            manifestPlaceholders["appLabel"] =
+                if (localReleaseLike) "WDTT Plus" else "WDTT Plus Preview"
+            buildConfigField("boolean", "REMOTE_ACTION_PREVIEW", (!localReleaseLike).toString())
             signingConfig = signingConfigs.getByName("release")
         }
     }
@@ -188,6 +207,10 @@ android {
         getByName("main") {
             jniLibs.setSrcDirs(listOf("src/main/jniLibs"))
         }
+        val privateAdapterTests = rootProject.file(".codex-local/android-vk-release-tests")
+        if (privateAdapterTests.isDirectory) {
+            getByName("test") { kotlin.directories.add(privateAdapterTests.absolutePath) }
+        }
     }
 }
 
@@ -218,6 +241,7 @@ tasks.register<Exec>("buildNativeClient") {
     inputs.files(fileTree(goClientDir.asFile) {
         include("**/*.go", "go.mod", "go.sum")
     })
+    inputs.files(fileTree(rootProject.file("pathprobe")) { include("**/*.go", "go.mod") })
     outputs.files(
         listOf("arm64-v8a", "armeabi-v7a", "x86_64").map { abi ->
             jniLibsDir.file("$abi/libclient.so")
@@ -336,15 +360,24 @@ tasks.matching {
     dependsOn("buildNativeClient")
 }
 
+val verifyVersionSynchronization = tasks.register<Exec>("verifyVersionSynchronization") {
+    group = "verification"
+    description = "Fails when Android, wdtt-server, installers, or the release changelog use different versions."
+    workingDir(rootProject.layout.projectDirectory.asFile)
+    commandLine("bash", rootProject.file("server-installer/tests/version_sync_test.sh").absolutePath)
+}
+
 tasks.register<Exec>("buildServerAsset") {
     group = "build"
     description = "Builds the Linux wdtt-server binary embedded into Android deploy assets."
+    dependsOn(verifyVersionSynchronization)
     workingDir(rootProject.layout.projectDirectory.asFile)
 
     inputs.files(fileTree(rootProject.layout.projectDirectory.asFile) {
         include("*.go", "go.mod", "go.sum")
         exclude("build/**", "app/**", "go_client/**")
     })
+    inputs.files(fileTree(rootProject.file("pathprobe")) { include("**/*.go", "go.mod") })
     outputs.file(serverAssetFile)
 
     commandLine(
@@ -473,6 +506,9 @@ tasks.configureEach {
 }
 
 dependencies {
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("androidx.webkit:webkit:1.13.0")
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
     implementation("androidx.core:core-ktx:1.15.0")
     implementation(platform("androidx.compose:compose-bom:2024.12.01"))
     implementation("androidx.compose.ui:ui")

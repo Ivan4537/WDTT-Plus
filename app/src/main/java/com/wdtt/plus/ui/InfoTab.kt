@@ -105,7 +105,6 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.wdtt.plus.BuildConfig
@@ -261,6 +260,7 @@ fun InfoTab(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val settingsStore = remember { SettingsStore(context) }
+    val questionProfileSnapshot by settingsStore.activeTunnelProfileContentUiSnapshot.collectAsStateWithLifecycle()
     val infoScrollState = rememberRememberedScrollState(scrollPosition)
     val topRevealOffsetPx = with(LocalDensity.current) { 10.dp.toPx() }
     var actionsSectionY by remember { mutableStateOf(0f) }
@@ -281,6 +281,9 @@ fun InfoTab(
     var actionCatalog by remember { mutableStateOf(RemoteActionCatalogGateway.cached()) }
     var questionAction by remember { mutableStateOf<RemoteUiAction?>(null) }
     var questionActionLoading by remember { mutableStateOf(false) }
+    var questionActionProfile by remember { mutableStateOf<Int?>(null) }
+    var questionActionRetry by remember { mutableIntStateOf(0) }
+    var questionActionGeneration by remember { mutableIntStateOf(0) }
     var isCheckingDevice by remember { mutableStateOf(false) }
     var deviceCheckReport by remember { mutableStateOf<com.wdtt.plus.DeviceCompatibilityReport?>(null) }
 	var actionsExpanded by actionsExpandedState
@@ -334,10 +337,22 @@ fun InfoTab(
             actionCatalog = RemoteActionCatalogGateway.fetch(force = true)
         }
     }
-    LaunchedEffect(Unit) {
-        questionActionLoading = true
-        questionAction = RemoteActionCatalogGateway.fetchQuestionAction()
+    LaunchedEffect(questionProfileSnapshot?.profileIndex, questionProfileSnapshot?.remoteManaged, questionActionRetry) {
+        val generation = ++questionActionGeneration
+        questionAction = null
+        questionActionProfile = null
         questionActionLoading = false
+        val profile = questionProfileSnapshot?.takeIf { it.remoteManaged } ?: return@LaunchedEffect
+        questionActionLoading = true
+        try {
+            val action = RemoteActionCatalogGateway.fetchQuestionAction()
+            if (generation == questionActionGeneration) {
+                questionActionProfile = profile.profileIndex
+                questionAction = action
+            }
+        } finally {
+            if (generation == questionActionGeneration) questionActionLoading = false
+        }
     }
 
     fun requestDownloadedUpdateInstall(apkFile: File) {
@@ -512,7 +527,10 @@ fun InfoTab(
                     it.title == DeviceCompatibility.APP_VERSION_ITEM_TITLE ||
                         it.title == "Сеть Android"
                 } + listOfNotNull(
-                    tunnelProfile?.let { DeviceCompatibility.rtNetworkModeItem(context, it) },
+                    tunnelProfile?.let {
+                        com.wdtt.plus.connectionModeDiagnostic(it.rtNetwork)
+                    },
+                    tunnelProfile?.let { DeviceCompatibility.masqueModeItem(context, it) },
                     sleepBatteryModeItem(
                         enabled = sleepEnabled,
                         screenOffMode = screenOffMode,
@@ -585,6 +603,8 @@ fun InfoTab(
             }
 		)
 
+        com.wdtt.plus.LocalBuildExtensions.Content()
+
         ExpandableSectionCard(
             title = "Действия",
             itemCount = "4 пункта",
@@ -614,12 +634,8 @@ fun InfoTab(
                 subtitle = "Выбрать подходящий способ обращения",
                 onClick = {
                     showQuestionDialog = true
-                    if (questionAction == null && !questionActionLoading) {
-                        scope.launch {
-                            questionActionLoading = true
-                            questionAction = RemoteActionCatalogGateway.fetchQuestionAction()
-                            questionActionLoading = false
-                        }
+                    if (questionProfileSnapshot?.remoteManaged == true && questionAction == null && !questionActionLoading) {
+                        questionActionRetry++
                     }
                 },
                 icon = {
@@ -635,7 +651,7 @@ fun InfoTab(
             WideActionTile(
                 title = "Проверить устройство",
                 subtitle = if (isCheckingDevice) {
-                    "Проверяем Android, ABI, 16 КиБ, WireGuard, режим РТ и сеть..."
+                    "Проверяем Android, ABI, 16 КиБ, WireGuard, подключение и сеть..."
                 } else {
                     "Проверка совместимости и полный отчёт для диагностики"
                 },
@@ -669,7 +685,7 @@ fun InfoTab(
 
             WideActionTile(
                 title = "Справка",
-                subtitle = "Коротко про режимы, цепочки, исключения и запуск",
+                subtitle = "Коротко о подключении, настройках и проверках",
                 onClick = { showHelpDialog = true },
                 icon = {
                     Icon(
@@ -910,8 +926,10 @@ fun InfoTab(
 	if (showHelpDialog) ImportantInfoDialog(onDismiss = { showHelpDialog = false })
     if (showQuestionDialog) {
         QuestionDestinationDialog(
-            remoteAction = questionAction,
-            remoteActionLoading = questionActionLoading,
+            remoteAction = questionAction.takeIf {
+                questionProfileSnapshot?.remoteManaged == true && questionActionProfile == questionProfileSnapshot?.profileIndex
+            },
+            remoteActionLoading = questionActionLoading && questionProfileSnapshot?.remoteManaged == true,
             onDismiss = { showQuestionDialog = false },
             onGitHubClick = {
                 showQuestionDialog = false
@@ -1023,7 +1041,7 @@ private fun QuestionDestinationDialog(
     onRemoteActionClick: (RemoteUiAction) -> Unit,
 ) {
     val television = isTelevisionDevice()
-    Dialog(
+    BoundedAppDialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false),
     ) {
@@ -1043,7 +1061,8 @@ private fun QuestionDestinationDialog(
                 }).heightIn(max = 560.dp),
             ) {
                 Column(
-                    modifier = Modifier.fillMaxWidth().padding(20.dp),
+                    modifier = Modifier.fillMaxWidth().padding(20.dp)
+                        .verticalScroll(rememberScrollState()),
                     verticalArrangement = Arrangement.spacedBy(16.dp),
                 ) {
                     Row(
@@ -1160,7 +1179,7 @@ private fun AdditionalActionsDialog(
 	val supportScope = rememberCoroutineScope()
 	val topRevealOffsetPx = with(LocalDensity.current) { 10.dp.toPx() }
 	var originalAuthorSectionY by remember { mutableStateOf(0f) }
-	Dialog(
+	BoundedAppDialog(
 		onDismissRequest = onDismiss,
 		properties = DialogProperties(usePlatformDefaultWidth = false)
 	) {
@@ -1396,7 +1415,7 @@ private fun RemoteActionFormDialog(
         fallbackAvailable = false
     }
 
-    Dialog(
+    BoundedAppDialog(
         onDismissRequest = { if (!busy) onDismiss() },
         properties = DialogProperties(usePlatformDefaultWidth = false),
     ) {
@@ -1827,7 +1846,7 @@ private fun InfoHeroCard(
                         color = colors.onSurface
                     )
 				Text(
-					text = "Android-клиент для TURN/VK туннеля с WireGuard, капчей, управлением сервером и удобными сценариями подключения.",
+					text = "Android-клиент для TURN/ВК-туннеля с WireGuard, капчей, управлением сервером и удобными сценариями подключения.",
 					style = MaterialTheme.typography.bodyMedium,
 					color = colors.onSurfaceVariant,
 					lineHeight = 21.sp
@@ -2337,6 +2356,9 @@ private suspend fun buildSupportReportSummary(
             trustedWifiWaiting = trustedWifiWaiting,
         )
     }
+    val diagnosticConnectionProfile = diagnosticProfileIndex?.let {
+        runCatching { settingsStore.tunnelProfileSnapshot(it) }.getOrNull()
+    }
     val activeProfile = diagnosticProfileIndex?.plus(1)
     val routingSettings = diagnosticProfileIndex?.let { profile ->
         runCatching { settingsStore.vpnRoutingSettingsForProfile(profile) }.getOrNull()
@@ -2353,10 +2375,9 @@ private suspend fun buildSupportReportSummary(
         .count { it.isNotBlank() }
         .coerceAtMost(4)
     val vkCallsEnabled = runCatching { settingsStore.vkCallsPreflight.first() }.getOrNull()
-    val rtNetworkEnabled = runCatching { settingsStore.rtNetwork.first() }.getOrNull()
-    val rtMasqueEnabled = runCatching { settingsStore.rtMasque.first() }.getOrNull()
-    val rtMasqueServerBootstrap =
-        runCatching { settingsStore.rtMasqueServerBootstrap.first() }.getOrNull()
+    val rtNetworkEnabled = diagnosticConnectionProfile?.rtNetwork
+    val rtMasqueEnabled = diagnosticConnectionProfile?.rtMasque
+    val rtMasqueServerBootstrap = diagnosticConnectionProfile?.rtMasqueServerBootstrap
     val rtMasqueEnrollment = runCatching {
         val config = File(context.filesDir, RT_MASQUE_CONFIG_FILE_NAME)
         when (inspectRtMasqueEnrollment(config)) {
@@ -2494,18 +2515,24 @@ private suspend fun buildSupportReportSummary(
         }
         appendLine("Потоки: ${workers ?: "недоступно"}")
         appendLine(
-            "VK-хеши: заполнено $hashCount, " +
+            "ВК-хеши: заполнено $hashCount, " +
                 "автоматический резерв между хешами=${if (hashCount > 1) "включён" else "недоступен"}"
         )
-        appendLine("Быстрый VKCalls: ${vkCallsEnabled ?: "недоступно"}")
-        appendLine("Сеть РТ (TURN stream-first): ${rtNetworkEnabled ?: "недоступно"}")
+        appendLine("Быстрые ВК Звонки: ${vkCallsEnabled ?: "недоступно"}")
+        appendLine("Подключение: " + if (rtNetworkEnabled != null) {
+            com.wdtt.plus.connectionModeTitle(rtNetworkEnabled)
+        } else "недоступно")
+        appendLine("Внешний UDP запрещён: ${rtNetworkEnabled ?: "недоступно"}")
+        if (TunnelManager.running.value && TunnelManager.activeTunnelProfile.value == diagnosticProfileIndex) {
+            appendLine("Последний подтверждённый путь: ${TunnelManager.connectionPath.value.ifBlank { "ещё не выбран" }}")
+        }
         appendLine(
-            "MASQUE в Сети РТ (HTTP/2 → HTTP/3): ${rtMasqueEnabled ?: "недоступно"}, " +
+            "MASQUE (настройка профиля): ${rtMasqueEnabled ?: "недоступно"}, " +
                 "регистрация WARP=$rtMasqueEnrollment, " +
-                "первая регистрация через сервер=${rtMasqueServerBootstrap ?: "недоступно"}"
+                "регистрация по SSH=${rtMasqueServerBootstrap ?: "недоступно"}"
         )
         appendLine(
-            "Резерв VK: собственные=${customVkCredentialsEnabled ?: "недоступно"}, " +
+            "Резерв ВК: собственные=${customVkCredentialsEnabled ?: "недоступно"}, " +
                 "заполнены=${customVkCredentialsComplete ?: "недоступно"}, встроенных=${builtInVkClientCount ?: "недоступно"}"
         )
         appendLine("Captcha mode (legacy): ${captchaMode ?: "недоступно"}")

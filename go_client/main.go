@@ -142,6 +142,8 @@ func classifyHashCheckError(err error) (string, string) {
 	}
 	text := strings.ToLower(err.Error())
 	switch {
+	case strings.Contains(text, "error_code:9005") || strings.Contains(text, "call requires auth"):
+		return "auth_required", "Звонок требует входа в ВК и не подходит для подключения"
 	case strings.Contains(text, "captcha_required") || strings.Contains(text, "captcha_wait_required"):
 		return "captcha", "VK просит капчу"
 	case strings.Contains(text, "invalid_join_link") ||
@@ -267,21 +269,7 @@ func main() {
 	// Сигналы
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
-	go func() {
-		select {
-		case s := <-sig:
-			log.Printf("[КЛИЕНТ] Сигнал %v, завершаю...", s)
-			cancel()
-		case <-ctx.Done():
-			return
-		}
-		select {
-		case s := <-sig:
-			log.Printf("[КЛИЕНТ] Повторный %v, принудительный выход", s)
-			os.Exit(1)
-		case <-ctx.Done():
-		}
-	}()
+	go runNativeShutdownGuard(ctx, cancel, sig, os.Exit, 1250*time.Millisecond)
 
 	var pauseFlag int32
 	var activeDispatcher atomic.Pointer[Dispatcher]
@@ -289,6 +277,8 @@ func main() {
 	deviceSleeping := false
 	startupConfigCh := make(chan nativeStartupConfigResult, 1)
 
+	var connectionController atomic.Pointer[connectionPolicy]
+	connectionController.Store(newConnectionPolicy("", false))
 	// STDIN для конфигурации запуска, PAUSE/RESUME/STOP и CAPTCHA_RESULT.
 	// Секреты запуска не передаются через argv/environment, где их может
 	// прочитать системная диагностика Android.
@@ -297,7 +287,11 @@ func main() {
 		scanner.Buffer(make([]byte, 4096), 48*1024)
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
+			if controller := connectionController.Load(); controller != nil {
+				controller.command(line)
+			}
 			switch {
+			case line == "CONNECTION_NETWORK" || line == "CONNECTION_OFFLINE" || line == "CONNECTION_ONLINE":
 			case strings.HasPrefix(line, startupConfigPrefix):
 				secrets, err := decodeNativeStartupSecrets(strings.TrimPrefix(line, startupConfigPrefix))
 				select {
@@ -428,16 +422,19 @@ func main() {
 		"использовать остальные VK-хеши как резерв групп",
 	)
 
+	experiment := flag.String("transport-experiment", experimentAuto, "transport compatibility: auto|standard|uplink")
+	metrics := flag.Bool("transport-metrics", false, "обезличенные метрики очередей и порядка пакетов")
 	deviceID := flag.String("device-id", "unknown", "уникальный ID устройства")
 	deviceInfo := flag.String("device-info", "", "JSON с безопасной информацией об устройстве")
 	transportSessionFlag := flag.String("transport-session", "", "поколение текущего запуска транспорта")
 	connPassword := flag.String("password", "", "пароль подключения")
 	captchaMode := flag.String("captcha-mode", "auto", "режим обхода капчи (auto/wv/rjs)")
 	vkCallsPreflight := flag.Bool("vkcalls-preflight", true, "пробовать VKCalls до captcha-цепочки")
+	connectionUDPBackoff := flag.Int("connection-udp-backoff", 0, "пауза после недавнего отказа UDP, секунды")
 	turnStreamFirst := flag.Bool(
 		"turn-stream-first",
 		false,
-		"сначала пробовать TURN/TLS и TURN/TCP, сохраняя UDP как резерв",
+		"использовать только TURN/TLS, TURN/TCP и MASQUE HTTP/2",
 	)
 	turnSNI := flag.String(
 		"turn-sni",
@@ -447,7 +444,7 @@ func main() {
 	rtMasque := flag.Bool(
 		"rt-masque",
 		false,
-		"после прямых путей Сети РТ пробовать WARP CONNECT-IP по HTTP/2 и HTTP/3",
+		"резерв WARP CONNECT-IP по разрешённым протоколам HTTP/2 и HTTP/3",
 	)
 	rtMasqueConfig := flag.String(
 		"rt-masque-config",
@@ -483,6 +480,7 @@ func main() {
 	proxyAllowedCIDR := flag.String("proxy-allow-cidr", "", "разрешённая подсеть клиента для LAN-прокси")
 
 	flag.Parse()
+	transportMetricsEnabled = *metrics
 	var startupSecrets nativeStartupSecrets
 	if *startupConfigStdin {
 		select {
@@ -530,21 +528,17 @@ func main() {
 	}
 	activeCaptchaMode := setCaptchaMode(*captchaMode)
 	setVKCallsPreflight(*vkCallsPreflight)
-	var normalizedTurnSNI string
-	if *turnStreamFirst {
-		var turnSNIErr error
-		normalizedTurnSNI, turnSNIErr = normalizeTURNFrontSNI(*turnSNI)
-		if turnSNIErr != nil {
-			log.Fatalf("[КЛИЕНТ] Некорректный TURN SNI: %v", turnSNIErr)
-		}
-		if normalizedTurnSNI != "" {
-			log.Printf("[TURN] Режим «Сеть РТ»: TURN/TLS, затем TCP ко всем адресам VK с разделением первого STUN-запроса; UDP остаётся резервом; внешний TLS SNI=%s", normalizedTurnSNI)
-		} else {
-			log.Printf("[TURN] Режим «Сеть РТ»: TURN/TLS, затем TCP ко всем адресам VK с разделением первого STUN-запроса; UDP остаётся резервом")
-		}
+	normalizedTurnSNI, turnSNIErr := normalizeTURNFrontSNI(*turnSNI)
+	if turnSNIErr != nil {
+		log.Fatalf("[КЛИЕНТ] Некорректный TURN SNI: %v", turnSNIErr)
 	}
-	if *rtMasque && !*turnStreamFirst {
-		log.Printf("[MASQUE] Проигнорирован: механизм доступен только вместе с режимом «Сеть РТ»")
+	mode := "UDP: сначала UDP, при недоступности — TCP/TLS"
+	if *turnStreamFirst {
+		mode = "TCP/TLS: внешний UDP и HTTP/3 запрещены"
+	}
+	log.Printf("[ПОДКЛЮЧЕНИЕ] %s", mode)
+	if normalizedTurnSNI != "" {
+		log.Printf("[TURN] Внешний TLS SNI=%s", normalizedTurnSNI)
 	}
 
 	if *vkHash == "" {
@@ -618,26 +612,35 @@ func main() {
 		*numW = workersPerGroup
 	}
 	*numW = (*numW / workersPerGroup) * workersPerGroup
-	useConfigFirstStart := *configFirstStart
+	useConfigFirstStart := true // Both connection modes verify the server before adding workers.
+	_ = configFirstStart        // Retained CLI option for callers using the existing startup contract.
 	useHashFallback := *hashFallback
 
 	var masqueManager *warpMasqueManager
-	if *turnStreamFirst && *rtMasque {
+	if *rtMasque {
 		if err := configureWarpAPIRelay(*warpAPIRelay); err != nil {
 			log.Printf("[MASQUE] Локальный выход для регистрации WARP отклонён: %v; продолжаем прямые попытки", err)
 		}
 		masqueManager, err = newWarpMasqueManager(ctx, *rtMasqueConfig, normalizedTurnSNI, *rtMasqueAcceptTOS)
 		if err != nil {
-			log.Printf("[MASQUE] Не удалось включить новый механизм: %v; прямые пути «Сети РТ» остаются доступны", err)
+			log.Printf("[MASQUE] Не удалось подготовить резерв: %v; подключение без MASQUE остаётся доступно", err)
 			masqueManager = nil
 		} else {
 			defer masqueManager.Close()
-			log.Printf("[MASQUE] Включён резерв после прямых путей: HTTP/2 (TCP/443), затем HTTP/3 (QUIC/443)")
-			go masqueManager.prewarmConfig()
+			masqueManager.singleEnrollment = true
+			if *turnStreamFirst {
+				log.Print("[MASQUE] Включён резерв: только HTTP/2 (TCP/443); HTTP/3 запрещён режимом TCP/TLS")
+			} else {
+				log.Print("[MASQUE] Включён резерв: доступны HTTP/2 (TCP/443) и HTTP/3 (QUIC/443)")
+			}
 		}
 	}
 
+	if err := validateTransportExperiment(*experiment); err != nil {
+		log.Fatal(err)
+	}
 	tp := &TurnParams{
+		Experiment:  *experiment,
 		Host:        *host,
 		Port:        *port,
 		Hashes:      hashes,
@@ -646,10 +649,25 @@ func main() {
 		WrapKey:     wrapKey,
 	}
 
+	tp.NoUDP = *turnStreamFirst
+	{
+		tp.Auto = connectionController.Load()
+		tp.Auto.configure("", *turnStreamFirst)
+		tp.Auto.deferUDP(time.Duration(max(0, min(300, *connectionUDPBackoff))) * time.Second)
+		transportLifecycleMu.Lock()
+		if deviceSleeping {
+			tp.Auto.command("DEVICE_SLEEP")
+		}
+		if atomic.LoadInt32(&pauseFlag) != 0 {
+			tp.Auto.command("PAUSE")
+		}
+		connectionController.Store(tp.Auto)
+		transportLifecycleMu.Unlock()
+	}
 	// Слушаем локально с ожиданием (если старый процесс еще не убит Parent Watcher'ом)
 	var localConn net.PacketConn
 	actualListenAddr := *listen
-	for i := 0; i < 5; i++ {
+	for i := 0; localConn == nil && i < 5; i++ {
 		localConn, err = net.ListenPacket("udp", actualListenAddr)
 		if err == nil {
 			break
@@ -714,7 +732,7 @@ func main() {
 	}()
 	go stats.RunLoop(shutdownCh)
 
-	disp := NewDispatcher(ctx, localConn, stats)
+	disp := NewDispatcher(ctx, localConn, stats, *experiment)
 	disp.setUnansweredUserTrafficHealthEnabled(normalizedClientMode == "vpn")
 	transportLifecycleMu.Lock()
 	activeDispatcher.Store(disp)
@@ -787,7 +805,12 @@ func main() {
 					},
 				)
 				if err != nil && ctx.Err() == nil {
-					log.Printf("PROXY_ERROR|%v", err)
+					if address, portInUse := proxyPortInUseAddress(err); portInUse {
+						log.Printf("[ПРОКСИ] Порт занят: %s", address)
+						log.Printf("PROXY_ERROR|port_in_use|%s", address)
+					} else {
+						log.Printf("PROXY_ERROR|startup|%v", err)
+					}
 					cancel()
 				}
 				return

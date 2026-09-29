@@ -2,7 +2,7 @@ package main
 
 // The Cloudflare WARP MASQUE interoperability in this file is adapted from
 // Diniboy1123/usque (MIT, commit 6aa03fc97d12848dce34eedbd187fb1077b5d1ea).
-// It is intentionally isolated behind the explicit Android «Сеть РТ» +
+// It is intentionally isolated behind the explicit Android «Авто»/«TCP/TLS» +
 // «MASQUE» opt-in. The ordinary WDTT transport never constructs this manager.
 
 import (
@@ -70,7 +70,7 @@ var (
 // warpAPIFragmentConn divides only the first TLS ClientHello write. It leaves
 // DNS, addresses, certificate validation and all later HTTPS bytes untouched.
 // The wrapper is used only after a normal WARP API TLS handshake times out and
-// only while the explicit Android «Сеть РТ» + «MASQUE» mode is enrolling.
+// only while the explicit Android «Авто»/«TCP/TLS» + «MASQUE» mode is enrolling.
 type warpAPIFragmentConn struct {
 	net.Conn
 	mu         sync.Mutex
@@ -1224,10 +1224,12 @@ func (transport *warpMasqueTransport) DialContext(ctx context.Context, target st
 }
 
 type warpMasqueManager struct {
-	ctx       context.Context
-	path      string
-	sni       string
-	acceptTOS bool
+	singleEnrollment    bool
+	enrollmentAttempted bool
+	ctx                 context.Context
+	path                string
+	sni                 string
+	acceptTOS           bool
 
 	mu         sync.Mutex
 	config     *warpMasqueConfig
@@ -1284,6 +1286,10 @@ func (manager *warpMasqueManager) ensureConfigLocked() (*warpMasqueConfig, error
 	if !manager.acceptTOS {
 		return nil, errors.New("для первой регистрации WARP требуется согласие с условиями Cloudflare")
 	}
+	if manager.singleEnrollment && manager.enrollmentAttempted {
+		return nil, errors.New("регистрация WARP уже запрашивалась; повтор только после нового подключения")
+	}
+	manager.enrollmentAttempted = true
 	logMasque("регистрация начата: этап 1/4 — создаём отдельное устройство WARP в Cloudflare")
 	enrollCtx, cancel := context.WithTimeout(manager.ctx, 40*time.Second)
 	defer cancel()

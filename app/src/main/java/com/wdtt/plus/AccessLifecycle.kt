@@ -88,6 +88,13 @@ data class AccessProfileUpdate(
     val link: RemoteDocumentLink,
 )
 
+/** Ephemeral presentation for one exact remote binding; never persisted as a launch target. */
+data class RemoteProfileAction(
+    val binding: String,
+    val expiresAtSeconds: Long,
+    val action: RemoteUiAction,
+)
+
 data class AccessLifecycleStatus(
     val allowConnect: Boolean,
     val actionAvailable: Boolean,
@@ -108,6 +115,7 @@ data class AccessLifecycleStatus(
     val profileUpdate: AccessProfileUpdate? = null,
     val cachedAction: CachedRemoteAction = CachedRemoteAction.Unavailable,
     val exchange: RemoteProfileExchange? = null,
+    val profileAction: RemoteProfileAction? = null,
 )
 
 data class StoredAccessLifecycle(

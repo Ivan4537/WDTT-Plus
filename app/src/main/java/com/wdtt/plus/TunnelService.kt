@@ -649,6 +649,7 @@ class TunnelService : Service() {
                     connectionPassword = intent.getStringExtra("connection_password") ?: "",
                     protocol = intent.getStringExtra("protocol") ?: "udp",
                     vkCallsPreflight = intent.getBooleanExtra("vkcalls_preflight", true),
+                    transportExperiment = effectiveTransportExperiment(intent.getStringExtra("transport_experiment"), requestedMode),
                     rtNetwork = intent.getBooleanExtra("rt_network", false),
                     rtMasque = intent.getBooleanExtra("rt_masque", false),
                     rtMasqueServerBootstrap =
@@ -3273,7 +3274,6 @@ class TunnelService : Service() {
                             TunnelManager.transition.value == TunnelTransition.STARTING &&
                                 lastStartParams?.let { params ->
                                     shouldUseRtMasqueServerBootstrap(
-                                        rtNetwork = params.rtNetwork,
                                         rtMasque = params.rtMasque,
                                         serverBootstrap = params.rtMasqueServerBootstrap,
                                     )

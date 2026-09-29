@@ -51,20 +51,20 @@ internal fun sshProfileAccessStatus(
     if (host.isBlank()) {
         return SshProfileAccessStatus(
             available = false,
-            unavailableReason = "укажите адрес сервера в разделе «Деплой»",
+            unavailableReason = "укажите адрес сервера в «Деплой → SSH»",
         )
     }
     if (authMode == "key") {
         if (privateKey.isBlank()) {
             return SshProfileAccessStatus(
                 available = false,
-                unavailableReason = "добавьте приватный SSH-ключ в разделе «Деплой»",
+                unavailableReason = "добавьте приватный SSH-ключ в «Деплой → SSH»",
             )
         }
         sshPrivateKeyIssue(privateKey)?.let {
             return SshProfileAccessStatus(
                 available = false,
-                unavailableReason = "исправьте приватный SSH-ключ в разделе «Деплой»: ${it.removeSuffix(".")}",
+                unavailableReason = "исправьте приватный SSH-ключ в «Деплой → SSH»: ${it.removeSuffix(".")}",
             )
         }
         return SshProfileAccessStatus(available = true)
@@ -72,7 +72,7 @@ internal fun sshProfileAccessStatus(
     if (password.isBlank()) {
         return SshProfileAccessStatus(
             available = false,
-            unavailableReason = "укажите SSH-пароль в разделе «Деплой»",
+            unavailableReason = "укажите SSH-пароль в «Деплой → SSH»",
         )
     }
     return SshProfileAccessStatus(available = true)

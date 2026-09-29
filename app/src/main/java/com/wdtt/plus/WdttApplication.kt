@@ -23,6 +23,7 @@ class WdttApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        if (LocalBuildExtensions.initializeAuxiliaryProcess(this)) return
         DeployManager.init(this)
 
         val settingsStore = SettingsStore(this)

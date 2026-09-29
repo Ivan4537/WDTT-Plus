@@ -1,46 +1,34 @@
 package com.wdtt.plus.ui
 
-import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.HelpOutline
-import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.Cloud
-import androidx.compose.material3.HorizontalDivider
-import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Switch
-import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
+import androidx.compose.material.icons.filled.ChevronRight
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.SettingsEthernet
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.window.Dialog
-import androidx.compose.ui.window.DialogProperties
 import com.wdtt.plus.DEFAULT_RT_TURN_SNI
 import com.wdtt.plus.SshProfileAccessStatus
 
 @Composable
 internal fun RtNetworkSettingsDialog(
     rtNetwork: Boolean,
+    connectionPath: String,
+    onConnectionModeChange: (Boolean) -> Unit,
     turnSni: String,
     turnSniValid: Boolean,
     rtMasque: Boolean,
@@ -55,247 +43,42 @@ internal fun RtNetworkSettingsDialog(
     onShowServerHelp: () -> Unit,
     onDismiss: () -> Unit,
 ) {
-    val configuration = LocalConfiguration.current
-    val dialogMaxHeight = (configuration.screenHeightDp.dp - 32.dp).coerceAtLeast(360.dp)
-    val dialogMinHeight = 520.dp.coerceAtMost(dialogMaxHeight)
-    val controlsEnabled = rtNetwork && !tunnelRunning
-    val serverSupportingText = when {
-        !rtNetwork -> "Сначала включите «Сеть РТ»"
-        !rtMasque -> "Сначала включите MASQUE"
-        !serverAccess.available -> "Недоступно: ${serverAccess.unavailableReason}"
-        tunnelRunning -> "Остановите соединение, чтобы изменить настройку"
-        else -> "Только первая регистрация WARP · SSH из «Деплой»"
-    }
-    val serverTextIsError = rtNetwork && rtMasque && !serverAccess.available
-
-    Dialog(
-        onDismissRequest = onDismiss,
-        properties = DialogProperties(usePlatformDefaultWidth = false),
-    ) {
-        Box(
-            modifier = Modifier.fillMaxSize(),
-            contentAlignment = Alignment.Center,
-        ) {
-            Surface(
-                modifier = Modifier
-                    .fillMaxWidth(0.92f)
-                    .heightIn(min = dialogMinHeight, max = dialogMaxHeight),
-                shape = RoundedCornerShape(30.dp),
-                color = MaterialTheme.colorScheme.surface,
-                tonalElevation = 8.dp,
-                shadowElevation = 8.dp,
-            ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .verticalScroll(rememberScrollState())
-                        .padding(18.dp),
-                    verticalArrangement = Arrangement.spacedBy(14.dp),
+    val controlsEnabled = !tunnelRunning
+    var advancedExpanded by rememberSaveable { mutableStateOf(false) }
+    SettingsDialogLayout(title = "Подключение", onDismiss = onDismiss, onHelp = onShowRtHelp, animateSize = true) {
+        if (tunnelRunning) {
+            Text(
+                "Остановите соединение, чтобы изменить режим.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Column(Modifier.selectableGroup(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            listOf("UDP" to false, "TCP/TLS" to true).forEach { (title, mode) ->
+                val selected = rtNetwork == mode
+                val shape = RoundedCornerShape(16.dp)
+                Surface(
+                    shape = shape,
+                    color = if (selected) MaterialTheme.colorScheme.secondaryContainer
+                        else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f),
                 ) {
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier.fillMaxWidth()
+                            .remoteFocusOutline(shape, enabled = controlsEnabled)
+                            .selectable(
+                                selected = selected,
+                                enabled = controlsEnabled,
+                                role = Role.RadioButton,
+                                onClick = { onConnectionModeChange(mode) },
+                            ).padding(horizontal = 12.dp, vertical = 10.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(12.dp),
                     ) {
-                        Surface(
-                            shape = RoundedCornerShape(16.dp),
-                            color = MaterialTheme.colorScheme.primaryContainer,
-                        ) {
-                            Box(
-                                modifier = Modifier.size(48.dp),
-                                contentAlignment = Alignment.Center,
-                            ) {
-                                Icon(
-                                    Icons.Default.Cloud,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(25.dp),
-                                )
-                            }
-                        }
-                        Text(
-                            "Сеть РТ",
-                            modifier = Modifier.weight(1f),
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.Bold,
-                        )
-                        IconButton(
-                            onClick = onShowRtHelp,
-                            modifier = Modifier.remoteHelpFocus(),
-                        ) {
-                            Icon(
-                                Icons.AutoMirrored.Filled.HelpOutline,
-                                contentDescription = "Инструкция по режиму Сеть РТ",
-                            )
-                        }
-                        IconButton(
-                            onClick = onDismiss,
-                            modifier = Modifier.remoteIconButtonFocus(),
-                        ) {
-                            Icon(Icons.Default.Close, contentDescription = "Закрыть")
-                        }
-                    }
-
-                    if (!rtNetwork || tunnelRunning) {
-                        Surface(
-                            modifier = Modifier.fillMaxWidth(),
-                            shape = RoundedCornerShape(16.dp),
-                            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
-                            border = BorderStroke(
-                                1.dp,
-                                MaterialTheme.colorScheme.outline.copy(alpha = 0.2f),
-                            ),
-                        ) {
+                        RadioButton(selected = selected, enabled = controlsEnabled, onClick = null)
+                        Column(Modifier.weight(1f)) {
+                            Text(title, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
                             Text(
-                                if (!rtNetwork) {
-                                    "Включите «Сеть РТ» в основном окне, чтобы изменить эти параметры."
-                                } else {
-                                    "Остановите соединение, чтобы изменить параметры режима."
-                                },
-                                modifier = Modifier.padding(14.dp),
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
-                    }
-
-                    Column(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalArrangement = Arrangement.spacedBy(4.dp),
-                    ) {
-                        OutlinedTextField(
-                            value = turnSni,
-                            onValueChange = onTurnSniChange,
-                            label = { Text("SNI белого списка") },
-                            placeholder = { Text(DEFAULT_RT_TURN_SNI) },
-                            isError = !turnSniValid,
-                            enabled = controlsEnabled,
-                            singleLine = true,
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
-                            modifier = Modifier.fillMaxWidth(),
-                            shape = RoundedCornerShape(16.dp),
-                        )
-                        Text(
-                            text = if (turnSniValid) {
-                                "Только для TURN/TLS и MASQUE; в TURN/TCP и UDP SNI нет"
-                            } else {
-                                "Укажите домен латиницей, например $DEFAULT_RT_TURN_SNI"
-                            },
-                            modifier = Modifier.fillMaxWidth(),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = if (turnSniValid) {
-                                MaterialTheme.colorScheme.onSurfaceVariant
-                            } else {
-                                MaterialTheme.colorScheme.error
-                            },
-                        )
-                    }
-
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text("MASQUE", fontWeight = FontWeight.SemiBold)
-                                IconButton(
-                                    onClick = onShowMasqueHelp,
-                                    modifier = Modifier.size(32.dp).remoteHelpFocus(),
-                                ) {
-                                    Icon(
-                                        Icons.AutoMirrored.Filled.HelpOutline,
-                                        contentDescription = "Инструкция по MASQUE",
-                                        modifier = Modifier.size(19.dp),
-                                    )
-                                }
-                            }
-                            Text(
-                                "Резерв после TURN/TLS и TCP: HTTP/2, затем HTTP/3",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
-                        Switch(
-                            checked = rtMasque,
-                            enabled = controlsEnabled,
-                            onCheckedChange = onRtMasqueChange,
-                            modifier = Modifier.remoteSwitchFocus(enabled = controlsEnabled),
-                        )
-                    }
-
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text("Через сервер", fontWeight = FontWeight.SemiBold)
-                                IconButton(
-                                    onClick = onShowServerHelp,
-                                    modifier = Modifier.size(32.dp).remoteHelpFocus(),
-                                ) {
-                                    Icon(
-                                        Icons.AutoMirrored.Filled.HelpOutline,
-                                        contentDescription = "Инструкция по регистрации через сервер",
-                                        modifier = Modifier.size(19.dp),
-                                    )
-                                }
-                            }
-                            Text(
-                                serverSupportingText,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = if (serverTextIsError) {
-                                    MaterialTheme.colorScheme.error
-                                } else {
-                                    MaterialTheme.colorScheme.onSurfaceVariant
-                                },
-                            )
-                        }
-                        Switch(
-                            checked = rtMasqueServerBootstrap,
-                            enabled = controlsEnabled && rtMasque && serverAccess.available,
-                            onCheckedChange = onServerBootstrapChange,
-                            modifier = Modifier.remoteSwitchFocus(
-                                enabled = controlsEnabled && rtMasque && serverAccess.available,
-                            ),
-                        )
-                    }
-
-                    Surface(
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(16.dp),
-                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
-                        border = BorderStroke(
-                            1.dp,
-                            MaterialTheme.colorScheme.outline.copy(alpha = 0.2f),
-                        ),
-                    ) {
-                        Column(
-                            modifier = Modifier.padding(14.dp),
-                            verticalArrangement = Arrangement.spacedBy(6.dp),
-                        ) {
-                            Text(
-                                "Когда включать",
-                                style = MaterialTheme.typography.labelLarge,
-                                fontWeight = FontWeight.SemiBold,
-                            )
-                            Text(
-                                "Сеть РТ — если в мобильной сети Ростелекома открываются разрешённые сайты, но WDTT Plus не подключается.",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                            Text(
-                                "MASQUE — если одной «Сети РТ» недостаточно: это дополнительный резерв после TURN/TLS и TCP.",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                            Text(
-                                "Через сервер — только если первая регистрация WARP для MASQUE не проходит напрямую; нужен настроенный иностранный SSH-сервер в «Деплой».",
+                                if (mode) "Без внешнего UDP" else "UDP, при недоступности — TCP/TLS",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
@@ -303,6 +86,119 @@ internal fun RtNetworkSettingsDialog(
                     }
                 }
             }
+        }
+        if (connectionPath.isNotEmpty()) {
+            Text("Последний рабочий способ: $connectionPath", style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        run {
+            val extras = buildList {
+                if (rtMasque) add("MASQUE")
+                if (rtMasque && rtMasqueServerBootstrap) add("Регистрация по SSH")
+                if (!turnSniValid) add("Проверьте SNI")
+                else if (turnSni.isNotBlank() && turnSni != DEFAULT_RT_TURN_SNI) add("Свой SNI")
+            }.joinToString(" · ").ifBlank { "Для сетей с ограничениями" }
+            Surface(
+                shape = RoundedCornerShape(16.dp),
+                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f),
+                modifier = Modifier.fillMaxWidth().remoteFocusOutline(RoundedCornerShape(16.dp))
+                    .clickable { advancedExpanded = !advancedExpanded },
+            ) {
+                Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Дополнительно", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+                        Text(extras, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    Icon(if (advancedExpanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                        contentDescription = if (advancedExpanded) "Свернуть настройки" else "Раскрыть настройки")
+                }
+            }
+        }
+        if (advancedExpanded) {
+            OutlinedTextField(
+                value = turnSni,
+                onValueChange = onTurnSniChange,
+                label = { Text("Внешний SNI") },
+                placeholder = { Text(DEFAULT_RT_TURN_SNI) },
+                isError = !turnSniValid,
+                enabled = controlsEnabled,
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                supportingText = {
+                    Text(if (turnSniValid) "Для TURN/TLS и MASQUE"
+                        else "Укажите домен латиницей, например $DEFAULT_RT_TURN_SNI")
+                },
+            )
+            ConnectionOptionRow(
+                title = "MASQUE", subtitle = "Резерв через Cloudflare",
+                checked = rtMasque, enabled = controlsEnabled,
+                onCheckedChange = onRtMasqueChange, onHelp = onShowMasqueHelp,
+            )
+            if (rtMasque) {
+                ConnectionOptionRow(
+                    title = "Регистрация по SSH",
+                    subtitle = if (serverAccess.available) "Если WARP не регистрируется напрямую"
+                        else "Недоступно: ${serverAccess.unavailableReason}",
+                    checked = rtMasqueServerBootstrap,
+                    enabled = controlsEnabled && serverAccess.available,
+                    isError = !serverAccess.available,
+                    onCheckedChange = onServerBootstrapChange, onHelp = onShowServerHelp,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ConnectionOptionRow(
+    title: String,
+    subtitle: String,
+    checked: Boolean,
+    enabled: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+    onHelp: (() -> Unit)? = null,
+    isError: Boolean = false,
+) {
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Column(Modifier.weight(1f)) {
+            Row(verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(title, modifier = Modifier.weight(1f, fill = false),
+                    style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+                if (onHelp != null) {
+                    HintIconButton(hint = "Справка: $title", onClick = onHelp, modifier = Modifier.size(28.dp).remoteHelpFocus()) {
+                        Icon(Icons.AutoMirrored.Filled.HelpOutline, contentDescription = "Справка: $title",
+                            modifier = Modifier.size(20.dp))
+                    }
+                }
+            }
+            Text(subtitle, style = MaterialTheme.typography.bodySmall,
+                color = if (isError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        Switch(checked = checked, enabled = enabled, onCheckedChange = onCheckedChange,
+            modifier = Modifier.remoteSwitchFocus(enabled = enabled))
+    }
+}
+
+@Composable
+internal fun ConnectionSettingsCard(mode: String, onClick: () -> Unit) {
+    AppSectionCard(
+        modifier = Modifier.fillMaxWidth().remoteFocusOutline(RoundedCornerShape(16.dp)).clickable(onClick = onClick),
+        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
+    ) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Icon(Icons.Default.SettingsEthernet, contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(22.dp))
+            Column(Modifier.weight(1f)) {
+                Text("Подключение", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+                Text(mode, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            Icon(Icons.Default.ChevronRight, contentDescription = "Открыть настройку подключения",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 }

@@ -350,7 +350,19 @@ func databaseTrafficTotals(days int) trafficTotals {
 }
 
 func formatTrafficTotals(total trafficTotals) string {
-	return fmt.Sprintf("↓%.2f MB / ↑%.2f MB", float64(total.Down)/(1024*1024), float64(total.Up)/(1024*1024))
+	return fmt.Sprintf("↓%s / ↑%s", formatBotTrafficBytes(total.Down), formatBotTrafficBytes(total.Up))
+}
+
+// Telegram traffic counters use decimal units: 1000 MB = 1 GB, 1000 GB = 1 TB.
+func formatBotTrafficBytes(bytes int64) string {
+	divisor := int64(1_000_000)
+	unit := "МБ"
+	if bytes >= 1_000_000_000_000 {
+		divisor, unit = 1_000_000_000_000, "ТБ"
+	} else if bytes >= 1_000_000_000 {
+		divisor, unit = 1_000_000_000, "ГБ"
+	}
+	return fmt.Sprintf("%.2f %s", float64(bytes)/float64(divisor), unit)
 }
 
 func trafficPeriodReport(today, week, month, all trafficTotals) string {
@@ -1476,7 +1488,7 @@ func sendMainMenu(token string, adminID int64, messageID int) int {
 	}
 	dbMutex.Unlock()
 	text := fmt.Sprintf(
-		"🤖 *WDTT Manager*\n\nКлиенты: `%d/%d`\nУстройства: `%d`\nОтключены: `%d`\nИстекли: `%d`\n\nВыберите раздел.",
+		"🤖 *WDTT Plus Менеджер*\n\nКлиенты: `%d/%d`\nУстройства: `%d`\nОтключены: `%d`\nИстекли: `%d`\n\nВыберите раздел.",
 		passwords, maxGeneratedPasswords, devices, deactivated, expired,
 	)
 	return sendOrEditTelegram(token, adminID, messageID, text, inlineKeyboard(

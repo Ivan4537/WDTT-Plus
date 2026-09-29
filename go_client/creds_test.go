@@ -63,6 +63,7 @@ func TestClassifyHashCheckErrorKeepsTerminalAndTransientStatusesSeparate(t *test
 		status  string
 	}{
 		{errText: "INVALID_JOIN_LINK: VK API error_code:9008", status: "dead"},
+		{errText: "VK API error_code:9005 Call requires auth", status: "auth_required"},
 		{errText: "ANON_BLOCKED: anonymous join is disabled", status: "blocked"},
 		{errText: "CALL_FULL: call is full", status: "full"},
 		{errText: "vchat.joinConversationByLink: participant.check.flood", status: "limited"},

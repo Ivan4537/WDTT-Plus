@@ -204,6 +204,7 @@ internal fun processExitHistoryItem(
     manufacturer: String,
     backgroundRestricted: Boolean?,
     batteryOptimizationsIgnored: Boolean?,
+    nowMs: Long = System.currentTimeMillis(),
 ): DeviceCheckItem {
     val unexpected = history.latestUnexpected
     if (unexpected == null) {
@@ -239,25 +240,47 @@ internal fun processExitHistoryItem(
     val category = classifyProcessExit(unexpected)
     val time = processExitTimestamp(unexpected.timestampMs)
     val marker = recognizedSystemExitMarker(unexpected.description)
-    val newerExpectedEvent = history.latest
-        ?.takeIf { it.timestampMs > unexpected.timestampMs }
-        ?.let(::classifyProcessExit)
-        ?.takeIf {
-            it == ProcessExitCategory.UserAction ||
-                it == ProcessExitCategory.PackageChange ||
-                it == ProcessExitCategory.NormalExit
-        }
-    val laterEventNote = if (newerExpectedEvent != null) {
-        " После этого Android зафиксировал более новое штатное событие, но оно не отменяет найденное неожиданное завершение."
-    } else {
-        ""
-    }
     val markerText = if (marker.isNotBlank()) " Метка оболочки Android: $marker." else ""
-    val commonRecommendation = backgroundRestrictionRecommendation(
-        manufacturer = manufacturer,
-        backgroundRestricted = backgroundRestricted,
-        batteryOptimizationsIgnored = batteryOptimizationsIgnored,
-    )
+    val laterEventNote = history.latest
+        ?.takeIf { it.timestampMs > unexpected.timestampMs }
+        ?.let { " После этого в истории есть более новое завершение процесса." }.orEmpty()
+    val oldEvent = nowMs - unexpected.timestampMs > 24L * 60L * 60L * 1000L
+    val knownRestriction = backgroundRestricted == true || batteryOptimizationsIgnored == false
+    val settingsPermitted = backgroundRestricted == false && batteryOptimizationsIgnored == true
+    val commonRecommendation = if (settingsPermitted) {
+        "Android сейчас разрешает фоновую работу и исключение из оптимизации батареи. " +
+            "Повторно менять эти разрешения не нужно. Если VPN снова прервётся, " +
+            "сразу скопируйте отчёт устройства и журнал приложения."
+    } else {
+        backgroundRestrictionRecommendation(manufacturer, backgroundRestricted, batteryOptimizationsIgnored)
+    }
+    // Exit history describes a previous process, not the current health of this installation.
+    // REASON_OTHER and vendor descriptions cannot establish a battery-policy cause.
+    val historicalOnly = oldEvent ||
+        (category in setOf(ProcessExitCategory.SystemPolicy, ProcessExitCategory.Unknown) && !knownRestriction)
+    if (historicalOnly) {
+        val description = when (category) {
+            ProcessExitCategory.Crash -> "сбой приложения"
+            ProcessExitCategory.LowMemory -> "остановку при нехватке памяти"
+            ProcessExitCategory.ExcessiveResources -> "остановку из-за использования ресурсов"
+            ProcessExitCategory.Dependency -> "остановку после завершения системного компонента"
+            else -> "завершение основного процесса"
+        }
+        return DeviceCheckItem(
+            title = "Последнее завершение приложения",
+            status = "запись в истории",
+            details = "Android сохранил $description $time.$markerText$laterEventNote " +
+                "Эта запись не подтверждает текущую неисправность VPN и не влияет на итог проверки." +
+                if (marker.isNotBlank()) " По метке оболочки нельзя определить, какие настройки стали причиной." else "",
+            recommendation = if (knownRestriction) {
+                "Актуальные ограничения показаны отдельно в проверке батареи и фоновой работы."
+            } else if (settingsPermitted) commonRecommendation else {
+                "Если VPN работает без обрывов, дополнительных действий не требуется. " +
+                    "При повторении сразу сохраните отчёт устройства и журнал приложения."
+            },
+            severity = DeviceCheckSeverity.Info,
+        )
+    }
 
     return when (category) {
         ProcessExitCategory.SystemPolicy -> DeviceCheckItem(
@@ -266,7 +289,7 @@ internal fun processExitHistoryItem(
             details = "Android завершил основной процесс WDTT Plus $time вне штатной остановки приложения.$markerText$laterEventNote",
             recommendation = commonRecommendation,
             severity = DeviceCheckSeverity.Warning,
-            action = DeviceCheckAction.BatterySettings,
+            action = if (knownRestriction) DeviceCheckAction.BatterySettings else null,
         )
         ProcessExitCategory.ExcessiveResources -> DeviceCheckItem(
             title = "Последнее завершение приложения",
@@ -967,51 +990,45 @@ object DeviceCompatibility {
         return pageSizeCompatibilityItem(pageSize, android.os.Process.is64Bit())
     }
 
-    fun rtNetworkModeItem(context: Context, profile: TunnelProfileSnapshot): DeviceCheckItem {
+    fun masqueModeItem(context: Context, profile: TunnelProfileSnapshot): DeviceCheckItem {
         val enrollment = inspectRtMasqueEnrollment(
             File(context.filesDir, RT_MASQUE_CONFIG_FILE_NAME)
         )
         return when {
-            !profile.rtNetwork -> DeviceCheckItem(
-                title = "Режим Сеть РТ",
-                status = "выключен",
-                details = "Используется обычный порядок транспортов; настройки РТ этого профиля не влияют на подключение.",
-                severity = DeviceCheckSeverity.Info,
-            )
             !profile.rtMasque -> DeviceCheckItem(
-                title = "Режим Сеть РТ",
-                status = "TURN/TLS и TCP включены · MASQUE выключен",
-                details = "Для активного профиля включён только основной механизм Сети РТ. Регистрация WARP не требуется.",
+                title = "MASQUE",
+                status = "выключен",
+                details = "Используются TURN-пути без дополнительного резерва Cloudflare. Регистрация WARP не требуется.",
                 severity = DeviceCheckSeverity.Ok,
             )
-            profile.rtMasqueServerBootstrap && !profile.rtMasqueServerAccessReady -> DeviceCheckItem(
-                title = "Режим Сеть РТ",
-                status = "«Через сервер» настроен не полностью",
-                details = "MASQUE включён, но в активном профиле нет полного SSH-доступа из раздела «Деплой».",
-                recommendation = "Заполните адрес и пароль либо приватный SSH-ключ в «Деплой» или выключите «Через сервер».",
+            profile.rtMasqueServerBootstrap && !profile.rtMasqueServerAccessReady && enrollment == RtMasqueEnrollmentState.Missing -> DeviceCheckItem(
+                title = "MASQUE",
+                status = "«Регистрация по SSH» настроен не полностью",
+                details = "MASQUE включён, но в активном профиле нет полного SSH-доступа в «Деплой → SSH».",
+                recommendation = "Заполните адрес и пароль либо приватный SSH-ключ в «Деплой → SSH» или выключите «Регистрация по SSH».",
                 severity = DeviceCheckSeverity.Warning,
             )
             enrollment == RtMasqueEnrollmentState.Invalid -> DeviceCheckItem(
-                title = "Режим Сеть РТ",
+                title = "MASQUE",
                 status = "регистрация WARP повреждена",
                 details = "Локальный файл регистрации MASQUE не содержит корректной структуры версии 1. Секретные поля в отчёт не включены.",
                 recommendation = "Остановите VPN и выполните «Сбросить регистрацию WARP» в инструкции MASQUE.",
                 severity = DeviceCheckSeverity.Warning,
             )
             enrollment == RtMasqueEnrollmentState.Missing -> DeviceCheckItem(
-                title = "Режим Сеть РТ",
+                title = "MASQUE",
                 status = "MASQUE включён · регистрация ещё не создана",
-                details = "При следующем запуске VPN приложение попробует зарегистрировать отдельное устройство WARP. Прямые TURN-пути продолжат работать во время подготовки.",
+                details = "Регистрация потребуется при первом использовании резерва MASQUE. Она начинается только после перехода к этому резерву; готовность TURN-путей не требует регистрации WARP.",
                 recommendation = if (profile.rtMasqueServerBootstrap) {
                     "Если прямой TLS Cloudflare недоступен, приложение сможет использовать SSH-выход активного профиля."
                 } else {
-                    "Если регистрация не выполняется, проверьте журнал MASQUE; при необходимости настройте «Через сервер»."
+                    "Если регистрация не выполняется, проверьте журнал MASQUE; при необходимости настройте «Регистрация по SSH»."
                 },
                 severity = DeviceCheckSeverity.Info,
             )
             else -> DeviceCheckItem(
-                title = "Режим Сеть РТ",
-                status = "MASQUE готов",
+                title = "MASQUE",
+                status = "регистрация WARP сохранена",
                 details = "Структура сохранённой регистрации WARP корректна; при запуске её дополнительно проверит нативный клиент.",
                 severity = DeviceCheckSeverity.Ok,
             )

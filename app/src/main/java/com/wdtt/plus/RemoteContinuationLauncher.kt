@@ -12,7 +12,6 @@ import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URI
-import java.net.URL
 import java.net.URLDecoder
 
 data class RemoteLaunchTarget(
@@ -21,6 +20,10 @@ data class RemoteLaunchTarget(
     val preferredHandler: String = "",
     val alternateHandlers: List<String> = emptyList(),
     val returnScheme: String = "",
+    val completion: RemoteActionCompletion = RemoteActionCompletion.Unavailable,
+    /** Local-only context. Never parsed from a remote response or sent to a provider. */
+    val localProfile: LocalContinuationProfile? = null,
+    val embedded: RemoteEmbeddedPresentation? = null,
 ) {
     internal fun handlerPackages(): List<String> =
         (listOf(preferredHandler) + alternateHandlers)
@@ -28,8 +31,37 @@ data class RemoteLaunchTarget(
             .distinct()
 }
 
+data class LocalContinuationProfile(val index: Int, val identity: String)
+
+/** Exact server-provided targets. Context is opaque and only correlates UI messages. */
+data class RemoteEmbeddedPresentation(
+    val url: String,
+    val fallback: String,
+    val confirmationUrl: String,
+    val confirmationFallback: String,
+    val context: String,
+)
+
+data class RemoteActionCompletion(
+    val available: Boolean,
+    val url: String = "",
+    val key: String = "",
+    val expiresAtSeconds: Long = 0,
+) {
+    companion object {
+        val Unavailable = RemoteActionCompletion(available = false)
+    }
+}
+
+sealed interface RemoteActionCompletionState {
+    data object Pending : RemoteActionCompletionState
+    data object Unavailable : RemoteActionCompletionState
+    data class Ready(val document: RemoteDocumentLink) : RemoteActionCompletionState
+}
+
 object RemoteContinuationLauncher {
     suspend fun begin(
+        context: Context,
         capability: RemoteContinuation,
         device: String,
         localDocument: String? = null,
@@ -50,31 +82,36 @@ object RemoteContinuationLauncher {
             val payload = request
                 .toString()
                 .toByteArray(Charsets.UTF_8)
-            var connection: HttpURLConnection? = null
             try {
-                connection = URL(capability.url).openConnection() as HttpURLConnection
-                connection.requestMethod = "POST"
-                connection.connectTimeout = 10_000
-                connection.readTimeout = 15_000
-                connection.doOutput = true
-                connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
-                connection.setRequestProperty("Accept", "application/json")
-                connection.outputStream.use { it.write(payload) }
-                val status = connection.responseCode
-                val body = readBody(connection, status)
-                if (status !in 200..299) {
-                    val detail = runCatching { JSONObject(body).optString("detail") }.getOrDefault("")
+                val result = requestRemoteDocumentWithTunnelFallback(
+                    directRequest = {
+                        requestContinuationDirect(
+                            context = context,
+                            url = capability.url,
+                            payload = payload,
+                        )
+                    },
+                    tunnelRequest = {
+                        TunnelManager.postOpaqueHttpsStatusThroughTunnel(capability.url, payload)
+                    },
+                    preferTunnel = TunnelManager.isUpdateRelayAvailable(),
+                )
+                if (result.status !in 200..299) {
+                    val detail = runCatching {
+                        JSONObject(result.body).optString("detail")
+                    }.getOrDefault("")
                     throw IllegalStateException(
                         detail.ifBlank { "Не удалось продолжить действие. Откройте свежую ссылку подключения." }
                     )
                 }
-                val response = runCatching { JSONObject(body) }
+                val response = runCatching { JSONObject(result.body) }
                     .getOrElse { throw IllegalStateException("WDTT Plus вернул неполные данные.") }
                 val primary = response.optString("url").trim()
                 val fallback = response.optString("fallback").trim()
                 val handler = response.optString("handler").trim()
                 val alternateHandlers = parseAlternateHandlers(response)
                 val returnScheme = response.optString("return_scheme").trim()
+                val completion = parseCompletionCapability(response.optJSONObject("completion"))
                 require(safeExternalUrl(primary)) {
                     "WDTT Plus вернул повреждённый адрес продолжения."
                 }
@@ -90,12 +127,17 @@ object RemoteContinuationLauncher {
                 require(returnScheme.isBlank() || returnScheme == AUTH_TAB_RETURN_SCHEME) {
                     "WDTT Plus вернул повреждённый способ возврата."
                 }
+                require(completion != null) {
+                    "WDTT Plus вернул повреждённое восстановление результата."
+                }
                 RemoteLaunchTarget(
                     primaryUrl = primary,
                     fallbackUrl = fallback,
                     preferredHandler = handler,
                     alternateHandlers = alternateHandlers,
                     returnScheme = returnScheme,
+                    completion = completion,
+                    embedded = parseEmbeddedPresentation(response.optJSONObject("embedded")),
                 )
             } catch (cancelled: CancellationException) {
                 throw cancelled
@@ -104,9 +146,52 @@ object RemoteContinuationLauncher {
                 throw IllegalStateException(
                     "Не удалось связаться с WDTT Plus. Проверьте интернет и повторите попытку."
                 )
-            } finally {
-                connection?.disconnect()
             }
+        }
+    }
+
+    internal fun parseEmbeddedPresentation(json: JSONObject?): RemoteEmbeddedPresentation? {
+        if (json == null) return null // Older backend: use the existing safe fallback.
+        val urls = listOf("url", "fallback", "confirmation_url", "confirmation_fallback")
+            .map { json.optString(it) }
+        require(urls.all { safeExternalUrl(it) && it.length <= 4096 }) {
+            "Сервис вернул повреждённые адреса встроенного окна."
+        }
+        val context = json.optString("context")
+        require(opaqueValue(context)) { "Сервис вернул повреждённый контекст действия." }
+        return RemoteEmbeddedPresentation(urls[0], urls[1], urls[2], urls[3], context)
+    }
+
+    suspend fun checkCompletion(
+        context: Context,
+        completion: RemoteActionCompletion,
+        device: String,
+    ): RemoteActionCompletionState {
+        require(
+            completion.available &&
+                safeServiceUrl(completion.url) &&
+                opaqueValue(completion.key)
+        ) { "Проверка готового результата недоступна." }
+        require(validDevice(device)) { "Не удалось определить текущее устройство." }
+        return withContext(Dispatchers.IO) {
+            val payload = JSONObject()
+                .put("key", completion.key.trim())
+                .put("device", device.trim())
+                .toString()
+                .toByteArray(Charsets.UTF_8)
+            val response = requestRemoteDocumentWithTunnelFallback(
+                directRequest = {
+                    requestCompletionDirect(context, completion.url, payload)
+                },
+                tunnelRequest = {
+                    TunnelManager.postOpaqueHttpsStatusThroughTunnel(completion.url, payload)
+                },
+                preferTunnel = TunnelManager.isUpdateRelayAvailable(),
+            )
+            if (response.status !in 200..299) {
+                throw IllegalStateException("Не удалось проверить готовность результата.")
+            }
+            parseCompletionStatus(response.body)
         }
     }
 
@@ -169,6 +254,11 @@ object RemoteContinuationLauncher {
 
     internal fun authTabLaunchUrl(target: RemoteLaunchTarget): String =
         browserLaunchUrls(target).first()
+
+    internal fun primaryAuthTabLaunchUrl(target: RemoteLaunchTarget): String =
+        target.primaryUrl.also {
+            require(safeExternalUrl(it)) { "Адрес продолжения повреждён." }
+        }
 
     internal fun browserLaunchUrls(target: RemoteLaunchTarget): List<String> =
         (
@@ -270,6 +360,91 @@ object RemoteContinuationLauncher {
                 values.all { it.isNotBlank() && safePackageName(it) } &&
                     values.distinct().size == values.size
             }
+    }
+
+    internal fun parseCompletionCapability(source: JSONObject?): RemoteActionCompletion? {
+        if (source == null) return RemoteActionCompletion.Unavailable
+        val url = source.optString("url").trim()
+        val key = source.optString("key").trim()
+        val expires = source.optLong("expires", 0L)
+        if (!safeServiceUrl(url) || !opaqueValue(key) || expires <= 0L) return null
+        return RemoteActionCompletion(
+            available = true,
+            url = url,
+            key = key,
+            expiresAtSeconds = expires,
+        )
+    }
+
+    internal fun parseCompletionStatus(body: String): RemoteActionCompletionState {
+        val response = runCatching { JSONObject(body) }
+            .getOrElse { throw IllegalStateException("WDTT Plus вернул неполный статус результата.") }
+        require(response.optInt("version", 0) == 1) {
+            "Для восстановления результата нужна более новая версия WDTT Plus."
+        }
+        return when (response.optString("state").trim()) {
+            "pending" -> RemoteActionCompletionState.Pending
+            "unavailable" -> RemoteActionCompletionState.Unavailable
+            "ready" -> {
+                val document = RemoteDocumentGateway.extractLink(
+                    response.optString("document").trim()
+                ) ?: throw IllegalStateException("WDTT Plus вернул повреждённый адрес результата.")
+                RemoteActionCompletionState.Ready(document)
+            }
+            else -> throw IllegalStateException("WDTT Plus вернул неизвестный статус результата.")
+        }
+    }
+
+    private fun requestCompletionDirect(
+        context: Context,
+        url: String,
+        payload: ByteArray,
+    ): RemoteDocumentHttpResponse {
+        var connection: HttpURLConnection? = null
+        return try {
+            connection = openDefaultHttpConnection(context, url)
+            connection.requestMethod = "POST"
+            connection.instanceFollowRedirects = false
+            connection.connectTimeout = 5_000
+            connection.readTimeout = 7_000
+            connection.doOutput = true
+            connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+            connection.setRequestProperty("Accept", "application/json")
+            connection.outputStream.use { it.write(payload) }
+            val status = connection.responseCode
+            RemoteDocumentHttpResponse(
+                status = status,
+                body = readBody(connection, status),
+            )
+        } finally {
+            connection?.disconnect()
+        }
+    }
+
+    private fun requestContinuationDirect(
+        context: Context,
+        url: String,
+        payload: ByteArray,
+    ): RemoteDocumentHttpResponse {
+        var connection: HttpURLConnection? = null
+        return try {
+            connection = openDefaultHttpConnection(context, url)
+            connection.requestMethod = "POST"
+            connection.instanceFollowRedirects = false
+            connection.connectTimeout = 4_000
+            connection.readTimeout = 8_000
+            connection.doOutput = true
+            connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+            connection.setRequestProperty("Accept", "application/json")
+            connection.outputStream.use { it.write(payload) }
+            val status = connection.responseCode
+            RemoteDocumentHttpResponse(
+                status = status,
+                body = readBody(connection, status),
+            )
+        } finally {
+            connection?.disconnect()
+        }
     }
 
     private fun opaqueValue(value: String): Boolean =

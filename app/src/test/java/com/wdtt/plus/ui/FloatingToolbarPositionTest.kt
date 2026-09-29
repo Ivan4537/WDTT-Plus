@@ -7,6 +7,30 @@ import org.junit.Test
 
 class FloatingToolbarPositionTest {
     @Test
+    fun relativePositionSurvivesRestartAndLateWindowMeasurement() {
+        val saved = floatingToolbarFraction(680f, 80f, 1680f, 1f)
+        assertEquals(0.375f, saved)
+        assertEquals(680f, floatingToolbarOffset(saved, 80f, 1680f))
+        assertEquals(380f, floatingToolbarOffset(saved, 80f, 880f))
+        assertEquals(680f, floatingToolbarOffset(saved, 80f, 1680f))
+    }
+
+    @Test
+    fun tinyWindowDoesNotReplaceTheSavedFraction() {
+        assertEquals(80f, floatingToolbarOffset(0.6f, 80f, 80f))
+        assertEquals(0.6f, floatingToolbarFraction(80f, 80f, 80f, 0.6f))
+        assertEquals(680f, floatingToolbarOffset(0.6f, 80f, 1080f))
+    }
+
+    @Test
+    fun newInstallationDefaultsToBottomAndDraggingClampsToBothEdges() {
+        assertEquals(880f, floatingToolbarOffset(-1f, 80f, 880f))
+        assertEquals(880f, floatingToolbarOffset(Float.NaN, 80f, 880f))
+        assertEquals(0f, floatingToolbarFraction(-200f, 80f, 880f, 0.5f))
+        assertEquals(1f, floatingToolbarFraction(1200f, 80f, 880f, 0.5f))
+    }
+
+    @Test
     fun defaultBottomPositionStaysAboveNavigation() {
         assertEquals(
             1_600f,
@@ -93,6 +117,19 @@ class FloatingToolbarPositionTest {
                 fallbackAddress = "127.0.0.1:1080",
                 readyAddresses = listOf("127.0.0.1:1080", "192.168.1.34:1080"),
                 running = false,
+            ),
+        )
+    }
+
+    @Test
+    fun startingProxyDoesNotPresentConfiguredAddressAsReady() {
+        assertEquals(
+            "АВТО ПРОКСИ · не запущен",
+            proxyTunnelAddressSummary(
+                mode = "auto",
+                fallbackAddress = "127.0.0.1:1080",
+                readyAddresses = emptyList(),
+                running = true,
             ),
         )
     }

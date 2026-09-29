@@ -25,32 +25,12 @@ class RtTurnSniTest {
     }
 
     @Test
-    fun masqueRequiresBothSwitches() {
-        assertFalse(shouldUseRtMasque(rtNetwork = false, rtMasque = false))
-        assertFalse(shouldUseRtMasque(rtNetwork = false, rtMasque = true))
-        assertFalse(shouldUseRtMasque(rtNetwork = true, rtMasque = false))
-        assertTrue(shouldUseRtMasque(rtNetwork = true, rtMasque = true))
-        assertFalse(
-            shouldUseRtMasqueServerBootstrap(
-                rtNetwork = false,
-                rtMasque = true,
-                serverBootstrap = true,
-            )
-        )
-        assertFalse(
-            shouldUseRtMasqueServerBootstrap(
-                rtNetwork = true,
-                rtMasque = false,
-                serverBootstrap = true,
-            )
-        )
-        assertTrue(
-            shouldUseRtMasqueServerBootstrap(
-                rtNetwork = true,
-                rtMasque = true,
-                serverBootstrap = true,
-            )
-        )
+    fun masqueRequiresConsentInEitherConnectionMode() {
+        assertFalse(shouldUseRtMasque(false))
+        assertTrue(shouldUseRtMasque(true))
+        assertFalse(shouldUseRtMasqueServerBootstrap(false, true))
+        assertFalse(shouldUseRtMasqueServerBootstrap(true, false))
+        assertTrue(shouldUseRtMasqueServerBootstrap(true, true))
     }
 
     @Test
@@ -281,5 +261,16 @@ class RtTurnSniTest {
 
         assertNotNull(params)
         assertEquals(false, params?.rtMasqueServerBootstrap)
+    }
+    @Test
+    fun masqueLogsRespectNoUdpAndDoNotPromiseForbiddenFallbacks() {
+        val enabled = classifyMasqueLog("[MASQUE] Включён резерв: только HTTP/2; HTTP/3 запрещён режимом TCP/TLS")
+        assertTrue(enabled!!.message.contains("HTTP/3 отключён"))
+        val failure = classifyMasqueLog("[MASQUE] TLS через HTTP/2 не сработал: timeout")
+        assertFalse(failure!!.message.contains("и HTTP/3"))
+        val fallback = classifyMasqueLog("[MASQUE] Прямые TCP/TLS-пути не сработали; пробуем резерв MASQUE")
+        assertFalse(fallback!!.message.contains("РТ"))
+        assertFalse(fallback.message.contains("до попытки UDP"))
+        assertFalse(wrapHandshakeTerminalMessage(true).contains("сеть РТ"))
     }
 }

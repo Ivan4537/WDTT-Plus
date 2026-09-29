@@ -49,7 +49,6 @@ import androidx.compose.material.icons.filled.Hub
 import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.SettingsEthernet
 import androidx.compose.material.icons.filled.Search
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CheckboxDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -759,14 +758,14 @@ private fun RoutingTitleRow(
             contentColor = MaterialTheme.colorScheme.onSurface,
             disabledContentColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f),
         )
-        IconButton(
+        HintIconButton(hint = "Импорт маршрутизации",
             onClick = onImport,
             enabled = enabled,
             colors = iconButtonColors,
         ) {
             Icon(Icons.Default.FileDownload, contentDescription = "Импорт маршрутизации")
         }
-        IconButton(
+        HintIconButton(hint = "Экспорт маршрутизации",
             onClick = onExport,
             enabled = enabled,
             colors = iconButtonColors,
@@ -799,7 +798,7 @@ private fun RoutingModeCard(
             Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("Режим списка", fontWeight = FontWeight.SemiBold)
-                    IconButton(
+                    HintIconButton(hint = "Инструкция по режиму списка",
                         onClick = onHelp,
                         modifier = Modifier.size(30.dp).remoteHelpFocus(),
                     ) {
@@ -874,7 +873,7 @@ private fun AppsRoutingHeader(
                 onClick = onQuickExclusions,
                 enabled = !isWhitelist && !isLoading,
                 contentPadding = PaddingValues(horizontal = 2.dp),
-                modifier = Modifier.weight(1f),
+                modifier = Modifier.weight(1f, fill = false),
             ) {
                 if (quickExcludeStatus.isBlank()) {
                     Text(
@@ -900,7 +899,7 @@ private fun AppsRoutingHeader(
                     }
                 }
             }
-            IconButton(
+            HintIconButton(hint = "Инструкция по быстрым исключениям",
                 onClick = onQuickHelp,
                 modifier = Modifier.size(38.dp).remoteHelpFocus(),
             ) {
@@ -1046,7 +1045,14 @@ private fun AddressesRoutingHeader(
                     )
                 }
                 Column(modifier = Modifier.weight(1f).padding(horizontal = 12.dp)) {
-                    Text("Добавить адрес", fontWeight = FontWeight.SemiBold)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Добавить адрес", fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.weight(1f, fill = false))
+                        HintIconButton(hint = "Инструкция по адресам", onClick = onHelp, modifier = Modifier.size(30.dp).remoteHelpFocus()) {
+                            Icon(Icons.AutoMirrored.Filled.HelpOutline,
+                                contentDescription = "Инструкция по адресам", modifier = Modifier.size(18.dp))
+                        }
+                    }
                     Text(
                         "Домен, URL, IPv4, CIDR или диапазон",
                         style = MaterialTheme.typography.labelSmall,
@@ -1055,15 +1061,7 @@ private fun AddressesRoutingHeader(
                         maxLines = 2,
                     )
                 }
-                IconButton(
-                    onClick = onHelp,
-                    modifier = Modifier.remoteHelpFocus(),
-                ) {
-                    Icon(
-                        Icons.AutoMirrored.Filled.HelpOutline,
-                        contentDescription = "Инструкция по адресам",
-                    )
-                }
+
             }
         }
     }
@@ -1112,7 +1110,7 @@ private fun AddAddressDialog(
     }
     val previewRules = previewResult?.getOrNull()
     val validationError = previewResult?.exceptionOrNull()?.message.orEmpty()
-    AlertDialog(
+    BoundedAlertDialog(
         onDismissRequest = onDismiss,
         title = {
             Row(
@@ -1190,8 +1188,6 @@ private fun AddAddressDialog(
 
 @Composable
 private fun RoutingHelpDialog(help: RoutingHelp, onDismiss: () -> Unit) {
-    val television = isTelevisionDevice()
-    val scrollState = rememberScrollState()
     val title: String
     val body: String
     when (help) {
@@ -1212,41 +1208,12 @@ private fun RoutingHelpDialog(help: RoutingHelp, onDismiss: () -> Unit) {
             body = "В ЧС выбранные адреса идут напрямую, в БС — только выбранные адреса идут через VPN. Можно вставить несколько строк: точные домены, ссылки, домены или IPv4 с портом, отдельные IPv4, подсети CIDR и диапазоны IPv4. Порт удаляется, а диапазон преобразуется в минимальный набор подсетей. Домен при запуске VPN преобразуется в его текущие IPv4-адреса, поэтому после смены DNS-адресов перезапустите VPN. Значение ru обозначает доменную зону, а не все сайты .ru. Доменные зоны и маски *.example.org требуют отдельного DNS-перехватчика; обычный WireGuard принимает только IP-маршруты, поэтому такие правила и IPv6 сейчас не применяются. Если в БС заполнены приложения и адреса, через VPN пойдёт трафик выбранных приложений к выбранным адресам."
         }
     }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        modifier = Modifier.televisionDialogWidth(television),
-        title = {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    title,
-                    modifier = Modifier.weight(1f),
-                )
-                IconButton(
-                    onClick = onDismiss,
-                    modifier = Modifier.remoteIconButtonFocus(),
-                ) {
-                    Icon(
-                        Icons.Default.Close,
-                        contentDescription = "Закрыть инструкцию",
-                    )
-                }
-            }
-        },
-        text = {
-            Text(
-                body,
-                modifier = Modifier
-                    .heightIn(max = if (television) 520.dp else 360.dp)
-                    .verticalScroll(scrollState)
-                    .tvDpadScrollable(scrollState, television),
-            )
-        },
-        confirmButton = { TextButton(onClick = onDismiss) { Text("Понятно") } },
-        properties = DialogProperties(usePlatformDefaultWidth = !television),
-    )
+    SettingsDialogLayout(
+        title = title,
+        onDismiss = onDismiss,
+    ) {
+        Text(body)
+    }
 }
 
 @Composable

@@ -62,6 +62,34 @@ internal fun effectiveWireGuardAllowedIps(
     }
 }.distinct()
 
+/**
+ * Removes a bounded set of exact IPv4 destinations from the routes captured by
+ * Android's VPN interface.  This is used by an optional local continuation to
+ * keep the normal WDTT route alive while selected external HTTPS destinations
+ * use the phone's underlying network.  User routing settings are not mutated.
+ */
+internal fun applyTemporaryDirectIpv4Addresses(
+    allowedIps: List<String>,
+    directAddresses: Collection<String>,
+): List<String> {
+    val excluded = directAddresses
+        .mapNotNull(::parseIpv4)
+        .distinct()
+        .map { address -> Ipv4Prefix(address, IPV4_BITS) }
+    if (excluded.isEmpty()) return allowedIps.distinct()
+
+    val ipv4Routes = allowedIps.mapNotNull(::parseIpv4Prefix)
+    val nonIpv4Routes = allowedIps.filter { parseIpv4Prefix(it) == null }
+    val routedIpv4 = subtractIpv4Prefixes(ipv4Routes, excluded)
+        .sortedWith(compareBy<Ipv4Prefix> { it.network }.thenBy { it.length })
+        .map(Ipv4Prefix::toCidr)
+    return (routedIpv4 + nonIpv4Routes).distinct().also { routes ->
+        require(routes.size <= MAX_WIREGUARD_ALLOWED_IPS) {
+            "Временная прямая маршрутизация создаёт слишком много маршрутов (${routes.size})."
+        }
+    }
+}
+
 internal data class VpnRoutingDocument(
     val isWhitelist: Boolean,
     val blacklistApps: List<String>,

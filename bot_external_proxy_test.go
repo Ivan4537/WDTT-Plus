@@ -7,6 +7,42 @@ import (
 	"testing"
 )
 
+func TestFormatBotTrafficBytes(t *testing.T) {
+	for _, tc := range []struct {
+		bytes int64
+		want  string
+	}{
+		{0, "0.00 МБ"},
+		{1_000_000, "1.00 МБ"},
+		{999_000_000, "999.00 МБ"},
+		{999_990_000, "999.99 МБ"},
+		{1_000_000_000, "1.00 ГБ"},
+		{1_250_000_000, "1.25 ГБ"},
+		{999_990_000_000, "999.99 ГБ"},
+		{1_000_000_000_000, "1.00 ТБ"},
+		{1_250_000_000_000, "1.25 ТБ"},
+		{9_223_372_036_854_775_807, "9223372.04 ТБ"},
+	} {
+		if got := formatBotTrafficBytes(tc.bytes); got != tc.want {
+			t.Errorf("formatBotTrafficBytes(%d) = %q, want %q", tc.bytes, got, tc.want)
+		}
+	}
+}
+
+func TestBotTrafficReportScalesEveryPeriodAndDirection(t *testing.T) {
+	want := "↓1.25 ГБ / ↑2.50 ТБ"
+	total := trafficTotals{Down: 1_250_000_000, Up: 2_500_000_000_000}
+	if got := formatTrafficTotals(total); got != want {
+		t.Fatalf("totals = %q, want %q", got, want)
+	}
+	if got := trafficPeriodReport(total, total, total, total); strings.Count(got, want) != 4 {
+		t.Fatalf("not every period uses adaptive units: %s", got)
+	}
+	if got := formatTrafficTotals(trafficTotals{Down: 1_000_000, Up: 1_000_000_000}); got != "↓1.00 МБ / ↑1.00 ГБ" {
+		t.Fatalf("directions must scale independently: %s", got)
+	}
+}
+
 func TestExternalProxyTransparentCheckDoesNotCaptureRootXrayTraffic(t *testing.T) {
 	script := outboundBotPrelude()
 

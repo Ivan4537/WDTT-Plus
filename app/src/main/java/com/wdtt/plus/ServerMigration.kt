@@ -1,18 +1,30 @@
 package com.wdtt.plus
 
 /** Версии приложения, для которых выпускалась новая обязательная серверная часть. */
-internal val SERVER_MIGRATION_LEVELS = intArrayOf(2, 3, 5, 6, 7, 12, 14, 15, 16, 17)
+internal val SERVER_MIGRATION_LEVELS = intArrayOf(2, 3, 5, 6, 7, 12, 14, 15, 16, 17, 19)
 
 data class ServerMigrationState(
     val pendingLevel: Int,
     val acknowledgedLevel: Int,
-    val completedLevel: Int
+    val completedLevel: Int,
+    val profileIndex: Int = 0,
+    val installationPresent: Boolean? = null,
 ) {
+    fun shouldShowNoticeForProfile(profile: Int): Boolean =
+        profileIndex == profile && noticeRequired && profileUpdateRequired
+
     val noticeRequired: Boolean
         get() = pendingLevel > acknowledgedLevel
 
     val profileUpdateRequired: Boolean
-        get() = pendingLevel > completedLevel
+        get() = pendingLevel > completedLevel && installationPresent != false
+}
+
+internal fun resolveServerInstallationPresence(
+    presence: Boolean?, probedHost: String?, probedPort: Int?, host: String, port: Int,
+): Boolean? = presence.takeIf {
+    host.isNotBlank() && probedHost?.trim()?.equals(host.trim(), ignoreCase = true) == true &&
+        probedPort == port
 }
 
 internal data class ServerMigrationInitialization(

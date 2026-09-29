@@ -14,6 +14,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"wdtt.local/pathprobe"
+
 	"github.com/cbeuw/connutil"
 	"github.com/pion/dtls/v3"
 	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
@@ -199,7 +201,7 @@ func (c *connectedUDPConn) WriteTo(p []byte, _ net.Addr) (int, error) { return c
 // splitFirstWriteConn fragments the first STUN request so its magic cookie
 // crosses TCP segment boundaries. Some shallow DPI rules classify plain TURN
 // by looking only at the first segment. This wrapper is enabled exclusively by
-// the explicit «Сеть РТ» mode; ordinary operators keep the original writes.
+// stream-first connection modes; ordinary mode keeps the original writes.
 type splitFirstWriteConn struct {
 	net.Conn
 	splitAt int
@@ -264,7 +266,7 @@ func normalizeTURNFrontSNI(value string) (string, error) {
 	return host, nil
 }
 
-func verifyTURNCertificateChainWithoutHostname(state tls.ConnectionState) error {
+func verifyTURNPeerCertificate(state tls.ConnectionState, hostname string, roots *x509.CertPool) error {
 	if len(state.PeerCertificates) == 0 {
 		return fmt.Errorf("TURN TLS не прислал сертификат")
 	}
@@ -274,6 +276,8 @@ func verifyTURNCertificateChainWithoutHostname(state tls.ConnectionState) error 
 	}
 	_, err := state.PeerCertificates[0].Verify(x509.VerifyOptions{
 		Intermediates: intermediates,
+		Roots:         roots,
+		DNSName:       hostname,
 		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	})
 	if err != nil {
@@ -293,11 +297,13 @@ func turnTLSConfig(endpoint turnEndpoint, frontSNI string) *tls.Config {
 	}
 
 	// При подмене SNI имя сертификата ожидаемо относится к TURN-узлу, а не к
-	// домену белого списка. Отключаем только сопоставление имени: публичная CA-
-	// цепочка всё равно проверяется в VerifyConnection.
+	// домену белого списка. VerifyConnection проверяет цепочку И настоящее
+	// имя TURN-узла из реквизитов; frontSNI не является доверенной личностью.
 	if frontSNI != "" && !strings.EqualFold(frontSNI, endpoint.Host) {
 		config.InsecureSkipVerify = true // проверка перенесена в VerifyConnection
-		config.VerifyConnection = verifyTURNCertificateChainWithoutHostname
+		config.VerifyConnection = func(state tls.ConnectionState) error {
+			return verifyTURNPeerCertificate(state, endpoint.Host, nil)
+		}
 	}
 	return config
 }
@@ -332,14 +338,12 @@ func openTURNAllocation(
 	var turnConn net.PacketConn
 	switch endpoint.Transport {
 	case turnTransportUDP:
-		resolved, err := net.ResolveUDPAddr("udp", turnAddr)
-		if err != nil {
-			return nil, nil, fmt.Errorf("TURN UDP резолв %s: %w", turnAddr, err)
-		}
-		c, err := net.DialUDP("udp", nil, resolved)
+		dialer := &net.Dialer{Timeout: 6 * time.Second}
+		raw, err := dialer.DialContext(ctx, "udp", turnAddr)
 		if err != nil {
 			return nil, nil, fmt.Errorf("TURN UDP подключение %s: %w", turnAddr, err)
 		}
+		c := raw.(*net.UDPConn)
 		_ = c.SetReadBuffer(socketBufSize)
 		_ = c.SetWriteBuffer(socketBufSize)
 		turnConn = &connectedUDPConn{c}
@@ -372,6 +376,8 @@ func openTURNAllocation(
 		return nil, nil, fmt.Errorf("неподдерживаемый TURN transport: %s", endpoint.Transport)
 	}
 
+	stop := context.AfterFunc(ctx, func() { _ = turnConn.Close() })
+	defer stop()
 	return allocateTURNOnConn(endpoint, peer, creds, turnConn)
 }
 
@@ -381,6 +387,14 @@ func allocateTURNOnConn(
 	creds *Credentials,
 	turnConn net.PacketConn,
 ) (*turn.Client, net.PacketConn, error) {
+	deletion := &turnDeletionTransport{PacketConn: turnConn, ack: make(chan struct{})}
+	turnConn = deletion
+	owned := false
+	defer func() {
+		if !owned {
+			_ = turnConn.Close()
+		}
+	}()
 	turnAddr := endpoint.address()
 
 	// RequestedAddressFamily
@@ -401,7 +415,6 @@ func allocateTURNOnConn(
 		LoggerFactory:          &NullLoggerFactory{},
 	})
 	if err != nil {
-		_ = turnConn.Close()
 		return nil, nil, fmt.Errorf("TURN %s клиент %s: %w", endpoint.label(), turnAddr, err)
 	}
 
@@ -424,7 +437,8 @@ func allocateTURNOnConn(
 		return nil, nil, fmt.Errorf("TURN %s Allocate %s: %w", endpoint.label(), turnAddr, err)
 	}
 
-	return tc, relay, nil
+	owned = true
+	return tc, &ownedTURNAllocation{PacketConn: relay, transport: turnConn, closeClient: tc.Close, deletion: deletion}, nil
 }
 
 func openTURNAllocationOverMasque(
@@ -456,6 +470,8 @@ func openTURNAllocationOverMasque(
 		conn = tlsConn
 	}
 
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
 	return allocateTURNOnConn(endpoint, peer, creds, turn.NewSTUNConn(conn))
 }
 
@@ -516,8 +532,11 @@ func RunSession(
 	preferTURNStream bool,
 	turnCandidateRetry int,
 	onTURNAllocated func(),
-) (bool, error) {
+) (delivered bool, sessionErr error) {
+	replacingUplink, recoveryComplete := d.uplinkRecovery.completion(sessionID)
+	defer recoveryComplete()
 	configDelivered := false
+	useWrap := len(tp.WrapKey) == wrapKeyLen
 
 	if len(creds.TurnURLs) == 0 {
 		return false, fmt.Errorf("нет TURN URL в учетных данных")
@@ -532,6 +551,45 @@ func RunSession(
 	if len(candidates) == 0 {
 		return false, fmt.Errorf("нет пригодных TURN URL в учетных данных")
 	}
+	var autoLease *connectionLease
+	var startupTimer *time.Timer
+	if tp.Auto != nil {
+		outerCtx := ctx
+		var acquireErr error
+		autoLease, acquireErr = tp.Auto.acquire(ctx, connectionPaths(candidates, tp, tp.NoUDP))
+		if acquireErr != nil {
+			return false, acquireErr
+		}
+		defer func() {
+			failure := sessionErr
+			if errors.Is(context.Cause(ctx), context.DeadlineExceeded) {
+				failure = context.DeadlineExceeded
+			}
+			autoLease.finish(failure, outerCtx.Err() != nil)
+		}()
+		var cancelCause context.CancelCauseFunc
+		ctx, cancelCause = context.WithCancelCause(ctx)
+		attemptCancel := func() { cancelCause(context.Canceled) }
+		autoLease.bind(attemptCancel)
+		defer attemptCancel()
+		// Includes Allocate, relay handshake and authenticated registration.
+		budget := 30 * time.Second
+		if autoLease.path.masque != "" {
+			budget = 60 * time.Second
+		}
+		startupTimer = time.AfterFunc(budget, func() { cancelCause(context.DeadlineExceeded) })
+		defer startupTimer.Stop()
+		candidates = []turnEndpoint{autoLease.path.endpoint}
+	}
+	if tp.NoUDP {
+		filtered := candidates[:0]
+		for _, c := range candidates {
+			if c.Transport != turnTransportUDP {
+				filtered = append(filtered, c)
+			}
+		}
+		candidates = filtered
+	}
 	directCandidates, masqueCandidates, finalUDPCandidates := turnCandidateStages(candidates, tp.Masque != nil)
 
 	var tc *turn.Client
@@ -540,51 +598,29 @@ func RunSession(
 	var selectedMasqueProtocol warpMasqueProtocol
 	var lastTURNErr error
 	var err error
-	for idx, candidate := range directCandidates {
-		if !preferTURNStream && idx == 0 {
-			log.Printf("[СЕССИЯ #%d] TURN %s (%s)", sessionID, candidate.label(), candidate.address())
-		} else if !preferTURNStream {
-			log.Printf("[СЕССИЯ #%d] [TURN] Резервный путь %s (%s) после ошибки: %v", sessionID, candidate.label(), candidate.address(), lastTURNErr)
-		} else if idx == 0 {
-			log.Printf("[СЕССИЯ #%d] [TURN] Путь %s (%s), %s", sessionID, candidate.label(), candidate.address(), turnPathSNI(candidate, tp.TLSFrontSNI, preferTURNStream))
+	if autoLease != nil {
+		p := autoLease.path
+		if p.masque != "" {
+			tc, relay, err = openTURNAllocationOverMasque(ctx, p.endpoint, peer, creds, tp.Masque, p.masque)
 		} else {
-			log.Printf("[СЕССИЯ #%d] [TURN] Резервный путь %s (%s), %s, после ошибки: %v", sessionID, candidate.label(), candidate.address(), turnPathSNI(candidate, tp.TLSFrontSNI, preferTURNStream), lastTURNErr)
+			tc, relay, err = openTURNAllocation(ctx, p.endpoint, peer, creds, sessionID, p.front, true)
 		}
-
-		tc, relay, err = openTURNAllocation(ctx, candidate, peer, creds, sessionID, tp.TLSFrontSNI, preferTURNStream)
-		if err == nil {
-			selectedEndpoint = candidate
-			break
-		}
-		lastTURNErr = err
-		if isCredentialTURNError(err) {
+		if err != nil {
 			return false, err
 		}
-	}
-	if relay == nil && tp.Masque != nil {
-		log.Printf("[СЕССИЯ #%d] [MASQUE] Прямые TCP/TLS-пути «Сети РТ» не сработали; до UDP пробуем WARP CONNECT-IP: %v", sessionID, lastTURNErr)
-	masqueProtocols:
-		for _, protocol := range tp.Masque.protocolOrder() {
-			for _, candidate := range masqueCandidates {
-				log.Printf("[СЕССИЯ #%d] [MASQUE] Пробуем TURN %s (%s) внутри CONNECT-IP %s", sessionID, candidate.label(), candidate.address(), protocol)
-				tc, relay, err = openTURNAllocationOverMasque(ctx, candidate, peer, creds, tp.Masque, protocol)
-				if err == nil {
-					selectedEndpoint = candidate
-					selectedMasqueProtocol = protocol
-					tp.Masque.markPreferred(protocol)
-					break masqueProtocols
-				}
-				lastTURNErr = err
-				log.Printf("[СЕССИЯ #%d] [MASQUE] %s через %s не сработал: %v", sessionID, candidate.label(), protocol, err)
-				if isCredentialTURNError(err) {
-					return false, err
-				}
+		selectedEndpoint, selectedMasqueProtocol = p.endpoint, p.masque
+	} else {
+		for idx, candidate := range directCandidates {
+			if !preferTURNStream && idx == 0 {
+				log.Printf("[СЕССИЯ #%d] TURN %s (%s)", sessionID, candidate.label(), candidate.address())
+			} else if !preferTURNStream {
+				log.Printf("[СЕССИЯ #%d] [TURN] Резервный путь %s (%s) после ошибки: %v", sessionID, candidate.label(), candidate.address(), lastTURNErr)
+			} else if idx == 0 {
+				log.Printf("[СЕССИЯ #%d] [TURN] Путь %s (%s), %s", sessionID, candidate.label(), candidate.address(), turnPathSNI(candidate, tp.TLSFrontSNI, preferTURNStream))
+			} else {
+				log.Printf("[СЕССИЯ #%d] [TURN] Резервный путь %s (%s), %s, после ошибки: %v", sessionID, candidate.label(), candidate.address(), turnPathSNI(candidate, tp.TLSFrontSNI, preferTURNStream), lastTURNErr)
 			}
-		}
-	}
-	if relay == nil && tp.Masque != nil {
-		for _, candidate := range finalUDPCandidates {
-			log.Printf("[СЕССИЯ #%d] [TURN] Последний резерв после MASQUE: %s (%s), после ошибки: %v", sessionID, candidate.label(), candidate.address(), lastTURNErr)
+
 			tc, relay, err = openTURNAllocation(ctx, candidate, peer, creds, sessionID, tp.TLSFrontSNI, preferTURNStream)
 			if err == nil {
 				selectedEndpoint = candidate
@@ -595,11 +631,51 @@ func RunSession(
 				return false, err
 			}
 		}
+		if relay == nil && tp.Masque != nil {
+			log.Printf("[СЕССИЯ #%d] [MASQUE] Прямые TCP/TLS-пути не сработали; пробуем резерв MASQUE: %v", sessionID, lastTURNErr)
+		masqueProtocols:
+			for _, protocol := range tp.Masque.protocolOrder() {
+				if tp.NoUDP && protocol == warpMasqueHTTP3 {
+					continue
+				}
+				for _, candidate := range masqueCandidates {
+					log.Printf("[СЕССИЯ #%d] [MASQUE] Пробуем TURN %s (%s) внутри CONNECT-IP %s", sessionID, candidate.label(), candidate.address(), protocol)
+					tc, relay, err = openTURNAllocationOverMasque(ctx, candidate, peer, creds, tp.Masque, protocol)
+					if err == nil {
+						selectedEndpoint = candidate
+						selectedMasqueProtocol = protocol
+						tp.Masque.markPreferred(protocol)
+						break masqueProtocols
+					}
+					lastTURNErr = err
+					log.Printf("[СЕССИЯ #%d] [MASQUE] %s через %s не сработал: %v", sessionID, candidate.label(), protocol, err)
+					if isCredentialTURNError(err) {
+						return false, err
+					}
+				}
+			}
+		}
+		if relay == nil && tp.Masque != nil {
+			for _, candidate := range finalUDPCandidates {
+				log.Printf("[СЕССИЯ #%d] [TURN] Последний резерв после MASQUE: %s (%s), после ошибки: %v", sessionID, candidate.label(), candidate.address(), lastTURNErr)
+				tc, relay, err = openTURNAllocation(ctx, candidate, peer, creds, sessionID, tp.TLSFrontSNI, preferTURNStream)
+				if err == nil {
+					selectedEndpoint = candidate
+					break
+				}
+				lastTURNErr = err
+				if isCredentialTURNError(err) {
+					return false, err
+				}
+			}
+		}
+	}
+	if relay == nil && lastTURNErr == nil {
+		return false, fmt.Errorf("нет разрешённых путей подключения")
 	}
 	if lastTURNErr != nil && relay == nil {
 		return false, lastTURNErr
 	}
-	defer tc.Close()
 	defer relay.Close()
 
 	// Reset error count on successful allocation
@@ -639,8 +715,6 @@ func RunSession(
 	// Relay ↔ Pipe proxy (with RTP obfuscation)
 	var relayWg sync.WaitGroup
 	relayWg.Add(2)
-
-	useWrap := len(tp.WrapKey) == wrapKeyLen
 
 	// Initialize obfs config per session
 	var obfsCfg *ObfsConfig
@@ -693,6 +767,7 @@ func RunSession(
 		defer relayWg.Done()
 		defer sessCancel()
 		b := make([]byte, readBufSize)
+		var reusableWrap []byte
 		for {
 			n, _, readErr := pipeA.ReadFrom(b)
 			if readErr != nil {
@@ -701,7 +776,7 @@ func RunSession(
 			out := b[:n]
 			if useWrap {
 				if obfsCfg != nil && obfsWriteState != nil {
-					wrapped, wrapErr := obfsWrapPacket(tp.WrapKey, out, obfsCfg, obfsWriteState)
+					wrapped, wrapErr := obfsWrapPacketInto(reusableWrap, tp.WrapKey, out, obfsCfg, obfsWriteState)
 					if wrapErr != nil {
 						log.Printf("[СЕССИЯ #%d] OBFS wrap: %v", sessionID, wrapErr)
 						return
@@ -715,6 +790,18 @@ func RunSession(
 		}
 	}()
 
+	// Handshake, admission and experiment negotiation can all return early.
+	// Close both directions before joining so a failed path cannot leave a
+	// blocked pipe writer or TURN reader alive until process shutdown.
+	defer func() {
+		sessCancel()
+		_ = relay.Close()
+		_ = pipeA.Close()
+		_ = pipeB.Close()
+		relayWg.Wait()
+		sessionWg.Wait()
+	}()
+
 	// DTLS с поддержкой Connection ID (без SNI)
 	cert, err := selfsign.GenerateSelfSigned()
 	if err != nil {
@@ -722,6 +809,9 @@ func RunSession(
 	}
 
 	// Acquire handshake semaphore
+	if autoLease != nil {
+		autoLease.setStage("dtls")
+	}
 	select {
 	case handshakeSem <- struct{}{}:
 	case <-sessCtx.Done():
@@ -769,15 +859,12 @@ func RunSession(
 	})
 	defer stopDTLS()
 
-	stats.ActiveConnections.Add(1)
-	globalActiveConnections.Add(1)
-	defer func() {
-		stats.ActiveConnections.Add(-1)
-		globalActiveConnections.Add(-1)
-	}()
-
+	transportMode := tp.Experiment
 	// Запрос конфига
-	if getConfig && configCh != nil {
+	{ // Every worker must authenticate its device before joining the relay.
+		if autoLease != nil {
+			autoLease.setStage("registration")
+		}
 		conf, confErr := RequestConfig(
 			sessCtx,
 			dtlsConn,
@@ -786,6 +873,7 @@ func RunSession(
 			password,
 			deviceInfo,
 			transportSession,
+			pathprobe.Worker{Slot: uint32(sessionID), Attempt: d.workerAttempt.Add(1)},
 		)
 		if confErr != nil {
 			if _, limited := workerPolicyLimit(confErr); limited {
@@ -795,11 +883,34 @@ func RunSession(
 			if strings.Contains(errStr, "FATAL_AUTH") {
 				return false, confErr
 			}
-			if requireConfig {
-				return false, fmt.Errorf("регистрация нового подключения: %w", confErr)
+			return false, fmt.Errorf("регистрация нового подключения: %w", confErr)
+		}
+		if conf == "" {
+			return false, fmt.Errorf("сервер ещё не выдал конфигурацию")
+		}
+		transportMode = d.resolveTransport(conf)
+		if autoLease != nil {
+			autoLease.setStage("protocol")
+		}
+		if err := negotiateTransportExperiment(sessCtx, dtlsConn, conf, transportMode); err != nil {
+			return false, err
+		}
+		if autoLease != nil {
+			autoLease.setStage("confirmation")
+			if err := confirmConnectionPath(sessCtx, dtlsConn); err != nil {
+				return false, err
 			}
-			log.Printf("[ВОРКЕР #%d] Ошибка конфига: %v", sessionID, confErr)
-		} else if conf != "" {
+			if !startupTimer.Stop() || ctx.Err() != nil {
+				return false, context.DeadlineExceeded
+			}
+			if !autoLease.accept() {
+				return false, context.Canceled
+			}
+			if selectedMasqueProtocol != "" {
+				tp.Masque.markPreferred(selectedMasqueProtocol)
+			}
+		}
+		if getConfig && configCh != nil {
 			select {
 			case configCh <- conf:
 				configDelivered = true
@@ -811,22 +922,17 @@ func RunSession(
 			if onConfigDelivered != nil {
 				onConfigDelivered()
 			}
-		} else {
-			if requireConfig {
-				return false, fmt.Errorf("сервер ещё не выдал WireGuard-конфиг")
-			}
-			log.Printf("[ВОРКЕР #%d] Сервер ещё не выдал WireGuard-конфиг, повторим позже", sessionID)
 		}
 	}
 
-	log.Printf("[ВОРКЕР #%d] [READY] Туннель готов к работе ✓", sessionID)
+	stats.ActiveConnections.Add(1)
+	globalActiveConnections.Add(1)
+	defer func() {
+		stats.ActiveConnections.Add(-1)
+		globalActiveConnections.Add(-1)
+	}()
 
-	// New servers use this one-shot capability marker to bind every worker of
-	// a device to one stable WireGuard-side UDP source. An older server treats
-	// it as an invalid WireGuard datagram, then continues with the next packet.
-	if _, err := dtlsConn.Write([]byte(multipathRelayHello)); err != nil {
-		return false, fmt.Errorf("запуск multipath-реле: %w", err)
-	}
+	log.Printf("[ВОРКЕР #%d] [READY] Туннель готов к работе ✓", sessionID)
 
 	// Регистрация в диспетчере
 	slot := &WorkerSlot{
@@ -836,7 +942,32 @@ func RunSession(
 		SleepCh:   make(chan struct{}, 1),
 		WakeAckCh: make(chan uint64, 1),
 	}
+	var uplinkReplacement atomic.Bool
+	if transportMode == experimentUplink {
+		slot.uplink = &uplinkQuality{id: sessionID, pacer: d.uplinkPacing}
+		slot.uplink.sleeping = d.deviceSleeping.Load
+		slot.uplink.probeWait = d.uplinkPacing.probes.Wait
+		slot.uplink.replace = func() bool {
+			if !d.canReplaceUplink(sessionID) {
+				return false
+			}
+			uplinkReplacement.Store(true)
+			return true
+		}
+		if replacingUplink {
+			slot.uplink.muted.Store(true)
+			slot.uplink.probation.Store(true)
+		}
+	}
+	var measuredPackets <-chan timedDatagram
+	if transportMetricsEnabled {
+		slot.queue = newTransportQueue(workerSendBuf)
+		measuredPackets = slot.queue.items
+		go slot.queue.run(sessCtx, "client_uplink", transportMode)
+	}
 	d.Register(slot)
+	d.uplinkRecovery.registered(sessionID)
+	recoveryComplete()
 	defer d.Unregister(slot)
 
 	var lastServerRxAt atomic.Int64
@@ -856,6 +987,20 @@ func RunSession(
 		_ = dtlsConn.SetWriteDeadline(now.Add(5 * time.Second))
 		_, err := dtlsConn.Write(ping)
 		return err == nil
+	}
+
+	if slot.uplink != nil {
+		proxyWg.Add(1)
+		go func() {
+			defer proxyWg.Done()
+			slot.uplink.run(sessCtx, func(p []byte) error {
+				dtlsWriteMu.Lock()
+				defer dtlsWriteMu.Unlock()
+				_ = dtlsConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+				_, err := dtlsConn.Write(p)
+				return err
+			}, sessCancel)
+		}()
 	}
 
 	// DTLS Keepalive: prevents TURN allocation timeout and DTLS idle disconnect
@@ -945,27 +1090,42 @@ func RunSession(
 	go func() {
 		defer proxyWg.Done()
 		defer sessCancel()
+		var framedPacket []byte
 		for {
+			var pkt []byte
 			select {
 			case <-sessCtx.Done():
 				return
-			case pkt, ok := <-slot.SendCh:
+			case queued := <-measuredPackets:
+				slot.queue.noteDequeue(queued)
+				pkt = queued.data
+			case p, ok := <-slot.SendCh:
 				if !ok {
 					return
 				}
-				userTraffic := isWireGuardUserDataPacket(pkt)
-				dtlsWriteMu.Lock()
-				_ = dtlsConn.SetWriteDeadline(time.Now().Add(sessionReadTimeout))
-				_, writeErr := dtlsConn.Write(pkt)
-				dtlsWriteMu.Unlock()
-				putPktBuf(pkt)
-				if writeErr != nil {
-					log.Printf("[ВОРКЕР #%d] Ошибка Writer: %v", sessionID, writeErr)
-					return
-				}
-				if userTraffic {
-					d.noteUserTrafficSent(time.Now())
-				}
+				pkt = p
+			}
+			userTraffic := d.isUserPacket(pkt)
+			writeStarted := time.Now()
+			dtlsWriteMu.Lock()
+			_ = dtlsConn.SetWriteDeadline(time.Now().Add(sessionReadTimeout))
+			outgoing := pkt
+			if slot.uplink != nil && len(pkt) >= 4 && pkt[0] >= 1 && pkt[0] <= 4 && pkt[1] == 0 && pkt[2] == 0 && pkt[3] == 0 {
+				outgoing = slot.uplink.frame(framedPacket, pkt, pathprobe.Data)
+				framedPacket = outgoing[:0]
+			}
+			_, writeErr := dtlsConn.Write(outgoing)
+			dtlsWriteMu.Unlock()
+			if slot.queue != nil {
+				slot.queue.noteWrite(writeStarted, len(pkt), writeErr)
+			}
+			putPktBuf(pkt)
+			if writeErr != nil {
+				log.Printf("[ВОРКЕР #%d] Ошибка Writer: %v", sessionID, writeErr)
+				return
+			}
+			if userTraffic {
+				d.noteUserTrafficSent(time.Now())
 			}
 		}
 	}()
@@ -1005,6 +1165,9 @@ func RunSession(
 			}
 
 			lastServerRxAt.Store(time.Now().UnixNano())
+			if slot.queue != nil {
+				slot.queue.received.Add(uint64(n))
+			}
 
 			if _, policyErr := parseConfigResponse(string(pkt[:n])); policyErr != nil {
 				if maxWorkers, limited := workerPolicyLimit(policyErr); limited {
@@ -1023,11 +1186,15 @@ func RunSession(
 				putPktBuf(pkt)
 				continue
 			}
+			if slot.uplink != nil && slot.uplink.ack(pkt[:n], time.Now()) {
+				putPktBuf(pkt)
+				continue
+			}
 			if d.handleUpdateMetadataResponse(pkt[:n]) {
 				putPktBuf(pkt)
 				continue
 			}
-			if isWireGuardUserDataPacket(pkt[:n]) {
+			if d.isUserPacket(pkt[:n]) {
 				if d.noteUserTrafficResponse() {
 					log.Printf("[HEALTH] пользовательский трафик снова получает ответы")
 				}
@@ -1054,6 +1221,9 @@ func RunSession(
 	case maxWorkers := <-policyLimitCh:
 		return configDelivered, &workerPolicyLimitError{maxWorkers: maxWorkers}
 	default:
+	}
+	if uplinkReplacement.Load() {
+		return configDelivered, errUplinkPathReplacement
 	}
 	return configDelivered, nil
 }

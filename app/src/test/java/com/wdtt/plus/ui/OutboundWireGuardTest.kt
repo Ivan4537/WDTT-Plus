@@ -740,7 +740,7 @@ class OutboundWireGuardTest {
         assertTrue("chmod 0600 /etc/wdtt/outbound.json" in script)
         assertTrue("WDTT_PROXY_TEST_SOURCE=\"${'$'}test_source\"" in script)
         assertTrue("iptables -t nat -I OUTPUT -s \"${'$'}test_source\" -p tcp -j WDTT_PROXY_TEST" in script)
-        assertTrue("curl --interface \"${'$'}test_source\"" in script)
+        assertTrue("--interface \"${'$'}test_source\"" in script)
         assertFalse("iptables -t nat -I OUTPUT -p tcp -m owner --uid-owner 0 -j WDTT_PROXY_TEST" in script)
         assertShellSyntax(script)
     }

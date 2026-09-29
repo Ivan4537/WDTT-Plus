@@ -6,6 +6,8 @@ import android.content.Context
 import android.widget.Toast
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.focusGroup
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -46,6 +48,10 @@ fun LogsTab(
     val scope = rememberCoroutineScope()
     val currentLogs by TunnelManager.logs.collectAsStateWithLifecycle()
     val tunnelRunning by TunnelManager.running.collectAsStateWithLifecycle()
+    var problemsOnly by rememberSaveable { mutableStateOf(false) }
+    val visibleLogs = remember(currentLogs, problemsOnly) {
+        if (problemsOnly) currentLogs.filter { it.severity != LogSeverity.Info } else currentLogs
+    }
     val listState = rememberRememberedLazyListState(
         firstVisibleItemIndex,
         firstVisibleItemScrollOffset
@@ -59,22 +65,22 @@ fun LogsTab(
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(
-                "Лог событий",
+                "Журнал событий",
                 style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
                 color = MaterialTheme.colorScheme.onSurface
             )
             Row {
-                IconButton(onClick = { TunnelManager.clearLogs() }) {
-                    Icon(Icons.Default.Delete, contentDescription = "Clear", tint = MaterialTheme.colorScheme.primary)
+                HintIconButton(hint = "Очистить журнал", enabled = currentLogs.isNotEmpty(), onClick = { TunnelManager.clearLogs() }) {
+                    Icon(Icons.Default.Delete, contentDescription = "Очистить журнал", tint = MaterialTheme.colorScheme.primary)
                 }
-                IconButton(onClick = {
-                    val text = currentLogs.joinToString("\n") { "${it.message} (x${it.count})" }
+                HintIconButton(hint = "Копировать журнал", enabled = visibleLogs.isNotEmpty(), onClick = {
+                    val text = visibleLogs.joinToString("\n") { if (it.count > 1) "${it.message} (×${it.count})" else it.message }
                     val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                     val clip = ClipData.newPlainText("WDTT Logs", text)
                     clipboard.setPrimaryClip(clip)
                     Toast.makeText(context, "Скопировано", Toast.LENGTH_SHORT).show()
                 }) {
-                    Icon(Icons.Default.ContentCopy, contentDescription = "Copy", tint = MaterialTheme.colorScheme.primary)
+                    Icon(Icons.Default.ContentCopy, contentDescription = "Копировать журнал", tint = MaterialTheme.colorScheme.primary)
                 }
             }
         }
@@ -99,7 +105,7 @@ fun LogsTab(
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
                 Text(
-                    "Активное логирование",
+                    "Записывать события",
                     style = MaterialTheme.typography.bodyMedium,
                     fontWeight = FontWeight.Medium,
                     fontSize = 14.sp,
@@ -110,6 +116,14 @@ fun LogsTab(
                     onCheckedChange = null,
                 )
             }
+        }
+
+        Row(
+            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(bottom = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            FilterChip(selected = !problemsOnly, onClick = { problemsOnly = false }, label = { Text("Все") })
+            FilterChip(selected = problemsOnly, onClick = { problemsOnly = true }, label = { Text("Предупреждения и ошибки") })
         }
 
         // Нейтральный фон в светлой теме не спорит с цветами уровней лога.
@@ -131,7 +145,21 @@ fun LogsTab(
                 modifier = Modifier.fillMaxSize().padding(12.dp),
                 contentPadding = PaddingValues(bottom = 12.dp)
             ) {
-                items(currentLogs, key = { it.key }) { entry ->
+                if (visibleLogs.isEmpty()) {
+                    item {
+                        Text(
+                            when {
+                                !loggingEnabled -> "Запись событий выключена"
+                                problemsOnly -> "Предупреждений и ошибок нет"
+                                else -> "Здесь появятся события подключения и диагностики"
+                            },
+                            modifier = Modifier.padding(12.dp),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                items(visibleLogs, key = { it.key }) { entry ->
                     LogLine(entry, sessionActive = tunnelRunning)
                 }
             }

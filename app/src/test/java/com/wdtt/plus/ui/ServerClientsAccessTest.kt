@@ -11,7 +11,7 @@ class ServerClientsAccessTest {
     fun primaryServerAccessExplainsEveryLocalBlocker() {
         val key = "-----BEGIN OPENSSH PRIVATE KEY-----\ndGVzdA==\n-----END OPENSSH PRIVATE KEY-----"
         assertEquals(
-            "Укажите IP-адрес или домен сервера в верхнем блоке «Деплой».",
+            "Укажите IP-адрес или домен сервера в настройках SSH.",
             primaryServerSshAccessIssue("", false, "password", "", "", 22)
         )
         assertEquals(
@@ -23,7 +23,7 @@ class ServerClientsAccessTest {
             primaryServerSshAccessIssue("vpn.example.org", true, "key", "sudo", "", 22)
         )
         assertEquals(
-            "Откройте «Секреты» и укажите корректный SSH-порт от 1 до 65535.",
+            "Откройте настройки SSH и укажите корректный SSH-порт от 1 до 65535.",
             primaryServerSshAccessIssue("vpn.example.org", true, "key", "", key, 0)
         )
         assertNull(primaryServerSshAccessIssue("vpn.example.org", true, "key", "", key, 22))
@@ -32,11 +32,11 @@ class ServerClientsAccessTest {
     @Test
     fun accessRequiresDeployHostSshAndAdminPassword() {
         assertEquals(
-            "Укажите IP-адрес или домен сервера в верхнем блоке «Деплой».",
+            "Укажите IP-адрес или домен сервера в настройках SSH.",
             serverClientsAccessIssue("", false, "", 22, "")
         )
         assertEquals(
-            "Проверьте IP-адрес или домен сервера в верхнем блоке «Деплой».",
+            "Проверьте IP-адрес или домен сервера в настройках SSH.",
             serverClientsAccessIssue("https://bad host", false, "ssh", 22, "owner")
         )
         assertEquals(
@@ -60,7 +60,7 @@ class ServerClientsAccessTest {
             serverClientsAccessIssue("vpn.example.org", true, "ssh", 0, "owner")
         )
         assertEquals(
-            "Откройте «Секреты» и укажите главный пароль администратора.",
+            "Откройте параметры сервера и укажите главный пароль администратора.",
             serverClientsAccessIssue("vpn.example.org", true, "ssh", 22, "")
         )
         assertNull(serverClientsAccessIssue("vpn.example.org", true, "ssh", 22, "owner"))

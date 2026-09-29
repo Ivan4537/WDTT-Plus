@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"wdtt.local/pathprobe"
 )
 
 const (
@@ -97,11 +98,20 @@ func (b *tokenBucket) allow(amount float64) bool {
 }
 
 func (b *tokenBucket) wait(ctx context.Context, amount int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if b == nil || b.rate <= 0 || amount <= 0 {
 		return nil
 	}
 	need := float64(amount)
+	if need > b.burst {
+		return errors.New("packet exceeds rate limiter burst capacity")
+	}
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		b.mu.Lock()
 		now := time.Now()
 		b.refill(now)
@@ -111,8 +121,9 @@ func (b *tokenBucket) wait(ctx context.Context, amount int) error {
 			return nil
 		}
 		missing := need - b.tokens
-		b.tokens = 0
-		b.last = now
+		// Keep accumulated credit while waiting. Consuming a partial packet
+		// here makes concurrent workers repeatedly destroy each other's
+		// allowance and can stall a rate-limited access below its limit.
 		wait := time.Duration(missing / b.rate * float64(time.Second))
 		b.mu.Unlock()
 		if wait < time.Millisecond {
@@ -149,6 +160,7 @@ type accessRuntime struct {
 	disconnectedAt time.Time
 	currentDevice  string
 	currentSession string
+	workerAttempts map[uint32]uint64
 	workers        map[*accessWorkerLease]struct{}
 	upload         *tokenBucket
 	download       *tokenBucket
@@ -157,6 +169,8 @@ type accessRuntime struct {
 }
 
 type accessWorkerLease struct {
+	worker     pathprobe.Worker
+	retired    atomic.Bool
 	runtime    *accessRuntime
 	connection net.Conn
 	session    string
@@ -243,7 +257,7 @@ func acquireAccessWorkerSession(
 	if item.currentSession != "" {
 		activeForCurrentSession = 0
 		for worker := range item.workers {
-			if worker.session == item.currentSession {
+			if worker.session == item.currentSession && !worker.retired.Load() {
 				activeForCurrentSession++
 			}
 		}
@@ -292,6 +306,7 @@ func acquireAccessWorkerForSession(
 	identity accessIdentity,
 	connection net.Conn,
 	deviceID, session string,
+	workerRef ...pathprobe.Worker,
 ) (*accessRuntime, *accessWorkerLease, func(), bool) {
 	deviceID = strings.TrimSpace(deviceID)
 	session = strings.TrimSpace(session)
@@ -300,10 +315,18 @@ func acquireAccessWorkerForSession(
 	}
 
 	staleConnections := make([]net.Conn, 0)
+	var ref pathprobe.Worker
+	if len(workerRef) > 0 {
+		ref = workerRef[0]
+		if !ref.Valid() {
+			return nil, nil, func() {}, false
+		}
+	}
 	accessRuntimes.mu.Lock()
 	item := accessRuntimes.getOrCreateLocked(identity)
 	switch {
 	case item.currentSession == "":
+		item.workerAttempts = make(map[uint32]uint64)
 		item.currentDevice = deviceID
 		item.currentSession = session
 		for worker := range item.workers {
@@ -320,19 +343,30 @@ func acquireAccessWorkerForSession(
 		// has authorized deviceID.
 		item.currentDevice = deviceID
 		item.currentSession = session
+		item.workerAttempts = make(map[uint32]uint64)
 		for worker := range item.workers {
 			if worker.session == session {
 				continue
 			}
+			worker.retired.Store(true)
 			if worker.connection != nil {
 				staleConnections = append(staleConnections, worker.connection)
 			}
 		}
 	}
+	if ref.Valid() && item.workerAttempts[ref.Slot] >= ref.Attempt {
+		accessRuntimes.mu.Unlock()
+		return nil, nil, func() {}, false
+	}
 
 	activeForSession := 0
+	var replaced *accessWorkerLease
 	for worker := range item.workers {
-		if worker.session == session {
+		if worker.session == session && !worker.retired.Load() {
+			if ref.Valid() && worker.worker.Slot == ref.Slot {
+				replaced = worker
+				continue
+			}
 			activeForSession++
 		}
 	}
@@ -341,8 +375,21 @@ func acquireAccessWorkerForSession(
 		atomic.AddInt64(&workerLimitRejections, 1)
 		return nil, nil, func() {}, false
 	}
+	if replaced != nil {
+		replaced.retired.Store(true)
+		if replaced.connection != nil {
+			staleConnections = append(staleConnections, replaced.connection)
+		}
+	}
+	if ref.Valid() {
+		if item.workerAttempts == nil {
+			item.workerAttempts = make(map[uint32]uint64)
+		}
+		item.workerAttempts[ref.Slot] = ref.Attempt
+	}
 
 	lease := &accessWorkerLease{
+		worker:     ref,
 		runtime:    item,
 		connection: connection,
 		session:    session,
@@ -358,6 +405,7 @@ func acquireAccessWorkerForSession(
 
 	for _, staleConnection := range staleConnections {
 		_ = staleConnection.SetDeadline(time.Now())
+		_ = staleConnection.Close()
 	}
 
 	var once sync.Once

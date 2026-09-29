@@ -235,6 +235,7 @@ data class TunnelProfileSnapshot(
     val vpnDnsSelectionId: String = VPN_DNS_PROFILE_ID,
     val vpnDnsCustomServers: List<String> = emptyList(),
     val vkCallsPreflight: Boolean,
+    val transportExperiment: String = TRANSPORT_AUTO,
     val rtNetwork: Boolean = false,
     val rtMasque: Boolean = false,
     val rtMasqueServerBootstrap: Boolean = false,
@@ -352,6 +353,7 @@ data class ActiveTunnelProfileUiSnapshot(
     val customVkClientId: String,
     val customVkClientSecret: String,
     val vkCallsPreflight: Boolean,
+    val transportExperiment: String = TRANSPORT_AUTO,
     val rtNetwork: Boolean = false,
     val rtMasque: Boolean = false,
     val rtMasqueServerBootstrap: Boolean = false,
@@ -569,6 +571,31 @@ object WdttDeepLink {
     }
 }
 
+internal fun shouldPrepareInitialServerTunnel(
+    peer: String, password: String, link: String, remoteManaged: Boolean, remoteBinding: String,
+): Boolean = peer.isBlank() && password.isBlank() && link.isBlank() && !remoteManaged && remoteBinding.isBlank()
+
+data class ServerConnectionAccess(
+    val user: String, val password: String, val port: Int, val privateKey: String,
+    val keyPassphrase: String, val authMode: String, val adminId: String,
+    val botToken: String, val dns1: String, val dns2: String,
+)
+
+data class ServerSetupSettings(
+    val profileIndex: Int, val host: String, val user: String, val sshPassword: String,
+    val sshPort: String, val authMode: String, val privateKey: String, val keyPassphrase: String,
+    val mainPassword: String, val adminId: String, val botToken: String,
+    val dns1: String, val dns2: String, val dtlsPort: Int, val wgPort: Int, val localPort: Int,
+    val manualPorts: Boolean, val completed: Boolean,
+)
+
+data class ServerSetupCompletion(
+    val profileIndex: Int, val host: String, val user: String, val sshPassword: String,
+    val sshPort: String, val authMode: String, val mainPassword: String,
+    val dtlsPort: Int, val wgPort: Int, val localPort: Int, val dns1: String, val dns2: String,
+    val adminId: String = "", val botToken: String = "", val tunnelPrepared: Boolean = false,
+)
+
 class SettingsStore(context: Context) {
     private val appContext = context.applicationContext
     private val sharedPreferences = obtainSharedPreferences(appContext)
@@ -579,7 +606,9 @@ class SettingsStore(context: Context) {
     val settingsReady: StateFlow<Boolean> = _settingsReady.asStateFlow()
 
     companion object {
-        private val Context.dataStore by preferencesDataStore("settings")
+        private val Context.dataStore by preferencesDataStore(
+            name = "settings",
+        )
         private data class SharedPreferences(
             val scope: CoroutineScope,
             val state: StateFlow<Preferences?>,
@@ -630,6 +659,7 @@ class SettingsStore(context: Context) {
         private val WDTT_LINK_MODE = booleanPreferencesKey("wdtt_link_mode")
         private val CONNECTION_INPUT_METHOD = stringPreferencesKey("connection_input_method")
         private val CONNECT_DEVICE_ID = stringPreferencesKey("connect_device_id")
+        private val LOCAL_CONTINUATION_ID = stringPreferencesKey("local_continuation_id")
         private val TUNNEL_DEVICE_ID = stringPreferencesKey("tunnel_device_id")
 
         private val PEER = stringPreferencesKey("peer")
@@ -684,6 +714,7 @@ class SettingsStore(context: Context) {
         private val ACCESS_ACTION_MESSAGE = stringPreferencesKey("access_action_message")
         private val ACCESS_TITLE = stringPreferencesKey("access_title")
         private val ACCESS_MESSAGE = stringPreferencesKey("access_message")
+        private val PROFILE_TRANSFER_MESSAGE = stringPreferencesKey("profile_transfer_message")
         private val ACCESS_DETAIL_LABEL = stringPreferencesKey("access_detail_label")
         private val ACCESS_DETAIL_VALUE = stringPreferencesKey("access_detail_value")
         private val ACCESS_ACTION_ICON = stringPreferencesKey("access_action_icon")
@@ -745,6 +776,15 @@ class SettingsStore(context: Context) {
         private val CONNECTION_PASSWORD_ENCRYPTED = stringPreferencesKey("connection_password_encrypted")
         private val DEPLOY_MAIN_PASSWORD = stringPreferencesKey("deploy_main_password")
         private val DEPLOY_MAIN_PASSWORD_ENCRYPTED = stringPreferencesKey("deploy_main_password_encrypted")
+        private val DEPLOY_SETUP_COMPLETED = booleanPreferencesKey("deploy_setup_completed")
+        private val DEPLOY_INSTALLATION_PRESENT = booleanPreferencesKey("deploy_installation_present")
+        private val DEPLOY_INSTALLATION_HOST = stringPreferencesKey("deploy_installation_host")
+        private val DEPLOY_INSTALLATION_SSH_PORT = intPreferencesKey("deploy_installation_ssh_port")
+        private val DEPLOY_SETUP_RESULT_PENDING = booleanPreferencesKey("deploy_setup_result_pending")
+        private val DEPLOY_SETUP_TUNNEL_PREPARED = booleanPreferencesKey("deploy_setup_tunnel_prepared")
+        private val DEPLOY_DTLS_PORT = intPreferencesKey("deploy_dtls_port")
+        private val DEPLOY_WG_PORT = intPreferencesKey("deploy_wg_port")
+        private val DEPLOY_LOCAL_PORT = intPreferencesKey("deploy_local_port")
         private val DEPLOY_ADMIN_ID = stringPreferencesKey("deploy_admin_id")
         private val DEPLOY_ADMIN_ID_ENCRYPTED = stringPreferencesKey("deploy_admin_id_encrypted")
         private val DEPLOY_BOT_TOKEN = stringPreferencesKey("deploy_bot_token")
@@ -764,6 +804,7 @@ class SettingsStore(context: Context) {
 
         // ═══ Captcha Solve Mode ═══
         private val VKCALLS_PREFLIGHT = booleanPreferencesKey("vkcalls_preflight")
+        private val TRANSPORT_EXPERIMENT = stringPreferencesKey("transport_experiment")
         private val RT_NETWORK = booleanPreferencesKey("rt_network")
         private val RT_MASQUE = booleanPreferencesKey("rt_masque")
         private val RT_MASQUE_SERVER_BOOTSTRAP = booleanPreferencesKey("rt_masque_server_bootstrap")
@@ -826,7 +867,8 @@ class SettingsStore(context: Context) {
         private val PERMISSION_ONBOARDING_COMPLETE = booleanPreferencesKey("permission_onboarding_complete")
         private const val VPN_PROFILE_COUNT = 3
 
-        private val PROFILE_STRING_KEYS = listOf(
+        private val PROFILE_STRING_KEYS: List<Preferences.Key<String>> = listOf(
+            TRANSPORT_EXPERIMENT,
             PROFILE_NAME,
             PEER,
             VK_HASHES,
@@ -859,6 +901,7 @@ class SettingsStore(context: Context) {
             ACCESS_ACTION_MESSAGE,
             ACCESS_TITLE,
             ACCESS_MESSAGE,
+            PROFILE_TRANSFER_MESSAGE,
             ACCESS_DETAIL_LABEL,
             ACCESS_DETAIL_VALUE,
             ACCESS_ACTION_ICON,
@@ -871,6 +914,7 @@ class SettingsStore(context: Context) {
             VPN_DNS_CUSTOM,
             USER_AGENT,
             DEPLOY_IP,
+            DEPLOY_INSTALLATION_HOST,
             DEPLOY_LOGIN,
             DEPLOY_PASSWORD,
             DEPLOY_PASSWORD_ENCRYPTED,
@@ -917,7 +961,11 @@ class SettingsStore(context: Context) {
             CUSTOM_VK_CLIENT_SECRET,
             CUSTOM_VK_CLIENT_SECRET_ENCRYPTED
         )
-        private val PROFILE_INT_KEYS = listOf(
+        // Device-local profile identity is never part of exported settings.
+        private val PROFILE_LOCAL_STRING_KEYS: List<Preferences.Key<String>> = listOf(
+            LOCAL_CONTINUATION_ID,
+        )
+        private val PROFILE_INT_KEYS: List<Preferences.Key<Int>> = listOf(
             WORKERS_PER_HASH,
             PROFILE_MAX_WORKERS,
             PROFILE_WORKER_LIMIT_SEEN,
@@ -925,16 +973,21 @@ class SettingsStore(context: Context) {
             LISTEN_PORT,
             SERVER_DTLS_PORT,
             SERVER_WG_PORT,
-            PROXY_PORT
+            PROXY_PORT,
+            DEPLOY_INSTALLATION_SSH_PORT,
+            DEPLOY_DTLS_PORT,
+            DEPLOY_WG_PORT,
+            DEPLOY_LOCAL_PORT,
+            SERVER_MIGRATION_COMPLETED_LEVEL,
         )
-        private val PROFILE_LONG_KEYS = listOf(
+        private val PROFILE_LONG_KEYS: List<Preferences.Key<Long>> = listOf(
             ACCESS_CHECKED_AT,
             ACCESS_LAST_ATTEMPT_AT,
             ACCESS_PROFILE_REVISION,
             ACCESS_ACTION_LAUNCHED_AT,
             ACCESS_CONTINUATION_EXPIRES_AT,
         )
-        private val PROFILE_BOOLEAN_KEYS = listOf(
+        private val PROFILE_BOOLEAN_KEYS: List<Preferences.Key<Boolean>> = listOf(
             MANUAL_PORTS_ENABLED,
             NO_DTLS,
             NO_DNS,
@@ -958,23 +1011,54 @@ class SettingsStore(context: Context) {
             PROXY_LAN_ENABLED,
             PROXY_AUTH_ENABLED,
             PROXY_MODE_ACTIVATED,
+            DEPLOY_INSTALLATION_PRESENT,
+            DEPLOY_SETUP_COMPLETED,
+            DEPLOY_SETUP_TUNNEL_PREPARED,
+            DEPLOY_SETUP_RESULT_PENDING,
         )
 
         internal fun resettableProfilePreferenceNames(): Set<String> =
-            (PROFILE_STRING_KEYS + PROFILE_INT_KEYS + PROFILE_LONG_KEYS + PROFILE_BOOLEAN_KEYS)
+            (PROFILE_STRING_KEYS + PROFILE_LOCAL_STRING_KEYS + PROFILE_INT_KEYS +
+                PROFILE_LONG_KEYS + PROFILE_BOOLEAN_KEYS)
                 .mapTo(linkedSetOf()) { it.name }
 
+        internal fun profilePreferenceKeys(profile: Int): List<Preferences.Key<*>> =
+            (PROFILE_STRING_KEYS + PROFILE_LOCAL_STRING_KEYS + PROFILE_INT_KEYS +
+                PROFILE_LONG_KEYS + PROFILE_BOOLEAN_KEYS).map { getProfileKey(it, profile) }
+
+        internal fun resetProfilePreferences(prefs: MutablePreferences, profile: Int) {
+            profilePreferenceKeys(profile).forEach { prefs.remove(it) }
+        }
+
         private fun <T> getProfileKey(baseKey: Preferences.Key<T>, profile: Int): Preferences.Key<T> {
+            require(profile in 0 until VPN_PROFILE_COUNT)
             if (profile == 0) return baseKey
             val newName = "${baseKey.name}_$profile"
             @Suppress("UNCHECKED_CAST")
             return when {
-                PROFILE_STRING_KEYS.any { it.name == baseKey.name } -> stringPreferencesKey(newName) as Preferences.Key<T>
+                PROFILE_STRING_KEYS.any { it.name == baseKey.name } ||
+                    PROFILE_LOCAL_STRING_KEYS.any { it.name == baseKey.name } ->
+                    stringPreferencesKey(newName) as Preferences.Key<T>
                 PROFILE_INT_KEYS.any { it.name == baseKey.name } -> intPreferencesKey(newName) as Preferences.Key<T>
                 PROFILE_LONG_KEYS.any { it.name == baseKey.name } -> longPreferencesKey(newName) as Preferences.Key<T>
                 PROFILE_BOOLEAN_KEYS.any { it.name == baseKey.name } -> booleanPreferencesKey(newName) as Preferences.Key<T>
                 else -> throw IllegalArgumentException("Unsupported key type: ${baseKey.name}")
             }
+        }
+
+        internal fun resolveLocalContinuationProfile(
+            prefs: MutablePreferences,
+            profileIndex: Int,
+        ): LocalContinuationProfile {
+            val key = getProfileKey(LOCAL_CONTINUATION_ID, profileIndex)
+            val local = prefs[key]?.takeIf { it.isNotBlank() } ?: UUID.randomUUID().toString()
+            prefs[key] = local
+            val binding = prefs[getProfileKey(REMOTE_DOCUMENT_BINDING, profileIndex)].orEmpty()
+                .ifBlank { prefs[getProfileKey(ACCESS_LIFECYCLE_BINDING, profileIndex)].orEmpty() }
+            val identity = java.security.MessageDigest.getInstance("SHA-256")
+                .digest("$profileIndex\n$local\n$binding".toByteArray(Charsets.UTF_8))
+                .joinToString("") { "%02x".format(it) }
+            return LocalContinuationProfile(profileIndex, identity)
         }
     }
 
@@ -1047,6 +1131,7 @@ class SettingsStore(context: Context) {
                         profile
                     ),
                     vkCallsPreflight = it[getProfileKey(VKCALLS_PREFLIGHT, profile)] ?: true,
+                    transportExperiment = normalizeTransportExperiment(it[getProfileKey(TRANSPORT_EXPERIMENT, profile)]),
                     rtNetwork = it[getProfileKey(RT_NETWORK, profile)] ?: false,
                     rtMasque = it[getProfileKey(RT_MASQUE, profile)] ?: false,
                     rtMasqueServerBootstrap =
@@ -1188,7 +1273,7 @@ class SettingsStore(context: Context) {
     val showSystemApps: Flow<Boolean> = preferencesFlow.map { it[SHOW_SYSTEM_APPS] ?: false }
     val loggingEnabled: Flow<Boolean> = preferencesFlow.map { it[LOGGING_ENABLED] ?: true }
     val floatingToolbarYFraction: Flow<Float> = preferencesFlow.map { prefs ->
-        prefs[FLOATING_TOOLBAR_Y_FRACTION]?.coerceIn(0f, 1f) ?: -1f
+        prefs[FLOATING_TOOLBAR_Y_FRACTION]?.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: -1f
     }
     val trustedWifiEnabled: Flow<Boolean> = preferencesFlow.map { it[TRUSTED_WIFI_ENABLED] ?: false }
     val trustedWifiSsids: Flow<List<String>> = preferencesFlow.map { prefs ->
@@ -1470,6 +1555,72 @@ class SettingsStore(context: Context) {
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         readSecret(prefs, CONNECTION_PASSWORD_ENCRYPTED, CONNECTION_PASSWORD, profile)
     }.distinctUntilChanged().flowOn(Dispatchers.IO)
+    private fun serverSetupPorts(prefs: Preferences, profile: Int): Triple<Int, Int, Int> {
+        val manual = prefs[getProfileKey(MANUAL_PORTS_ENABLED, profile)] == true
+        return Triple(
+            prefs[getProfileKey(DEPLOY_DTLS_PORT, profile)] ?: if (manual) prefs[getProfileKey(SERVER_DTLS_PORT, profile)] ?: 56000 else 56000,
+            prefs[getProfileKey(DEPLOY_WG_PORT, profile)] ?: if (manual) prefs[getProfileKey(SERVER_WG_PORT, profile)] ?: 56001 else 56001,
+            prefs[getProfileKey(DEPLOY_LOCAL_PORT, profile)] ?: if (manual) prefs[getProfileKey(LISTEN_PORT, profile)] ?: 9000 else 9000,
+        )
+    }
+
+    private fun readServerSetupSettings(prefs: Preferences, profile: Int) = ServerSetupSettings(
+        profile, prefs[getProfileKey(DEPLOY_IP, profile)].orEmpty(),
+        prefs[getProfileKey(DEPLOY_LOGIN, profile)].orEmpty(),
+        readSecret(prefs, DEPLOY_PASSWORD_ENCRYPTED, DEPLOY_PASSWORD, profile),
+        prefs[getProfileKey(DEPLOY_SSH_PORT, profile)] ?: "22",
+        prefs[getProfileKey(DEPLOY_SSH_AUTH_MODE, profile)]?.takeIf { it == "key" || it == "password" }
+            ?: if (readSecret(prefs, DEPLOY_SSH_PRIVATE_KEY_ENCRYPTED, DEPLOY_SSH_PRIVATE_KEY, profile).isNotBlank()) "key" else "password",
+        readSecret(prefs, DEPLOY_SSH_PRIVATE_KEY_ENCRYPTED, DEPLOY_SSH_PRIVATE_KEY, profile),
+        readSecret(prefs, DEPLOY_SSH_KEY_PASSPHRASE_ENCRYPTED, DEPLOY_SSH_KEY_PASSPHRASE, profile),
+        readSecret(prefs, DEPLOY_MAIN_PASSWORD_ENCRYPTED, DEPLOY_MAIN_PASSWORD, profile),
+        readSecret(prefs, DEPLOY_ADMIN_ID_ENCRYPTED, DEPLOY_ADMIN_ID, profile),
+        readSecret(prefs, DEPLOY_BOT_TOKEN_ENCRYPTED, DEPLOY_BOT_TOKEN, profile),
+        prefs[getProfileKey(DEPLOY_DNS1, profile)] ?: "1.1.1.1",
+        prefs[getProfileKey(DEPLOY_DNS2, profile)] ?: "1.0.0.1",
+        serverSetupPorts(prefs, profile).first,
+        serverSetupPorts(prefs, profile).second,
+        serverSetupPorts(prefs, profile).third,
+        (serverSetupPorts(prefs, profile).first) != 56000 ||
+            (serverSetupPorts(prefs, profile).second) != 56001 ||
+            (serverSetupPorts(prefs, profile).third) != 9000,
+        prefs[getProfileKey(DEPLOY_SETUP_COMPLETED, profile)] ?: false,
+    )
+
+    val serverSetupSettings: Flow<ServerSetupSettings> = preferencesFlow.map { prefs ->
+        readServerSetupSettings(prefs, prefs[ACTIVE_PROFILE] ?: 0)
+    }.distinctUntilChanged().flowOn(Dispatchers.IO)
+
+    suspend fun readServerSetupSettings(profileIndex: Int): ServerSetupSettings {
+        require(profileIndex in 0 until VPN_PROFILE_COUNT)
+        return readServerSetupSettings(dataStore.data.first(), profileIndex)
+    }
+
+    val deploySetupCompleted: Flow<Boolean> = preferencesFlow.map { prefs ->
+        prefs[getProfileKey(DEPLOY_SETUP_COMPLETED, prefs[ACTIVE_PROFILE] ?: 0)] ?: false
+    }
+
+    val deploySetupCompletion: Flow<ServerSetupCompletion?> = preferencesFlow.map { prefs ->
+        val profile = prefs[ACTIVE_PROFILE] ?: 0
+        if (prefs[getProfileKey(DEPLOY_SETUP_RESULT_PENDING, profile)] != true) null
+        else ServerSetupCompletion(
+            profile, prefs[getProfileKey(DEPLOY_IP, profile)].orEmpty(),
+            prefs[getProfileKey(DEPLOY_LOGIN, profile)].orEmpty().ifBlank { "root" },
+            readSecret(prefs, DEPLOY_PASSWORD_ENCRYPTED, DEPLOY_PASSWORD, profile),
+            prefs[getProfileKey(DEPLOY_SSH_PORT, profile)] ?: "22",
+            prefs[getProfileKey(DEPLOY_SSH_AUTH_MODE, profile)] ?: "password",
+            readSecret(prefs, DEPLOY_MAIN_PASSWORD_ENCRYPTED, DEPLOY_MAIN_PASSWORD, profile),
+            serverSetupPorts(prefs, profile).first,
+            serverSetupPorts(prefs, profile).second,
+            serverSetupPorts(prefs, profile).third,
+            prefs[getProfileKey(DEPLOY_DNS1, profile)] ?: "1.1.1.1",
+            prefs[getProfileKey(DEPLOY_DNS2, profile)] ?: "1.0.0.1",
+            readSecret(prefs, DEPLOY_ADMIN_ID_ENCRYPTED, DEPLOY_ADMIN_ID, profile),
+            readSecret(prefs, DEPLOY_BOT_TOKEN_ENCRYPTED, DEPLOY_BOT_TOKEN, profile),
+            prefs[getProfileKey(DEPLOY_SETUP_TUNNEL_PREPARED, profile)] ?: false,
+        )
+    }.distinctUntilChanged().flowOn(Dispatchers.IO)
+
     val deployMainPassword: Flow<String> = preferencesFlow.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         readSecret(prefs, DEPLOY_MAIN_PASSWORD_ENCRYPTED, DEPLOY_MAIN_PASSWORD, profile)
@@ -1636,7 +1787,15 @@ class SettingsStore(context: Context) {
             ServerMigrationState(
                 pendingLevel = prefs[SERVER_MIGRATION_PENDING_LEVEL] ?: 0,
                 acknowledgedLevel = prefs[SERVER_MIGRATION_NOTICE_ACK_LEVEL] ?: 0,
-                completedLevel = prefs[serverMigrationCompletedKey(profile)] ?: 0
+                completedLevel = prefs[serverMigrationCompletedKey(profile)] ?: 0,
+                profileIndex = profile,
+                installationPresent = resolveServerInstallationPresence(
+                    prefs[getProfileKey(DEPLOY_INSTALLATION_PRESENT, profile)],
+                    prefs[getProfileKey(DEPLOY_INSTALLATION_HOST, profile)],
+                    prefs[getProfileKey(DEPLOY_INSTALLATION_SSH_PORT, profile)],
+                    prefs[getProfileKey(DEPLOY_IP, profile)].orEmpty(),
+                    prefs[getProfileKey(DEPLOY_SSH_PORT, profile)]?.toIntOrNull() ?: 22,
+                ),
             )
         }
     }
@@ -1833,10 +1992,23 @@ class SettingsStore(context: Context) {
         }
     }
 
-    suspend fun markProfileServerMigrationComplete(profile: Int, level: Int) {
-        if (level <= 0) return
+    suspend fun recordProfileServerInstallation(profile: Int, host: String, sshPort: Int, present: Boolean) {
+        require(profile in 0 until VPN_PROFILE_COUNT && host.isNotBlank() && sshPort in 1..65535)
         dataStore.edit { prefs ->
-            val key = serverMigrationCompletedKey(profile.coerceIn(0, VPN_PROFILE_COUNT - 1))
+            prefs[getProfileKey(DEPLOY_INSTALLATION_PRESENT, profile)] = present
+            prefs[getProfileKey(DEPLOY_INSTALLATION_HOST, profile)] = host.trim()
+            prefs[getProfileKey(DEPLOY_INSTALLATION_SSH_PORT, profile)] = sshPort
+        }
+    }
+
+    suspend fun markProfileServerMigrationComplete(profile: Int, level: Int, host: String, sshPort: Int) {
+        if (level <= 0) return
+        require(profile in 0 until VPN_PROFILE_COUNT && host.isNotBlank() && sshPort in 1..65535)
+        dataStore.edit { prefs ->
+            prefs[getProfileKey(DEPLOY_INSTALLATION_PRESENT, profile)] = true
+            prefs[getProfileKey(DEPLOY_INSTALLATION_HOST, profile)] = host.trim()
+            prefs[getProfileKey(DEPLOY_INSTALLATION_SSH_PORT, profile)] = sshPort
+            val key = serverMigrationCompletedKey(profile)
             prefs[key] = maxOf(prefs[key] ?: 0, level)
         }
     }
@@ -1877,9 +2049,13 @@ class SettingsStore(context: Context) {
         }
     }
 
-    suspend fun saveFloatingToolbarYFraction(fraction: Float) {
-        dataStore.edit { prefs ->
-            prefs[FLOATING_TOOLBAR_Y_FRACTION] = fraction.coerceIn(0f, 1f)
+    fun saveFloatingToolbarYFraction(fraction: Float) {
+        if (!fraction.isFinite()) return
+        // Finish persistence even if the UI leaves composition or the activity is recreated.
+        storeScope.launch {
+            dataStore.edit { prefs ->
+                prefs[FLOATING_TOOLBAR_Y_FRACTION] = fraction.coerceIn(0f, 1f)
+            }
         }
     }
 
@@ -1937,19 +2113,7 @@ class SettingsStore(context: Context) {
     suspend fun resetProfile(profile: Int) {
         val index = profile.coerceIn(0, VPN_PROFILE_COUNT - 1)
         dataStore.edit { prefs ->
-            PROFILE_STRING_KEYS.forEach { key ->
-                prefs.remove(getProfileKey(key, index))
-            }
-            PROFILE_INT_KEYS.forEach { key ->
-                prefs.remove(getProfileKey(key, index))
-            }
-            PROFILE_LONG_KEYS.forEach { key ->
-                prefs.remove(getProfileKey(key, index))
-            }
-            PROFILE_BOOLEAN_KEYS.forEach { key ->
-                prefs.remove(getProfileKey(key, index))
-            }
-            prefs.remove(serverMigrationCompletedKey(index))
+            resetProfilePreferences(prefs, index)
         }
     }
 
@@ -2158,6 +2322,7 @@ class SettingsStore(context: Context) {
                     prefs[getProfileKey(VPN_DNS_CUSTOM, profile)].orEmpty()
                 ),
                 vkCallsPreflight = prefs[getProfileKey(VKCALLS_PREFLIGHT, profile)] ?: true,
+                transportExperiment = normalizeTransportExperiment(prefs[getProfileKey(TRANSPORT_EXPERIMENT, profile)]),
                 rtNetwork = prefs[getProfileKey(RT_NETWORK, profile)] ?: false,
                 rtMasque = prefs[getProfileKey(RT_MASQUE, profile)] ?: false,
                 rtMasqueServerBootstrap =
@@ -2212,6 +2377,9 @@ class SettingsStore(context: Context) {
     suspend fun connectionLinkForProfile(profileIndex: Int): String {
         val profile = profileIndex.coerceIn(0, VPN_PROFILE_COUNT - 1)
         return appContext.dataStore.data.map { prefs ->
+            require(prefs[getProfileKey(REMOTE_MANAGED_PROFILE, profile)] != true) {
+                "Этот профиль переносится через сервис, где он был получен."
+            }
             val storedLink = prefs[getProfileKey(WDTT_LINK, profile)].orEmpty()
             val storedParts = WdttDeepLink.parse(storedLink)
             val parts = storedParts ?: WdttLinkParts(
@@ -2365,6 +2533,11 @@ class SettingsStore(context: Context) {
     suspend fun exportAdminSettings(): String = appContext.dataStore.data.map { prefs ->
         val profiles = JSONArray()
         repeat(VPN_PROFILE_COUNT) { profile ->
+            if (prefs[getProfileKey(REMOTE_MANAGED_PROFILE, profile)] == true) {
+                // Keep the slot index without serializing any connection or administrative secret.
+                profiles.put(JSONObject().put("omitted", true))
+                return@repeat
+            }
             profiles.put(JSONObject().apply {
                 put("wdttLink", prefs[getProfileKey(WDTT_LINK, profile)].orEmpty())
                 put("wdttLinkMode", prefs[getProfileKey(WDTT_LINK_MODE, profile)] ?: false)
@@ -2405,7 +2578,10 @@ class SettingsStore(context: Context) {
                 put("deployLogin", prefs[getProfileKey(DEPLOY_LOGIN, profile)].orEmpty())
                 put("deployPassword", readSecret(prefs, DEPLOY_PASSWORD_ENCRYPTED, DEPLOY_PASSWORD, profile))
                 put("deploySshPort", prefs[getProfileKey(DEPLOY_SSH_PORT, profile)].orEmpty())
-                put("deployDns1", prefs[getProfileKey(DEPLOY_DNS1, profile)] ?: "1.1.1.1")
+                put("deployDtlsPort", serverSetupPorts(prefs, profile).first)
+            put("deployWgPort", serverSetupPorts(prefs, profile).second)
+            put("deployLocalPort", serverSetupPorts(prefs, profile).third)
+            put("deployDns1", prefs[getProfileKey(DEPLOY_DNS1, profile)] ?: "1.1.1.1")
                 put("deployDns2", prefs[getProfileKey(DEPLOY_DNS2, profile)] ?: "1.0.0.1")
                 put("deployMainPassword", readSecret(prefs, DEPLOY_MAIN_PASSWORD_ENCRYPTED, DEPLOY_MAIN_PASSWORD, profile))
                 put("deployAdminId", readSecret(prefs, DEPLOY_ADMIN_ID_ENCRYPTED, DEPLOY_ADMIN_ID, profile))
@@ -2432,6 +2608,7 @@ class SettingsStore(context: Context) {
                     truncateSocks5Credential(readProtectedSecret(prefs, PROXY_PASSWORD_ENCRYPTED, profile)),
                 )
                 put("vkCallsPreflight", prefs[getProfileKey(VKCALLS_PREFLIGHT, profile)] ?: true)
+                put("transportExperiment", normalizeTransportExperiment(prefs[getProfileKey(TRANSPORT_EXPERIMENT, profile)]))
                 put("rtNetwork", prefs[getProfileKey(RT_NETWORK, profile)] ?: false)
                 put("rtMasque", prefs[getProfileKey(RT_MASQUE, profile)] ?: false)
                 put(
@@ -2487,6 +2664,8 @@ class SettingsStore(context: Context) {
         dataStore.edit { prefs ->
             repeat(VPN_PROFILE_COUNT) { profile ->
                 val item = profiles.getJSONObject(profile)
+                // An omitted slot must not erase an existing local profile on import.
+                if (item.optBoolean("omitted", false)) return@repeat
                 prefs.putSecret(
                     REMOTE_ACTION_KEY_ENCRYPTED,
                     REMOTE_ACTION_KEY,
@@ -2581,6 +2760,9 @@ class SettingsStore(context: Context) {
                 prefs.putSecret(WG_EXIT_SSH_KEY_PASSPHRASE_ENCRYPTED, WG_EXIT_SSH_KEY_PASSPHRASE, "", profile)
                 prefs[getProfileKey(WG_EXIT_SSH_AUTH_MODE, profile)] = "password"
                 prefs[getProfileKey(DEPLOY_SSH_PORT, profile)] = item.optString("deploySshPort")
+                prefs[getProfileKey(DEPLOY_DTLS_PORT, profile)] = item.safePort("deployDtlsPort", item.safePort("serverDtlsPort", 56000))
+                prefs[getProfileKey(DEPLOY_WG_PORT, profile)] = item.safePort("deployWgPort", item.safePort("serverWgPort", 56001))
+                prefs[getProfileKey(DEPLOY_LOCAL_PORT, profile)] = item.safePort("deployLocalPort", item.safePort("listenPort", 9000))
                 prefs[getProfileKey(DEPLOY_DNS1, profile)] = item.optString("deployDns1", "1.1.1.1")
                 prefs[getProfileKey(DEPLOY_DNS2, profile)] = item.optString("deployDns2", "1.0.0.1")
                 prefs.putSecret(DEPLOY_MAIN_PASSWORD_ENCRYPTED, DEPLOY_MAIN_PASSWORD, item.optString("deployMainPassword"), profile)
@@ -2610,6 +2792,7 @@ class SettingsStore(context: Context) {
                     profile,
                 )
                 prefs[getProfileKey(VKCALLS_PREFLIGHT, profile)] = item.optBoolean("vkCallsPreflight", true)
+                prefs[getProfileKey(TRANSPORT_EXPERIMENT, profile)] = normalizeTransportExperiment(item.optString("transportExperiment"))
                 prefs[getProfileKey(RT_NETWORK, profile)] = item.optBoolean("rtNetwork", false)
                 prefs[getProfileKey(RT_MASQUE, profile)] = item.optBoolean("rtMasque", false)
                 prefs[getProfileKey(RT_MASQUE_SERVER_BOOTSTRAP, profile)] =
@@ -2966,6 +3149,7 @@ class SettingsStore(context: Context) {
             remove(seenLimitKey)
         }
         if (!preserveConnectionSettings) {
+            remove(getProfileKey(TRANSPORT_EXPERIMENT, profile))
             val importedProfileName = vpnProfileRestorableName(parts.profileName)
             if (importedProfileName.isNotBlank()) {
                 this[getProfileKey(PROFILE_NAME, profile)] = importedProfileName
@@ -3105,7 +3289,8 @@ class SettingsStore(context: Context) {
         connectionPassword: String,
         dtlsPort: Int,
         wgPort: Int,
-        ownerProfile: ServerAdminProfileInfo
+        ownerProfile: ServerAdminProfileInfo,
+        deployAccess: ServerConnectionAccess? = null,
     ) {
         val profile = profileIndex.coerceIn(0, VPN_PROFILE_COUNT - 1)
         require(host.isNotBlank()) { "Адрес импортированного сервера пустой." }
@@ -3125,6 +3310,29 @@ class SettingsStore(context: Context) {
             importedVpnDnsSelection
         }
         dataStore.edit { prefs ->
+            deployAccess?.let { access ->
+                require(access.port in 1..65535 && access.authMode in setOf("password", "key"))
+                prefs[getProfileKey(DEPLOY_IP, profile)] = host.trim()
+                prefs[getProfileKey(DEPLOY_LOGIN, profile)] = access.user
+                prefs.putSecret(DEPLOY_PASSWORD_ENCRYPTED, DEPLOY_PASSWORD, access.password, profile)
+                prefs[getProfileKey(DEPLOY_SSH_PORT, profile)] = access.port.toString()
+                prefs[getProfileKey(DEPLOY_INSTALLATION_PRESENT, profile)] = true
+                prefs[getProfileKey(DEPLOY_INSTALLATION_HOST, profile)] = host.trim()
+                prefs[getProfileKey(DEPLOY_INSTALLATION_SSH_PORT, profile)] = access.port
+                prefs[getProfileKey(DEPLOY_SSH_AUTH_MODE, profile)] = access.authMode
+                if (access.authMode == "key") {
+                    prefs.putSecret(DEPLOY_SSH_PRIVATE_KEY_ENCRYPTED, DEPLOY_SSH_PRIVATE_KEY, normalizeSshPrivateKey(access.privateKey), profile)
+                    prefs.putSecret(DEPLOY_SSH_KEY_PASSPHRASE_ENCRYPTED, DEPLOY_SSH_KEY_PASSPHRASE, access.keyPassphrase, profile)
+                }
+                prefs.putSecret(DEPLOY_MAIN_PASSWORD_ENCRYPTED, DEPLOY_MAIN_PASSWORD, connectionPassword, profile)
+                prefs.putSecret(DEPLOY_ADMIN_ID_ENCRYPTED, DEPLOY_ADMIN_ID, access.adminId, profile)
+                prefs.putSecret(DEPLOY_BOT_TOKEN_ENCRYPTED, DEPLOY_BOT_TOKEN, access.botToken, profile)
+                prefs[getProfileKey(DEPLOY_DNS1, profile)] = access.dns1
+                prefs[getProfileKey(DEPLOY_DNS2, profile)] = access.dns2
+                prefs[getProfileKey(DEPLOY_DTLS_PORT, profile)] = dtlsPort
+                prefs[getProfileKey(DEPLOY_WG_PORT, profile)] = wgPort
+                prefs[getProfileKey(DEPLOY_LOCAL_PORT, profile)] = ownerProfile.listenPort
+            }
             prefs[getProfileKey(WDTT_LINK_MODE, profile)] = false
             prefs.remove(getProfileKey(WDTT_LINK, profile))
             prefs[getProfileKey(CONNECTION_INPUT_METHOD, profile)] = "manual"
@@ -3189,6 +3397,34 @@ class SettingsStore(context: Context) {
         val profile = profileIndex.coerceIn(0, VPN_PROFILE_COUNT - 1)
         dataStore.edit { prefs ->
             prefs.putRemoteAccessCapability(capability, profile)
+        }
+    }
+
+    fun profileTransferState(profile: Int): Flow<ProfileTransferState> {
+        require(profile in 0 until VPN_PROFILE_COUNT)
+        return preferencesFlow.map { prefs ->
+            val lifecycle = readStoredAccessLifecycle(prefs, profile)
+            ProfileTransferState(
+                managed = prefs[getProfileKey(REMOTE_MANAGED_PROFILE, profile)] == true,
+                capability = lifecycle.capability,
+                revision = lifecycle.appliedProfileRevision,
+                message = prefs[getProfileKey(PROFILE_TRANSFER_MESSAGE, profile)].orEmpty(),
+            )
+        }.distinctUntilChanged()
+    }
+
+    suspend fun saveProfileTransferMessage(
+        profile: Int,
+        expected: ProfileTransferState,
+        message: String,
+    ) {
+        require(profile in 0 until VPN_PROFILE_COUNT)
+        dataStore.edit { prefs ->
+            if (prefs[getProfileKey(REMOTE_MANAGED_PROFILE, profile)] == true &&
+                readStoredAccessLifecycle(prefs, profile).capability == expected.capability
+            ) {
+                prefs[getProfileKey(PROFILE_TRANSFER_MESSAGE, profile)] = message.take(2400)
+            }
         }
     }
 
@@ -3281,6 +3517,16 @@ class SettingsStore(context: Context) {
         return preferencesFlow.map { prefs ->
             prefs[getProfileKey(REMOTE_DOCUMENT_BINDING, profile)].orEmpty()
         }.first()
+    }
+
+    /** Local-only identity, stable across edits but different after reset or binding replacement. */
+    suspend fun localContinuationProfile(profileIndex: Int): LocalContinuationProfile {
+        require(profileIndex in 0 until VPN_PROFILE_COUNT)
+        lateinit var profile: LocalContinuationProfile
+        dataStore.edit { prefs ->
+            profile = resolveLocalContinuationProfile(prefs, profileIndex)
+        }
+        return profile
     }
 
     suspend fun remoteAccessBindingForProfile(profileIndex: Int): String {
@@ -3547,6 +3793,103 @@ class SettingsStore(context: Context) {
         }
     }
 
+    suspend fun saveServerAccess(profileIndex: Int, host: String, user: String, password: String, port: String) {
+        require(profileIndex in 0 until VPN_PROFILE_COUNT)
+        dataStore.edit { prefs ->
+            prefs[getProfileKey(DEPLOY_IP, profileIndex)] = host
+            prefs[getProfileKey(DEPLOY_LOGIN, profileIndex)] = user
+            prefs.putSecret(DEPLOY_PASSWORD_ENCRYPTED, DEPLOY_PASSWORD, password, profileIndex)
+            prefs[getProfileKey(DEPLOY_SSH_PORT, profileIndex)] = port
+        }
+    }
+
+    suspend fun saveServerParameters(
+        profileIndex: Int, mainPassword: String, adminId: String, botToken: String,
+        dns1: String? = null, dns2: String? = null, dtlsPort: Int? = null, wgPort: Int? = null,
+    ) {
+        require(profileIndex in 0 until VPN_PROFILE_COUNT && mainPassword.isNotBlank())
+        require((dtlsPort == null) == (wgPort == null))
+        require(dtlsPort == null || (dtlsPort in 1..65535 && wgPort != null && wgPort in 1..65535 && dtlsPort != wgPort))
+        dataStore.edit { prefs ->
+            prefs.putSecret(DEPLOY_MAIN_PASSWORD_ENCRYPTED, DEPLOY_MAIN_PASSWORD, mainPassword, profileIndex)
+            prefs.putSecret(DEPLOY_ADMIN_ID_ENCRYPTED, DEPLOY_ADMIN_ID, adminId, profileIndex)
+            prefs.putSecret(DEPLOY_BOT_TOKEN_ENCRYPTED, DEPLOY_BOT_TOKEN, botToken, profileIndex)
+            dns1?.let { prefs[getProfileKey(DEPLOY_DNS1, profileIndex)] = it }
+            dns2?.let { prefs[getProfileKey(DEPLOY_DNS2, profileIndex)] = it }
+            if (dtlsPort != null && wgPort != null) {
+                prefs[getProfileKey(DEPLOY_DTLS_PORT, profileIndex)] = dtlsPort
+                prefs[getProfileKey(DEPLOY_WG_PORT, profileIndex)] = wgPort
+            }
+        }
+    }
+
+    suspend fun saveServerSetup(
+        profileIndex: Int, host: String, user: String, sshPassword: String, sshPort: Int,
+        privateKey: String, keyPassphrase: String, authMode: String, mainPassword: String,
+        adminId: String, botToken: String, dns1: String, dns2: String,
+        dtlsPort: Int, wgPort: Int, localPort: Int, completeFirstInstallation: Boolean = false,
+    ) {
+        require(profileIndex in 0 until VPN_PROFILE_COUNT)
+        require(authMode in setOf("password", "key") && mainPassword.isNotBlank())
+        require(listOf(sshPort, dtlsPort, wgPort, localPort).all { it in 1..65535 } && dtlsPort != wgPort)
+        dataStore.edit { prefs ->
+            val profile = profileIndex
+            prefs[getProfileKey(DEPLOY_IP, profile)] = host
+            prefs[getProfileKey(DEPLOY_LOGIN, profile)] = user
+            prefs.putSecret(DEPLOY_PASSWORD_ENCRYPTED, DEPLOY_PASSWORD, sshPassword, profile)
+            prefs[getProfileKey(DEPLOY_SSH_PORT, profile)] = sshPort.toString()
+            prefs[getProfileKey(DEPLOY_SSH_AUTH_MODE, profile)] = authMode
+            if (!completeFirstInstallation || authMode == "key") {
+                prefs.putSecret(DEPLOY_SSH_PRIVATE_KEY_ENCRYPTED, DEPLOY_SSH_PRIVATE_KEY, normalizeSshPrivateKey(privateKey), profile)
+                prefs.putSecret(DEPLOY_SSH_KEY_PASSPHRASE_ENCRYPTED, DEPLOY_SSH_KEY_PASSPHRASE, keyPassphrase, profile)
+            }
+            prefs.putSecret(DEPLOY_MAIN_PASSWORD_ENCRYPTED, DEPLOY_MAIN_PASSWORD, mainPassword, profile)
+            prefs.putSecret(DEPLOY_ADMIN_ID_ENCRYPTED, DEPLOY_ADMIN_ID, adminId, profile)
+            prefs.putSecret(DEPLOY_BOT_TOKEN_ENCRYPTED, DEPLOY_BOT_TOKEN, botToken, profile)
+            prefs[getProfileKey(DEPLOY_DNS1, profile)] = dns1
+            prefs[getProfileKey(DEPLOY_DNS2, profile)] = dns2
+            prefs[getProfileKey(DEPLOY_DTLS_PORT, profile)] = dtlsPort
+            prefs[getProfileKey(DEPLOY_WG_PORT, profile)] = wgPort
+            prefs[getProfileKey(DEPLOY_LOCAL_PORT, profile)] = localPort
+            if (completeFirstInstallation) {
+                val prepareTunnel = shouldPrepareInitialServerTunnel(
+                    prefs[getProfileKey(PEER, profile)].orEmpty(),
+                    readSecret(prefs, CONNECTION_PASSWORD_ENCRYPTED, CONNECTION_PASSWORD, profile),
+                    prefs[getProfileKey(WDTT_LINK, profile)].orEmpty(),
+                    prefs[getProfileKey(REMOTE_MANAGED_PROFILE, profile)] == true,
+                    prefs[getProfileKey(REMOTE_DOCUMENT_BINDING, profile)].orEmpty(),
+                )
+                if (prepareTunnel) {
+                    prefs[getProfileKey(PEER, profile)] = host.trim()
+                    prefs.putSecret(CONNECTION_PASSWORD_ENCRYPTED, CONNECTION_PASSWORD, mainPassword, profile)
+                    prefs[getProfileKey(CONNECTION_INPUT_METHOD, profile)] = "manual"
+                    prefs[getProfileKey(WDTT_LINK_MODE, profile)] = false
+                    prefs.remove(getProfileKey(WDTT_LINK, profile))
+                    prefs[getProfileKey(SERVER_DTLS_PORT, profile)] = dtlsPort
+                    prefs[getProfileKey(SERVER_WG_PORT, profile)] = wgPort
+                    prefs[getProfileKey(LISTEN_PORT, profile)] = localPort
+                    prefs[getProfileKey(MANUAL_PORTS_ENABLED, profile)] = dtlsPort != 56000 || wgPort != 56001 || localPort != 9000
+                }
+                prefs[getProfileKey(DEPLOY_SETUP_TUNNEL_PREPARED, profile)] = prepareTunnel
+                prefs[getProfileKey(DEPLOY_SETUP_RESULT_PENDING, profile)] = true
+                prefs[getProfileKey(DEPLOY_SETUP_COMPLETED, profile)] = true
+            }
+        }
+    }
+
+    suspend fun finishServerSetup(profileIndex: Int) {
+        require(profileIndex in 0 until VPN_PROFILE_COUNT)
+        dataStore.edit { prefs ->
+            prefs[getProfileKey(DEPLOY_SETUP_COMPLETED, profileIndex)] = true
+            prefs[getProfileKey(DEPLOY_SETUP_RESULT_PENDING, profileIndex)] = false
+        }
+    }
+
+    suspend fun dismissServerSetupCompletion(profileIndex: Int) {
+        require(profileIndex in 0 until VPN_PROFILE_COUNT)
+        dataStore.edit { it[getProfileKey(DEPLOY_SETUP_RESULT_PENDING, profileIndex)] = false }
+    }
+
     suspend fun saveDeploy(ip: String, login: String, pass: String, sshPort: String, dns1: String, dns2: String) {
         dataStore.edit { prefs ->
             val profile = prefs[ACTIVE_PROFILE] ?: 0
@@ -3559,10 +3902,11 @@ class SettingsStore(context: Context) {
         }
     }
 
-    suspend fun saveDeploySshKey(privateKey: String, passphrase: String) {
+    suspend fun saveDeploySshKey(privateKey: String, passphrase: String, profileIndex: Int? = null) {
         dataStore.edit { prefs ->
-            val profile = prefs[ACTIVE_PROFILE] ?: 0
+            val profile = profileIndex ?: prefs[ACTIVE_PROFILE] ?: 0
             val normalizedKey = normalizeSshPrivateKey(privateKey)
+            if (normalizedKey.isNotBlank()) prefs[getProfileKey(DEPLOY_SSH_AUTH_MODE, profile)] = "key"
             prefs.putSecret(
                 DEPLOY_SSH_PRIVATE_KEY_ENCRYPTED,
                 DEPLOY_SSH_PRIVATE_KEY,
@@ -3578,10 +3922,10 @@ class SettingsStore(context: Context) {
         }
     }
 
-    suspend fun saveDeploySshAuthMode(mode: String) {
+    suspend fun saveDeploySshAuthMode(mode: String, profileIndex: Int? = null) {
         require(mode == "password" || mode == "key")
         dataStore.edit { prefs ->
-            val profile = prefs[ACTIVE_PROFILE] ?: 0
+            val profile = profileIndex ?: prefs[ACTIVE_PROFILE] ?: 0
             prefs[getProfileKey(DEPLOY_SSH_AUTH_MODE, profile)] = mode
         }
     }
@@ -3880,6 +4224,27 @@ class SettingsStore(context: Context) {
         dataStore.edit { prefs ->
             val profile = prefs[ACTIVE_PROFILE] ?: 0
             prefs[getProfileKey(VKCALLS_PREFLIGHT, profile)] = enabled
+        }
+    }
+
+    suspend fun saveTransportExperiment(value: String, profileIndex: Int) {
+        val profile = profileIndex.coerceIn(0, VPN_PROFILE_COUNT - 1)
+        dataStore.edit { prefs ->
+            prefs[getProfileKey(TRANSPORT_EXPERIMENT, profile)] = normalizeTransportExperiment(value)
+        }
+    }
+
+    suspend fun saveConnectionMode(streamOnly: Boolean) {
+        dataStore.edit { prefs ->
+            val profile = prefs[ACTIVE_PROFILE] ?: 0
+            prefs[getProfileKey(RT_NETWORK, profile)] = streamOnly
+        }
+    }
+
+    suspend fun saveConnectionSni(turnSni: String, profileIndex: Int) {
+        val profile = profileIndex.coerceIn(0, VPN_PROFILE_COUNT - 1)
+        dataStore.edit { prefs ->
+            prefs[getProfileKey(RT_TURN_SNI, profile)] = turnSni
         }
     }
 
@@ -4242,6 +4607,11 @@ class SettingsStore(context: Context) {
             putCachedRemoteAction(status.cachedAction, profile)
         }
         status.exchange?.let { putProfileExchange(it, profile) }
+        status.profileAction?.takeIf {
+            it.binding == this[getProfileKey(ACCESS_LIFECYCLE_BINDING, profile)]
+        }?.let {
+            this[getProfileKey(PROFILE_TRANSFER_MESSAGE, profile)] = it.action.message.take(2400)
+        }
         this[getProfileKey(ACCESS_ALLOW_CONNECT, profile)] = status.allowConnect
         this[getProfileKey(ACCESS_CHECKED_AT, profile)] = status.checkedAtMillis.coerceAtLeast(0)
         this[getProfileKey(ACCESS_ACTION_AVAILABLE, profile)] = status.actionAvailable
@@ -4424,6 +4794,7 @@ class SettingsStore(context: Context) {
         remove(getProfileKey(ACCESS_ACTION_MESSAGE, profile))
         remove(getProfileKey(ACCESS_TITLE, profile))
         remove(getProfileKey(ACCESS_MESSAGE, profile))
+        remove(getProfileKey(PROFILE_TRANSFER_MESSAGE, profile))
         remove(getProfileKey(ACCESS_DETAIL_LABEL, profile))
         remove(getProfileKey(ACCESS_DETAIL_VALUE, profile))
         remove(getProfileKey(ACCESS_ACTION_ICON, profile))

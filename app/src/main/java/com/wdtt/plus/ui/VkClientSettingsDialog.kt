@@ -61,7 +61,6 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.wdtt.plus.BUILT_IN_VK_CLIENT_IDS
@@ -115,7 +114,7 @@ internal fun vkClientIdAvailabilityMessage(
         cleanIds.size == 1 && rejected.isNotEmpty() ->
             "Client ID ${cleanIds.first()} не принимается резервным способом"
         cleanIds.size == 1 ->
-            "Не удалось проверить Client ID ${cleanIds.first()}: сеть или временная ошибка VK"
+            "Не удалось проверить Client ID ${cleanIds.first()}: сеть или временная ошибка ВК"
         rejected.isEmpty() && failed.isEmpty() -> "Все встроенные Client ID доступны для резервного способа"
         else -> buildList {
             if (available.isNotEmpty()) add("Доступны: ${available.joinToString(", ")}")
@@ -263,7 +262,7 @@ fun VkClientSettingsDialog(
         }
     }
 
-    Dialog(
+    BoundedAppDialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false)
     ) {
@@ -300,7 +299,7 @@ fun VkClientSettingsDialog(
                         }
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                "Клиенты VK",
+                                "Клиенты ВК",
                                 style = MaterialTheme.typography.titleMedium,
                                 fontWeight = FontWeight.Bold
                             )
@@ -369,9 +368,9 @@ fun VkClientSettingsDialog(
                                     Text("Собственные резервные реквизиты", fontWeight = FontWeight.SemiBold)
                                     Text(
                                         if (enabled) {
-                                            "После быстрого VKCalls сначала пробуется ваш Client ID."
+                                            "После быстрых ВК Звонков сначала пробуется ваш Client ID."
                                         } else {
-                                            "После быстрого VKCalls используются встроенные Client ID."
+                                            "После быстрых ВК Звонков используются встроенные Client ID."
                                         },
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -392,21 +391,16 @@ fun VkClientSettingsDialog(
                                 horizontalArrangement = Arrangement.SpaceBetween
                             ) {
                                 Column(modifier = Modifier.weight(1f)) {
-                                    Text("Резервные реквизиты приложения VK", fontWeight = FontWeight.Bold)
-                                    Text(
-                                        "Оба поля обязательны",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                }
-                                IconButton(
-                                    onClick = { showHelp = true },
-                                    modifier = Modifier.remoteHelpFocus(),
-                                ) {
-                                    Icon(
-                                        Icons.AutoMirrored.Filled.HelpOutline,
-                                        contentDescription = "Как получить Client ID и secret"
-                                    )
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text("Резервные реквизиты приложения ВК", fontWeight = FontWeight.Bold,
+                                            modifier = Modifier.weight(1f, fill = false))
+                                        HintIconButton(hint = "Как получить Client ID и secret", onClick = { showHelp = true }, modifier = Modifier.remoteHelpFocus()) {
+                                            Icon(Icons.AutoMirrored.Filled.HelpOutline,
+                                                contentDescription = "Как получить Client ID и secret")
+                                        }
+                                    }
+                                    Text("Оба поля обязательны", style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 }
                             }
 
@@ -415,7 +409,7 @@ fun VkClientSettingsDialog(
                                 onValueChange = { clientIdInput = normalizeVkClientId(it) },
                                 modifier = Modifier.fillMaxWidth(),
                                 label = { Text("Client ID") },
-                                supportingText = { Text("ID приложения из кабинета VK ID") },
+                                supportingText = { Text("ID приложения из кабинета ВК ID") },
                                 enabled = !tunnelRunning,
                                 singleLine = true,
                                 keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
@@ -533,7 +527,7 @@ fun VkClientSettingsDialog(
                                                 VkClientIdProbeStatus.LegacyRejected ->
                                                     "Client ID не принимается резервным способом"
                                                 VkClientIdProbeStatus.CheckFailed ->
-                                                    "Проверку выполнить не удалось: сеть или временная ошибка VK"
+                                                    "Проверку выполнить не удалось: сеть или временная ошибка ВК"
                                             },
                                             style = MaterialTheme.typography.bodySmall,
                                             color = statusContentColor,
@@ -544,7 +538,7 @@ fun VkClientSettingsDialog(
                             }
 
                             Text(
-                                "Сохранённый собственный Client ID проверяется автоматически при входе. Это второй вариант после VKCalls. Такая проверка подтверждает только приём ID старым способом VK; получение TURN-данных окончательно проверяется при подключении.",
+                                "Сохранённый собственный Client ID проверяется автоматически при входе. Это второй вариант после быстрых ВК Звонков. Такая проверка подтверждает только приём ID старым способом ВК; получение TURN-данных окончательно проверяется при подключении.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -553,9 +547,9 @@ fun VkClientSettingsDialog(
                         Text("Встроенный резерв", fontWeight = FontWeight.Bold)
                         Text(
                             if (enabled) {
-                                "Используется, если VKCalls и собственные реквизиты не сработали. Встроенный ID можно проверить нажатием на строку."
+                                "Используется, если ВК Звонки и собственные реквизиты не сработали. Встроенный ID можно проверить нажатием на строку."
                             } else {
-                                "Используется, если VKCalls не сработал. Проверка запускается автоматически при входе; нажмите на строку для повтора."
+                                "Используется, если ВК Звонки не сработали. Проверка запускается автоматически при входе; нажмите на строку для повтора."
                             },
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -641,9 +635,9 @@ fun VkClientSettingsDialog(
                         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f))
                         Text(
                             if (enabled) {
-                                "Порядок подключения: быстрый VKCalls без капчи → собственные реквизиты → встроенный резерв. Если резервный способ запросит капчу, приложение попробует решить её автоматически."
+                                "Порядок подключения: быстрые ВК Звонки без капчи → собственные реквизиты → встроенный резерв. Если резервный способ запросит капчу, приложение попробует решить её автоматически."
                             } else {
-                                "Порядок подключения: быстрый VKCalls без капчи → встроенный резерв. Если резервный способ запросит капчу, приложение попробует решить её автоматически."
+                                "Порядок подключения: быстрые ВК Звонки без капчи → встроенный резерв. Если резервный способ запросит капчу, приложение попробует решить её автоматически."
                             },
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -662,9 +656,7 @@ fun VkClientSettingsDialog(
 @Composable
 private fun VkClientCredentialsHelpDialog(onDismiss: () -> Unit) {
     val context = LocalContext.current
-    val television = isTelevisionDevice()
     val clipboard = LocalClipboardManager.current
-    val configuration = LocalConfiguration.current
     val packageName = context.packageName
     val signingSha1 = remember(context) { appSigningSha1(context) }
 
@@ -673,144 +665,30 @@ private fun VkClientCredentialsHelpDialog(onDismiss: () -> Unit) {
         Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
     }
 
-    Dialog(
-        onDismissRequest = onDismiss,
-        properties = DialogProperties(usePlatformDefaultWidth = false)
+    SettingsDialogLayout(
+        title = "Резервные реквизиты ВК",
+        onDismiss = onDismiss,
     ) {
-        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            Surface(
-                modifier = (if (television) {
-                    Modifier.televisionDialogWidth(television, fraction = 0.82f, maxWidth = 1_000.dp)
-                } else {
-                    Modifier.fillMaxWidth(0.92f)
-                })
-                    .fillMaxHeight(0.9f)
-                    .heightIn(max = (configuration.screenHeightDp.dp - 32.dp).coerceAtLeast(360.dp)),
-                shape = RoundedCornerShape(30.dp),
-                color = MaterialTheme.colorScheme.surface,
-                tonalElevation = 10.dp,
-                shadowElevation = 10.dp
-            ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .verticalScroll(rememberScrollState())
-                        .padding(18.dp),
-                    verticalArrangement = Arrangement.spacedBy(14.dp)
-                ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                "Резервные реквизиты VK",
-                                style = MaterialTheme.typography.titleMedium,
-                                fontWeight = FontWeight.Bold
-                            )
-                            Text(
-                                "Резервный провайдер через кабинет VK ID",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                        IconButton(
-                            onClick = onDismiss,
-                            modifier = Modifier.remoteIconButtonFocus(),
-                        ) {
-                            Icon(Icons.Default.Close, contentDescription = "Закрыть")
-                        }
-                    }
-
-                    Surface(
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(16.dp),
-                        color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.65f)
-                    ) {
-                        Text(
-                            "Собственные реквизиты относятся только к резервному legacy-провайдеру. Для основного быстрого VKCalls они не нужны. Понадобятся ID приложения и Защищённый ключ из одного приложения VK; сервисный ключ доступа не подходит.",
-                            modifier = Modifier.padding(14.dp),
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onPrimaryContainer
-                        )
-                    }
-
-                    HelpStep(
-                        number = 1,
-                        title = "Откройте кабинет VK ID",
-                        text = "Войдите в аккаунт владельца приложения, откройте раздел «Мои приложения» и нажмите «Добавить приложение»."
-                    )
-                    Button(
-                        onClick = {
-                            runCatching {
-                                context.startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(VK_ID_CABINET_URL)))
-                            }
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(14.dp)
-                    ) {
-                        Text("Открыть кабинет VK ID")
-                    }
-
-                    HelpStep(
-                        number = 2,
-                        title = "Создайте Android-приложение",
-                        text = "Укажите понятное название, выберите платформу Android, затем заполните имя пакета и SHA-1 подписи установленного APK."
-                    )
-                    CopyValueCard(
-                        label = "Название пакета",
-                        value = packageName,
-                        onCopy = { copy(packageName, "Название пакета скопировано") }
-                    )
-                    CopyValueCard(
-                        label = "SHA-1 подписи этого APK",
-                        value = signingSha1.ifBlank { "Не удалось определить" },
-                        onCopy = signingSha1.takeIf(String::isNotBlank)?.let { sha1 ->
-                            { copy(sha1, "SHA-1 скопирован") }
-                        }
-                    )
-
-                    HelpStep(
-                        number = 3,
-                        title = "Скопируйте реквизиты",
-                        text = "После создания откройте карточку приложения → «Приложение» → «Информация о приложении». Поле «ID приложения» вставьте как Client ID, а поле «Защищённый ключ» — как Client secret."
-                    )
-
-                    HelpStep(
-                        number = 4,
-                        title = "Сохраните и проверьте",
-                        text = "Вернитесь в WDTT Plus, заполните оба поля, нажмите «Сохранить», затем «Проверить Client ID». Для полного доступа к ключам VK может попросить подтвердить профиль бизнеса."
-                    )
-
-                    Surface(
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(16.dp),
-                        color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.55f),
-                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.error.copy(alpha = 0.25f))
-                    ) {
-                        Column(
-                            modifier = Modifier.padding(14.dp),
-                            verticalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
-                            Text("Важно", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onErrorContainer)
-                            Text(
-                                "Не публикуйте Защищённый ключ, не отправляйте его в чат и не добавляйте в GitHub. Новое приложение VK ID может не иметь прав старой TURN-цепочки: статус проверки показывает распознавание legacy OAuth, а окончательный результат виден только при реальном подключении. При неудаче приложение продолжит через встроенный резерв.",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onErrorContainer
-                            )
-                        }
-                    }
-
-                    Button(
-                        onClick = onDismiss,
-                        modifier = Modifier.fillMaxWidth().heightIn(min = 50.dp),
-                        shape = RoundedCornerShape(16.dp)
-                    ) {
-                        Text("Понятно")
-                    }
-                }
-            }
+        Text("Резервный провайдер через кабинет ВК ID", style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(16.dp),
+            color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.65f)
+        ) {
+            Text(
+                "Собственные реквизиты относятся только к резервному legacy-провайдеру. Для основных быстрых ВК Звонков они не нужны. Понадобятся ID приложения и Защищённый ключ из одного приложения ВК; сервисный ключ доступа не подходит.",
+                modifier = Modifier.padding(14.dp),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onPrimaryContainer
+            )
         }
+
+        HelpStep(
+            number = 1,
+            title = "Откройте кабинет ВК ID",
+            text = "Войдите в аккаунт владельца приложения, откройте раздел «Мои приложения» и нажмите «Добавить приложение»."
+        )
     }
 }
 
@@ -853,7 +731,7 @@ private fun CopyValueCard(label: String, value: String, onCopy: (() -> Unit)?) {
                 Text(label, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Text(value, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
             }
-            IconButton(onClick = { onCopy?.invoke() }, enabled = onCopy != null) {
+            HintIconButton(hint = "Копировать", onClick = { onCopy?.invoke() }, enabled = onCopy != null) {
                 Icon(Icons.Default.ContentCopy, contentDescription = "Копировать")
             }
         }

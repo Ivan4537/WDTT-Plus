@@ -122,7 +122,16 @@ class WireGuardHelper(context: Context) {
                 .toSet()
             val isWhitelist = routingSettings.isWhitelist
             val addressRules = routingSettings.addressRules
-            val resolvedDomains = resolveAddressRuleDomains(addressRules)
+            val temporaryDirectDomains = TemporaryDirectRouteRegistry.currentDomains()
+            val temporaryDirectRules = temporaryDirectDomains.map { domain ->
+                VpnAddressRule(VpnAddressType.DOMAIN, domain)
+            }
+            val resolvedDomains = resolveAddressRuleDomains(addressRules + temporaryDirectRules)
+            TemporaryDirectRouteRegistry.recordResolvedDomains(
+                temporaryDirectDomains.filterTo(linkedSetOf()) { domain ->
+                    resolvedDomains[domain].orEmpty().any(::isIpv4Literal)
+                }
+            )
             val addressRouting = runCatching {
                 resolveVpnAddressRouting(
                     isWhitelist = isWhitelist,
@@ -167,9 +176,14 @@ class WireGuardHelper(context: Context) {
             } else if (routing.excluded.isNotEmpty()) {
                 builder.excludeApplications(routing.excluded)
             }
-            val routedAllowedIps = applyVpnAppRoutingToAllowedIps(
-                routing = routing,
-                allowedIps = effectiveAllowedIps,
+            val routedAllowedIps = applyTemporaryDirectIpv4Addresses(
+                allowedIps = applyVpnAppRoutingToAllowedIps(
+                    routing = routing,
+                    allowedIps = effectiveAllowedIps,
+                ),
+                directAddresses = temporaryDirectDomains.flatMap { domain ->
+                    resolvedDomains[domain].orEmpty()
+                },
             )
 
             val routingMode = if (isWhitelist) "белый список" else "чёрный список"
@@ -183,6 +197,9 @@ class WireGuardHelper(context: Context) {
                     append("«$profileLabel»: $routingMode; правил приложений: $appRuleCount, ")
                     append("правил адресов: ${addressRules.size}, маршрутов VPN: ${routedAllowedIps.size}; ")
                     append(if (fullIpv4Tunnel) "IPv4 идёт через VPN полностью" else "действует раздельная маршрутизация")
+                    if (temporaryDirectDomains.isNotEmpty()) {
+                        append("; временных прямых назначений: ${temporaryDirectDomains.size}")
+                    }
                     if (routing.blocksAllApps) append("; пустой белый список блокирует пользовательский трафик")
                 },
             )
@@ -282,9 +299,9 @@ class WireGuardHelper(context: Context) {
             )
             Log.d("WG", "WireGuard tunnel started successfully")
         } catch (e: Exception) {
-            val stillUp = sharedTunnel?.let { tunnel ->
+            val stillUp = (sharedTunnel?.let { tunnel ->
                 runCatching { backend.getState(tunnel) == Tunnel.State.UP }.getOrDefault(false)
-            } ?: false
+            } ?: false)
             TunnelManager.noteVpnInterfaceState(stillUp)
             val detailed = "WireGuard start failed: ${e.readableMessage()}; ${configString.describeWireGuardConfig()}"
             Log.e("WG", detailed)
@@ -293,19 +310,21 @@ class WireGuardHelper(context: Context) {
         }
     }
 
-    suspend fun reloadTunnel() = wgMutex.withLock {
+    suspend fun reloadTunnel(): Boolean = wgMutex.withLock {
         withContext(Dispatchers.IO) {
-            if (sharedTunnel == null) return@withContext
+            if (sharedTunnel == null) return@withContext false
             try {
-                val configFlow = TunnelManager.config.first() ?: return@withContext
+                val configFlow = TunnelManager.config.first() ?: return@withContext false
                 startTunnelLocked(configFlow)
                 Log.d("WG", "WireGuard tunnel reloaded for updated profile settings")
+                true
             } catch (e: Exception) {
                 Log.e("WG", "Failed to reload WireGuard: ${e.readableMessage()}")
                 TunnelManager.noteVpnInterfaceReloadWarning(
                     message = "Новые настройки маршрутизации или DNS не применились: ${e.readableMessage()}. " +
                         "Рабочая конфигурация сохранена, если Android смог её восстановить.",
                 )
+                false
             }
         }
     }
@@ -363,9 +382,9 @@ class WireGuardHelper(context: Context) {
                 }
                 TunnelManager.noteVpnInterfaceState(false)
             } catch (e: Exception) {
-                val stillUp = sharedTunnel?.let { tunnel ->
+                val stillUp = (sharedTunnel?.let { tunnel ->
                     runCatching { backend.getState(tunnel) == Tunnel.State.UP }.getOrDefault(false)
-                } ?: false
+                } ?: false)
                 TunnelManager.noteVpnInterfaceState(stillUp)
                 Log.e("WG", "Failed to stop WireGuard: ${e.readableMessage()}")
             }

@@ -31,6 +31,8 @@ import (
 	"syscall"
 	"time"
 
+	"wdtt.local/pathprobe"
+
 	"crypto/cipher"
 
 	"github.com/pion/dtls/v3"
@@ -48,7 +50,7 @@ import (
 )
 
 const (
-	wdttServerVersion     = "17"
+	wdttServerVersion     = "19"
 	wgIfaceName           = "wdtt0"
 	wgServerAddr          = "10.66.66.1"
 	wgServerCIDR          = wgServerAddr + "/24"
@@ -68,18 +70,22 @@ const (
 // A deviceWGRelay gives all workers of one device one stable source socket and
 // only multiplexes the already-encrypted WireGuard datagrams around it.
 type deviceWGAttachment struct {
+	lease      atomic.Pointer[accessWorkerLease]
+	queue      *transportQueue
 	downstream chan []byte
 }
 
 type deviceWGRelay struct {
-	key         string
-	conn        *net.UDPConn
-	mu          sync.Mutex
-	attachments map[*deviceWGAttachment]struct{}
-	order       []*deviceWGAttachment
-	rrIndex     int
-	rrCount     int
-	closed      bool
+	lastOrderReport time.Time
+	uplinkOrder     transportOrder
+	key             string
+	conn            *net.UDPConn
+	mu              sync.Mutex
+	attachments     map[*deviceWGAttachment]struct{}
+	order           []*deviceWGAttachment
+	rrIndex         int
+	rrCount         int
+	closed          bool
 }
 
 var deviceWGRelays = struct {
@@ -113,8 +119,15 @@ func acquireDeviceWGRelay(deviceID, wgEndpoint string) (*deviceWGRelay, *deviceW
 		go relay.readLoop()
 	}
 	attachment := &deviceWGAttachment{downstream: make(chan []byte, 384)}
+	if transportMetricsEnabled {
+		attachment.queue = newTransportQueue(384)
+	}
+	// The registry lock protects lookup/lifetime, not the readers of this
+	// relay. Publication must use the same lock as dispatch and release.
+	relay.mu.Lock()
 	relay.attachments[attachment] = struct{}{}
 	relay.order = append(relay.order, attachment)
+	relay.mu.Unlock()
 	return relay, attachment, nil
 }
 
@@ -126,6 +139,7 @@ func (relay *deviceWGRelay) release(attachment *deviceWGAttachment) {
 	defer deviceWGRelays.Unlock()
 	relay.mu.Lock()
 	delete(relay.attachments, attachment)
+	attachment.drainMeasured()
 	for i, candidate := range relay.order {
 		if candidate == attachment {
 			relay.order = append(relay.order[:i], relay.order[i+1:]...)
@@ -140,6 +154,7 @@ func (relay *deviceWGRelay) release(attachment *deviceWGAttachment) {
 	}
 	empty := len(relay.attachments) == 0
 	if empty && !relay.closed {
+		relay.uplinkOrder.report("server_uplink")
 		relay.closed = true
 		_ = relay.conn.Close()
 	}
@@ -155,8 +170,13 @@ func (relay *deviceWGRelay) writeFrom(attachment *deviceWGAttachment, packet []b
 	if relay.closed {
 		return net.ErrClosed
 	}
-	if _, ok := relay.attachments[attachment]; !ok {
+	if _, ok := relay.attachments[attachment]; !ok || attachment.isRetired() {
 		return net.ErrClosed
+	}
+	relay.uplinkOrder.observe(packet)
+	if transportMetricsEnabled && time.Since(relay.lastOrderReport) >= 5*time.Second {
+		relay.uplinkOrder.report("server_uplink")
+		relay.lastOrderReport = time.Now()
 	}
 	_, err := relay.conn.Write(packet)
 	return err
@@ -165,13 +185,17 @@ func (relay *deviceWGRelay) writeFrom(attachment *deviceWGAttachment, packet []b
 func (relay *deviceWGRelay) nextAttachment() *deviceWGAttachment {
 	relay.mu.Lock()
 	defer relay.mu.Unlock()
+	return relay.nextAttachmentLocked()
+}
+
+func (relay *deviceWGRelay) nextAttachmentLocked() *deviceWGAttachment {
 	if relay.closed || len(relay.order) == 0 {
 		return nil
 	}
 	for attempts := 0; attempts < len(relay.order); attempts++ {
 		index := relay.rrIndex % len(relay.order)
 		attachment := relay.order[index]
-		if _, attached := relay.attachments[attachment]; attached {
+		if _, attached := relay.attachments[attachment]; attached && !attachment.isRetired() {
 			relay.rrCount++
 			if relay.rrCount >= multipathRelayChunk {
 				relay.rrIndex = (index + 1) % len(relay.order)
@@ -192,16 +216,7 @@ func (relay *deviceWGRelay) readLoop() {
 		if err != nil {
 			return
 		}
-		packet := append([]byte(nil), buf[:n]...)
-		attachment := relay.nextAttachment()
-		if attachment == nil {
-			continue
-		}
-		select {
-		case attachment.downstream <- packet:
-		default:
-			// A blocked DTLS path must not stall the shared WireGuard reader.
-		}
+		relay.dispatchPacket(buf[:n])
 	}
 }
 
@@ -1809,6 +1824,7 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 		password := ""
 		deviceInfo := deviceInfoPayload{}
 		transportSession := ""
+		var workerRef []pathprobe.Worker
 		if len(parts) > 0 {
 			clientPort = parts[0]
 		}
@@ -1823,6 +1839,13 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 		}
 		if len(parts) > 4 {
 			transportSession = strings.TrimSpace(parts[4])
+		}
+		if len(parts) > 5 {
+			ref, valid := pathprobe.ParseWorker(parts[5])
+			if !valid || transportSession == "" {
+				return
+			}
+			workerRef = append(workerRef, ref)
 		}
 		if password != identity.password {
 			atomic.AddInt64(&handshakeFailures, 1)
@@ -1945,9 +1968,10 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 				}
 			}
 			if dev != nil {
-				connDevice = dev
 				authorized = true
-				configResponse = buildClientConfig(keys.serverPublic, dev.PrivKey, dev.IP, clientPort)
+				snapshot := *dev
+				connDevice = &snapshot
+				configResponse = transportCapabilities() + buildClientConfig(keys.serverPublic, dev.PrivKey, dev.IP, clientPort)
 			} else {
 				configResponse = "NOCONF"
 			}
@@ -1973,6 +1997,12 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 			return
 		}
 
+		if workerAdmitted && len(workerRef) != 0 {
+			// Re-enter the authenticated slot-aware admission path. The early
+			// compatibility lease has no relay attachment and releases once.
+			releaseWorker()
+			workerAdmitted = false
+		}
 		if workerAdmitted {
 			if transportSession != "" &&
 				!activateAccessSession(workerLease, deviceID, transportSession) {
@@ -1984,6 +2014,7 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 				clientConn,
 				deviceID,
 				transportSession,
+				workerRef...,
 			)
 		} else {
 			runtimeLease, workerLease, releaseWorker, ok =
@@ -2047,7 +2078,8 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 
 	// WDTT_MUX1 is sent by current clients before their first WireGuard packet.
 	// Older clients retain the independent-socket path unchanged.
-	useMultipathRelay := firstStr == multipathRelayHello && connDevice != nil
+	useUplink := firstStr == adaptiveTransportHello && connDevice != nil
+	useMultipathRelay := (firstStr == multipathRelayHello || useUplink) && connDevice != nil
 	var relay *deviceWGRelay
 	var relayAttachment *deviceWGAttachment
 	var wgConn net.Conn
@@ -2075,10 +2107,18 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 	if !accessIdentityIsActive(identity) {
 		return
 	}
+	if relayAttachment != nil && workerLease != nil {
+		relayAttachment.lease.Store(workerLease)
+	}
 	if connDevice != nil {
 		upsertPeerInWG(wgDev, connDevice)
 	}
 
+	if useUplink {
+		if _, err := clientConn.Write([]byte(transportAck)); err != nil {
+			return
+		}
+	}
 	writeToWG := func(packet []byte) error {
 		if relay != nil {
 			return relay.writeFrom(relayAttachment, packet)
@@ -2099,6 +2139,13 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 
 	pctx, pcancel := context.WithCancel(ctx)
 	defer pcancel()
+	if relayAttachment != nil && relayAttachment.queue != nil {
+		mode := "standard"
+		if useUplink {
+			mode = "uplink"
+		}
+		go relayAttachment.queue.run(pctx, "server_downlink", mode)
+	}
 	var clientWriteMu sync.Mutex
 	writeClientPacket := func(packet []byte) error {
 		clientWriteMu.Lock()
@@ -2149,6 +2196,11 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 
 	var proxyWg sync.WaitGroup
 	proxyWg.Add(2)
+	var delivery uplinkReceipt
+	if useUplink {
+		proxyWg.Add(1)
+		go func() { defer proxyWg.Done(); delivery.run(pctx, writeClientPacket, pcancel) }()
+	}
 
 	// Клиент → WG
 	go func() {
@@ -2168,12 +2220,38 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 			if err != nil {
 				return
 			}
+			if relayAttachment != nil && relayAttachment.queue != nil {
+				relayAttachment.queue.received.Add(uint64(nn))
+			}
 			// Reply to DTLS keepalive packets so clients can detect silent UDP stalls.
 			if nn == 1 && (*b)[0] == dtlsKeepaliveByte {
 				if err := writeClientPacket([]byte{dtlsKeepaliveByte}); err != nil {
 					return
 				}
 				continue
+			}
+			framed := false
+			if useUplink {
+				kind, seq, payload, ok := pathprobe.Parse((*b)[:nn])
+				if ok {
+					if time.Since(lastAccessCheck) >= 5*time.Second {
+						if !accessIdentityIsActive(identity) {
+							return
+						}
+						lastAccessCheck = time.Now()
+					}
+					if runtimeLease.upload.wait(pctx, nn) != nil {
+						return
+					}
+					if !delivery.forward(kind, seq) {
+						continue
+					}
+					if len(payload) < 4 || payload[0] < 1 || payload[0] > 4 || payload[1] != 0 || payload[2] != 0 || payload[3] != 0 {
+						return
+					}
+					nn = copy(*b, payload)
+					framed = true
+				}
 			}
 			if requestID, ok := parseUpdateMetadataRequest((*b)[:nn]); ok {
 				if err := writeClientPacket([]byte(updateMetadataResponsePrefix + requestID + "|ACK|")); err != nil {
@@ -2357,8 +2435,13 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 				}
 				lastAccessCheck = time.Now()
 			}
-			if err := runtimeLease.upload.wait(pctx, nn); err != nil {
+			if useUplink && !framed {
 				return
+			}
+			if !framed {
+				if err := runtimeLease.upload.wait(pctx, nn); err != nil {
+					return
+				}
 			}
 			if err := writeToWG((*b)[:nn]); err != nil {
 				return
@@ -2382,15 +2465,12 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 			default:
 			}
 			var packet []byte
-			if relay != nil {
-				select {
-				case packet = <-relayAttachment.downstream:
-				case <-pctx.Done():
+			if relayAttachment != nil {
+				var ok bool
+				packet, ok = relayAttachment.takeData(pctx)
+				if !ok {
 					return
 				}
-				nn := len(packet)
-				copy(*b, packet)
-				_ = nn
 			} else {
 				wgConn.SetReadDeadline(time.Now().Add(30 * time.Minute))
 				nn, err := wgConn.Read(*b)
@@ -2405,21 +2485,32 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 				}
 				packet = append(packet, (*b)[:nn]...)
 			}
-			nn := len(packet)
-			if time.Since(lastAccessCheck) >= 5*time.Second {
-				if !accessIdentityIsActive(identity) {
-					return
+			ok := func() bool {
+				nn := len(packet)
+				if time.Since(lastAccessCheck) >= 5*time.Second {
+					if !accessIdentityIsActive(identity) {
+						return false
+					}
+					lastAccessCheck = time.Now()
 				}
-				lastAccessCheck = time.Now()
-			}
-			if err := runtimeLease.download.wait(pctx, nn); err != nil {
+				if err := runtimeLease.download.wait(pctx, nn); err != nil {
+					return false
+				}
+				writeStarted := time.Now()
+				err := writeClientPacket(packet)
+				if relayAttachment != nil && relayAttachment.queue != nil {
+					relayAttachment.queue.noteWrite(writeStarted, len(packet), err)
+				}
+				if err != nil {
+					return false
+				}
+				atomic.AddInt64(&totalBytesToClient, int64(nn))
+				recordAccessTraffic(runtimeLease, int64(nn), 0)
+				return true
+			}()
+			if !ok {
 				return
 			}
-			if err := writeClientPacket(packet); err != nil {
-				return
-			}
-			atomic.AddInt64(&totalBytesToClient, int64(nn))
-			recordAccessTraffic(runtimeLease, int64(nn), 0)
 		}
 	}()
 
@@ -3986,17 +4077,55 @@ func deploySafeWDTTSource(ctx context.Context) string {
 	return ""
 }
 
-func deploySafePublicIP(ctx context.Context, source string) string {
-	args := []string{"-4fsS", "--connect-timeout", "4", "--max-time", "10"}
-	if source != "" {
-		args = append(args, "--interface", source)
+// The route and HTTPS probe must use the same destination, without user curl configuration.
+func deploySafeRouteUsesInterface(route, expected string) bool {
+	fields := strings.Fields(route)
+	for i := 0; i+1 < len(fields); i++ {
+		if fields[i] == "dev" {
+			return fields[i+1] == expected && expected != ""
+		}
 	}
-	args = append(args, "https://api.ipify.org")
-	output, err := deploySafeCommandOK(ctx, "curl", args...)
-	if err != nil || net.ParseIP(output) == nil {
+	return false
+}
+
+func deploySafeRoutedPublicIP(ctx context.Context, source, iface string) string {
+	if net.ParseIP(source) == nil || iface == "" {
 		return ""
 	}
-	return output
+	return deploySafeProbeIP(ctx, source, iface)
+}
+
+func deploySafePublicIP(ctx context.Context, source string) string {
+	// A source-bound call alone cannot establish that policy routing was applied.
+	if source != "" {
+		return ""
+	}
+	return deploySafeProbeIP(ctx, "", "")
+}
+
+func deploySafeProbeIP(ctx context.Context, source, iface string) string {
+	for _, host := range []string{"api.ipify.org", "checkip.amazonaws.com"} {
+		args := []string{"-q", "--proxy", "", "--noproxy", "*", "-4fsS", "--connect-timeout", "4", "--max-time", "10"}
+		if source != "" {
+			resolved, err := deploySafeCommandOK(ctx, "getent", "ahostsv4", host)
+			fields := strings.Fields(resolved)
+			if err != nil || len(fields) == 0 || net.ParseIP(fields[0]).To4() == nil {
+				continue
+			}
+			destination := fields[0]
+			route, err := deploySafeCommandOK(ctx, "ip", "-4", "route", "get", destination, "from", source)
+			if err != nil || !deploySafeRouteUsesInterface(route, iface) {
+				continue
+			}
+			args = append(args, "--interface", source, "--resolve", host+":443:"+destination)
+		}
+		args = append(args, "https://"+host)
+		output, err := deploySafeCommandOK(ctx, "curl", args...)
+		if err == nil && net.ParseIP(output).To4() != nil {
+			return output
+		}
+	}
+	return ""
 }
 
 func deploySafeOutboundStatus(ctx context.Context, configDir string) string {
@@ -4008,7 +4137,11 @@ func deploySafeOutboundStatus(ctx context.Context, configDir string) string {
 	source := deploySafeWDTTSource(ctx)
 	exitIP := serverIP
 	if mode != "direct" && mode != "external_proxy" {
-		exitIP = deploySafePublicIP(ctx, source)
+		iface := "wg-wdtt-exit"
+		if mode == "tun_interface" {
+			iface = deploySafeFileFirstLine("/etc/wdtt-plus/tun-exit/interface")
+		}
+		exitIP = deploySafeRoutedPublicIP(ctx, source, iface)
 		if exitIP == "" {
 			exitIP = "не удалось проверить"
 		}
@@ -4060,11 +4193,11 @@ func deploySafeCheckWireGuard(ctx context.Context, configDir, expectedMode strin
 	if source == "" {
 		return "", errors.New("WDTT_ERROR=wdtt_test_source_missing")
 	}
-	ip := deploySafePublicIP(ctx, source)
+	ip := deploySafeRoutedPublicIP(ctx, source, "wg-wdtt-exit")
 	if ip == "" {
 		return "", errors.New("WDTT_ERROR=wireguard_exit_check_failed")
 	}
-	message := fmt.Sprintf("Проверка успешна: WDTT-пользователи выходят через WireGuard. Проверочный IP: %s", ip)
+	message := fmt.Sprintf("Проверка маршрута сервера через WireGuard успешна. Проверочный IP: %s", ip)
 	if mode != expectedMode {
 		message = fmt.Sprintf("Предупреждение: активен режим %s, ожидался %s.\n%s", deploySafeModeLabel(mode), deploySafeModeLabel(expectedMode), message)
 	}
@@ -4083,11 +4216,11 @@ func deploySafeCheckTun(ctx context.Context, interfaceName string) (string, erro
 	if source == "" {
 		return "", errors.New("WDTT_ERROR=wdtt_test_source_missing")
 	}
-	ip := deploySafePublicIP(ctx, source)
+	ip := deploySafeRoutedPublicIP(ctx, source, interfaceName)
 	if ip == "" {
 		return "", errors.New("WDTT_ERROR=tun_exit_check_failed")
 	}
-	return fmt.Sprintf("Проверка успешна: WDTT-пользователи выходят через TUN-интерфейс %s. Проверочный IP: %s", interfaceName, ip), nil
+	return fmt.Sprintf("Проверка маршрута сервера через TUN-интерфейс %s успешна. Проверочный IP: %s", interfaceName, ip), nil
 }
 
 func deploySafeCheckLocalProxy(ctx context.Context, port, login, password string) (string, error) {
@@ -4095,8 +4228,8 @@ func deploySafeCheckLocalProxy(ctx context.Context, port, login, password string
 		return "", errors.New("WDTT_ERROR=local_proxy_service_inactive")
 	}
 	proxy := "127.0.0.1:" + port
-	ip, commandErr := deploySafeCommandOK(ctx, "curl", "--proxy-user", login+":"+password, "--socks5-hostname", proxy, "-4fsS", "--connect-timeout", "4", "--max-time", "15", "https://api.ipify.org")
-	if commandErr != nil || net.ParseIP(ip) == nil {
+	ip, commandErr := deploySafeCommandOK(ctx, "curl", "-q", "--noproxy", "", "--proxy-user", login+":"+password, "--socks5-hostname", proxy, "-4fsS", "--connect-timeout", "4", "--max-time", "15", "https://api.ipify.org")
+	if commandErr != nil || net.ParseIP(ip).To4() == nil {
 		return "", errors.New("WDTT_ERROR=local_proxy_check_failed")
 	}
 	return fmt.Sprintf("Проверка успешна: SOCKS5 на %s отвечает с указанными логином и паролем. Выходной IP: %s", proxy, ip), nil
@@ -4107,13 +4240,13 @@ func deploySafeCheckExternalProxy(ctx context.Context, kind, host, port, login, 
 	if kind == "Socks5" {
 		scheme = "socks5h"
 	}
-	args := []string{"--proxy", scheme + "://" + host + ":" + port}
+	args := []string{"-q", "--noproxy", "", "--proxy", scheme + "://" + host + ":" + port}
 	if login != "" {
 		args = append(args, "--proxy-user", login+":"+password)
 	}
 	args = append(args, "-4fsS", "--connect-timeout", "5", "--max-time", "18", "https://api.ipify.org")
 	ip, commandErr := deploySafeCommandOK(ctx, "curl", args...)
-	if commandErr != nil || net.ParseIP(ip) == nil {
+	if commandErr != nil || net.ParseIP(ip).To4() == nil {
 		return "", errors.New("WDTT_ERROR=external_proxy_check_failed")
 	}
 	return fmt.Sprintf("Проверка успешна: внешний TCP-прокси отвечает. IP через прокси: %s", ip), nil

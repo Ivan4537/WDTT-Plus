@@ -345,6 +345,7 @@ internal fun boundedVkCallsPreflightCooldownUntil(
 enum class ConnectionIssueKind {
     GENERAL,
     ACCESS,
+    PROXY_PORT_IN_USE,
 }
 
 @Stable
@@ -354,6 +355,46 @@ data class ConnectionIssue(
     val isError: Boolean = true,
     val kind: ConnectionIssueKind = ConnectionIssueKind.GENERAL,
 )
+
+internal data class ProxyErrorPresentation(
+    val issue: ConnectionIssue,
+    val logMessage: String,
+    val readyAddress: String? = null,
+    val readyAddresses: List<String> = emptyList(),
+)
+
+internal fun proxyErrorPresentation(payload: String): ProxyErrorPresentation {
+    val parts = payload.split('|', limit = 3)
+    if (parts.firstOrNull() == "port_in_use") {
+        val address = parts.getOrNull(1).orEmpty().trim()
+        val port = address.substringAfterLast(':', "").toIntOrNull()?.takeIf { it in 1..65535 }
+        val safeAddress = address.takeIf {
+            port != null && Regex("^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}:[0-9]{1,5}$").matches(it)
+        }
+        val endpointText = safeAddress?.let { "$it уже занят. " }.orEmpty()
+        return ProxyErrorPresentation(
+            issue = ConnectionIssue(
+                title = "Порт прокси уже занят",
+                action = endpointText +
+                    "Порт ${port ?: "прокси"} уже используется другим приложением или предыдущим процессом WDTT Plus. " +
+                    "Выберите другой порт в настройках прокси.",
+                kind = ConnectionIssueKind.PROXY_PORT_IN_USE,
+            ),
+            logMessage = "[ПРОКСИ] Порт занят: ${safeAddress ?: "адрес не определён"}",
+        )
+    }
+    val reason = when (parts.firstOrNull()) {
+        "startup" -> parts.drop(1).joinToString("|")
+        else -> payload
+    }.ifBlank { "неизвестная ошибка" }
+    return ProxyErrorPresentation(
+        issue = ConnectionIssue(
+            title = "Прокси не запустился",
+            action = "Проверьте порт, сеть и настройки аутентификации. Причина: $reason",
+        ),
+        logMessage = "[ПРОКСИ] $reason",
+    )
+}
 
 internal val ConnectionIssue.isStandaloneUiIssue: Boolean
     get() = kind != ConnectionIssueKind.ACCESS
@@ -677,21 +718,19 @@ internal const val WRAP_HANDSHAKE_RETRY_MESSAGE =
 
 internal fun wrapHandshakeTerminalMessage(rtNetwork: Boolean): String =
     if (rtNetwork) {
-        "\uD83C\uDF10 Через сеть РТ не получен ответ WRAP. Обычно сеть не пропустила выбранный TURN/SNI; реже причина в пароле или совместимости WRAP. Воркеры остановлены."
+        "\uD83C\uDF10 Сервер не ответил на WRAP через выбранный способ подключения. Возможны ограничения сети, недоступность сервера, неверный пароль или несовместимость WRAP. Каналы остановлены."
     } else {
         "\uD83D\uDD0C Сервер не ответил на WRAP. Возможны проблемы с сервером или маршрутом, блокировка UDP/TURN, неверный пароль либо несовместимость WRAP. Воркеры остановлены."
     }
 
 internal const val RT_MASQUE_CONFIG_FILE_NAME = "rt-masque-v1.json"
 
-internal fun shouldUseRtMasque(rtNetwork: Boolean, rtMasque: Boolean): Boolean =
-    rtNetwork && rtMasque
+internal fun shouldUseRtMasque(rtMasque: Boolean): Boolean = rtMasque
 
 internal fun shouldUseRtMasqueServerBootstrap(
-    rtNetwork: Boolean,
     rtMasque: Boolean,
     serverBootstrap: Boolean,
-): Boolean = rtNetwork && rtMasque && serverBootstrap
+): Boolean = rtMasque && serverBootstrap
 
 internal data class MasqueLogPresentation(
     val key: String,
@@ -923,13 +962,15 @@ internal fun classifyMasqueLog(line: String): MasqueLogPresentation? {
         text.contains("конфигурация WARP подготовлена", ignoreCase = true) ->
             MasqueLogPresentation("masque_config_ready", "[MASQUE] Сохранённая регистрация WARP готова ✓")
         text.contains("Включён резерв", ignoreCase = true) ->
-            MasqueLogPresentation("masque_enabled", "[MASQUE] Резерв включён: HTTP/2 (TCP/443), затем HTTP/3 (QUIC/443)")
+            MasqueLogPresentation("masque_enabled", if (text.contains("только HTTP/2"))
+                "[MASQUE] Резерв включён: HTTP/2 (TCP/443); HTTP/3 отключён режимом TCP/TLS"
+                else "[MASQUE] Резерв включён: доступны HTTP/2 и HTTP/3")
         text.contains("Прямые TCP/TLS-пути", ignoreCase = true) ->
-            MasqueLogPresentation("masque_fallback_start", "[MASQUE] Прямые TCP/TLS-пути РТ не ответили — запускаем CONNECT-IP до попытки UDP")
+            MasqueLogPresentation("masque_fallback_start", "[MASQUE] Прямые TLS/TCP-подключения не удались — пробуем резерв через Cloudflare")
         text.contains("Последний резерв после MASQUE", ignoreCase = true) ->
             MasqueLogPresentation(
                 "masque_udp_fallback",
-                "[MASQUE] HTTP/2 и HTTP/3 не дали рабочий TURN — пробуем прямой UDP последним резервом",
+                "[MASQUE] MASQUE не дал рабочего подключения — пробуем разрешённый резерв UDP",
                 warning = true,
             )
         text.contains("Relay:", ignoreCase = true) && h2 ->
@@ -951,13 +992,13 @@ internal fun classifyMasqueLog(line: String): MasqueLogPresentation? {
         (text.contains("не сработал", ignoreCase = true) || text.contains("потерян", ignoreCase = true)) && h2 ->
             MasqueLogPresentation(
                 "masque_h2_failed",
-                "[MASQUE] Путь HTTP/2/TCP/443 не сработал ($pathFailureReason); проверяем другие TURN-адреса и HTTP/3",
+                "[MASQUE] Путь HTTP/2/TCP/443 не сработал ($pathFailureReason); остаются другие разрешённые варианты подключения",
                 warning = true,
             )
         (text.contains("не сработал", ignoreCase = true) || text.contains("потерян", ignoreCase = true)) && h3 ->
             MasqueLogPresentation(
                 "masque_h3_failed",
-                "[MASQUE] Путь HTTP/3/QUIC/443 не сработал ($pathFailureReason); проверяем другие TURN-адреса и прямой UDP",
+                "[MASQUE] Путь HTTP/3/QUIC/443 не сработал ($pathFailureReason); остаются другие разрешённые варианты подключения",
                 warning = true,
             )
         else -> MasqueLogPresentation("masque_status", "[MASQUE] $text")
@@ -985,6 +1026,13 @@ object TunnelManager {
     @Volatile
     private var process: Process? = null
     private val processInputLock = Any()
+    private val processLifecycleLock = Any()
+    @Volatile private var connectionRecoveryNetwork: Pair<Long, String?> = 0L to null
+    @Volatile private var recoveryNetworkKey: String? = null
+    @Volatile private var connectionRecoveryRestarts = 0
+    @Volatile private var connectionRecoveryPaused = false
+    @Volatile private var connectionRecoveryOffline = false
+    private var connectionRecoveryJob: Job? = null
     private var readerJob: Job? = null
     private var watchdogJob: Job? = null
     private var wireGuardReloadJob: Job? = null
@@ -1048,6 +1096,7 @@ object TunnelManager {
     @Volatile
     var isLoggingEnabled = true
 
+    val connectionPath = MutableStateFlow("")
     val running = MutableStateFlow(false)
     val transition = MutableStateFlow(TunnelTransition.IDLE)
     val activeTunnelProfile = MutableStateFlow<Int?>(null)
@@ -1347,6 +1396,7 @@ object TunnelManager {
 
     fun pollNetworkRecoveryAction(now: Long = System.currentTimeMillis()): NetworkRecoveryAction? {
         if (!running.value) return null
+        if (process?.isAlive == true) return null
         if (isWakeRecoveryGraceActive(now)) return null
         if (AMNEZIA_STYLE_RECOVERY) {
             return pollStableNetworkRecoveryAction(now)
@@ -1532,6 +1582,12 @@ object TunnelManager {
     fun addDeployErrorLog(message: String) {
         val hash = message.hashCode().toString()
         updateLog("deploy_err_$hash", "[ДЕПЛОЙ] $message", 99, true)
+    }
+
+    fun addDeployMessageLog(message: String, warning: Boolean = false) {
+        val key = "deploy_${if (warning) "warning" else "info"}_${message.hashCode()}"
+        val text = "[ДЕПЛОЙ] $message"
+        if (warning) updateWarningLog(key, text, 20) else updateLog(key, text, 20, false)
     }
 
     fun addDeploySuccessLog(message: String) {
@@ -1745,14 +1801,14 @@ object TunnelManager {
                     activeHashIndex = 0
                     currentParams = params
                     activeMode.value = requestedMode
-                    proxyReadyAddress.value = null
-                    proxyReadyAddresses.value = emptyList()
                     lastContext = appContext
                     accessRefreshRequestedForProcess = false
                     forceRegenerateUA = false
                     currentCaptchaMode = params.captchaMode
                     currentCaptchaSolveMethod = params.captchaSolveMethod
                 }
+                proxyReadyAddress.value = null
+                proxyReadyAddresses.value = emptyList()
                 
                 wgHelper = if (requestedMode == TUNNEL_MODE_VPN) WireGuardHelper(appContext) else null
 
@@ -1888,6 +1944,10 @@ object TunnelManager {
                     "-n", totalWorkers.toString(),
                     "-listen", "127.0.0.1:${params.port}"
                 )
+                val experiment = effectiveTransportExperiment(params.transportExperiment, requestedMode)
+                cmd.add("-transport-experiment")
+                cmd.add(experiment)
+                if (BuildConfig.TRANSPORT_DIAGNOSTICS) cmd.add("-transport-metrics=true")
                 cmd.add("-mode")
                 cmd.add(requestedMode)
                 if (tunnelModeUsesLocalProxy(requestedMode)) {
@@ -1952,7 +2012,22 @@ object TunnelManager {
                     )
                 }
                 cmd.add("-turn-stream-first=${params.rtNetwork}")
-                if (params.rtNetwork) {
+                updateLog(
+                    "connection_mode",
+                    "[Подключение] ${connectionModeTitle(params.rtNetwork)}" +
+                        (if (params.rtMasque) " · MASQUE разрешён" else " · MASQUE выключен"),
+                    3,
+                )
+                connectionRecoveryNetwork = 0L to ConnectionNetwork.cacheKey(appContext, params)
+                connectionPath.value = ""
+                connectionRecoveryPaused = false
+                connectionRecoveryOffline = false
+                if (!isSwitching) {
+                    connectionRecoveryRestarts = 0
+                    recoveryNetworkKey = connectionRecoveryNetwork.second
+                }
+                cmd.add("-connection-udp-backoff=${ConnectionNetwork.udpBackoffSeconds(appContext, connectionRecoveryNetwork.second)}")
+                run {
                     val turnSni = normalizeRtTurnSni(params.rtTurnSni)
                     if (turnSni != null) {
                         cmd.add("-turn-sni")
@@ -1960,12 +2035,12 @@ object TunnelManager {
                     } else if (params.rtTurnSni.isNotBlank()) {
                         updateWarningLog(
                             "rt_sni_invalid",
-                            "[TURN] SNI режима «Сеть РТ» имеет неверный формат; запускаем TCP/TLS без подмены SNI",
+                            "[TURN] Внешний SNI имеет неверный формат; запускаем TCP/TLS без подмены SNI",
                             20,
                         )
                     }
                 }
-                val useRtMasque = shouldUseRtMasque(params.rtNetwork, params.rtMasque)
+                val useRtMasque = shouldUseRtMasque(params.rtMasque)
                 cmd.add("-rt-masque=$useRtMasque")
                 if (useRtMasque) {
                     val masqueConfig = File(appContext.filesDir, RT_MASQUE_CONFIG_FILE_NAME)
@@ -1975,7 +2050,6 @@ object TunnelManager {
                     if (
                         !masqueConfig.exists() &&
                         shouldUseRtMasqueServerBootstrap(
-                            rtNetwork = params.rtNetwork,
                             rtMasque = params.rtMasque,
                             serverBootstrap = params.rtMasqueServerBootstrap,
                         )
@@ -1995,7 +2069,7 @@ object TunnelManager {
                             WarpApiSshRelayStartResult.MissingProfileAccess -> {
                                 updateWarningLog(
                                     "masque_server_bootstrap_missing",
-                                    "[MASQUE] «Через сервер» недоступен: в «Деплой» нет адреса сервера или выбранного SSH-доступа (пароль/приватный ключ); пробуем прямую регистрацию",
+                                    "[MASQUE] «Регистрация по SSH» недоступна: в «Деплой → SSH» нет адреса сервера или выбранного SSH-доступа (пароль/приватный ключ); пробуем прямую регистрацию",
                                     20,
                                 )
                             }
@@ -2038,7 +2112,7 @@ object TunnelManager {
                 env.remove("WDTT_CUSTOM_VK_CLIENT_ID")
                 env.remove("WDTT_CUSTOM_VK_CLIENT_SECRET")
 
-                process = pb.start()
+                process = startNativeProcess(pb)
                 peerDnsWaitStartedAtMs = 0L
                 val startupLine = nativeClientStartupConfigLine(
                     NativeClientStartupSecrets(
@@ -2066,6 +2140,7 @@ object TunnelManager {
                     // Передаём сохранённое состояние после запуска процесса.
                     sendTransportLifecycleCommand("DEVICE_SLEEP")
                 }
+                startConnectionMonitor(appContext, params)
                 startWatchdog(appContext, params)
 
             } catch (e: Exception) {
@@ -2111,6 +2186,36 @@ object TunnelManager {
                     // Output buffered by a process that has just been replaced must
                     // not poison the recovery state of the new transport generation.
                     if (!isActive || process !== observedProcess) return@forEachLine
+                    if (line.contains("[CONNECTION]")) {
+                        val event = line.substringAfter("[CONNECTION] ")
+                        if (event.startsWith("READY ")) {
+                            val parts = event.split(' ')
+                            val network = connectionRecoveryNetwork
+                            if (parts.size == 3 && parts[1].toLongOrNull() == network.first) {
+                                lastContext?.let { ConnectionNetwork.noteReady(it, network.second, parts[2]) }
+                                connectionPath.value = connectionPathTitle(parts[2]).orEmpty()
+                                connectionRecoveryPaused = false
+                            }
+                        } else if (event.startsWith("UDP_BACKOFF ")) {
+                            val epoch = event.substringAfter("UDP_BACKOFF ").toLongOrNull()
+                            val network = connectionRecoveryNetwork
+                            if (epoch == network.first) lastContext?.let { ConnectionNetwork.noteUdpFailure(it, network.second) }
+                        } else if (event.startsWith("PAUSED ")) {
+                            connectionRecoveryPaused = true
+                            setConnectionIssue("Попытки приостановлены", "Не удалось найти рабочий путь. Смените сеть или подключитесь заново. Ручной выбор — в разделе «Подключение».")
+                        }
+                        connectionEventLog(event, connectionRecoveryNetwork.first)?.let { entry ->
+                            if (entry.warning) {
+                                updateWarningLog("connection_policy_${entry.key}", "[Подключение] ${entry.message}", 10)
+                            } else {
+                                if (entry.key.startsWith("ready_")) {
+                                    logs.update { entries -> entries.filterNot { it.key == "connection_policy_paused" } }
+                                }
+                                updateLog("connection_policy_${entry.key}", "[Подключение] ${entry.message}", 10)
+                            }
+                        }
+                        return@forEachLine
+                    }
                     val now = System.currentTimeMillis()
                     if (now - lastResetTime > 60000) {
                         refusedCount = 0
@@ -2279,6 +2384,27 @@ object TunnelManager {
                         stop(TunnelStopReason.CriticalError)
                         return@forEachLine
                     }
+                    if (lineTrim.contains("[ОТДАЧА]")) {
+                        if (BuildConfig.TRANSPORT_DIAGNOSTICS) {
+                            val text = lineTrim.substringAfter("[ОТДАЧА]").trim()
+                            val channel = Regex("Канал #(\\d+)").find(text)?.groupValues?.get(1)
+                            updateLog("uplink_delivery_${channel ?: "status"}", "[ОТДАЧА] $text", 20, false)
+                        }
+                        return@forEachLine
+                    }
+                    if (lineTrim.startsWith("TRANSPORT_METRIC|") || lineTrim.startsWith("TRANSPORT_ORDER|")) {
+                        if (BuildConfig.TRANSPORT_DIAGNOSTICS) android.util.Log.i("WDTTTransport", lineTrim)
+                        return@forEachLine
+                    }
+                    if (lineTrim.contains("FATAL_TRANSPORT:")) {
+                        setConnectionIssue(
+                            "Адаптивный транспорт недоступен",
+                            "Переподключите туннель. Если ошибка повторяется, обновите сервер.",
+                        )
+                        updateLog("transport_error", "[ТРАНСПОРТ] Адаптивный режим не запущен", 99, true)
+                        stop(TunnelStopReason.CriticalError)
+                        return@forEachLine
+                    }
                     if (lineTrim.startsWith("PROXY_READY|")) {
                         val parts = lineTrim.substringAfter("PROXY_READY|").split('|')
                         val readyMode = normalizeTunnelMode(parts.getOrNull(0))
@@ -2309,15 +2435,13 @@ object TunnelManager {
                         return@forEachLine
                     }
                     if (lineTrim.startsWith("PROXY_ERROR|")) {
-                        val reason = lineTrim.substringAfter("PROXY_ERROR|")
-                            .ifBlank { "неизвестная ошибка" }
-                        proxyReadyAddress.value = null
-                        proxyReadyAddresses.value = emptyList()
-                        setConnectionIssue(
-                            "Прокси не запустился",
-                            "Проверьте порт, сеть и настройки аутентификации. Причина: $reason",
+                        val presentation = proxyErrorPresentation(
+                            lineTrim.substringAfter("PROXY_ERROR|"),
                         )
-                        updateLog("proxy_error", "[ПРОКСИ] $reason", 99, true)
+                        proxyReadyAddress.value = presentation.readyAddress
+                        proxyReadyAddresses.value = presentation.readyAddresses
+                        connectionIssue.value = presentation.issue
+                        updateLog("proxy_error", presentation.logMessage, 99, true)
                         stop(TunnelStopReason.CriticalError)
                         return@forEachLine
                     }
@@ -3113,7 +3237,7 @@ object TunnelManager {
                     setConnectionIssue("Системная ошибка туннеля", "Попробуйте подключиться снова. Причина: $message")
                 }
             } finally {
-                if (process === observedProcess) {
+                if (process === observedProcess && !observedProcess.isAlive) {
                     process = null
                     failPendingUpdateMetadataRequests()
                     failPendingOpaqueHttpsRequests("Соединение WDTT остановлено")
@@ -3154,6 +3278,50 @@ object TunnelManager {
             val msg = if (activeHashIndex == 1) "Запасной хеш тоже мертв. Отключение." else "Хеш умер, запасного нет. Отключение."
             setConnectionIssue("VK-звонок недоступен", "Проверьте, что групповой звонок VK ещё жив, и замените VK-хеш при необходимости.")
             handleCriticalError(msg)
+        }
+    }
+
+    private fun startConnectionMonitor(context: Context, params: TunnelParams) {
+        connectionRecoveryJob?.cancel()
+                val observedProcess = process ?: return
+        connectionRecoveryJob = scope.launch(Dispatchers.IO) {
+            var reachability = ConnectionReachability()
+            var lastCheck = 0L
+            var baselineChecked = false
+            while (isActive && process === observedProcess && observedProcess.isAlive) {
+                val key = ConnectionNetwork.cacheKey(context, params)
+                if (key != connectionRecoveryNetwork.second) {
+                    connectionRecoveryNetwork = (connectionRecoveryNetwork.first + 1L) to key
+                    reachability = ConnectionReachability()
+                    baselineChecked = false
+                    connectionRecoveryPaused = false
+                    connectionRecoveryRestarts = 0
+                    sendTransportLifecycleCommand("CONNECTION_NETWORK")
+                }
+                val network = ConnectionNetwork.underlying(context)
+                var offline = network == null
+                val now = System.currentTimeMillis()
+                if (network != null && !deviceSleeping &&
+                    (!baselineChecked || activeWorkers.value == 0) && now - lastCheck >= 30_000L
+                ) {
+                    lastCheck = now
+                    val first = ConnectionNetwork.reachable(network, "vk.com")
+                    val second = ConnectionNetwork.reachable(network, "max.ru")
+                    if (process !== observedProcess || key != ConnectionNetwork.cacheKey(context, params)) continue
+                    baselineChecked = true
+                    offline = reachability.observe(first, second)
+                } else if (network != null) {
+                    offline = connectionRecoveryOffline && activeWorkers.value == 0
+                }
+                if (offline != connectionRecoveryOffline) {
+                    connectionRecoveryOffline = offline
+                    sendTransportLifecycleCommand(if (offline) "CONNECTION_OFFLINE" else "CONNECTION_ONLINE")
+                    if (offline) {
+                        setConnectionIssue("Ожидание сети", "Новые попытки приостановлены: базовое соединение недоступно. Проверка продолжится автоматически.")
+                    }
+                }
+                delay(5_000)
+            }
         }
     }
 
@@ -3205,6 +3373,10 @@ object TunnelManager {
                     processDeadSince = 0L
                 }
 
+                if (proc?.isAlive == true) {
+                    delay(5_000)
+                    continue
+                }
                 val workers = activeWorkers.value
                 if (workers <= 0) {
                     if (zeroWorkersSince == 0L) {
@@ -3259,6 +3431,16 @@ object TunnelManager {
     ): Boolean {
         val params = currentParams ?: return false
         val context = lastContext ?: return false
+        run {
+            val key = ConnectionNetwork.cacheKey(context, params)
+            if (key != recoveryNetworkKey) {
+                recoveryNetworkKey = key
+                connectionRecoveryRestarts = 0
+                connectionRecoveryPaused = false
+                connectionRecoveryOffline = key == null
+            }
+            if (connectionRecoveryPaused || connectionRecoveryOffline || connectionRecoveryRestarts >= 1) return false
+        }
         if (resetNetworkRecovery) {
             // Wake rescue is already the decision taken for the previous
             // transport generation. Its delayed health lines must not trigger
@@ -3277,6 +3459,7 @@ object TunnelManager {
             return false
         }
         lastSoftRestartAtMs = now
+        connectionRecoveryRestarts++
         softRestartCount++
         updateLog("network_restart", reason, 50, false)
         activeWorkers.value = 0
@@ -3747,31 +3930,57 @@ object TunnelManager {
             watchdogJob?.cancel()
         }
         readerJob?.cancel()
-        val proc = process
-        process = null
         failPendingUpdateMetadataRequests()
         failPendingOpaqueHttpsRequests("Соединение WDTT остановлено")
         failPendingUpdateApkRequests()
         failPendingDeploySafeRequests("Соединение WDTT остановлено")
-        if (proc != null) {
-            try {
-                synchronized(processInputLock) {
-                    proc.outputStream.write("STOP\n".toByteArray(Charsets.UTF_8))
-                    proc.outputStream.flush()
-                }
-            } catch (_: Exception) {}
-            try { proc.waitFor(1500, java.util.concurrent.TimeUnit.MILLISECONDS) } catch (_: Exception) {}
-            if (proc.isAlive) {
-                try { proc.destroy() } catch (_: Exception) {}
-                try { proc.waitFor(750, java.util.concurrent.TimeUnit.MILLISECONDS) } catch (_: Exception) {}
-            }
-            if (proc.isAlive) {
-                try { proc.destroyForcibly() } catch (_: Exception) {}
-                try { proc.waitFor(1000, java.util.concurrent.TimeUnit.MILLISECONDS) } catch (_: Exception) {}
+        if (tunnelModeUsesLocalProxy(activeMode.value)) {
+            proxyReadyAddress.value = null
+            proxyReadyAddresses.value = emptyList()
+        }
+        synchronized(processLifecycleLock) {
+            val stopped = process?.let(::stopNativeProcessLocked) ?: true
+            if (stopped) {
+                process = null
+            } else {
+                // Keep ownership and let a later recovery retry. Never crash
+                // the application or overlap two transport generations.
+                updateWarningLog("native_stop_pending", "[СВЯЗЬ] Завершение предыдущего транспорта задержалось; повторное подключение ожидает его остановки.", 50)
             }
         }
         closeWarpApiSshRelay()
         resetWakeRecoveryState()
+    }
+
+    private fun startNativeProcess(builder: ProcessBuilder): Process =
+        synchronized(processLifecycleLock) {
+            // A recovery/resume request can arrive while the previous reader is
+            // still unwinding. Never overlap two libclient processes: retain the
+            // Process handle until the OS confirms exit, then start the new one.
+            check(process?.let(::stopNativeProcessLocked) != false) {
+                "предыдущий нативный процесс ещё завершает работу"
+            }
+            builder.start().also { process = it }
+        }
+
+    private fun stopNativeProcessLocked(proc: Process): Boolean {
+        if (!proc.isAlive) return true
+        try {
+            synchronized(processInputLock) {
+                proc.outputStream.write("STOP\n".toByteArray(Charsets.UTF_8))
+                proc.outputStream.flush()
+            }
+        } catch (_: Exception) {}
+        try { proc.waitFor(1500, java.util.concurrent.TimeUnit.MILLISECONDS) } catch (_: Exception) {}
+        if (proc.isAlive) {
+            try { proc.destroy() } catch (_: Exception) {}
+            try { proc.waitFor(750, java.util.concurrent.TimeUnit.MILLISECONDS) } catch (_: Exception) {}
+        }
+        if (proc.isAlive) {
+            try { proc.destroyForcibly() } catch (_: Exception) {}
+            try { proc.waitFor(1000, java.util.concurrent.TimeUnit.MILLISECONDS) } catch (_: Exception) {}
+        }
+        return !proc.isAlive
     }
 
     @Synchronized
@@ -4420,6 +4629,7 @@ object TunnelManager {
 }
 
 data class TunnelParams(
+    val transportExperiment: String = TRANSPORT_AUTO,
     val peer: String,
     val vkHashes: String,
     val secondaryVkHash: String = "",

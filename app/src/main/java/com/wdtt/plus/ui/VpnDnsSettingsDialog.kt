@@ -40,7 +40,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.wdtt.plus.VPN_DNS_CUSTOM_ID
 import com.wdtt.plus.VPN_DNS_PROFILE_ID
@@ -117,7 +116,7 @@ internal fun VpnDnsSettingsDialog(
     var validationError by remember(initialSettings.profileIndex) { mutableStateOf<String?>(null) }
     val selectedPreset = vpnDnsPresets.firstOrNull { it.id == selectionId }
 
-    Dialog(
+    BoundedAppDialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false),
     ) {

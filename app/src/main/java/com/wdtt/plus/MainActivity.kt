@@ -1,5 +1,7 @@
 package com.wdtt.plus
 
+import com.wdtt.plus.ui.BoundedAlertDialog
+
 import android.Manifest
 import android.content.Context
 import android.content.Intent
@@ -74,10 +76,14 @@ import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalInputModeManager
@@ -101,6 +107,9 @@ import com.wdtt.plus.ui.AppUpdateDialog
 import com.wdtt.plus.ui.FloatingToolbar
 import com.wdtt.plus.ui.LogsTab
 import com.wdtt.plus.ui.SettingsTab
+import com.wdtt.plus.ui.VK_HASH_AUTO_HELP_TEXT
+import com.wdtt.plus.ui.HintIconButton
+import com.wdtt.plus.ui.WdttInlineNotice
 import com.wdtt.plus.ui.DeployTab
 import com.wdtt.plus.ui.DeviceCompatibilityDialog
 import com.wdtt.plus.ui.ExceptionsTab
@@ -187,6 +196,9 @@ class MainActivity : ComponentActivity() {
     @Volatile
     private var uiReadyForFirstDraw = false
     private val remoteAuthTabLauncher = AuthTabIntent.registerActivityResultLauncher(this) { result ->
+        if (LocalContinuationExtensions.offerCallback(result.resultUri)) {
+            return@registerActivityResultLauncher
+        }
         if (result.resultCode != AuthTabIntent.RESULT_OK) return@registerActivityResultLauncher
         if (RemoteContinuationLauncher.isCancellationCallback(result.resultUri)) {
             connectActionJob?.cancel()
@@ -214,6 +226,13 @@ class MainActivity : ComponentActivity() {
         super.onStart()
         activeActivities++
         ManlCaptchaWebViewManager.checkAndShowPendingCaptcha(this)
+        lifecycleScope.launch {
+            runCatching {
+                LocalContinuationExtensions.recoverPending(this@MainActivity)
+            }.getOrNull()?.let { documentUri ->
+                handleRemoteDocument(documentUri)
+            }
+        }
         lifecycleScope.launch(Dispatchers.IO) {
             val profiles = AccessLifecycleCoordinator.takePendingExternalRefreshProfiles() +
                 settingsStore.takeAccessLifecycleActionProfiles()
@@ -349,7 +368,9 @@ class MainActivity : ComponentActivity() {
                             )
                         }
                     },
-                    onStartWdttConnectAction = ::startConnectAction,
+                    onStartWdttConnectAction = { profile, continuation ->
+                        startConnectAction(profile, continuation)
+                    },
                     onCancelWdttConnectAction = ::cancelConnectAction,
                     onSaveWdttConnectManualHashes = ::saveConnectManualHashes,
                     onRestoreWdttConnectHashes = ::restoreConnectHashes,
@@ -420,6 +441,16 @@ class MainActivity : ComponentActivity() {
         RemoteContinuationLauncher.launch(this, target, remoteAuthTabLauncher)
     }
 
+    internal fun launchLocalContinuation(url: Uri) {
+        AuthTabIntent.Builder()
+            .build()
+            .launch(remoteAuthTabLauncher, url, "wdtt")
+    }
+
+    internal fun acceptLocalContinuationDocument(uri: Uri) {
+        handleRemoteDocument(uri)
+    }
+
     private fun handleIncomingIntent(intent: Intent?) {
         when (intent?.action) {
             Intent.ACTION_VIEW -> {
@@ -428,7 +459,9 @@ class MainActivity : ComponentActivity() {
                 externalIntentConsumed = true
                 replaceConsumedIncomingIntent()
                 if (data == null) return
-                if (RemoteDocumentGateway.extractLink(data) != null) {
+                if (LocalContinuationExtensions.offerCallback(data)) {
+                    return
+                } else if (RemoteDocumentGateway.extractLink(data) != null) {
                     handleRemoteDocument(data)
                 } else if (
                     data.scheme.equals("wdtt", ignoreCase = true) &&
@@ -529,7 +562,7 @@ class MainActivity : ComponentActivity() {
             WdttTransferCodec.isAdminTransfer(value) -> pendingAdminTransfer = value.trim()
             WdttTransferCodec.isEncryptedServerBackup(value) ||
                 WdttTransferCodec.documentFormat(value) == "wdtt-server-backup" -> {
-                wdttDeepLinkMessage = "Распознана резервная копия сервера. Она применяется к выбранному серверу во вкладке «Деплой» → «Перенос сервера» → «Импорт»."
+                wdttDeepLinkMessage = "Распознана резервная копия сервера. Она применяется к выбранному серверу во вкладке «Деплой» → «Резервные копии и перенос»."
             }
             WdttTransferCodec.documentFormat(value) == "wdtt-plus-admin-settings" -> {
                 wdttDeepLinkMessage = "Распознаны незашифрованные настройки администратора. В целях безопасности импортируется только защищённый файл, созданный в разделе «Получение/Передача»."
@@ -544,13 +577,14 @@ class MainActivity : ComponentActivity() {
             wdttDeepLinkMessage = "Ссылка подключения повреждена или устарела."
             return
         }
-        receiveRemoteDocument(link)
+        receiveRemoteDocument(link, completionDocument = uri)
     }
 
     private fun receiveRemoteDocument(
         link: RemoteDocumentLink,
         localDocument: String? = null,
         attachmentProfile: Int? = null,
+        completionDocument: Uri? = null,
     ) {
         if (!remoteDocumentRequests.add(link.url)) return
         lifecycleScope.launch {
@@ -570,6 +604,7 @@ class MainActivity : ComponentActivity() {
                         localBindings = settingsStore.remoteDocumentBindings(),
                         localDocument = document,
                         profileAttachment = profileAttachment,
+                        context = this@MainActivity,
                     )
                 val delivery = try {
                     request(
@@ -683,6 +718,7 @@ class MainActivity : ComponentActivity() {
                     delivery = delivery,
                     preferredProfile = boundProfile,
                     existingRemoteProfile = boundProfile != null,
+                    completionDocument = completionDocument,
                 )
             } catch (cancelled: CancellationException) {
                 throw cancelled
@@ -708,6 +744,7 @@ class MainActivity : ComponentActivity() {
         delivery: RemoteDocumentDelivery? = null,
         preferredProfile: Int? = null,
         existingRemoteProfile: Boolean = false,
+        completionDocument: Uri? = null,
     ) {
         lifecycleScope.launch {
             val store = SettingsStore(this@MainActivity)
@@ -738,6 +775,7 @@ class MainActivity : ComponentActivity() {
                         delivery = delivery,
                         isBoundUpdate = true,
                         existingRemoteProfile = true,
+                        completionDocument = completionDocument,
                     )
                 } else if (
                     fromRemoteDocument &&
@@ -763,6 +801,7 @@ class MainActivity : ComponentActivity() {
                         delivery,
                         isBoundUpdate = false,
                         existingRemoteProfile = existingRemoteProfile,
+                        completionDocument = completionDocument,
                     )
                 }
             }.onFailure { error ->
@@ -783,6 +822,7 @@ class MainActivity : ComponentActivity() {
         delivery: RemoteDocumentDelivery? = null,
         isBoundUpdate: Boolean = false,
         existingRemoteProfile: Boolean = false,
+        completionDocument: Uri? = null,
     ) {
         lifecycleScope.launch {
             if (fromRemoteDocument) {
@@ -809,6 +849,9 @@ class MainActivity : ComponentActivity() {
                     )
                 }
             }.onSuccess { result ->
+                completionDocument?.let { document ->
+                    LocalContinuationExtensions.acknowledgeDocument(this@MainActivity, document)
+                }
                 val savedProfile = result?.targetProfile ?: plan.targetProfile
                 if (fromRemoteDocument && result != null) {
                     requestTunnelProfileRuntimeUpdate(savedProfile)
@@ -826,7 +869,7 @@ class MainActivity : ComponentActivity() {
                                 ?.hashes
                                 .isNullOrBlank()
                         ) {
-                            append(" Добавьте свой VK-хеш перед запуском соединения.")
+                            append(" Добавьте свой ВК-хеш перед запуском соединения.")
                         }
                     }
                 }
@@ -888,7 +931,10 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun startConnectAction(profile: Int, continuation: RemoteContinuation) {
+    private fun startConnectAction(
+        profile: Int,
+        continuation: RemoteContinuation,
+    ) {
         // The dialog can deliver two taps before Compose has rendered the
         // ExternalAction state.  Do not cancel an already running preparation
         // and start a second browser/login flow: VK treats those parallel
@@ -903,69 +949,114 @@ class MainActivity : ComponentActivity() {
             profile = profile,
             continuation = continuation,
             access = access,
-            message = "Подготавливаем безопасный переход в VK..."
+            message = "Подготавливаем безопасный переход в ВК..."
         )
         connectActionJob = lifecycleScope.launch {
             val runningJob = coroutineContext[Job]
             if (!continuation.available) {
                 wdttConnectFlow = WdttConnectFlow.Failed(
                     continuation.message.ifBlank {
-                        "Автоматическое получение сейчас недоступно. Заполните VK-хеши вручную."
+                        "Автоматическое получение сейчас недоступно. Заполните ВК-хеши вручную."
                     }
                 )
                 return@launch
             }
             var tunnelStoppedForVk = false
             try {
-                if (
-                    TunnelManager.running.value ||
-                    TunnelManager.transition.value != TunnelTransition.IDLE
-                ) {
+                val deviceId = settingsStore.getOrCreateConnectDeviceId()
+                val localDocument = settingsStore.remoteActionProfileDocument(profile)
+                if (LocalContinuationExtensions.available) {
                     wdttConnectFlow = WdttConnectFlow.ExternalAction(
                         profile = profile,
                         continuation = continuation,
                         access = access,
-                        message = "Останавливаем соединение и ждём стабильного доступа в интернет перед входом в VK..."
+                        message = "Связываемся с WDTT Plus через ещё работающее соединение..."
                     )
-                }
-                val stopResult = TunnelStopCoordinator.stopAndAwait(this@MainActivity)
-                if (!stopResult.succeeded) {
-                    throw IllegalStateException(
-                        if (stopResult == TunnelStopResult.TIMED_OUT) {
-                            "Соединение не остановилось за 20 секунд. Вернитесь в приложение и повторите попытку."
+                    val target = RemoteContinuationLauncher.begin(
+                        context = this@MainActivity,
+                        capability = continuation,
+                        device = deviceId,
+                        localDocument = localDocument,
+                    )
+                    val hasCompleteLocalValues = VkJoinLink.hasCompleteHashSet(
+                        settingsStore.tunnelProfileSnapshot(profile).vkHashes,
+                    )
+                    val progress: (String) -> Unit = { message ->
+                        wdttConnectFlow = WdttConnectFlow.ExternalAction(
+                            profile = profile,
+                            continuation = continuation,
+                            access = access,
+                            message = message,
+                        )
+                    }
+                    val documentUri = LocalContinuationExtensions.execute(
+                        activity = this@MainActivity,
+                        target = target.copy(localProfile = settingsStore.localContinuationProfile(profile)),
+                        deviceId = deviceId,
+                        hasCompleteLocalValues = hasCompleteLocalValues,
+                        onProgress = progress,
+                    )
+                    handleRemoteDocument(documentUri)
+                } else {
+                    // The legacy build deliberately keeps its proven stop-first
+                    // native-handler/browser sequence for already installed APKs.
+                    if (
+                        TunnelManager.running.value ||
+                        TunnelManager.transition.value != TunnelTransition.IDLE
+                    ) {
+                        wdttConnectFlow = WdttConnectFlow.ExternalAction(
+                            profile = profile,
+                            continuation = continuation,
+                            access = access,
+                            message = "Останавливаем соединение и ждём стабильного доступа в интернет перед входом в ВК..."
+                        )
+                    }
+                    val stopResult = TunnelStopCoordinator.stopAndAwait(this@MainActivity)
+                    if (!stopResult.succeeded) {
+                        throw IllegalStateException(
+                            if (stopResult == TunnelStopResult.TIMED_OUT) {
+                                "Соединение не остановилось за 20 секунд. Вернитесь в приложение и повторите попытку."
+                            } else {
+                                "Не удалось запросить остановку соединения. Остановите его и повторите попытку."
+                            }
+                        )
+                    }
+                    if (stopResult == TunnelStopResult.STOPPED) {
+                        tunnelStoppedForVk = true
+                        delay(TunnelStopCoordinator.DIRECT_NETWORK_SETTLE_MS)
+                    }
+                    wdttConnectFlow = WdttConnectFlow.ExternalAction(
+                        profile = profile,
+                        continuation = continuation,
+                        access = access,
+                        message = "Открываем защищённое продолжение..."
+                    )
+                    val target = RemoteContinuationLauncher.begin(
+                        context = this@MainActivity,
+                        capability = continuation,
+                        device = deviceId,
+                        localDocument = localDocument,
+                    )
+                    launchRemoteContinuation(target)
+                    wdttConnectFlow = WdttConnectFlow.Complete(
+                        if (tunnelStoppedForVk) {
+                            "Страница открыта. Завершите действие там; результат вернётся в нужный профиль автоматически. Соединение оставлено выключенным."
                         } else {
-                            "Не удалось запросить остановку соединения. Остановите его и повторите попытку."
+                            "Страница открыта. Завершите действие там; результат вернётся в нужный профиль автоматически."
                         }
                     )
                 }
-                if (stopResult == TunnelStopResult.STOPPED) {
-                    tunnelStoppedForVk = true
-                    delay(TunnelStopCoordinator.DIRECT_NETWORK_SETTLE_MS)
-                }
-                wdttConnectFlow = WdttConnectFlow.ExternalAction(
+            } catch (_: LocalContinuationCancelledException) {
+                wdttConnectFlow = WdttConnectFlow.SelectHashes(
                     profile = profile,
                     continuation = continuation,
                     access = access,
-                    message = "Открываем защищённое продолжение..."
-                )
-                val target = RemoteContinuationLauncher.begin(
-                    capability = continuation,
-                    device = settingsStore.getOrCreateConnectDeviceId(),
-                    localDocument = settingsStore.remoteActionProfileDocument(profile),
-                )
-                launchRemoteContinuation(target)
-                wdttConnectFlow = WdttConnectFlow.Complete(
-                    if (tunnelStoppedForVk) {
-                        "Страница открыта. Завершите действие там; результат вернётся в нужный профиль автоматически. Соединение оставлено выключенным."
-                    } else {
-                        "Страница открыта. Завершите действие там; результат вернётся в нужный профиль автоматически."
-                    }
                 )
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Exception) {
                 wdttConnectFlow = WdttConnectFlow.Failed(
-                    error.message ?: "Не удалось автоматически получить VK-хеши."
+                    error.message ?: "Не удалось автоматически получить ВК-хеши."
                 )
             } finally {
                 if (connectActionJob === runningJob) {
@@ -989,7 +1080,7 @@ class MainActivity : ComponentActivity() {
     private fun skipConnectHashes() {
         if (wdttConnectFlow !is WdttConnectFlow.SelectHashes) return
         wdttConnectFlow = WdttConnectFlow.Complete(
-            "Доступ добавлен. VK-хеши можно заполнить позже в настройках профиля."
+            "Доступ добавлен. ВК-хеши можно заполнить позже в настройках профиля."
         )
     }
 
@@ -1008,7 +1099,7 @@ class MainActivity : ComponentActivity() {
                 .distinct()
             if (hashes.isEmpty()) {
                 wdttConnectFlow = WdttConnectFlow.Failed(
-                    "Вставьте от 1 до 4 VK-хешей или ссылок VK Звонков."
+                    "Вставьте от 1 до 4 ВК-хешей или ссылок ВК Звонков."
                 )
                 return@launch
             }
@@ -1023,11 +1114,11 @@ class MainActivity : ComponentActivity() {
                     )
                 }
                 wdttConnectFlow = WdttConnectFlow.Complete(
-                    "VK-хеши сохранены в новом профиле подключения."
+                    "ВК-хеши сохранены в новом профиле подключения."
                 )
             }.onFailure { error ->
                 wdttConnectFlow = WdttConnectFlow.Failed(
-                    error.message ?: "Не удалось сохранить VK-хеши."
+                    error.message ?: "Не удалось сохранить ВК-хеши."
                 )
             }
         }
@@ -1037,7 +1128,7 @@ class MainActivity : ComponentActivity() {
         connectActionJob?.cancel()
         wdttConnectFlow = WdttConnectFlow.Progress(
             capability.exchange.message.ifBlank {
-                "Возвращаем сохранённые VK-хеши в этот профиль..."
+                "Возвращаем сохранённые ВК-хеши в этот профиль..."
             }
         )
         connectActionJob = lifecycleScope.launch {
@@ -1049,13 +1140,13 @@ class MainActivity : ComponentActivity() {
                     expectedCapability = capability,
                 )
                 wdttConnectFlow = WdttConnectFlow.Complete(
-                    "Сохранённые VK-хеши возвращены в профиль."
+                    "Сохранённые ВК-хеши возвращены в профиль."
                 )
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Exception) {
                 wdttConnectFlow = WdttConnectFlow.Failed(
-                    error.message ?: "Не удалось вернуть сохранённые VK-хеши."
+                    error.message ?: "Не удалось вернуть сохранённые ВК-хеши."
                 )
             } finally {
                 if (connectActionJob === runningJob) {
@@ -1070,12 +1161,12 @@ class MainActivity : ComponentActivity() {
         val looksLikeJoinLink = trimmed.contains("/call/join/", ignoreCase = true)
         val looksLikeRawHash = Regex("^[A-Za-z0-9_-]{16,512}$").matches(trimmed)
         if (!looksLikeJoinLink && !looksLikeRawHash) {
-            sharedVkHashError = "Данные не распознаны. Поддерживаются ссылка подключения wdtt://, файл или QR WDTT Plus и ссылка VK-звонка."
+            sharedVkHashError = "Данные не распознаны. Поддерживаются ссылка подключения wdtt://, файл или QR WDTT Plus и ссылка ВК-звонка."
             return
         }
         val hash = VkJoinLink.extractHash(sharedText)
         if (!VkJoinLink.isValidHash(hash)) {
-            sharedVkHashError = "В переданной ссылке не найден VK-хеш звонка."
+            sharedVkHashError = "В переданной ссылке не найден ВК-хеш звонка."
             return
         }
         lifecycleScope.launch {
@@ -1094,7 +1185,7 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }.onFailure { error ->
-                sharedVkHashError = error.message ?: "Не удалось сохранить VK-хеш."
+                sharedVkHashError = error.message ?: "Не удалось сохранить ВК-хеш."
             }
         }
     }
@@ -1473,11 +1564,8 @@ private fun MainScreen(
         remoteManagedProfile = remoteManagedProfile,
     )
     SideEffect(onUiReadyForFirstDraw)
-    val migrationDeployHost by settingsStore.deployIp.collectAsStateWithLifecycle(initialValue = "")
-    val migrationSshPassword by settingsStore.deployPassword.collectAsStateWithLifecycle(initialValue = "")
-    val migrationSshPrivateKey by settingsStore.deploySshPrivateKey.collectAsStateWithLifecycle(initialValue = "")
-    val migrationSshAuthMode by settingsStore.deploySshAuthMode.collectAsStateWithLifecycle(initialValue = "password")
-    val migrationMainPassword by settingsStore.deployMainPassword.collectAsStateWithLifecycle(initialValue = "")
+    val migrationServerSettings by settingsStore.serverSetupSettings.collectAsStateWithLifecycle(initialValue = null)
+    val currentMigrationProfile by rememberUpdatedState(activeProfile)
     val serverMigrationState by settingsStore.serverMigrationState.collectAsStateWithLifecycle(initialValue = null)
     val deviceCompatibilityCheckComplete by settingsStore.deviceCompatibilityCheckComplete.collectAsStateWithLifecycle(
         initialValue = true
@@ -1500,6 +1588,8 @@ private fun MainScreen(
         )
     }
     var selectedTab by rememberSaveable { mutableIntStateOf(0) }
+    var navigationRevision by rememberSaveable { mutableIntStateOf(0) }
+    val currentNavigationRevision by rememberUpdatedState(navigationRevision)
     var projectSupportDialogRequest by remember { mutableIntStateOf(0) }
     val tunnelScrollPosition = rememberSaveable { mutableIntStateOf(0) }
     val deployScrollPosition = rememberSaveable { mutableIntStateOf(0) }
@@ -1524,7 +1614,16 @@ private fun MainScreen(
     val currentVersion = remember { "v${BuildConfig.VERSION_NAME.removePrefix("v")}" }
     val safeBottomInset = with(density) { WindowInsets.safeDrawing.getBottom(density).toDp() }
     val navOverlayReserve = safeBottomInset + 96.dp
+    val profileSwipeThresholdPx = with(density) { 64.dp.toPx() }
+    val profileSwipeNoticeHost = remember { SnackbarHostState() }
+    val profileSwipeMutex = remember { Mutex() }
+    var tunnelHeaderBounds by remember { mutableStateOf<Rect?>(null) }
+    var deployHeaderBounds by remember { mutableStateOf<Rect?>(null) }
+    var tunnelProfileStripEnd by remember { mutableStateOf<Float?>(null) }
+    var deployProfileStripEnd by remember { mutableStateOf<Float?>(null) }
+    var contentBounds by remember { mutableStateOf(Rect.Zero) }
     var showTransferCenter by rememberSaveable { mutableStateOf(false) }
+    LaunchedEffect(selectedTab, activeProfile, showTransferCenter) { navigationRevision++ }
     var startupDeviceReport by remember { mutableStateOf<DeviceCompatibilityReport?>(null) }
     var startupDeviceCheckRunning by remember { mutableStateOf(false) }
     val updateInstallPermissionLauncher = rememberLauncherForActivityResult(
@@ -1657,6 +1756,8 @@ private fun MainScreen(
     val projectExpanded = rememberSaveable { mutableStateOf(false) }
     val tabStateHolder = rememberSaveableStateHolder()
     var deployTabInitialized by rememberSaveable { mutableStateOf(false) }
+    var deployInstallRequest by rememberSaveable { mutableIntStateOf(0) }
+    var deployInstallProfile by rememberSaveable { mutableStateOf<Int?>(null) }
 
 
 
@@ -1800,6 +1901,7 @@ private fun MainScreen(
                     .fillMaxSize()
                     .padding(padding)
                     .consumeWindowInsets(padding)
+                    .onGloballyPositioned { contentBounds = it.boundsInWindow() }
                     .pointerInput(focusManager) {
                         awaitPointerEventScope {
                             while (true) {
@@ -1810,21 +1912,73 @@ private fun MainScreen(
                             }
                         }
                     }
-                    .pointerInput(selectedTab, wdttLinkMode) {
+                    .pointerInput(selectedTab, wdttLinkMode, remoteManagedProfile) {
                         var totalDrag = 0f
+                        var startedOnProfileHeader = false
                         detectHorizontalDragGestures(
-                            onDragStart = {
+                            onDragStart = { start ->
                                 totalDrag = 0f
-                                navigationDragActive = true
+                                val header = when (selectedTab) {
+                                    0 -> tunnelHeaderBounds
+                                    1 -> deployHeaderBounds
+                                    else -> null
+                                }
+                                val stripEnd = when (selectedTab) {
+                                    0 -> tunnelProfileStripEnd
+                                    1 -> deployProfileStripEnd
+                                    else -> null
+                                }
+                                val strip = if (header != null && stripEnd != null && header.bottom > contentBounds.top) {
+                                    Rect(contentBounds.left,
+                                        if (selectedTab == 0 && remoteManagedProfile) maxOf(contentBounds.top, header.top) else contentBounds.top,
+                                        contentBounds.right, minOf(contentBounds.bottom, stripEnd))
+                                } else null
+                                startedOnProfileHeader = strip?.contains(
+                                    Offset(contentBounds.left + start.x, contentBounds.top + start.y)
+                                ) == true
+                                navigationDragActive = !startedOnProfileHeader
                                 dragTargetIndex = -1
                                 dragProgress = 0f
                             },
                             onDragCancel = {
+                                startedOnProfileHeader = false
+                                totalDrag = 0f
                                 navigationDragActive = false
                                 dragTargetIndex = -1
                                 dragProgress = 0f
                             },
                             onDragEnd = {
+                                if (startedOnProfileHeader) {
+                                    if (kotlin.math.abs(totalDrag) >= profileSwipeThresholdPx) {
+                                        val direction = if (totalDrag < 0f) 1 else -1
+                                        scope.launch {
+                                            val switchedTo = profileSwipeMutex.withLock {
+                                                val current = settingsStore.activeProfile.first()
+                                                val target = (current + direction).takeIf { it in 0..2 }
+                                                    ?: return@withLock null
+                                                settingsStore.saveActiveProfile(target)
+                                                target
+                                            }
+                                            if (switchedTo != null) {
+                                                view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                                                val name = vpnProfileDisplayName(
+                                                    switchedTo, settingsStore.profileNames.first()
+                                                )
+                                                profileSwipeNoticeHost.currentSnackbarData?.dismiss()
+                                                profileSwipeNoticeHost.showSnackbar(
+                                                    "Переключено на профиль «$name»",
+                                                    duration = SnackbarDuration.Short,
+                                                )
+                                            }
+                                        }
+                                    }
+                                    startedOnProfileHeader = false
+                                    totalDrag = 0f
+                                    navigationDragActive = false
+                                    dragTargetIndex = -1
+                                    dragProgress = 0f
+                                    return@detectHorizontalDragGestures
+                                }
                                 val selectedIndex = activeNavItems.indexOfFirst {
                                     it.id == selectedTab
                                 }.coerceAtLeast(0)
@@ -1847,6 +2001,7 @@ private fun MainScreen(
                             if (change.isConsumed) return@detectHorizontalDragGestures
                             change.consume()
                             totalDrag += dragAmount
+                            if (startedOnProfileHeader) return@detectHorizontalDragGestures
                             if (abs(totalDrag) < 12f) {
                                 dragTargetIndex = -1
                                 dragProgress = 0f
@@ -1885,6 +2040,14 @@ private fun MainScreen(
                         DeployTab(
                             scrollPosition = deployScrollPosition,
                             visible = deployVisible,
+                            openInstallRequest = deployInstallRequest,
+                            openInstallProfile = deployInstallProfile,
+                            navigationRevision = navigationRevision,
+                            onOpenTunnel = { profile, revision ->
+                                if (currentMigrationProfile == profile && selectedTab == 1 && currentNavigationRevision == revision) selectedTab = 0
+                            },
+                            onProfileHeaderBounds = { deployHeaderBounds = it },
+                            onProfileHeaderBoundary = { deployProfileStripEnd = it },
                             modifier = Modifier
                                 .fillMaxSize()
                                 .padding(bottom = navOverlayReserve)
@@ -1911,6 +2074,8 @@ private fun MainScreen(
                                 settingsStore = settingsStore,
                                 scrollPosition = tunnelScrollPosition,
                                 onVkHashesSaved = onVkHashesSaved,
+                                onProfileHeaderBounds = { tunnelHeaderBounds = it },
+                                onProfileHeaderBoundary = { tunnelProfileStripEnd = it },
                                 onOpenProjectSupport = {
                                     selectedTab = 4
                                     projectSupportDialogRequest += 1
@@ -1989,27 +2154,32 @@ private fun MainScreen(
             onFingerprintChange = onFingerprintChange,
             activeClientIds = activeClientIds,
             onClientIdsChange = onClientIdsChange,
-            onTransferRequested = { showTransferCenter = true }
+            onTransferRequested = { showTransferCenter = true },
+            onOpened = { navigationRevision++ }
         )
+        SnackbarHost(
+            hostState = profileSwipeNoticeHost,
+            modifier = Modifier.align(Alignment.BottomCenter)
+                .padding(start = 16.dp, end = 16.dp, bottom = navOverlayReserve + 8.dp),
+        ) { data ->
+            WdttInlineNotice(data.visuals.message)
+        }
     }
 
     val migrationNotice = serverMigrationState
-    val activeProfileManagesServer = hasManagedServerCredentials(
-        host = migrationDeployHost,
-        sshAuthMode = migrationSshAuthMode,
-        sshPassword = migrationSshPassword,
-        mainPassword = migrationMainPassword,
-        sshPrivateKey = migrationSshPrivateKey
-    )
+    val activeProfileManagesServer = migrationServerSettings?.takeIf { it.profileIndex == activeProfile }?.let {
+        hasManagedServerCredentials(it.host, it.authMode, it.sshPassword, it.mainPassword, it.privateKey)
+    } == true
     val serverMigrationPromptVisible =
+        selectedTab != 1 &&
         isAdminInterface &&
         !remoteManagedProfile &&
         activeProfileManagesServer &&
-        migrationNotice?.noticeRequired == true &&
+        migrationNotice?.shouldShowNoticeForProfile(activeProfile) == true &&
         pendingUpdateCandidate == null &&
         startupDeviceReport == null
     if (serverMigrationPromptVisible) {
-        AlertDialog(
+        BoundedAlertDialog(
             onDismissRequest = {},
             properties = DialogProperties(
                 dismissOnBackPress = false,
@@ -2019,11 +2189,11 @@ private fun MainScreen(
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Text(
-                        "В новых версиях WDTT Plus была изменена серверная часть. Для корректной работы приложения с сервером выполните установку сервера с сохранением данных во вкладке «Деплой».\n\n" +
+                        "В новых версиях WDTT Plus была изменена серверная часть. Для корректной работы приложения с сервером во вкладке «Деплой» выберите «Установить», нажмите «Обновить сервер», затем «Обновить с сохранением».\n\n" +
                             "Клиенты, выданные доступы и настройки сохранятся. Установку с нуля выполнять не нужно."
                     )
                     Text(
-                        "После успешной установки приложение отметит обновление для выбранного профиля.",
+                        "После успешного обновления напоминание для этого профиля исчезнет. Сервер, установленный вручную, обновляйте тем же способом.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -2032,8 +2202,13 @@ private fun MainScreen(
             confirmButton = {
                 Button(
                     onClick = {
+                        val targetProfile = activeProfile
+                        val requiredLevel = migrationNotice.pendingLevel
                         scope.launch {
-                            settingsStore.acknowledgeServerMigrationNotice(migrationNotice.pendingLevel)
+                            settingsStore.acknowledgeServerMigrationNotice(requiredLevel)
+                            if (currentMigrationProfile != targetProfile) return@launch
+                            deployInstallProfile = targetProfile
+                            deployInstallRequest++
                             selectedTab = 1
                         }
                     }
@@ -2170,7 +2345,7 @@ private fun MainScreen(
     }
 
     sharedVkHashError?.let { error ->
-        AlertDialog(
+        BoundedAlertDialog(
             onDismissRequest = onSharedVkHashMessageShown,
             title = { Text("Данные не импортированы") },
             text = { Text(error) },
@@ -2202,7 +2377,7 @@ private fun MainScreen(
     }
 
     wdttDeepLinkMessage?.let { message ->
-        AlertDialog(
+        BoundedAlertDialog(
             onDismissRequest = onWdttDeepLinkMessageShown,
             title = { Text("Передача WDTT") },
             text = { Text(message) },
@@ -2217,7 +2392,7 @@ private fun MainScreen(
     pendingWdttDeepLinkPlan?.let { plan ->
         val profileLabel = vpnProfileDisplayName(plan.targetProfile, profileNames)
         val incomingProfileName = WdttDeepLink.parse(plan.link)?.profileName.orEmpty()
-        AlertDialog(
+        BoundedAlertDialog(
             onDismissRequest = onCancelWdttDeepLinkOverwrite,
             title = { Text("Профили подключения заполнены") },
             text = {
@@ -2312,7 +2487,7 @@ private fun WdttConnectActivationDialog(
     val canDismiss = flow is WdttConnectFlow.SelectAttachmentProfile ||
         flow is WdttConnectFlow.Complete ||
         flow is WdttConnectFlow.Failed
-    AlertDialog(
+    BoundedAlertDialog(
         onDismissRequest = {
             when {
                 flow is WdttConnectFlow.ExternalAction -> onCancelExternalAction()
@@ -2422,14 +2597,14 @@ private fun WdttConnectActivationDialog(
                     }
                     is WdttConnectFlow.ConfirmLimitedSetup -> {
                         val reason = state.delivery.continuation.message.ifBlank {
-                            "Автоматическое получение VK-хешей сейчас недоступно."
+                            "Автоматическое получение ВК-хешей сейчас недоступно."
                         }
                         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                             Text("Перед продолжением обратите внимание:")
                             Text(reason)
                             Text(
                                 "Это ограничение относится только к автоматическому получению " +
-                                    "VK-хешей. Сам профиль можно добавить и заполнить вручную.",
+                                    "ВК-хешей. Сам профиль можно добавить и заполнить вручную.",
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 style = MaterialTheme.typography.bodySmall,
                             )
@@ -2437,12 +2612,26 @@ private fun WdttConnectActivationDialog(
                     }
                     is WdttConnectFlow.SelectHashes -> {
                         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                            Text("Выберите способ заполнения VK-хешей для профиля.")
+                            Text("Выберите способ заполнения ВК-хешей для профиля.")
+                            if (state.access.exchange.actionAvailable) {
+                                HashMethodRow(
+                                    title = state.access.exchange.label.ifBlank {
+                                        "Получить сохранённые данные"
+                                    },
+                                    body = state.access.exchange.message.ifBlank {
+                                        "Добавить данные, сохранённые для этого профиля"
+                                    },
+                                    onHelp = { helpMethod = "restore" },
+                                    onClick = {
+                                        onRestoreSavedHashes(state.profile, state.access)
+                                    }
+                                )
+                            }
                             HashMethodRow(
                                 title = "Получить автоматически",
                                 body = if (state.continuation.available) {
                                     state.continuation.message.ifBlank {
-                                        "Войти в VK при необходимости и создать ссылки"
+                                        "Войти в ВК при необходимости и создать ссылки"
                                     }
                                 } else {
                                     "Недоступно — нажмите, чтобы узнать, что делать"
@@ -2460,30 +2649,16 @@ private fun WdttConnectActivationDialog(
                             )
                             HashMethodRow(
                                 title = "Заполнить вручную",
-                                body = "Вставить 1-4 хеша или ссылки VK Звонков",
+                                body = "Вставить 1-4 хеша или ссылки ВК Звонков",
                                 onHelp = { helpMethod = "manual" },
                                 onClick = { selectedHashMethod = "manual" }
                             )
-                            if (state.access.exchange.actionAvailable) {
-                                HashMethodRow(
-                                    title = state.access.exchange.label.ifBlank {
-                                        "Вернуть хеши"
-                                    },
-                                    body = state.access.exchange.message.ifBlank {
-                                        "Восстановить сохранённые хеши этого профиля"
-                                    },
-                                    onHelp = { helpMethod = "restore" },
-                                    onClick = {
-                                        onRestoreSavedHashes(state.profile, state.access)
-                                    }
-                                )
-                            }
                             if (selectedHashMethod == "manual") {
                                 OutlinedTextField(
                                     value = manualHashes,
                                     onValueChange = { manualHashes = it },
                                     modifier = Modifier.fillMaxWidth(),
-                                    label = { Text("VK-хеши или ссылки") },
+                                    label = { Text("ВК-хеши или ссылки") },
                                     minLines = 2,
                                     maxLines = 4
                                 )
@@ -2589,7 +2764,7 @@ private fun WdttConnectActivationDialog(
     )
 
     helpMethod?.let { method ->
-        AlertDialog(
+        BoundedAlertDialog(
             onDismissRequest = { helpMethod = null },
             modifier = Modifier.televisionDialogWidth(television),
             title = {
@@ -2605,16 +2780,14 @@ private fun WdttConnectActivationDialog(
                 Text(
                     when (method) {
                         "auto" -> {
-                            "WDTT Plus откроет официальное мини-приложение VK. Если вы ещё не " +
-                                "вошли, VK сначала покажет свою форму входа, а затем вернёт вас к " +
-                                "созданию ссылок. Пароль VK не передаётся WDTT Plus."
+                            VK_HASH_AUTO_HELP_TEXT
                         }
                         "restore" -> {
                             "WDTT Plus безопасно вернёт хеши, ранее сохранённые именно для " +
                                 "этого профиля. Значения других профилей не используются."
                         }
                         else -> {
-                            "Создайте или скопируйте до четырёх ссылок-приглашений VK Звонков, " +
+                            "Создайте или скопируйте до четырёх ссылок-приглашений ВК Звонков, " +
                                 "либо вставьте готовые хеши. Разделяйте значения пробелом, запятой " +
                                 "или новой строкой."
                         }
@@ -2629,12 +2802,12 @@ private fun WdttConnectActivationDialog(
     }
 
     unavailableAutoMessage?.let { message ->
-        AlertDialog(
+        BoundedAlertDialog(
             onDismissRequest = { unavailableAutoMessage = null },
             title = { Text("Автоматическое получение недоступно") },
             text = {
                 Text(
-                    "$message\n\nСейчас можно заполнить VK-хеши вручную или пропустить этот шаг."
+                    "$message\n\nСейчас можно заполнить ВК-хеши вручную или пропустить этот шаг."
                 )
             },
             confirmButton = {
@@ -2673,7 +2846,7 @@ private fun HashMethodRow(
                 Text(title, fontWeight = FontWeight.SemiBold)
                 Text(body, style = MaterialTheme.typography.bodySmall)
             }
-            IconButton(
+            HintIconButton(hint = "Как это работает",
                 onClick = onHelp,
                 modifier = Modifier.remoteHelpFocus(),
             ) {
@@ -2689,12 +2862,12 @@ private fun SharedVkHashDialog(
     onDismiss: () -> Unit
 ) {
     val previous = result.previousHash
-    AlertDialog(
+    BoundedAlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("VK-хеш добавлен") },
+        title = { Text("ВК-хеш добавлен") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Слот VK Хеш ${result.slot} обновлён.")
+                Text("Слот ВК-хеш ${result.slot} обновлён.")
                 Text(
                     text = result.hash,
                     style = MaterialTheme.typography.bodyMedium,

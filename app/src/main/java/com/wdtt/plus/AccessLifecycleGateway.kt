@@ -1,12 +1,12 @@
 package com.wdtt.plus
 
+import android.content.Context
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URI
-import java.net.URL
 
 enum class AccessLifecycleFailureKind {
     REJECTED,
@@ -34,6 +34,7 @@ object AccessLifecycleGateway {
     )
 
     suspend fun fetch(
+        context: Context,
         capability: RemoteAccessCapability,
         device: String,
         client: String,
@@ -41,6 +42,7 @@ object AccessLifecycleGateway {
         timezone: String,
         profileRevision: Long,
     ): AccessLifecycleStatus = request(
+        context = context,
         capability = capability,
         device = device,
         client = client,
@@ -51,6 +53,7 @@ object AccessLifecycleGateway {
     ).let(::parseStatus)
 
     suspend fun begin(
+        context: Context,
         capability: RemoteAccessCapability,
         device: String,
         client: String,
@@ -58,6 +61,7 @@ object AccessLifecycleGateway {
         timezone: String,
         profileRevision: Long,
     ): RemoteLaunchTarget = request(
+        context = context,
         capability = capability,
         device = device,
         client = client,
@@ -68,6 +72,7 @@ object AccessLifecycleGateway {
     ).let(::parseLaunchTarget)
 
     suspend fun submitProfileValues(
+        context: Context,
         capability: RemoteAccessCapability,
         token: String,
         device: String,
@@ -78,6 +83,7 @@ object AccessLifecycleGateway {
     ): RemoteProfileExchange =
         parseExchangeResult(
             request(
+                context = context,
                 capability = capability,
                 device = device,
                 client = client,
@@ -90,6 +96,7 @@ object AccessLifecycleGateway {
         )
 
     suspend fun invokeProfileAction(
+        context: Context,
         capability: RemoteAccessCapability,
         token: String,
         device: String,
@@ -98,6 +105,7 @@ object AccessLifecycleGateway {
         timezone: String,
         profileRevision: Long,
     ): RemoteDocumentLink = request(
+        context = context,
         capability = capability,
         device = device,
         client = client,
@@ -108,6 +116,7 @@ object AccessLifecycleGateway {
     ).let(::parseActionDocument)
 
     private suspend fun request(
+        context: Context,
         capability: RemoteAccessCapability,
         device: String,
         client: String,
@@ -154,7 +163,23 @@ object AccessLifecycleGateway {
             val relayAllowed = operation == "status" && action.isBlank() && values.isEmpty() &&
                 TunnelManager.isUpdateRelayAvailable()
             try {
+                if (relayAllowed) {
+                    when (
+                        val relayed = TunnelManager.postOpaqueHttpsStatusThroughTunnel(
+                            capability.url,
+                            payload,
+                        )
+                    ) {
+                        is OpaqueHttpsRelayResult.Success -> return@withContext HttpResponse(
+                            status = relayed.status,
+                            body = relayed.body,
+                            codeHint = relayed.codeHint,
+                        ).bodyOrThrow(operation)
+                        is OpaqueHttpsRelayResult.Unavailable -> Unit
+                    }
+                }
                 requestDirect(
+                    context = context,
                     url = capability.url,
                     payload = payload,
                     connectTimeoutMs = if (relayAllowed) 2_500 else 7_000,
@@ -164,31 +189,13 @@ object AccessLifecycleGateway {
                 throw cancelled
             } catch (error: Exception) {
                 if (error is IllegalStateException) throw error
-                if (relayAllowed) {
-                    when (
-                        val relayed = TunnelManager.postOpaqueHttpsStatusThroughTunnel(
-                            capability.url,
-                            payload,
-                        )
-                    ) {
-                        is OpaqueHttpsRelayResult.Success -> HttpResponse(
-                            status = relayed.status,
-                            body = relayed.body,
-                            codeHint = relayed.codeHint,
-                        ).bodyOrThrow(operation)
-                        is OpaqueHttpsRelayResult.Unavailable -> throw IllegalStateException(
-                            "Не удалось проверить состояние доступа к профилю. " +
-                                "Сохранённые настройки подключения не изменены.",
-                        )
-                    }
-                } else {
-                    throw IllegalStateException(requestFailureMessage(operation, action))
-                }
+                throw IllegalStateException(requestFailureMessage(operation, action))
             }
         }
     }
 
     private fun requestDirect(
+        context: Context,
         url: String,
         payload: ByteArray,
         connectTimeoutMs: Int,
@@ -196,7 +203,7 @@ object AccessLifecycleGateway {
     ): HttpResponse {
         var connection: HttpURLConnection? = null
         return try {
-            connection = URL(url).openConnection() as HttpURLConnection
+            connection = openDefaultHttpConnection(context, url)
             connection.requestMethod = "POST"
             connection.instanceFollowRedirects = false
             connection.connectTimeout = connectTimeoutMs
@@ -352,8 +359,24 @@ object AccessLifecycleGateway {
             profileUpdate = update,
             cachedAction = cachedAction,
             exchange = exchange,
+            profileAction = root.optJSONObject("profile_action")?.let(::parseProfileAction),
         )
     }
+
+    internal fun parseProfileAction(source: JSONObject): RemoteProfileAction? = runCatching {
+        val binding = source.optString("binding").trim()
+        val expires = source.optLong("expires", 0)
+        val title = source.optString("title").trim().take(120)
+        val message = source.optString("message").trim().take(2400)
+        val label = source.optString("label").trim().take(80)
+        require(binding.isNotBlank() && binding.length <= 256 && expires > 0)
+        require(title.isNotBlank() && message.isNotBlank() && label.isNotBlank())
+        RemoteProfileAction(
+            binding = binding,
+            expiresAtSeconds = expires,
+            action = RemoteUiAction(title, message, label, parseLaunchTarget(source.toString())),
+        )
+    }.getOrNull()
 
     internal fun parseLaunchTarget(body: String): RemoteLaunchTarget {
         val root = parseRoot(body)

@@ -37,6 +37,9 @@ usage() {
 Подготовка релизного комплекта WDTT Plus
 
 Использование:
+  release_bundle.sh sync-local
+                             Синхронизировать локальный standalone-бинарник и
+                             SHA256SUMS с текущим серверным asset без сборки APK.
   release_bundle.sh prepare  Пересобрать локальный standalone-комплект,
                              создать единый каталог готовых файлов релиза и
                              сразу проверить его вместе со всеми APK.
@@ -97,6 +100,8 @@ validate_versions() {
     APP_VERSION="$(read_single_assignment "$REPOSITORY_ROOT/app/build.gradle.kts" appVersionName)"
     [[ "$APP_VERSION" =~ ^[0-9]+$ ]] ||
         die "версия Android-приложения должна быть целым числом"
+    [[ "$APP_VERSION" == "$WDTT_SERVER_VERSION" ]] ||
+        die "версии приложения ($APP_VERSION) и сервера ($WDTT_SERVER_VERSION) расходятся"
     BUNDLE_NAME="WDTT-Plus-server-v${WDTT_SERVER_VERSION}-installer-${INSTALLER_VERSION}-linux-amd64"
     ARCHIVE_NAME="$BUNDLE_NAME.tar.gz"
     ARCHIVE_SUM_NAME="$ARCHIVE_NAME.sha256"
@@ -358,7 +363,7 @@ main() {
     local mode="${1:-}"
     [[ $# -eq 1 ]] || { usage; exit 2; }
     case "$mode" in
-        prepare|verify|invalidate) ;;
+        sync-local|prepare|verify|invalidate) ;;
         -h|--help|help) usage; exit 0 ;;
         *) usage; exit 2 ;;
     esac
@@ -366,7 +371,7 @@ main() {
     validate_versions
     install -d -m 0755 "$OUTPUTS_ROOT"
     exec 9>"$LOCK_PATH"
-    if [[ "$mode" == "prepare" || "$mode" == "invalidate" ]]; then
+    if [[ "$mode" == "sync-local" || "$mode" == "prepare" || "$mode" == "invalidate" ]]; then
         flock -n 9 || die "другая подготовка релиза уже выполняется"
     else
         flock -s -n 9 || die "комплект сейчас изменяется другой подготовкой релиза"
@@ -374,6 +379,14 @@ main() {
     TEMP_ROOT="$(mktemp -d /tmp/wdtt-server-release.XXXXXX)"
     chmod 0700 "$TEMP_ROOT"
     case "$mode" in
+        sync-local)
+            require_regular_file "$SERVER_ASSET"
+            validate_linux_server "$SERVER_ASSET"
+            write_local_standalone_files
+            verify_source_and_local_files
+            printf 'Локальный standalone-комплект синхронизирован с wdtt-server v%s.\n' \
+                "$WDTT_SERVER_VERSION"
+            ;;
         prepare)
             prepare_release
             ;;

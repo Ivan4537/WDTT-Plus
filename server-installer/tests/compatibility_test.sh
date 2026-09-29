@@ -103,6 +103,8 @@ grep -Fq '[ "$server_version" = "$WDTT_SERVER_VERSION" ]' "$DEPLOY" ||
 
 grep -Eq "wdttServerVersion[[:space:]]*=[[:space:]]*\"$WDTT_SERVER_VERSION\"" "$SERVER" ||
     fail "Go-сервер не соответствует версии из контракта"
+bash "$TEST_DIR/version_sync_test.sh" >/dev/null ||
+    fail "версии приложения, сервера и установщиков не синхронизированы"
 
 # Готовый standalone-комплект должен соответствовать текущему корневому Go-коду,
 # а не только сообщать тот же номер версии.

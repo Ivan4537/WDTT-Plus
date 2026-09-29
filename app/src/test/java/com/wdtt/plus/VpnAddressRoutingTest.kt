@@ -9,6 +9,33 @@ import org.json.JSONObject
 
 class VpnAddressRoutingTest {
     @Test
+    fun temporaryDirectAddressesAreRemovedWithoutDroppingOtherRoutes() {
+        assertEquals(
+            listOf(
+                "198.51.100.0/24",
+                "203.0.113.0/32",
+                "203.0.113.2/31",
+                "::/1",
+            ),
+            applyTemporaryDirectIpv4Addresses(
+                allowedIps = listOf("203.0.113.0/30", "198.51.100.0/24", "::/1"),
+                directAddresses = listOf("203.0.113.1", "203.0.113.1", "not-an-ip"),
+            ),
+        )
+    }
+
+    @Test
+    fun temporaryDirectAddressesDoNotCreateRoutesOutsideExistingWhitelist() {
+        assertEquals(
+            listOf("192.0.2.0/24"),
+            applyTemporaryDirectIpv4Addresses(
+                allowedIps = listOf("192.0.2.0/24"),
+                directAddresses = listOf("203.0.113.1"),
+            ),
+        )
+    }
+
+    @Test
     fun addressListsAreRegisteredAsPerProfilePreferences() {
         assertTrue(
             SettingsStore.resettableProfilePreferenceNames().containsAll(

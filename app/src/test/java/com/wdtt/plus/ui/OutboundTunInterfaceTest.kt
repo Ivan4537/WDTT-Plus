@@ -129,7 +129,7 @@ class OutboundTunInterfaceTest {
         )
         assertFalse("block() {\n          cleanup" in script)
         assertTrue("${'$'}ROUTE_HELPER\" block" in script)
-        assertTrue("curl -4fsS --interface \"${'$'}TEST_SOURCE\"" in script)
+        assertTrue("wdtt_routed_public_ip \"${'$'}TEST_SOURCE\" \"${'$'}TUN_IFACE\"" in script)
         assertTrue("wdtt_write_mode \"tun_interface\"" in script)
         assertTrue("tun_interface_is_primary" in script)
         assertTrue("WDTT_TUN_EXIT_V1" in script)
@@ -181,7 +181,7 @@ class OutboundTunInterfaceTest {
         assertTrue("WDTT_ERROR=tun_exit_not_owned" in script)
         assertTrue("WDTT_ERROR=tun_interface_mismatch" in script)
         assertTrue("tun-exit-route status" in script)
-        assertTrue("curl -4fsS --interface \"${'$'}TEST_SOURCE\"" in script)
+        assertTrue("wdtt_routed_public_ip \"${'$'}TEST_SOURCE\" \"${'$'}TUN_IFACE\"" in script)
         assertShellSyntax(script)
     }
 

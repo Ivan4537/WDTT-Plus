@@ -2,32 +2,24 @@ package com.wdtt.plus.ui
 
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Warning
-import androidx.compose.material3.FilledTonalIconButton
+import androidx.compose.material3.Button
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -40,8 +32,6 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.window.Dialog
-import androidx.compose.ui.window.DialogProperties
 import com.wdtt.plus.DeviceCheckAction
 import com.wdtt.plus.DeviceCheckItem
 import com.wdtt.plus.DeviceCheckSeverity
@@ -58,155 +48,90 @@ fun DeviceCompatibilityDialog(
     onCopy: (() -> Unit)? = null,
     onAction: ((DeviceCheckAction) -> Unit)? = null
 ) {
-    val television = isTelevisionDevice()
-    val scrollState = rememberScrollState()
     val visibleItems = remember(report) {
         report.items.ifEmpty {
-            listOf(
-                DeviceCheckItem(
-                    title = "Проверка устройства",
-                    status = "замечаний нет",
-                    details = "Архитектурных проблем для запуска WDTT Plus не найдено.",
-                    severity = DeviceCheckSeverity.Ok
-                )
-            )
+            listOf(DeviceCheckItem("Проверка", "замечаний нет",
+                "Проблем для запуска WDTT Plus не найдено."))
         }
     }
-
-    Dialog(
-        onDismissRequest = onDismiss,
-        properties = DialogProperties(usePlatformDefaultWidth = false)
+    SettingsDialogLayout(
+        title = title,
+        onDismiss = onDismiss,
+        footer = onCopy?.let { copy ->
+            {
+                Button(
+                    onClick = copy,
+                    shape = RoundedCornerShape(16.dp),
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                ) {
+                    Icon(Icons.Default.ContentCopy, null, Modifier.size(18.dp))
+                    Spacer(Modifier.size(8.dp))
+                    FlexibleButtonText("Скопировать отчёт", fontWeight = FontWeight.Bold)
+                }
+            }
+        },
     ) {
-        BoxWithConstraints(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(8.dp),
-            contentAlignment = Alignment.Center
+        Surface(
+            shape = RoundedCornerShape(20.dp),
+            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.46f),
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f))
         ) {
-            Surface(
-                shape = RoundedCornerShape(28.dp),
-                color = MaterialTheme.colorScheme.surface,
-                tonalElevation = 8.dp,
-                shadowElevation = 18.dp,
+            Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 12.dp)
-                    .heightIn(max = maxHeight * 0.92f)
+                    .padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(20.dp)
-                        .verticalScroll(scrollState)
-                        .tvDpadScrollable(scrollState, television),
-                    verticalArrangement = Arrangement.spacedBy(14.dp)
+                val summarySeverity = if (report.hasErrors) {
+                    DeviceCheckSeverity.Error
+                } else if (report.problemItems.isNotEmpty()) {
+                    DeviceCheckSeverity.Warning
+                } else {
+                    DeviceCheckSeverity.Ok
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalAlignment = Alignment.Top
                 ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(12.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
+                    Icon(
+                        imageVector = when (summarySeverity) {
+                            DeviceCheckSeverity.Error -> Icons.Default.Error
+                            DeviceCheckSeverity.Warning -> Icons.Default.Warning
+                            else -> Icons.Default.CheckCircle
+                        },
+                        contentDescription = null,
+                        tint = severityColor(summarySeverity),
+                        modifier = Modifier
+                            .padding(top = 2.dp)
+                            .size(22.dp)
+                    )
+                    Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         Text(
-                            title,
-                            modifier = Modifier.weight(1f),
-                            style = MaterialTheme.typography.titleLarge,
+                            "Итог: ${report.overallStatus}",
+                            style = MaterialTheme.typography.titleSmall,
                             fontWeight = FontWeight.Bold,
                             color = MaterialTheme.colorScheme.onSurface
                         )
-                        FilledTonalIconButton(onClick = onDismiss) {
-                            Icon(Icons.Default.Close, contentDescription = "Закрыть")
-                        }
+                        Text(
+                            subtitle,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            lineHeight = 18.sp
+                        )
                     }
-
-                    Surface(
-                        shape = RoundedCornerShape(20.dp),
-                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.46f),
-                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f))
-                    ) {
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(14.dp),
-                            verticalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            val summarySeverity = if (report.hasErrors) {
-                                DeviceCheckSeverity.Error
-                            } else if (report.problemItems.isNotEmpty()) {
-                                DeviceCheckSeverity.Warning
-                            } else {
-                                DeviceCheckSeverity.Ok
-                            }
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(10.dp),
-                                verticalAlignment = Alignment.Top
-                            ) {
-                                Icon(
-                                    imageVector = when (summarySeverity) {
-                                        DeviceCheckSeverity.Error -> Icons.Default.Error
-                                        DeviceCheckSeverity.Warning -> Icons.Default.Warning
-                                        else -> Icons.Default.CheckCircle
-                                    },
-                                    contentDescription = null,
-                                    tint = severityColor(summarySeverity),
-                                    modifier = Modifier
-                                        .padding(top = 2.dp)
-                                        .size(22.dp)
-                                )
-                                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                    Text(
-                                        "Итог: ${report.overallStatus}",
-                                        style = MaterialTheme.typography.titleSmall,
-                                        fontWeight = FontWeight.Bold,
-                                        color = MaterialTheme.colorScheme.onSurface
-                                    )
-                                    Text(
-                                        subtitle,
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        lineHeight = 18.sp
-                                    )
-                                }
-                            }
-                            Text(
-                                note,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                lineHeight = 18.sp
-                            )
-                        }
-                    }
-
-                    visibleItems.forEach { item ->
-                        DeviceCheckItemCard(item = item, onAction = onAction)
-                    }
-
-                    Column(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        if (onCopy != null) {
-                            OutlinedButton(
-                                onClick = onCopy,
-                                shape = RoundedCornerShape(16.dp),
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(18.dp))
-                                Spacer(modifier = Modifier.size(8.dp))
-                                Text("Скопировать отчёт")
-                            }
-                        }
-                        Button(
-                            onClick = onDismiss,
-                            shape = RoundedCornerShape(16.dp),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Text("Понятно", fontWeight = FontWeight.Bold)
-                        }
-                    }
-                    Spacer(modifier = Modifier.height(2.dp))
                 }
+                Text(
+                    note,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    lineHeight = 18.sp
+                )
             }
+        }
+
+        visibleItems.forEach { item ->
+            DeviceCheckItemCard(item = item, onAction = onAction)
         }
     }
 }

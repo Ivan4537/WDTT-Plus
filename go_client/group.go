@@ -474,6 +474,11 @@ func WorkerGroup(
 		}
 	}
 
+	if tp.Auto != nil {
+		if err := configStartGate.wait(ctx, getConfig); err != nil {
+			return
+		}
+	}
 	hashCandidates := workerHashCandidates(tp.Hashes, hashIndex, requestedWorkers, hashFallback)
 	selectedHash := 0
 	hash := hashCandidates[selectedHash]
@@ -481,6 +486,11 @@ func WorkerGroup(
 
 	credStreamID := groupID * 100
 	fetchCredentials := func(candidateHash string) credentialFetchResult {
+		if tp.Auto != nil {
+			if err := tp.Auto.waitAvailable(ctx); err != nil {
+				return credentialFetchResult{err: err}
+			}
+		}
 		return credentialRequests.fetch(ctx, func() (string, string, []string, error) {
 			return GetCreds(ctx, candidateHash, credStreamID)
 		})
@@ -688,6 +698,12 @@ func WorkerGroup(
 					if ctx.Err() != nil {
 						return
 					}
+					if errors.Is(sessErr, errUplinkPathReplacement) {
+						// Local delivery failure does not invalidate VK credentials.
+						// The dispatcher has already granted a bounded recovery permit.
+						turnCandidateRetry++
+						continue
+					}
 					relayHandshakeFailed := shouldRotateTurnCandidateAfterSessionError(sessErr)
 					if relayHandshakeFailed {
 						turnCandidateRetry++
@@ -729,8 +745,14 @@ func WorkerGroup(
 					}
 
 					if strings.Contains(errStr, "хеш мёртв") ||
-						strings.Contains(errStr, "FATAL_AUTH") {
+						strings.Contains(errStr, "FATAL_AUTH") || strings.Contains(errStr, "FATAL_TRANSPORT") {
 						log.Printf("[ВОРКЕР #%d] Фатальная ошибка: %s", wid, errStr)
+						if strings.Contains(errStr, "FATAL_TRANSPORT") {
+							// Other groups may still be waiting for this group's
+							// configuration. An unsupported mode cannot recover by
+							// retrying workers, even without an Android log reader.
+							cancel()
+						}
 						return
 					}
 
@@ -742,6 +764,7 @@ func WorkerGroup(
 						log.Printf("[ВОРКЕР #%d] [TURN] Ошибка allocation/кредов, обновляем TURN-креды и повторяем (попытка %d): %s", wid, attempt, errStr)
 						refreshResult = refreshCreds("TURN allocation error", credsRevision)
 					} else if turnCapacityLimited {
+						d.uplinkRecovery.capacityLimited(time.Now())
 						startedRound, round, waitErr := turnCapacityGate.wait(ctx, wid)
 						if startedRound {
 							log.Printf("[ВОРКЕР #%d] [TURN] Узел временно ограничил новые allocation; снижаем темп повторов (раунд %d), креды сохранены: %s", wid, round, errStr)
@@ -750,7 +773,7 @@ func WorkerGroup(
 							return
 						}
 						continue
-					} else if relayHandshakeFailed &&
+					} else if tp.Auto == nil && relayHandshakeFailed &&
 						hashFallback &&
 						len(credsSnapshot.TurnURLs) > 0 &&
 						turnCandidateRetry%len(credsSnapshot.TurnURLs) == 0 {
@@ -894,6 +917,9 @@ func normalizeVKJoinHash(input string) string {
 
 // TurnParams — конфигурация TURN
 type TurnParams struct {
+	Auto        *connectionPolicy
+	NoUDP       bool
+	Experiment  string
 	Host        string
 	Port        string
 	Hashes      []string

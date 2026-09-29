@@ -2,16 +2,16 @@
 # ==============================================================================
 #  WDTT Plus Server — Универсальный установщик для VPS
 #  Поддержка: Debian 11+, Ubuntu 20.04+, CentOS/RHEL/Fedora/AlmaLinux/Rocky
-#  Версия: 3.11  |  Дата: 2026-09-06
+#  Версия: 3.13  |  Дата: 2026-09-12
 #  NAT:  MASQUERADE через iptables
 #  WG:   порт 56001 (не конфликтует с существующим WG на 51820)
 #  DTLS: порт 56000
 # ==============================================================================
 set -euo pipefail
 
-readonly SCRIPT_VERSION="3.11"
+readonly SCRIPT_VERSION="3.13"
 readonly WDTT_DEPLOY_CONTRACT_VERSION="1"
-readonly WDTT_SERVER_VERSION="17"
+readonly WDTT_SERVER_VERSION="19"
 readonly WDTT_SERVER_BINARY_PATH="/usr/local/bin/wdtt-server"
 readonly WDTT_SYSTEMD_UNIT_PATH="/etc/systemd/system/wdtt.service"
 readonly WDTT_ANDROID_DEPLOY_MARKER="Managed by WDTT Plus Android deploy"

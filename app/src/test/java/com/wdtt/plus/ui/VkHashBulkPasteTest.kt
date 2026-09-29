@@ -71,4 +71,32 @@ class VkHashBulkPasteTest {
         assertEquals(4, result.insertedCount)
         assertEquals(0, result.skippedCount)
     }
+
+    @Test
+    fun acquisitionUsesOneDynamicEntryPoint() {
+        assertEquals(
+            "Получить ВК-хеши",
+            hashAcquisitionButtonLabel(false, canRestore = false, canAcquire = true, busy = false)
+        )
+        assertEquals(
+            "Получить новые ВК-хеши",
+            hashAcquisitionButtonLabel(true, canRestore = false, canAcquire = true, busy = false)
+        )
+        assertEquals(
+            "Получить или вернуть ВК-хеши",
+            hashAcquisitionButtonLabel(true, canRestore = true, canAcquire = true, busy = false)
+        )
+        assertEquals(
+            "Вернуть ВК-хеши",
+            hashAcquisitionButtonLabel(false, canRestore = true, canAcquire = false, busy = false)
+        )
+    }
+
+    @Test
+    fun uiTextUsesRussianVkNameWithoutChangingUrls() {
+        assertEquals(
+            "ВК-хеши из ВК · https://id.vk.ru",
+            localizeVkUiText("VK-хеши из ВКонтакте · https://id.vk.ru")
+        )
+    }
 }

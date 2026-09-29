@@ -42,8 +42,10 @@ func putPktBuf(b []byte) {
 }
 
 const (
-	returnChBuf           = 384
-	deviceWakeHealthGrace = 60 * time.Second
+	returnChBuf             = 384
+	deviceWakeHealthGrace   = 60 * time.Second
+	uplinkBulkQueueCapacity = 512
+	uplinkBulkQueueMaxAge   = 50 * time.Millisecond
 
 	// chunkSize — количество последовательных пакетов, отправляемых в один worker
 	// перед переключением на следующий.
@@ -56,8 +58,8 @@ const (
 	// С chunk=16 пакеты реже перескакивают между путями с разной задержкой. Это
 	// уменьшает reorder на активной многоканальной сессии, сохраняя равномерную
 	// загрузку всех workers.
-	// Reorder возможен только между chunk-границами, что покрывается WG replay
-	// window (2048 пакетов).
+	// Chunk не гарантирует порядок доставки: очереди и задержки путей различаются.
+	// Replay window отбрасывает старые повторы, но не восстанавливает порядок TCP.
 	//
 	// Все workers по-прежнему получают одинаковую долю трафика за полный цикл;
 	// фактический выигрыш зависит от различия задержек между TURN-путями.
@@ -65,6 +67,8 @@ const (
 )
 
 type WorkerSlot struct {
+	uplink    *uplinkQuality
+	queue     *transportQueue
 	ID        int
 	SendCh    chan []byte
 	WakeCh    chan uint64
@@ -77,6 +81,15 @@ type WorkerSlot struct {
 }
 
 type Dispatcher struct {
+	workerAttempt         atomic.Uint64
+	negotiatedTransport   atomic.Uint32
+	uplinkBulk            chan timedDatagram
+	uplinkIngress         uplinkIngressMetrics
+	dispatchMu            sync.Mutex
+	uplinkRecovery        uplinkRecovery
+	uplinkPacing          *uplinkPacer
+	downlinkOrder         transportOrder
+	experiment            string
 	localConn             net.PacketConn
 	clientAddr            atomic.Pointer[net.Addr]
 	workers               atomic.Pointer[[]*WorkerSlot]
@@ -106,9 +119,14 @@ type Dispatcher struct {
 	wakeHealthGraceUntil                atomic.Int64
 }
 
-func NewDispatcher(ctx context.Context, localConn net.PacketConn, stats *Stats) *Dispatcher {
+func NewDispatcher(ctx context.Context, localConn net.PacketConn, stats *Stats, experiment ...string) *Dispatcher {
 	dctx, dcancel := context.WithCancel(ctx)
+	mode := experimentStandard
+	if len(experiment) != 0 {
+		mode = experiment[0]
+	}
 	d := &Dispatcher{
+		experiment:            mode,
 		localConn:             localConn,
 		ReturnCh:              make(chan []byte, returnChBuf),
 		ctx:                   dctx,
@@ -117,18 +135,44 @@ func NewDispatcher(ctx context.Context, localConn net.PacketConn, stats *Stats) 
 		updateMetadataWaiters: make(map[string]*updateMetadataAssembly),
 	}
 
+	if mode == experimentUplink || mode == experimentAuto {
+		d.uplinkPacing = newUplinkPacer()
+		d.uplinkBulk = make(chan timedDatagram, uplinkBulkQueueCapacity)
+		d.wg.Add(2)
+		go func() { defer d.wg.Done(); d.uplinkPacing.run(dctx) }()
+		go d.runUplinkBulk()
+	}
+
 	empty := make([]*WorkerSlot, 0)
 	d.workers.Store(&empty)
 
 	d.wg.Add(2)
 	go d.readLoop()
 	go d.writeLoop()
+	if transportMetricsEnabled {
+		d.wg.Add(1)
+		go func() {
+			defer d.wg.Done()
+			t := time.NewTicker(5 * time.Second)
+			defer t.Stop()
+			for {
+				select {
+				case <-d.ctx.Done():
+					return
+				case <-t.C:
+					d.downlinkOrder.report("client_downlink")
+					d.uplinkIngress.report(d.uplinkBulk)
+				}
+			}
+		}()
+	}
 	return d
 }
 
 func (d *Dispatcher) Shutdown() {
 	d.cancel()
 	d.wg.Wait()
+	d.downlinkOrder.report("client_downlink")
 }
 
 func (d *Dispatcher) Register(w *WorkerSlot) {
@@ -138,6 +182,9 @@ func (d *Dispatcher) Register(w *WorkerSlot) {
 	copy(newWorkers, *oldWorkers)
 	newWorkers[len(*oldWorkers)] = w
 	d.workers.Store(&newWorkers)
+	if w.uplink != nil && d.uplinkPacing != nil {
+		d.uplinkPacing.registerPath(w.uplink)
+	}
 	d.mu.Unlock()
 	log.Printf("[ДИСП] Воркер #%d зарегистрирован (всего: %d)", w.ID, len(newWorkers))
 
@@ -160,6 +207,9 @@ func (d *Dispatcher) Unregister(slot *WorkerSlot) {
 		}
 	}
 	d.workers.Store(&newWorkers)
+	if slot.uplink != nil && d.uplinkPacing != nil {
+		d.uplinkPacing.unregisterPath(slot.uplink)
+	}
 	d.mu.Unlock()
 	log.Printf("[ДИСП] Воркер #%d отключён (осталось: %d)", slot.ID, len(newWorkers))
 	if generation := d.wakeGeneration.Load(); generation > 0 && !d.deviceSleeping.Load() {
@@ -324,12 +374,13 @@ func (d *Dispatcher) claimStalledUserTraffic(now time.Time, timeout time.Duratio
 //
 // Логика: отправляем chunkSize подряд пакетов в один worker, потом переходим
 // к следующему. Если текущий worker перегружен (канал полный) — немедленно
-// ищем свободный worker и начинаем новый chunk на нём. Это гарантирует:
-//   - В рамках chunk пакеты идут через один TURN relay → in-order delivery
-//   - Между chunks — разные relay → максимальная агрегатная скорость
-//   - Нет блокировки, нет буферизации, нет дополнительного latency
+// ищем свободный worker и начинаем новый chunk на нём. Порядок и пропускная
+// способность зависят от потерь, очередей и задержек отдельных путей.
 func (d *Dispatcher) readLoop() {
 	defer d.wg.Done()
+	if d.uplinkBulk != nil {
+		defer close(d.uplinkBulk)
+	}
 
 	for {
 		if err := d.ctx.Err(); err != nil {
@@ -352,56 +403,121 @@ func (d *Dispatcher) readLoop() {
 		d.clientAddr.Store(&addr)
 		d.stats.TotalBytesUp.Add(int64(n))
 
-		workersPtr := d.workers.Load()
-		if workersPtr == nil || len(*workersPtr) == 0 {
+		if d.usesUplink() && d.uplinkBulk != nil && n > 160 {
+			// Read and dispatch ACKs even while bulk pacing is waiting. Blocking
+			// this UDP reader would trap ACKs behind data in the socket buffer.
+			select {
+			case d.uplinkBulk <- timedDatagram{data: pkt, queued: time.Now()}:
+				if transportMetricsEnabled {
+					d.uplinkIngress.accepted.Add(1)
+				}
+			default:
+				if transportMetricsEnabled {
+					d.uplinkIngress.dropped.Add(1)
+				}
+				putPktBuf(pkt)
+			}
+		} else {
+			d.dispatchPacket(pkt)
+		}
+	}
+}
+
+func (d *Dispatcher) runUplinkBulk() {
+	defer d.wg.Done()
+	for queued := range d.uplinkBulk {
+		pkt := queued.data
+		// Absorb short local bursts without keeping a slow path's old bulk
+		// traffic queued indefinitely. ACKs still bypass this queue entirely.
+		if d.expireUplinkBulk(queued) {
+			continue
+		}
+		var started time.Time
+		if transportMetricsEnabled {
+			started = time.Now()
+		}
+		if d.uplinkPacing.wait(d.ctx, len(pkt)) != nil {
 			putPktBuf(pkt)
 			continue
 		}
+		if d.expireUplinkBulk(queued) {
+			continue
+		}
+		if transportMetricsEnabled {
+			d.uplinkIngress.pacingWait.observe(time.Since(started))
+			d.uplinkIngress.dispatched.Add(1)
+		}
+		d.dispatchPacket(pkt)
+	}
+}
 
-		ws := *workersPtr
-		nw := len(ws)
-		wakeGeneration := d.wakeGeneration.Load()
-		deviceSleeping := d.deviceSleeping.Load()
+func (d *Dispatcher) expireUplinkBulk(queued timedDatagram) bool {
+	if time.Since(queued.queued) <= uplinkBulkQueueMaxAge {
+		return false
+	}
+	if transportMetricsEnabled {
+		d.uplinkIngress.expired.Add(1)
+	}
+	putPktBuf(queued.data)
+	return true
+}
 
-		sent := false
-		idx := d.rrIndex % nw
+func (d *Dispatcher) dispatchPacket(pkt []byte) {
+	d.dispatchMu.Lock()
+	defer d.dispatchMu.Unlock()
+	n := len(pkt)
+	workersPtr := d.workers.Load()
+	if workersPtr == nil || len(*workersPtr) == 0 {
+		putPktBuf(pkt)
+		return
+	}
 
-		// After wake, a registered worker is only a candidate after its own
-		// current-generation keepalive has returned. This keeps stale sockets
-		// out of the user-data round robin while healthy workers keep carrying
-		// traffic and the remaining sessions reconnect independently.
-		for offset := 0; offset < nw; offset++ {
-			candidateIdx := (idx + offset) % nw
-			candidate := ws[candidateIdx]
-			if !workerEligibleForWakeGeneration(candidate, wakeGeneration, deviceSleeping) {
-				continue
+	ws := *workersPtr
+	nw := len(ws)
+	wakeGeneration := d.wakeGeneration.Load()
+	deviceSleeping := d.deviceSleeping.Load()
+
+	if d.usesUplink() {
+		ensureUplinkServiceFloor(ws, wakeGeneration, deviceSleeping)
+	}
+
+	sent := false
+	idx := d.rrIndex % nw
+
+	// After wake, a registered worker is only a candidate after its own
+	// current-generation keepalive has returned. This keeps stale sockets
+	// out of the user-data round robin while healthy workers keep carrying
+	// traffic and the remaining sessions reconnect independently.
+	for offset := 0; offset < nw; offset++ {
+		candidateIdx := (idx + offset) % nw
+		candidate := ws[candidateIdx]
+		if !workerEligibleForWakeGeneration(candidate, wakeGeneration, deviceSleeping) || (n > 160 && candidate.uplink != nil && candidate.uplink.muted.Load()) {
+			continue
+		}
+		if candidate.offerData(pkt) {
+			sent = true
+			if offset == 0 {
+				d.rrCount++
+			} else {
+				d.rrIndex = candidateIdx
+				d.rrCount = 1
 			}
-			select {
-			case candidate.SendCh <- pkt:
-				sent = true
-				if offset == 0 {
-					d.rrCount++
-				} else {
-					d.rrIndex = candidateIdx
-					d.rrCount = 1
-				}
-				if d.rrCount >= chunkSize {
-					d.rrIndex = (candidateIdx + 1) % nw
-					d.rrCount = 0
-				}
-			default:
-			}
-			if sent {
-				break
+			rotate := d.rrCount >= chunkSize
+			if rotate {
+				d.rrIndex = (candidateIdx + 1) % nw
+				d.rrCount = 0
 			}
 		}
-
-		if !sent {
-			// Все workers перегружены — сдвигаем указатель, пакет дропается
-			d.rrIndex = (idx + 1) % nw
-			d.rrCount = 0
-			putPktBuf(pkt)
+		if sent {
+			break
 		}
+	}
+
+	if !sent {
+		// Все workers перегружены — сдвигаем указатель, пакет дропается
+		d.rrIndex = (idx + 1) % nw
+		d.rrCount = 0
+		putPktBuf(pkt)
 	}
 }
 
@@ -413,6 +529,7 @@ func (d *Dispatcher) writeLoop() {
 		case <-d.ctx.Done():
 			return
 		case pkt := <-d.ReturnCh:
+			d.downlinkOrder.observe(pkt)
 			addrPtr := d.clientAddr.Load()
 			if addrPtr == nil {
 				putPktBuf(pkt)

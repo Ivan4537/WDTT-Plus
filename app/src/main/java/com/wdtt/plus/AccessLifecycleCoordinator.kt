@@ -72,7 +72,7 @@ object AccessLifecycleCoordinator {
             val currentNow = System.currentTimeMillis()
             if (!current.capability.available) return@withLock AccessLifecycleRefreshResult.Unmanaged
             if (current.status?.continuationAvailable != false) {
-                syncPendingProfileValues(store, profile, current.capability)
+                syncPendingProfileValues(appContext, store, profile, current.capability)
             }
             if (
                 !force &&
@@ -92,6 +92,7 @@ object AccessLifecycleCoordinator {
             setRefreshing(profile, true)
             try {
                 val received = AccessLifecycleGateway.fetch(
+                    context = appContext,
                     capability = current.capability,
                     device = store.getOrCreateConnectDeviceId(),
                     client = BuildConfig.VERSION_NAME,
@@ -119,7 +120,7 @@ object AccessLifecycleCoordinator {
                 }
                 if (received.continuationAvailable != false) {
                     try {
-                        syncPendingProfileValues(store, profile, effectiveCapability)
+                        syncPendingProfileValues(appContext, store, profile, effectiveCapability)
                     } catch (cancelled: CancellationException) {
                         throw cancelled
                     } catch (error: Exception) {
@@ -276,6 +277,7 @@ object AccessLifecycleCoordinator {
             } ?: "Действие сейчас недоступно."
         }
         val target = AccessLifecycleGateway.begin(
+            context = context.applicationContext,
             capability = current.capability,
             device = store.getOrCreateConnectDeviceId(),
             client = BuildConfig.VERSION_NAME,
@@ -374,6 +376,7 @@ object AccessLifecycleCoordinator {
         }
         store.markProfileValuesSyncPending(profile)
         val updatedExchange = AccessLifecycleGateway.submitProfileValues(
+            context = context.applicationContext,
             capability = current.capability,
             token = exchange.submitToken,
             device = store.getOrCreateConnectDeviceId(),
@@ -416,6 +419,7 @@ object AccessLifecycleCoordinator {
                 "Действие для этого профиля больше недоступно."
             }
             val link = AccessLifecycleGateway.invokeProfileAction(
+                context = appContext,
                 capability = current.capability,
                 token = exchange.actionToken,
                 device = store.getOrCreateConnectDeviceId(),
@@ -431,6 +435,7 @@ object AccessLifecycleCoordinator {
                 client = BuildConfig.VERSION_NAME,
                 system = Build.VERSION.RELEASE.orEmpty(),
                 localBindings = store.remoteDocumentBindings(),
+                context = appContext,
             )
             require(delivery.kind == RemoteDocumentKind.UPDATE) {
                 "WDTT Plus вернул неподходящее обновление профиля."
@@ -458,6 +463,7 @@ object AccessLifecycleCoordinator {
     }
 
     private suspend fun syncPendingProfileValues(
+        context: Context,
         store: SettingsStore,
         profile: Int,
         capability: RemoteAccessCapability,
@@ -473,6 +479,7 @@ object AccessLifecycleCoordinator {
             .take(4)
         runCatching {
             val updatedExchange = AccessLifecycleGateway.submitProfileValues(
+                context = context,
                 capability = capability,
                 token = exchange.submitToken,
                 device = store.getOrCreateConnectDeviceId(),
@@ -506,6 +513,7 @@ object AccessLifecycleCoordinator {
             client = BuildConfig.VERSION_NAME,
             system = Build.VERSION.RELEASE.orEmpty(),
             localBindings = store.remoteDocumentBindings(),
+            context = appContext,
         )
         require(delivery.kind == RemoteDocumentKind.UPDATE) {
             "WDTT Plus вернул неподходящее обновление профиля."

@@ -30,7 +30,6 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.LocationOn
 import androidx.compose.material.icons.filled.Wifi
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -56,7 +55,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.core.net.toUri
@@ -193,7 +191,7 @@ fun TrustedWifiSettingsDialog(
         currentWifi = withContext(Dispatchers.Default) { readConnectedWifiState(context) }
     }
 
-    Dialog(
+    BoundedAppDialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false)
     ) {
@@ -332,7 +330,7 @@ fun TrustedWifiSettingsDialog(
                                     ) {
                                         Icon(Icons.Default.Wifi, contentDescription = null, modifier = Modifier.size(19.dp))
                                         Text(ssid, modifier = Modifier.weight(1f).padding(horizontal = 10.dp))
-                                        IconButton(
+                                        HintIconButton(hint = "Удалить сеть",
                                             onClick = {
                                                 scope.launch {
                                                     settingsStore.removeTrustedWifiSsid(ssid)
@@ -391,7 +389,7 @@ fun TrustedWifiSettingsDialog(
     }
 
     if (showManualInput) {
-        AlertDialog(
+        BoundedAlertDialog(
             onDismissRequest = { showManualInput = false },
             title = {
                 Row(
@@ -515,7 +513,7 @@ private fun PermissionExplanationDialog(
     onDismiss: () -> Unit,
     onConfirm: () -> Unit
 ) {
-    AlertDialog(
+    BoundedAlertDialog(
         onDismissRequest = onDismiss,
         icon = { Icon(Icons.Default.LocationOn, contentDescription = null) },
         title = { Text(title, textAlign = TextAlign.Center) },

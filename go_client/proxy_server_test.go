@@ -60,6 +60,123 @@ func TestValidateProxyListenAddressesRejectsUnsafeCombinations(t *testing.T) {
 	}
 }
 
+func TestUnifiedProxyReportsFirstListenerPortInUse(t *testing.T) {
+	occupied, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+
+	err = runUnifiedProxyServer(
+		context.Background(),
+		"auto",
+		[]string{occupied.Addr().String()},
+		systemSocksDialer{},
+		false,
+		"",
+		"",
+		true,
+		"",
+		nil,
+	)
+	address, portInUse := proxyPortInUseAddress(err)
+	if !portInUse || address != occupied.Addr().String() {
+		t.Fatalf("port conflict = %q, %t; error=%v", address, portInUse, err)
+	}
+}
+
+func TestUnifiedProxyClosesFirstListenerWhenSecondPortIsInUse(t *testing.T) {
+	portSource, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, port, err := net.SplitHostPort(portSource.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = portSource.Close()
+
+	firstAddress := net.JoinHostPort("127.0.0.1", port)
+	secondAddress := net.JoinHostPort("127.0.0.2", port)
+	occupiedSecond, err := net.Listen("tcp4", secondAddress)
+	if err != nil {
+		t.Skipf("second loopback address is unavailable: %v", err)
+	}
+	defer occupiedSecond.Close()
+
+	err = runUnifiedProxyServer(
+		context.Background(),
+		"socks5",
+		[]string{firstAddress, secondAddress},
+		systemSocksDialer{},
+		false,
+		"",
+		"",
+		true,
+		"",
+		nil,
+	)
+	address, portInUse := proxyPortInUseAddress(err)
+	if !portInUse || address != secondAddress {
+		t.Fatalf("second conflict = %q, %t; error=%v", address, portInUse, err)
+	}
+
+	reopenedFirst, err := net.Listen("tcp4", firstAddress)
+	if err != nil {
+		t.Fatalf("first listener remained open after transactional failure: %v", err)
+	}
+	_ = reopenedFirst.Close()
+}
+
+func TestUnifiedProxyReadyForEveryMode(t *testing.T) {
+	for _, mode := range []string{"socks5", "http", "auto"} {
+		t.Run(mode, func(t *testing.T) {
+			reserved, err := net.Listen("tcp4", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			listenAddress := reserved.Addr().String()
+			_ = reserved.Close()
+			ctx, cancel := context.WithCancel(context.Background())
+			ready := make(chan []string, 1)
+			done := make(chan error, 1)
+			go func() {
+				done <- runUnifiedProxyServer(
+					ctx,
+					mode,
+					[]string{listenAddress},
+					systemSocksDialer{},
+					false,
+					"",
+					"",
+					true,
+					"",
+					func(addresses []string) { ready <- addresses },
+				)
+			}()
+			select {
+			case addresses := <-ready:
+				if len(addresses) != 1 || addresses[0] != listenAddress {
+					t.Fatalf("ready addresses=%v", addresses)
+				}
+			case err := <-done:
+				t.Fatalf("proxy failed before ready: %v", err)
+			case <-time.After(2 * time.Second):
+				t.Fatal("proxy did not become ready")
+			}
+			cancel()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("proxy did not stop")
+			}
+		})
+	}
+}
+
 func TestAutoProxyDetectsSOCKSAndHTTPWithoutWaitingForMoreData(t *testing.T) {
 	for name, greeting := range map[string][]byte{
 		"SOCKS5": {socksVersion5},

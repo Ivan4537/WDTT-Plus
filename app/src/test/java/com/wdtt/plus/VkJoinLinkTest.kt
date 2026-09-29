@@ -52,4 +52,12 @@ class VkJoinLinkTest {
         assertFalse(VkJoinLink.isValidInput("https://vk.ru/not-a-call/a"))
         assertEquals("a,b_C-2", VkJoinLink.normalizeHashes("a, b_C-2"))
     }
+
+    @Test
+    fun completeHashSetRequiresFourDistinctValidValues() {
+        assertTrue(VkJoinLink.hasCompleteHashSet("one,two,three,four"))
+        assertFalse(VkJoinLink.hasCompleteHashSet("one,two,three"))
+        assertFalse(VkJoinLink.hasCompleteHashSet("one,two,three,three"))
+        assertFalse(VkJoinLink.hasCompleteHashSet("one,two,three,нельзя"))
+    }
 }

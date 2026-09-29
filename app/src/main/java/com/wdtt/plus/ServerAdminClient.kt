@@ -1027,23 +1027,112 @@ internal fun buildAdminProfilePatchArgs(
     }
 }
 
+internal data class AdminRootStdinExecPlan(
+    val command: String,
+    val stdinPayload: String,
+)
+
+private const val ADMIN_STDIN_FRAME_START = "__WDTT_ADMIN_STDIN_V1__"
+private const val ADMIN_STDIN_FRAME_END = "__WDTT_ADMIN_STDIN_END_V1__"
+
+private fun quoteAdminShell(value: String): String =
+    "'" + value.replace("'", "'\"'\"'") + "'"
+
+internal fun buildAdminStdinForwardingCommand(command: String, shell: String = "bash"): String {
+    require(shell == "bash" || shell == "sh")
+    val quotedStart = quoteAdminShell(ADMIN_STDIN_FRAME_START)
+    val quotedEnd = quoteAdminShell(ADMIN_STDIN_FRAME_END)
+    val invalidFrame = "echo 'error: invalid WDTT admin stdin frame' >&2; exit 97"
+    return "IFS= read -r wdtt_frame_first || { $invalidFrame; }; " +
+        "IFS= read -r wdtt_frame_second || { $invalidFrame; }; " +
+        "if [ \"\$wdtt_frame_first\" = $quotedStart ] && [ \"\$wdtt_frame_second\" = $quotedEnd ]; then :; " +
+        "elif [ \"\$wdtt_frame_second\" = $quotedStart ]; then " +
+        "IFS= read -r wdtt_frame_third || { $invalidFrame; }; " +
+        "[ \"\$wdtt_frame_third\" = $quotedEnd ] || { $invalidFrame; }; " +
+        "else $invalidFrame; fi; " +
+        "exec $shell -c ${quoteAdminShell(command)}"
+}
+
+internal fun buildAdminRootStdinExecPlan(
+    command: String,
+    sudoPassword: String,
+    stdinPayload: String,
+    shell: String = "bash",
+): AdminRootStdinExecPlan {
+    require('\n' !in sudoPassword && '\r' !in sudoPassword) {
+        "Пароль sudo не должен содержать перенос строки"
+    }
+    // sudo читает первую строку stdin только когда действительно запрашивает пароль.
+    // Две метки позволяют дочерней root-команде отбросить пароль и при запросе,
+    // и при уже действующей квитанции/NOPASSWD, оставив ей ровно исходный payload.
+    val forwardingCommand = buildAdminStdinForwardingCommand(command, shell)
+    val quotedForwardingCommand = quoteAdminShell(forwardingCommand)
+    val rootCommand =
+        "if [ \"\$(id -u)\" = \"0\" ]; then exec $shell -c $quotedForwardingCommand; " +
+            "elif command -v sudo >/dev/null 2>&1; then exec sudo -S -p '' $shell -c $quotedForwardingCommand; " +
+            "else echo 'error: root privileges required and sudo not found'; exit 1; fi"
+    val payload = buildString {
+        append(sudoPassword)
+        append('\n')
+        append(ADMIN_STDIN_FRAME_START)
+        append('\n')
+        append(ADMIN_STDIN_FRAME_END)
+        append('\n')
+        append(stdinPayload)
+    }
+    return AdminRootStdinExecPlan(rootCommand, payload)
+}
+
+internal fun friendlyAdminSudoError(raw: String): String? {
+    val value = raw.lowercase()
+    return when {
+        "incorrect password" in value ||
+            "sorry, try again" in value ||
+            "a password is required" in value ||
+            "no password was provided" in value ||
+            "authentication failure" in value ->
+            "Не удалось подтвердить права sudo. Проверьте SSH-пароль или пароль sudo в «Деплой → SSH»."
+        "is not in the sudoers file" in value ||
+            "is not allowed to execute" in value ||
+            "may not run sudo" in value ->
+            "У SSH-пользователя нет разрешения выполнять команды управления через sudo."
+        "root privileges required" in value || "sudo not found" in value ->
+            "Для управления сервером нужны root-права или установленный sudo."
+        else -> null
+    }
+}
+
+internal fun buildSshExecStdinPlan(
+    command: String,
+    sudoPassword: String,
+    stdinPayload: String? = null,
+): AdminRootStdinExecPlan? = when {
+    stdinPayload != null -> AdminRootStdinExecPlan(command, stdinPayload)
+    // Send the original script over stdin: nesting it inside another `sh -c`
+    // doubles its quoting and can exceed the OS limit for one argument.
+    // The original command still selects its own shell and privilege branch.
+    "sudo -S" in command -> buildAdminRootStdinExecPlan(
+        command = "exec sh -s",
+        sudoPassword = sudoPassword,
+        stdinPayload = "$command\n",
+        shell = "sh",
+    )
+    else -> null
+}
+
 private class AdminSshClient(private val session: Session, private val sudoPassword: String) {
     companion object {
         private const val MAX_COMMAND_OUTPUT_CHARS = 16_000_000
     }
 
     fun execRootWithStdin(command: String, stdinPayload: String, timeout: Long): String {
-        val isRoot = session.userName == "root"
-        if (!isRoot) {
-            exec("sudo -S -p '' -v", 20_000L, sudoPassword + "\n")
+        val plan = buildAdminRootStdinExecPlan(command, sudoPassword, stdinPayload)
+        return try {
+            exec(plan.command, timeout, plan.stdinPayload)
+        } catch (error: IllegalStateException) {
+            val friendly = friendlyAdminSudoError(error.message.orEmpty()) ?: throw error
+            throw IllegalStateException(friendly, error)
         }
-        val quoted = "'" + command.replace("'", "'\"'\"'") + "'"
-        val rootCommand = if (isRoot) {
-            "bash -c $quoted"
-        } else {
-            "sudo -n bash -c $quoted"
-        }
-        return exec(rootCommand, timeout, stdinPayload)
     }
 
     fun exec(command: String, timeout: Long): String = exec(command, timeout, null)
@@ -1054,18 +1143,19 @@ private class AdminSshClient(private val session: Session, private val sudoPassw
         val stdout = StringBuilder()
         val stderr = StringBuilder()
         try {
+            val plan = buildSshExecStdinPlan(command, sudoPassword, stdinPayload)
             channel = session.openChannel("exec") as ChannelExec
-            channel.setCommand(command)
+            channel.setCommand(plan?.command ?: command)
             val outStream = channel.outputStream
             val input = channel.inputStream
             val err = channel.errStream
             channel.connect(15_000)
-            if (stdinPayload != null) {
-                outStream.write(stdinPayload.toByteArray(Charsets.UTF_8))
+            if (plan != null) {
+                // The frame is consumed before even a fast root/NOPASSWD command
+                // can finish; do not write a password into an already closed channel.
+                outStream.write(plan.stdinPayload.toByteArray(Charsets.UTF_8))
                 outStream.flush()
-            } else if (command.contains("sudo -S")) {
-                outStream.write("$sudoPassword\n".toByteArray(Charsets.UTF_8))
-                outStream.flush()
+                outStream.close()
             }
             val reader = input.bufferedReader()
             val errReader = err.bufferedReader()

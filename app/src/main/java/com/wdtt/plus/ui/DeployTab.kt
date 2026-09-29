@@ -18,6 +18,7 @@ import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animate
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
@@ -51,12 +52,14 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import com.wdtt.plus.TunnelService
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.graphicsLayer
@@ -66,7 +69,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.boundsInWindow
 import androidx.compose.ui.layout.onGloballyPositioned
-import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
@@ -93,11 +95,14 @@ import com.wdtt.plus.DeviceCheckItem
 import com.wdtt.plus.DeviceCheckSeverity
 import com.wdtt.plus.DeviceCompatibilityReport
 import com.wdtt.plus.ServerAdminClient
+import com.wdtt.plus.buildSshExecStdinPlan
+import com.wdtt.plus.friendlyAdminSudoError
 import com.wdtt.plus.ServerAdminProfileInfo
 import com.wdtt.plus.ServerAdminTarget
 import com.wdtt.plus.ServerBackupManagerInfo
 import com.wdtt.plus.ServerStoredBackupDocument
 import com.wdtt.plus.ServerStoredBackupInfo
+import com.wdtt.plus.ServerConnectionAccess
 import com.wdtt.plus.SettingsStore
 import com.wdtt.plus.SshCredentials
 import com.wdtt.plus.SshRoutePolicy
@@ -118,13 +123,18 @@ import com.wdtt.plus.sshCredentialsForMode
 import com.wdtt.plus.vpnProfileRestorableName
 import com.wdtt.plus.vpnProfileDisplayName
 import com.wdtt.plus.vpnProfileTransferName
+import kotlinx.coroutines.asContextElement
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import java.io.File
 import java.io.FileOutputStream
 import java.security.MessageDigest
@@ -292,8 +302,8 @@ internal fun primaryServerSshAccessIssue(
     privateKey: String,
     sshPort: Int
 ): String? {
-    if (host.isBlank()) return "Укажите IP-адрес или домен сервера в верхнем блоке «Деплой»."
-    if (!hostValid) return "Проверьте IP-адрес или домен сервера в верхнем блоке «Деплой»."
+    if (host.isBlank()) return "Укажите IP-адрес или домен сервера в настройках SSH."
+    if (!hostValid) return "Проверьте IP-адрес или домен сервера в настройках SSH."
     sshAuthenticationIssueForMode(
         mode = mode,
         password = password,
@@ -301,7 +311,7 @@ internal fun primaryServerSshAccessIssue(
         passwordLabel = "SSH-пароль",
         privateKeyLabel = "приватный SSH-ключ"
     )?.let { return it }
-    if (sshPort !in 1..65535) return "Откройте «Секреты» и укажите корректный SSH-порт от 1 до 65535."
+    if (sshPort !in 1..65535) return "Откройте настройки SSH и укажите корректный SSH-порт от 1 до 65535."
     return null
 }
 
@@ -460,7 +470,8 @@ internal data class ExistingServerConnection(
 
 private data class PendingExistingConnectionApply(
     val connection: ExistingServerConnection,
-    val effectiveLogin: String,
+    val profileIndex: Int,
+    val target: OutboundSshTarget,
     val localProfile: ServerAdminProfileInfo,
     val serverProfile: ServerAdminProfileInfo,
     val diffLines: List<String>
@@ -502,11 +513,56 @@ private data class ExistingInstallInfo(
     val legacyAndroidDeployCandidate: Boolean = false,
     val preservedAndroidData: Boolean = false,
     val incompleteAndroidDeployCandidate: Boolean = false,
+    val updateRollbackState: ServerUpdateRollbackState = ServerUpdateRollbackState.None,
     val checkError: String? = null,
     val comparison: DeployServerComparison? = null
 ) {
+    val hasInstalledServer: Boolean
+        get() = serviceExists && binaryExists && accessDbExists && wgKeysExist
+
     val hasAnyTrace: Boolean
-        get() = serviceExists || binaryExists || configDirExists || accessDbExists || wgKeysExist
+        get() = serviceExists || binaryExists || configDirExists || accessDbExists || wgKeysExist || active
+}
+
+internal data class ServerUpdateRollbackMarkers(
+    val hadConfig: Boolean,
+    val hadBinary: Boolean,
+    val hadService: Boolean,
+    val wasActive: Boolean,
+    val wasEnabled: Boolean,
+)
+
+internal sealed class ServerUpdateRollbackState {
+    data object None : ServerUpdateRollbackState()
+    data class PreparedValid(val markers: ServerUpdateRollbackMarkers) : ServerUpdateRollbackState()
+    data class PreparedCorrupted(val diagnostic: String) : ServerUpdateRollbackState()
+    data class UnknownState(val diagnostic: String) : ServerUpdateRollbackState()
+}
+
+internal fun parseServerUpdateRollbackState(output: String): ServerUpdateRollbackState {
+    fun flag(name: String): Boolean = markerValue(output, name) == "1"
+    val diagnostic = markerValue(output, "WDTT_UPDATE_BACKUP_DIAGNOSTIC")
+        ?.replace('_', ' ')
+        ?.take(160)
+        .orEmpty()
+    return when (markerValue(output, "WDTT_UPDATE_BACKUP_STATUS")) {
+        "none" -> ServerUpdateRollbackState.None
+        "prepared_valid" -> ServerUpdateRollbackState.PreparedValid(
+            ServerUpdateRollbackMarkers(
+                hadConfig = flag("WDTT_UPDATE_BACKUP_HAD_CONFIG"),
+                hadBinary = flag("WDTT_UPDATE_BACKUP_HAD_BINARY"),
+                hadService = flag("WDTT_UPDATE_BACKUP_HAD_SERVICE"),
+                wasActive = flag("WDTT_UPDATE_BACKUP_WAS_ACTIVE"),
+                wasEnabled = flag("WDTT_UPDATE_BACKUP_WAS_ENABLED"),
+            ),
+        )
+        "prepared_corrupted" -> ServerUpdateRollbackState.PreparedCorrupted(
+            diagnostic.ifBlank { "неполная или небезопасная структура копии" },
+        )
+        else -> ServerUpdateRollbackState.UnknownState(
+            diagnostic.ifBlank { "неизвестное состояние страховочной копии" },
+        )
+    }
 }
 
 internal enum class DeploymentOwnership {
@@ -1091,7 +1147,7 @@ private fun outboundDialogServerStateSummary(snapshot: OutboundServerSnapshot, d
 private fun formatOutboundTimestamp(raw: String): String {
     val cleaned = raw.trim()
     if (cleaned.isBlank()) return ""
-    val ru = Locale("ru", "RU")
+    val ru = Locale.forLanguageTag("ru-RU")
     val formatter = DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm", ru)
     val moscow = ZoneId.of("Europe/Moscow")
     val deviceZone = runCatching { ZoneId.systemDefault() }.getOrDefault(moscow)
@@ -1111,7 +1167,7 @@ private fun formatOutboundTimestamp(raw: String): String {
 
 private fun formatOutboundCheckTime(millis: Long): String {
     if (millis <= 0L) return ""
-    val ru = Locale("ru", "RU")
+    val ru = Locale.forLanguageTag("ru-RU")
     val formatter = DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm", ru)
     val moscow = ZoneId.of("Europe/Moscow")
     val deviceZone = runCatching { ZoneId.systemDefault() }.getOrDefault(moscow)
@@ -1129,16 +1185,25 @@ private fun formatOutboundCheckTime(millis: Long): String {
 fun DeployTab(
     scrollPosition: MutableIntState = rememberSaveable { mutableIntStateOf(0) },
     modifier: Modifier = Modifier,
-    visible: Boolean = true
+    visible: Boolean = true,
+    openInstallRequest: Int = 0,
+    openInstallProfile: Int? = null,
+    navigationRevision: Int = 0,
+    onOpenTunnel: (Int, Int) -> Unit = { _, _ -> },
+    onProfileHeaderBounds: (Rect) -> Unit = {},
+    onProfileHeaderBoundary: (Float) -> Unit = {},
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val settingsStore = remember { SettingsStore(context) }
     val deployScrollState = rememberRememberedScrollState(scrollPosition)
     val topRevealOffsetPx = with(LocalDensity.current) { 10.dp.toPx() }
-    var clientsSectionY by remember { mutableStateOf(0f) }
-    var outboundSectionY by remember { mutableStateOf(0f) }
-    var migrationSectionY by remember { mutableStateOf(0f) }
+    var clientsSectionTopInWindow by remember { mutableStateOf<Float?>(null) }
+    var outboundSectionTopInWindow by remember { mutableStateOf<Float?>(null) }
+    var migrationSectionTopInWindow by remember { mutableStateOf<Float?>(null) }
+    var revealClientsRequested by remember { mutableStateOf(false) }
+    var revealOutboundRequested by remember { mutableStateOf(false) }
+    var revealMigrationRequested by remember { mutableStateOf(false) }
     var deployViewportTopInWindow by remember { mutableStateOf<Float?>(null) }
     var migrationImportTopInWindow by remember { mutableStateOf<Float?>(null) }
     var restoreScrollRequestId by remember { mutableIntStateOf(0) }
@@ -1165,17 +1230,45 @@ fun DeployTab(
 
     LaunchedEffect(Unit) { DeployManager.init(context) }
 
-    val savedIp by settingsStore.deployIp.collectAsStateWithLifecycle(initialValue = "")
     val activeProfile by settingsStore.activeProfile.collectAsStateWithLifecycle(initialValue = 0)
     val profileNames by settingsStore.profileNames.collectAsStateWithLifecycle(initialValue = emptyList())
+    val setupSnapshot by settingsStore.serverSetupSettings.collectAsStateWithLifecycle(initialValue = null)
+    val serverSettings = setupSnapshot?.takeIf { it.profileIndex == activeProfile }
+    val savedIp = serverSettings?.host.orEmpty()
     val currentActiveProfile by rememberUpdatedState(activeProfile)
-    val savedLogin by settingsStore.deployLogin.collectAsStateWithLifecycle(initialValue = "")
-    val savedPassword by settingsStore.deployPassword.collectAsStateWithLifecycle(initialValue = "")
-    val savedSshPrivateKey by settingsStore.deploySshPrivateKey.collectAsStateWithLifecycle(initialValue = "")
-    val savedSshKeyPassphrase by settingsStore.deploySshKeyPassphrase.collectAsStateWithLifecycle(initialValue = "")
-    val storedSshAuthMode by produceState<String?>(initialValue = null, settingsStore, activeProfile) {
-        settingsStore.deploySshAuthMode.collect { value = it }
+    val setupCompleted = serverSettings?.completed ?: false
+    val setupCompletion by settingsStore.deploySetupCompletion.collectAsStateWithLifecycle(initialValue = null)
+    var showFirstServerSetup by remember(activeProfile) { mutableStateOf(false) }
+    var setupInitial by remember(activeProfile) { mutableStateOf<ServerSetupDraft?>(null) }
+    var accessSaveJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+    var openingSetup by remember { mutableStateOf(false) }
+    var setupOpenError by remember(activeProfile) { mutableStateOf("") }
+    fun openSetup() {
+        val profile = activeProfile
+        openingSetup = true
+        setupOpenError = ""
+        scope.launch {
+            try {
+                accessSaveJob?.join()
+                val settings = settingsStore.readServerSetupSettings(profile)
+                if (currentActiveProfile != profile) return@launch
+                setupInitial = ServerSetupDraft(settings.host, settings.user.ifBlank { "root" }, settings.sshPassword,
+                    settings.sshPort, settings.authMode, settings.privateKey, settings.keyPassphrase,
+                    settings.mainPassword, settings.dns1, settings.dns2, settings.dtlsPort.toString(),
+                    settings.wgPort.toString(), settings.localPort.toString(), settings.adminId, settings.botToken)
+                showFirstServerSetup = true
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (currentActiveProfile == profile) setupOpenError = friendlyDeployError(e, "чтение настроек")
+            } finally { openingSetup = false }
+        }
     }
+    val savedLogin = serverSettings?.user ?: ""
+    val savedPassword = serverSettings?.sshPassword ?: ""
+    val savedSshPrivateKey = serverSettings?.privateKey ?: ""
+    val savedSshKeyPassphrase = serverSettings?.keyPassphrase ?: ""
+    val storedSshAuthMode = serverSettings?.authMode
     var sshAuthMode by rememberSaveable(activeProfile) { mutableStateOf<String?>(null) }
     val savedWireGuardExitSshPrivateKey by settingsStore.wireGuardExitSshPrivateKey.collectAsStateWithLifecycle(initialValue = "")
     val savedWireGuardExitSshKeyPassphrase by settingsStore.wireGuardExitSshKeyPassphrase.collectAsStateWithLifecycle(initialValue = "")
@@ -1195,47 +1288,103 @@ fun DeployTab(
         initialValue = com.wdtt.plus.VpnDnsSettingsSnapshot(profileIndex = activeProfile)
     )
 
-    var ip by remember { mutableStateOf("") }
-    var login by remember { mutableStateOf("") }
-    var password by remember { mutableStateOf("") }
-    var loginFocused by remember { mutableStateOf(false) }
-    var passwordFocused by remember { mutableStateOf(false) }
+    var ip by remember(activeProfile) { mutableStateOf("") }
+    var login by remember(activeProfile) { mutableStateOf("") }
+    var password by remember(activeProfile) { mutableStateOf("") }
 
-    val savedDns1 by settingsStore.deployDns1.collectAsStateWithLifecycle(initialValue = "1.1.1.1")
-    val savedDns2 by settingsStore.deployDns2.collectAsStateWithLifecycle(initialValue = "1.0.0.1")
+    val savedDns1 = serverSettings?.dns1 ?: "1.1.1.1"
+    val savedDns2 = serverSettings?.dns2 ?: "1.0.0.1"
     var dns1 by remember { mutableStateOf("1.1.1.1") }
     var dns2 by remember { mutableStateOf("1.0.0.1") }
 
-    val savedMainPass by settingsStore.deployMainPassword.collectAsStateWithLifecycle(initialValue = "")
-    val savedAdminId by settingsStore.deployAdminId.collectAsStateWithLifecycle(initialValue = "")
-    val savedBotToken by settingsStore.deployBotToken.collectAsStateWithLifecycle(initialValue = "")
-    val savedSshPort by settingsStore.deploySshPort.collectAsStateWithLifecycle(initialValue = "22")
-    val savedManualPorts by settingsStore.manualPortsEnabled.collectAsStateWithLifecycle(initialValue = false)
-    val savedServerDtlsPort by settingsStore.serverDtlsPort.collectAsStateWithLifecycle(initialValue = 56000)
-    val savedServerWgPort by settingsStore.serverWgPort.collectAsStateWithLifecycle(initialValue = 56001)
-    val savedListenPort by settingsStore.listenPort.collectAsStateWithLifecycle(initialValue = 9000)
-    val clientsSectionExpanded by remember(settingsStore) {
+    val savedMainPass = serverSettings?.mainPassword ?: ""
+    val savedAdminId = serverSettings?.adminId ?: ""
+    val savedBotToken = serverSettings?.botToken ?: ""
+    val savedSshPort = serverSettings?.sshPort ?: "22"
+    val savedManualPorts = serverSettings?.manualPorts ?: false
+    val savedServerDtlsPort = serverSettings?.dtlsPort ?: 56000
+    val savedServerWgPort = serverSettings?.wgPort ?: 56001
+    val savedListenPort = serverSettings?.localPort ?: 9000
+    val storedClientsSectionExpanded by remember(settingsStore) {
         settingsStore.deployClientsSectionExpanded.map { it as Boolean? }
     }.collectAsStateWithLifecycle(initialValue = null)
-    val outboundSectionExpanded by remember(settingsStore) {
+    val storedOutboundSectionExpanded by remember(settingsStore) {
         settingsStore.deployOutboundSectionExpanded.map { it as Boolean? }
     }.collectAsStateWithLifecycle(initialValue = null)
-    val migrationSectionExpanded by remember(settingsStore) {
+    val storedMigrationSectionExpanded by remember(settingsStore) {
         settingsStore.deployMigrationSectionExpanded.map { it as Boolean? }
     }.collectAsStateWithLifecycle(initialValue = null)
+
+    var clientsExpandedOverride by remember(activeProfile) { mutableStateOf<Boolean?>(null) }
+    var outboundExpandedOverride by remember(activeProfile) { mutableStateOf<Boolean?>(null) }
+    var migrationExpandedOverride by remember(activeProfile) { mutableStateOf<Boolean?>(null) }
+    val clientsSectionExpanded = clientsExpandedOverride ?: storedClientsSectionExpanded
+    val outboundSectionExpanded = outboundExpandedOverride ?: storedOutboundSectionExpanded
+    val migrationSectionExpanded = migrationExpandedOverride ?: storedMigrationSectionExpanded
+
+    suspend fun revealExpandedSection(sectionTop: () -> Float?) {
+        val top = sectionTop() ?: return
+        val viewportTop = deployViewportTopInWindow ?: return
+        val start = deployScrollState.value
+        val target = (start + top - viewportTop - topRevealOffsetPx).coerceAtLeast(0f)
+        // Follow the growing scroll range during expansion, starting on the first frame.
+        deployScrollState.scroll {
+            animate(0f, 1f, animationSpec = tween(300)) { progress, _ ->
+                val next = (start + (target - start) * progress)
+                    .coerceIn(0f, deployScrollState.maxValue.toFloat())
+                scrollBy(next - deployScrollState.value)
+            }
+        }
+    }
+
+    LaunchedEffect(clientsSectionExpanded, revealClientsRequested) {
+        if (clientsSectionExpanded == true && revealClientsRequested) {
+            revealExpandedSection { clientsSectionTopInWindow }
+            revealClientsRequested = false
+        }
+    }
+    LaunchedEffect(outboundSectionExpanded, revealOutboundRequested) {
+        if (outboundSectionExpanded == true && revealOutboundRequested) {
+            revealExpandedSection { outboundSectionTopInWindow }
+            revealOutboundRequested = false
+        }
+    }
+    LaunchedEffect(migrationSectionExpanded, revealMigrationRequested) {
+        if (migrationSectionExpanded == true && revealMigrationRequested) {
+            revealExpandedSection { migrationSectionTopInWindow }
+            revealMigrationRequested = false
+        }
+    }
     val serverMigrationState by settingsStore.serverMigrationState.collectAsStateWithLifecycle(initialValue = null)
 
-    var showSecretsDialog by remember { mutableStateOf(false) }
-    var showSshKeyDialog by remember { mutableStateOf(false) }
-    var showSshAuthHelp by remember { mutableStateOf(false) }
+    var serverAction by rememberSaveable(activeProfile) { mutableStateOf("install") }
+    var handledInstallRequest by rememberSaveable { mutableIntStateOf(0) }
+    LaunchedEffect(openInstallRequest, openInstallProfile, activeProfile, visible) {
+        if (visible && (openInstallProfile == null || openInstallProfile == activeProfile) && openInstallRequest > handledInstallRequest) {
+            handledInstallRequest = openInstallRequest
+            serverAction = "install"
+            deployScrollState.scrollTo(0)
+        }
+    }
+
+    var showServerAccessDialog by remember(activeProfile) { mutableStateOf(false) }
+    var showServerWorkflowHelp by remember(activeProfile) { mutableStateOf(false) }
+    var showSecretsDialog by remember(activeProfile) { mutableStateOf(false) }
+    var showSshKeyDialog by remember(activeProfile) { mutableStateOf(false) }
+    var showSshAuthHelp by remember(activeProfile) { mutableStateOf(false) }
     var showWireGuardExitSshKeyDialog by remember { mutableStateOf(false) }
     var showWireGuardExitSshHelp by remember { mutableStateOf(false) }
     var showUninstallDialog by remember { mutableStateOf(false) }
-    var pendingDeployRequest by remember { mutableStateOf<DeployRequest?>(null) }
+    var pendingDeployRequest by remember(activeProfile) { mutableStateOf<DeployRequest?>(null) }
     var pendingDeployImportRequest by remember { mutableStateOf<DeployRequest?>(null) }
     var pendingDirectImportRequest by remember { mutableStateOf<DeployRequest?>(null) }
-    var existingInstallInfo by remember { mutableStateOf<ExistingInstallInfo?>(null) }
+    var pendingDeploySettings by remember(activeProfile) {
+        mutableStateOf<Pair<ServerAdminProfileInfo, OutboundProfileForms>?>(null)
+    }
+    var existingInstallInfo by remember(activeProfile) { mutableStateOf<ExistingInstallInfo?>(null) }
     var isCheckingExistingInstall by remember { mutableStateOf(false) }
+    var rollbackResolutionBusy by remember { mutableStateOf(false) }
+    var rollbackResolutionMessage by rememberSaveable { mutableStateOf("") }
     var exportIncludeWgKeys by rememberSaveable { mutableStateOf(true) }
     var pendingExportBackup by remember { mutableStateOf<ServerBackup?>(null) }
     var pendingExportDocument by remember { mutableStateOf<String?>(null) }
@@ -1253,8 +1402,8 @@ fun DeployTab(
     var backupRetentionInput by rememberSaveable { mutableStateOf("14") }
     var pendingBackupDelete by remember { mutableStateOf<ServerStoredBackupInfo?>(null) }
     var existingConnectBusy by remember { mutableStateOf(false) }
-    var existingConnectStatus by rememberSaveable { mutableStateOf("") }
-    var pendingExistingConnectionApply by remember { mutableStateOf<PendingExistingConnectionApply?>(null) }
+    var existingConnectStatus by rememberSaveable(activeProfile) { mutableStateOf("") }
+    var pendingExistingConnectionApply by remember(activeProfile) { mutableStateOf<PendingExistingConnectionApply?>(null) }
     var serverDiagnosticsBusy by remember { mutableStateOf(false) }
     var serverDiagnosticsReport by remember { mutableStateOf<DeviceCompatibilityReport?>(null) }
     var serverDiagnosticsJob by remember { mutableStateOf<Job?>(null) }
@@ -1263,7 +1412,8 @@ fun DeployTab(
     var outboundBusy by remember { mutableStateOf(false) }
     var outboundProgressActive by remember { mutableStateOf(false) }
     var outboundActionTitle by remember { mutableStateOf("") }
-    var outboundStatus by rememberSaveable { mutableStateOf("") }
+    var outboundStatus by remember { mutableStateOf("") }
+    var outboundFeedback by remember { mutableStateOf<OutboundActionFeedback?>(null) }
     var outboundStatusOwner by rememberSaveable { mutableStateOf<String?>(null) }
     var outboundSnapshot by remember { mutableStateOf<OutboundServerSnapshot?>(null) }
     var outboundSnapshotBusy by remember { mutableStateOf(false) }
@@ -1334,18 +1484,22 @@ fun DeployTab(
         mutableStateOf(storedOutboundForms.forms.tunInterface)
     }
 
-    var showSuccessBanner by rememberSaveable { mutableStateOf(false) }
-    var successCountdown by rememberSaveable { mutableIntStateOf(5) }
-
-    LaunchedEffect(showSuccessBanner) {
-        if (showSuccessBanner) {
-            while (successCountdown > 0) {
-                kotlinx.coroutines.delay(1000)
-                successCountdown--
-            }
-            showSuccessBanner = false
-        }
-    }
+    val otherServerWindowOpen = serverAction != "install" || revealClientsRequested || revealOutboundRequested || revealMigrationRequested ||
+        showServerAccessDialog || showServerWorkflowHelp || showSecretsDialog ||
+        showSshKeyDialog || showSshAuthHelp || showWireGuardExitSshKeyDialog || showWireGuardExitSshHelp ||
+        showUninstallDialog || showFirstServerSetup || outboundDialog != null || serverDiagnosticsReport != null ||
+        existingInstallInfo != null || pendingExistingConnectionApply != null || pendingDeployImportRequest != null ||
+        pendingDirectImportRequest != null || pendingBackupDelete != null || exportPasswordBackup != null || encryptedImportDocument != null
+    val completionNavigation = rememberServerInstallCompletionNavigation(
+        activeProfile, navigationRevision, visible, setupCompletion?.profileIndex, otherServerWindowOpen, onOpenTunnel,
+    )
+    var showSuccessBanner by completionNavigation.showSuccessBanner
+    var successCountdown by completionNavigation.successCountdown
+    var successProfile by completionNavigation.successProfile
+    var firstInstallTunnelProfile by completionNavigation.firstInstallTunnelProfile
+    var firstInstallationProfile by completionNavigation.firstInstallationProfile
+    var firstInstallationNavigationRevision by completionNavigation.firstInstallationNavigationRevision
+    var firstInstallationNavigationCancelled by completionNavigation.firstInstallationNavigationCancelled
 
     val isDeploying by DeployManager.isDeploying.collectAsStateWithLifecycle()
     val deployProgress by DeployManager.deployProgress.collectAsStateWithLifecycle()
@@ -1353,9 +1507,9 @@ fun DeployTab(
     val lastDeployResult by DeployManager.lastResult.collectAsStateWithLifecycle()
     val installedServerVersion by DeployManager.installedServerVersion.collectAsStateWithLifecycle()
 
-    LaunchedEffect(savedIp) { ip = savedIp }
-    LaunchedEffect(savedLogin) { login = savedLogin }
-    LaunchedEffect(savedPassword) { password = savedPassword }
+    LaunchedEffect(activeProfile, savedIp, showServerAccessDialog) { if (!showServerAccessDialog) ip = savedIp }
+    LaunchedEffect(activeProfile, savedLogin, showServerAccessDialog) { if (!showServerAccessDialog) login = savedLogin }
+    LaunchedEffect(activeProfile, savedPassword, showServerAccessDialog) { if (!showServerAccessDialog) password = savedPassword }
     LaunchedEffect(savedDns1) { dns1 = savedDns1 }
     LaunchedEffect(savedDns2) { dns2 = savedDns2 }
     LaunchedEffect(storedSshAuthMode) {
@@ -1493,6 +1647,10 @@ fun DeployTab(
     }
     LaunchedEffect(activeProfile, outboundTargetKey) {
         serverDiagnosticsReport = null
+        serverDiagnosticsRunToken += 1L
+        serverDiagnosticsJob?.cancel()
+        serverDiagnosticsJob = null
+        serverDiagnosticsBusy = false
     }
     LaunchedEffect(
         activeProfile,
@@ -1626,18 +1784,19 @@ fun DeployTab(
         }
     }
 
+    val ownerTunnelSnapshot by settingsStore.activeTunnelProfileContentUiSnapshot.collectAsStateWithLifecycle()
     fun currentOwnerProfile(): ServerAdminProfileInfo = buildOwnerProfile(
         vkHashes = savedVkHashes,
         secondaryVkHash = savedSecondaryVkHash,
         workersPerHash = savedWorkersPerHash,
         protocol = savedProtocol,
-        listenPort = savedListenPort,
+        listenPort = ownerTunnelSnapshot?.takeIf { it.profileIndex == activeProfile }?.listenPort ?: 9000,
         sni = savedSni,
         noDns = savedNoDns,
         vpnDnsSelectionId = savedVpnDns.selectionId,
         vpnDnsCustomServers = savedVpnDns.customServers,
-        dtlsPort = if (savedManualPorts) savedServerDtlsPort else 56000,
-        wgPort = if (savedManualPorts) savedServerWgPort else 56001,
+        dtlsPort = ownerTunnelSnapshot?.takeIf { it.profileIndex == activeProfile }?.let { if (it.manualPortsEnabled) it.serverDtlsPort else 56000 } ?: 56000,
+        wgPort = ownerTunnelSnapshot?.takeIf { it.profileIndex == activeProfile }?.let { if (it.manualPortsEnabled) it.serverWgPort else 56001 } ?: 56001,
         profileName = vpnProfileTransferName(activeProfile, profileNames)
     )
 
@@ -1676,7 +1835,7 @@ fun DeployTab(
         val target = backupAdminTarget
         if (target == null) {
             backupStatusMessage = if (savedMainPass.isBlank()) {
-                "Укажите главный пароль в разделе «Секреты»."
+                "Укажите главный пароль в разделе параметры сервера."
             } else {
                 primarySshAccessIssue ?: "Проверьте SSH-доступ к серверу."
             }
@@ -1790,7 +1949,8 @@ fun DeployTab(
 
     suspend fun applyExistingConnection(
         connection: ExistingServerConnection,
-        effectiveLogin: String,
+        profileIndex: Int,
+        target: OutboundSshTarget,
         profile: ServerAdminProfileInfo,
         source: OwnerProfileSource
     ) {
@@ -1799,37 +1959,13 @@ fun DeployTab(
             listenPort = ports.third,
             ports = ports.asPortsSpec()
         )
-        settingsStore.save(
-            peer = connection.host,
-            vkHashes = normalizedProfile.vkHashes,
-            secondaryVkHash = normalizedProfile.secondaryVkHash,
-            workersPerHash = normalizedProfile.workersPerHash,
-            protocol = normalizedProfile.protocol,
-            listenPort = normalizedProfile.listenPort,
-            sni = normalizedProfile.sni,
-            noDns = normalizedProfile.noDns
+        settingsStore.applyImportedServerConnection(
+            profileIndex, connection.host, connection.password, ports.first, ports.second, normalizedProfile,
+            ServerConnectionAccess(target.user, target.pass, target.port, target.privateKey, target.keyPassphrase,
+                if (target.allowPasswordAuthentication) "password" else "key",
+                connection.adminId, connection.botToken, connection.dns1, connection.dns2),
         )
-        settingsStore.saveConnectionPassword(connection.password)
-        settingsStore.savePorts(ports.first, ports.second, ports.third)
-        settingsStore.saveManualPortsEnabled(ports != Triple(56000, 56001, 9000))
-        settingsStore.saveDeploySecrets(
-            mainPass = savedMainPass,
-            adminId = connection.adminId,
-            botToken = connection.botToken,
-            sshPort = savedSshPort.ifBlank { "22" }
-        )
-        settingsStore.saveDeploy(ip.trim(), effectiveLogin, password, savedSshPort.ifBlank { "22" }, connection.dns1, connection.dns2)
-        settingsStore.saveWdttLinkMode(false)
-        if (normalizedProfile.vpnDnsStored) {
-            settingsStore.saveVpnDnsSettings(
-                selectionId = normalizedProfile.vpnDnsSelectionId,
-                customServersRaw = normalizedProfile.vpnDnsCustomServers.joinToString(","),
-                profileIndex = activeProfile,
-            )
-        }
-        vpnProfileRestorableName(normalizedProfile.profileName)
-            .takeIf { it.isNotBlank() }
-            ?.let { settingsStore.saveProfileName(activeProfile, it) }
+        if (currentActiveProfile != profileIndex) return
 
         existingConnectStatus = when (source) {
             OwnerProfileSource.Server -> "Готово: данные восстановлены с сервера в приложение. Сервер не изменялся. Адрес: ${connection.host}; порты: ${ports.first}, ${ports.second}, ${ports.third}."
@@ -1838,10 +1974,19 @@ fun DeployTab(
     }
 
     fun launchDeploy(request: DeployRequest, mode: DeployMode) {
+        showSuccessBanner = false
+        firstInstallTunnelProfile = null
         val appContext = context.applicationContext
         val importPlan = selectedImportBackup?.let { ServerImportPlan(it, selectedImportMode) }
+        firstInstallationProfile = activeProfile.takeIf { mode == DeployMode.FreshInstall && importPlan == null }
+        firstInstallationNavigationRevision = navigationRevision.takeIf { firstInstallationProfile != null }
+        firstInstallationNavigationCancelled = false
         val outboundProfile = currentOutboundProfileForms()
         val deployProfile = activeProfile
+        val deployOwnerProfile = currentOwnerProfile().copy(
+            listenPort = request.localPort,
+            ports = Triple(request.dtlsPort, request.wgPort, request.localPort).asPortsSpec()
+        )
         DeployManager.scope.launch {
             try {
                 DeployManager.startDeploy()
@@ -1873,7 +2018,9 @@ fun DeployTab(
                 if (success) {
                     settingsStore.markProfileServerMigrationComplete(
                         profile = deployProfile,
-                        level = latestServerMigrationLevel(BuildConfig.VERSION_CODE)
+                        level = latestServerMigrationLevel(BuildConfig.VERSION_CODE),
+                        host = request.host,
+                        sshPort = request.sshPort,
                     )
                     val restoredConnection = importPlan
                         ?.takeIf { it.mode == ServerImportMode.Replace }
@@ -1889,7 +2036,7 @@ fun DeployTab(
                             ownerProfile = restoredConnection.adminProfile.copy(listenPort = restoredPorts.third)
                         )
                     }
-                    val ownerProfile = restoredConnection?.adminProfile ?: currentOwnerProfile()
+                    val ownerProfile = restoredConnection?.adminProfile ?: deployOwnerProfile
                     DeployManager.updateProgress(
                         0.97f,
                         if (restoredConnection != null) {
@@ -1934,6 +2081,14 @@ fun DeployTab(
                         DeployManager.writeError("Outbound profile sync after deploy error: ${it.message}")
                         TunnelManager.addDeployErrorLog("Профиль выходного IP после деплоя: ${friendlyDeployError(it, "сохранение")}")
                     }
+                    if (mode == DeployMode.FreshInstall && importPlan == null) {
+                        settingsStore.saveServerSetup(deployProfile, request.host, request.user, request.pass, request.sshPort,
+                            request.privateKey, request.keyPassphrase, if (request.allowPasswordAuthentication) "password" else "key",
+                            request.mainPass, request.adminId, request.botToken, request.dns1, request.dns2,
+                            request.dtlsPort, request.wgPort, request.localPort, completeFirstInstallation = true)
+                    } else {
+                        settingsStore.finishServerSetup(deployProfile)
+                    }
                     DeployManager.updateProgress(1f, "Готово!")
                     kotlinx.coroutines.delay(DEPLOY_READY_HOLD_MS)
                     DeployManager.stopDeploy("success")
@@ -1941,8 +2096,11 @@ fun DeployTab(
                         "Деплой успешно завершён. Серверная часть WDTT Plus " +
                             "${DeployManager.installedServerVersion.value}, сервис активен."
                     )
+                    successProfile = deployProfile
+                    firstInstallTunnelProfile = null
                     successCountdown = 5
-                    showSuccessBanner = true
+                    // The initial installation first shows its one-time credentials; closing them starts the countdown.
+                    showSuccessBanner = mode != DeployMode.FreshInstall || importPlan != null
                 }
             } finally {
                 try { appContext.startService(Intent(appContext, TunnelService::class.java).apply { action = "DEPLOY_STOP" }) } catch (_: Exception) {}
@@ -1950,11 +2108,18 @@ fun DeployTab(
         }
     }
 
-    fun startDeployCheck(request: DeployRequest) {
-        val localOwnerProfile = currentOwnerProfile()
+    fun startDeployCheck(request: DeployRequest, requireExistingServer: Boolean = false) {
+        showSuccessBanner = false
+        firstInstallTunnelProfile = null
+        val checkProfile = activeProfile
+        val localOwnerProfile = currentOwnerProfile().copy(
+            listenPort = request.localPort,
+            ports = Triple(request.dtlsPort, request.wgPort, request.localPort).asPortsSpec()
+        )
         val localOutboundProfile = currentOutboundProfileForms()
+        isCheckingExistingInstall = true
+        pendingDeploySettings = null
         scope.launch {
-            isCheckingExistingInstall = true
             try {
                 var info = checkExistingInstall(
                     host = request.host,
@@ -1968,6 +2133,28 @@ fun DeployTab(
                     port = request.sshPort,
                     mainPassword = request.mainPass,
                 )
+                if (currentActiveProfile != checkProfile) return@launch
+                settingsStore.recordProfileServerInstallation(checkProfile, request.host, request.sshPort, info.hasInstalledServer)
+                if (info.updateRollbackState !is ServerUpdateRollbackState.None) {
+                    val validation = when (val rollback = info.updateRollbackState) {
+                        is ServerUpdateRollbackState.PreparedValid -> "prepared_valid"
+                        is ServerUpdateRollbackState.PreparedCorrupted ->
+                            "prepared_corrupted:${rollback.diagnostic}"
+                        is ServerUpdateRollbackState.UnknownState ->
+                            "unknown_state:${rollback.diagnostic}"
+                        ServerUpdateRollbackState.None -> "none"
+                    }
+                    DeployManager.writeError(
+                        "Server update rollback backup found; validation=$validation",
+                    )
+                    TunnelManager.addDeployErrorLog(
+                        "На сервере найдена страховочная копия обновления: $validation",
+                    )
+                    pendingDeployRequest = request
+                    existingInstallInfo = info
+                    rollbackResolutionMessage = ""
+                    return@launch
+                }
                 if (info.hasAnyTrace) {
                     val comparison = runCatching {
                         compareDeployWithServer(
@@ -1983,13 +2170,23 @@ fun DeployTab(
                             checkError = friendlyDeployError(it, "сверка данных перед установкой")
                         )
                     }
+                    if (currentActiveProfile != checkProfile) return@launch
+                    val currentOwner = currentOwnerProfile().copy(listenPort = request.localPort,
+                        ports = Triple(request.dtlsPort, request.wgPort, request.localPort).asPortsSpec())
+                    check(currentOwner == localOwnerProfile && currentOutboundProfileForms() == localOutboundProfile) {
+                        "Локальные настройки изменились. Повторите проверку сервера."
+                    }
+                    pendingDeploySettings = localOwnerProfile to localOutboundProfile
                     info = info.copy(comparison = comparison)
                     pendingDeployRequest = request
                     existingInstallInfo = info
+                } else if (requireExistingServer) {
+                    openSetup()
                 } else {
                     launchDeploy(request, DeployMode.FreshInstall)
                 }
             } catch (e: Exception) {
+                if (currentActiveProfile != checkProfile) return@launch
                 val friendly = friendlyDeployError(e, "проверка сервера")
                 DeployManager.writeError("Pre-deploy check error: ${e.message}")
                 TunnelManager.addDeployErrorLog("Проверка сервера перед деплоем: $friendly")
@@ -2009,10 +2206,34 @@ fun DeployTab(
         }
     }
 
+    fun runRollbackResolution(action: ServerUpdateRollbackAction) {
+        val request = pendingDeployRequest ?: return
+        if (rollbackResolutionBusy) return
+        scope.launch {
+            rollbackResolutionBusy = true
+            rollbackResolutionMessage = "Выполняется безопасная проверка сервера..."
+            runCatching { resolveServerUpdateRollback(request, action) }
+                .onSuccess { message ->
+                    rollbackResolutionMessage = message
+                    TunnelManager.addDeploySuccessLog(message)
+                    Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+                    pendingDeployRequest = null
+                    existingInstallInfo = null
+                    startDeployCheck(request)
+                }
+                .onFailure { error ->
+                    val message = friendlyDeployError(error, "восстановление после обновления")
+                    rollbackResolutionMessage = message
+                    TunnelManager.addDeployErrorLog("Страховочная копия обновления: $message")
+                }
+            rollbackResolutionBusy = false
+        }
+    }
+
     fun currentOutboundTarget(): OutboundSshTarget? {
         if (!primarySshAccessReady) {
             outboundStatus = primarySshAccessIssue
-                ?: "Проверьте доступ к серверу в верхнем блоке «Деплой»."
+                ?: "Проверьте доступ к серверу в настройках SSH."
             outboundStatusOwner = outboundDialog?.name
             return null
         }
@@ -2036,10 +2257,13 @@ fun DeployTab(
         tunCandidatesBusy = true
         outboundStatus = "Ищу доступные TUN-интерфейсы на сервере..."
         outboundStatusOwner = OutboundDialog.TunInterface.name
-        scope.launch {
+        val capture = RemoteCommandCapture(listOf(target.pass, savedMainPass, localProxyPasswordInput, externalProxyPasswordInput, wireGuardExitPasswordInput))
+        var feedbackCategory = RemoteLogCategory.Info
+        scope.launch(remoteCommandOutputCapture.asContextElement(capture)) {
             try {
                 val candidates = discoverTunInterfaces(target)
                 if (currentOutboundTargetKey != requestTargetKey) return@launch
+                if (candidates.isEmpty()) feedbackCategory = RemoteLogCategory.Warning
                 tunCandidates = candidates
                 outboundStatus = if (candidates.isEmpty()) {
                     "Автоматически определить TUN-интерфейсы не удалось. Введите точное имя вручную."
@@ -2048,11 +2272,17 @@ fun DeployTab(
                 }
                 outboundStatusOwner = OutboundDialog.TunInterface.name
             } catch (e: Exception) {
+                capture.append(e.message.orEmpty())
+                feedbackCategory = RemoteLogCategory.Error
                 if (currentOutboundTargetKey != requestTargetKey) return@launch
                 tunCandidates = emptyList()
-                outboundStatus = "Не удалось получить список TUN-интерфейсов: ${friendlyDeployError(e, "поиск TUN-интерфейсов")}. Имя можно ввести вручную."
+                outboundStatus = "Не удалось получить список TUN-интерфейсов: ${outboundErrorSummary(capture.sanitize(friendlyDeployError(e, "поиск TUN-интерфейсов")))}. Имя можно ввести вручную."
                 outboundStatusOwner = OutboundDialog.TunInterface.name
             } finally {
+                if (currentOutboundTargetKey == requestTargetKey) {
+                    outboundStatus = capture.sanitize(outboundStatus)
+                    outboundFeedback = OutboundActionFeedback(outboundStatus, feedbackCategory, capture.text())
+                }
                 if (currentOutboundTargetKey == requestTargetKey) tunCandidatesBusy = false
             }
         }
@@ -2116,7 +2346,9 @@ fun DeployTab(
             outboundStatus = "Проверяю, какой выходной IP/прокси сейчас активен на сервере..."
             outboundStatusOwner = null
         }
-        scope.launch {
+        val capture = RemoteCommandCapture(listOf(target.pass, savedMainPass, localProxyPasswordInput, externalProxyPasswordInput, wireGuardExitPasswordInput))
+        var feedbackCategory = RemoteLogCategory.Info
+        scope.launch(remoteCommandOutputCapture.asContextElement(capture)) {
             try {
                 val snapshot = readOutboundServerSnapshot(context, target)
                 val accepted = acceptOutboundSnapshot(requestTargetKey, snapshot)
@@ -2125,13 +2357,19 @@ fun DeployTab(
                     outboundStatusOwner = null
                 }
             } catch (e: Exception) {
+                capture.append(e.message.orEmpty())
+                feedbackCategory = RemoteLogCategory.Error
                 recordOutboundCheckFailure(requestTargetKey, e)
                 if (showStatus && currentOutboundTargetKey == requestTargetKey) {
-                    outboundStatus = "Не удалось прочитать состояние выходного IP: ${friendlyDeployError(e, "выходной IP")}"
+                    outboundStatus = "Не удалось прочитать состояние выходного IP: ${outboundErrorSummary(capture.sanitize(friendlyDeployError(e, "выходной IP")))}"
                     outboundStatusOwner = null
                 }
                 DeployManager.writeError("Outbound state refresh failed: ${e.message}")
             } finally {
+                if (currentOutboundTargetKey == requestTargetKey && showStatus) {
+                    outboundStatus = capture.sanitize(outboundStatus)
+                    outboundFeedback = OutboundActionFeedback(outboundStatus, feedbackCategory, capture.text())
+                }
                 outboundSnapshotBusy = false
                 DeployManager.updateProgress(0f, "")
             }
@@ -2154,7 +2392,9 @@ fun DeployTab(
         DeployManager.updateProgress(0.02f, title)
         outboundStatus = "$title..."
         outboundStatusOwner = owner
-        scope.launch {
+        val capture = RemoteCommandCapture(listOf(target.pass, savedMainPass, localProxyPasswordInput, externalProxyPasswordInput, wireGuardExitPasswordInput))
+        outboundFeedback = null
+        scope.launch(remoteCommandOutputCapture.asContextElement(capture)) {
             try {
                 if (preflightRouteMode != null) {
                     DeployManager.updateProgress(0.04f, "Проверяю текущий выход перед переключением...")
@@ -2162,6 +2402,8 @@ fun DeployTab(
                     if (!acceptOutboundSnapshot(requestTargetKey, before)) return@launch
                     before.routeConflictMessage?.let { conflict ->
                         outboundStatus = "Установка остановлена. $conflict"
+                        outboundFeedback = OutboundActionFeedback(outboundStatus, RemoteLogCategory.Warning, capture.text())
+                        TunnelManager.addDeployMessageLog(outboundStatus, warning = true)
                         outboundStatusOwner = owner
                         return@launch
                     }
@@ -2177,15 +2419,27 @@ fun DeployTab(
                 }.getOrNull()
                 val afterWarning = afterSnapshot?.routeConflictMessage
                     ?: afterSnapshot?.outboundModeMismatchWarning()
-                outboundStatus = listOfNotNull(
+                    ?: if (afterSnapshot == null) "Действие завершено, но обновить состояние сервера не удалось. Повторите проверку." else null
+                val resultText = listOfNotNull(
                     actionResult,
                     afterWarning?.let { "Проверьте сервер: $it" }
                 ).joinToString("\n")
+                if (capture.text().isBlank()) capture.append(actionResult)
+                val warning = afterWarning != null || actionResult.lineSequence().any {
+                    classifyRemoteCommandLine(it).category == RemoteLogCategory.Warning
+                }
+                outboundStatus = outboundResultSummary(capture.sanitize(resultText))
+                outboundFeedback = OutboundActionFeedback(
+                    outboundStatus, if (warning) RemoteLogCategory.Warning else RemoteLogCategory.Info, capture.text()
+                )
                 outboundStatusOwner = owner
+                TunnelManager.addDeployMessageLog(outboundStatus, warning)
                 onSuccess?.invoke()
             } catch (e: Exception) {
-                val friendly = friendlyDeployError(e, "выходной IP")
-                outboundStatus = "$title: $friendly"
+                val friendly = outboundErrorSummary(capture.sanitize(friendlyDeployError(e, "выходной IP")))
+                capture.append(e.message.orEmpty())
+                outboundStatus = friendly
+                outboundFeedback = OutboundActionFeedback(friendly, RemoteLogCategory.Error, capture.text())
                 outboundStatusOwner = owner
                 DeployManager.writeError("Ошибка действия «$title»: $friendly")
                 TunnelManager.addDeployErrorLog("$title: $friendly")
@@ -2241,18 +2495,26 @@ fun DeployTab(
         outboundStatus = "Читаю настройки выходного IP и прокси с сервера..."
         outboundStatusOwner = null
         DeployManager.updateProgress(0.02f, "Читаю настройки выходного IP и прокси с сервера...")
-        scope.launch {
+        val capture = RemoteCommandCapture(listOf(target.pass, savedMainPass, localProxyPasswordInput, externalProxyPasswordInput, wireGuardExitPasswordInput))
+        var feedbackCategory = RemoteLogCategory.Info
+        scope.launch(remoteCommandOutputCapture.asContextElement(capture)) {
             try {
                 val snapshot = readOutboundServerSnapshot(context, target)
                 if (!acceptOutboundSnapshot(requestTargetKey, snapshot)) return@launch
                 applyOutboundSnapshot(snapshot)
                 outboundStatus = outboundRestoreSummary(snapshot)
             } catch (e: Exception) {
+                capture.append(e.message.orEmpty())
+                feedbackCategory = RemoteLogCategory.Error
                 recordOutboundCheckFailure(requestTargetKey, e)
-                outboundStatus = "Не удалось прочитать настройки выходного IP с сервера: ${friendlyDeployError(e, "выходной IP")}"
+                outboundStatus = "Не удалось прочитать настройки выходного IP с сервера: ${outboundErrorSummary(capture.sanitize(friendlyDeployError(e, "выходной IP")))}"
                 outboundStatusOwner = null
                 DeployManager.writeError("Outbound profile restore failed: ${e.message}")
             } finally {
+                if (currentOutboundTargetKey == requestTargetKey) {
+                    outboundStatus = capture.sanitize(outboundStatus)
+                    outboundFeedback = OutboundActionFeedback(outboundStatus, feedbackCategory, capture.text())
+                }
                 outboundBusy = false
                 outboundSnapshotBusy = false
                 outboundProgressActive = false
@@ -2275,7 +2537,7 @@ fun DeployTab(
                 title = "SSH-доступ",
                 status = "не готов",
                 details = issue,
-                recommendation = "Исправьте адрес, порт или выбранный способ входа в блоке «Установка на сервер», затем повторите диагностику.",
+                recommendation = "Откройте SSH в «Деплой», исправьте адрес, порт или способ входа, затем повторите диагностику.",
                 profileName = diagnosticsProfileName,
                 profileIndex = diagnosticsProfile
             )
@@ -2296,18 +2558,32 @@ fun DeployTab(
         Toast.makeText(context, "Выполняется диагностика сервера", Toast.LENGTH_SHORT).show()
         serverDiagnosticsJob = scope.launch {
             val report = try {
-                collectServerDiagnostics(
-                    target = target,
-                    selectedAuthMode = selectedSshAuthMode,
+                withTimeout(95_000L) {
+                    collectServerDiagnostics(
+                        target = target,
+                        selectedAuthMode = selectedSshAuthMode,
+                        profileName = diagnosticsProfileName,
+                        profileIndex = diagnosticsProfile,
+                        expectedDtlsPort = savedServerDtlsPort,
+                        expectedWgPort = savedServerWgPort,
+                        expectedClientPort = savedListenPort,
+                        connectionProfile = runCatching { settingsStore.tunnelProfileSnapshot(diagnosticsProfile) }.getOrNull(),
+                    )
+                }
+            } catch (error: TimeoutCancellationException) {
+                serverDiagnosticsErrorReport(
+                    title = "Серверная диагностика",
+                    status = "время ожидания истекло",
+                    details = "Проверка не завершилась за 95 секунд. SSH-канал остановлен; состояние сервера не изменено.",
+                    recommendation = "Повторите проверку при стабильном соединении. Если ошибка сохраняется, проверьте доступ к VPS без другого VPN.",
                     profileName = diagnosticsProfileName,
                     profileIndex = diagnosticsProfile,
-                    expectedDtlsPort = savedServerDtlsPort,
-                    expectedWgPort = savedServerWgPort,
-                    expectedClientPort = savedListenPort
                 )
+            } catch (error: CancellationException) {
+                throw error
             } catch (error: Exception) {
                 serverDiagnosticsErrorReport(
-                    title = "SSH-подключение",
+                    title = "Серверная диагностика",
                     status = "не удалось",
                     details = friendlyDeployError(error, "диагностика сервера"),
                     recommendation = "Проверьте логин, пароль или SSH-ключ, порт SSH и доступность сервера из сети.",
@@ -2399,9 +2675,9 @@ fun DeployTab(
         }
     }
 
+    Box(modifier = modifier.fillMaxSize()) {
     Column(
-        modifier = modifier
-            .fillMaxSize()
+        modifier = Modifier.fillMaxSize()
             .focusGroup()
             .padding(16.dp)
             .onGloballyPositioned {
@@ -2412,11 +2688,15 @@ fun DeployTab(
     ) {
         Text(
             "Настройки сервера (${vpnProfileDisplayName(activeProfile, profileNames)})",
+            modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
+                .wrapContentHeight(Alignment.CenterVertically)
+                .onGloballyPositioned { onProfileHeaderBounds(it.boundsInWindow()) },
             style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
             color = MaterialTheme.colorScheme.onSurface
         )
 
         if (
+            serverMigrationState?.profileIndex == activeProfile &&
             serverMigrationState?.profileUpdateRequired == true &&
             hasManagedServerCredentials(
                 host = savedIp,
@@ -2450,7 +2730,7 @@ fun DeployTab(
                             color = MaterialTheme.colorScheme.onTertiaryContainer
                         )
                         Text(
-                            "Для профиля «${vpnProfileDisplayName(activeProfile, profileNames)}» выполните установку сервера с сохранением данных. После успешной установки это напоминание исчезнет.",
+                            "Для профиля «${vpnProfileDisplayName(activeProfile, profileNames)}» выберите «Установить» → «Обновить сервер» → «Обновить с сохранением». После успешного обновления это напоминание исчезнет.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onTertiaryContainer
                         )
@@ -2462,223 +2742,119 @@ fun DeployTab(
         val importCanProvideMainPassword = selectedImportMode == ServerImportMode.Replace &&
             selectedImportBackup?.mainPassword?.isNotBlank() == true
         val deploySecretsReady = savedMainPass.isNotBlank() || importCanProvideMainPassword
-        val deploySecretsMissing = !deploySecretsReady
-        val secretsDetails = buildList {
-            add("пароль")
-            if (savedDns1 != "1.1.1.1" || savedDns2 != "1.0.0.1") add("DNS")
-            if (savedSshPort.isNotBlank() && savedSshPort != "22") add("SSH")
-            if (savedManualPorts) add("порты")
-        }.joinToString(", ")
-
-        // ═══ Установка сервера ═══
+        val serverWorkflowBusy = isDeploying || isCheckingExistingInstall || serverDiagnosticsBusy || migrationBusy || existingConnectBusy || openingSetup || serverSettings == null || ownerTunnelSnapshot?.profileIndex != activeProfile
+        val selectedSettingsReady = if (serverAction == "install") deploySecretsReady else savedMainPass.isNotBlank()
+        val updateCandidate = offersServerUpdate(setupCompleted, primarySshAccessReady, savedMainPass)
         AppSectionCard(
+            modifier = Modifier.onGloballyPositioned { onProfileHeaderBoundary(it.boundsInWindow().top) },
             contentPadding = PaddingValues(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
+            verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    "Установка на сервер",
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.onSurface
-                )
-                val diagnosticsActionEnabled = !isDeploying && !isCheckingExistingInstall && !migrationBusy
-                IconButton(
-                    onClick = {
-                        if (serverDiagnosticsBusy) {
-                            cancelServerDiagnostics()
-                        } else {
-                            runServerDiagnostics()
-                        }
-                    },
-                    enabled = serverDiagnosticsBusy || diagnosticsActionEnabled,
-                    modifier = Modifier.size(40.dp),
-                    colors = IconButtonDefaults.iconButtonColors(
-                        contentColor = MaterialTheme.colorScheme.primary,
-                        disabledContentColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.42f)
-                    )
-                ) {
-                    if (serverDiagnosticsBusy) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(18.dp),
-                            strokeWidth = 2.dp,
-                            color = MaterialTheme.colorScheme.primary
-                        )
-                    } else {
-                        Icon(
-                            Icons.Default.Search,
-                            contentDescription = "Диагностика сервера",
-                            tint = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.size(21.dp)
-                        )
-                    }
-                }
-            }
-
-            OutlinedTextField(
-                value = ip,
-                onValueChange = {
-                    ip = it.filter { c -> !c.isWhitespace() }
-                    if (ip.isBlank() || ip.isValidPublicHost()) {
-                        scope.launch { settingsStore.saveDeploy(ip.trim(), login, password, savedSshPort, dns1, dns2) }
-                    }
-                },
-                label = { Text("IP сервера или домен (без порта)") },
-                placeholder = { Text("site.ru или 1.2.3.4") },
-                singleLine = true,
-                isError = ip.isNotBlank() && !isServerAddressValid,
-                supportingText = {
-                    if (ip.isNotBlank() && !isServerAddressValid) {
-                        Text("Укажите домен или IPv4 без https://, без / и без порта")
-                    }
-                },
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(16.dp),
-                enabled = !isDeploying,
-            )
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text("Способ входа на сервер", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
-                IconButton(
-                    onClick = { showSshAuthHelp = true },
-                    modifier = Modifier.size(32.dp).remoteHelpFocus(),
-                ) {
-                    Icon(Icons.AutoMirrored.Filled.HelpOutline, contentDescription = "Как работает вход по SSH", modifier = Modifier.size(20.dp))
-                }
-            }
-            SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
-                listOf("password" to "Пароль", "key" to "SSH-ключ").forEachIndexed { index, (mode, label) ->
-                    SegmentedButton(
-                        selected = selectedSshAuthMode == mode,
-                        onClick = {
-                            sshAuthMode = mode
-                            existingConnectStatus = ""
-                            scope.launch { settingsStore.saveDeploySshAuthMode(mode) }
-                        },
-                        shape = SegmentedButtonDefaults.itemShape(index, 2),
-                        enabled = !isDeploying,
-                        icon = {
-                            StableSegmentedButtonIcon(selected = selectedSshAuthMode == mode)
-                        },
-                    ) {
-                        Text(
-                            label,
-                            modifier = Modifier.fillMaxWidth(),
-                            maxLines = 1,
-                            textAlign = TextAlign.Center,
-                        )
-                    }
-                }
-            }
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                OutlinedTextField(
-                    value = login,
-                    onValueChange = {
-                        login = it.filter { c -> !c.isWhitespace() }
-                        if (ip.isBlank() || ip.isValidPublicHost()) {
-                            scope.launch { settingsStore.saveDeploy(ip.trim(), login, password, savedSshPort, dns1, dns2) }
-                        }
-                    },
-                    label = { Text("Логин") },
-                    placeholder = { Text("root") },
-                    singleLine = true,
-                    visualTransformation = if (loginFocused) VisualTransformation.None else PasswordVisualTransformation(),
-                    modifier = Modifier
-                        .weight(1f)
-                        .onFocusChanged { loginFocused = it.isFocused },
-                    shape = RoundedCornerShape(16.dp),
-                    enabled = !isDeploying,
-                )
-                OutlinedTextField(
-                    value = password,
-                    onValueChange = {
-                        password = it
-                        if (ip.isBlank() || ip.isValidPublicHost()) {
-                            scope.launch { settingsStore.saveDeploy(ip.trim(), login, password, savedSshPort, dns1, dns2) }
-                        }
-                    },
-                    label = { Text(if (selectedSshAuthMode == "key") "Пароль sudo" else "Пароль SSH") },
-                    placeholder = { Text(if (selectedSshAuthMode == "key") "необязательно" else "password") },
-                    singleLine = true,
-                    visualTransformation = if (passwordFocused) VisualTransformation.None else PasswordVisualTransformation(),
-                    modifier = Modifier
-                        .weight(1f)
-                        .onFocusChanged { passwordFocused = it.isFocused },
-                    shape = RoundedCornerShape(16.dp),
-                    enabled = !isDeploying,
-                )
-            }
-
-            if (selectedSshAuthMode == "key") {
-                OutlinedButton(
-                    onClick = { showSshKeyDialog = true },
-                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
-                    shape = RoundedCornerShape(16.dp),
-                    colors = ButtonDefaults.outlinedButtonColors(
-                        containerColor = if (!hasSshAuthentication) MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.surface,
-                        contentColor = if (!hasSshAuthentication) MaterialTheme.colorScheme.onErrorContainer else MaterialTheme.colorScheme.onSurface
-                    ),
-                    border = BorderStroke(
-                        1.dp,
-                        if (!hasSshAuthentication) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)
-                    )
-                ) {
-                    Icon(Icons.Default.Key, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(8.dp))
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
                     Text(
-                        when {
-                            savedSshPrivateKey.isNotBlank() && password.isNotBlank() -> "SSH-ключ добавлен · пароль sudo указан"
-                            savedSshPrivateKey.isNotBlank() -> "SSH-ключ добавлен"
-                            else -> "Добавить приватный SSH-ключ"
-                        },
-                        modifier = Modifier.weight(1f),
-                        fontWeight = FontWeight.SemiBold
+                        if (serverAction == "install") "Установка на сервер" else "Подключение к серверу",
+                        modifier = Modifier.weight(1f, fill = false),
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold,
                     )
+                    HintIconButton(hint = "Установка и подключение: справка", onClick = { showServerWorkflowHelp = true }, modifier = Modifier.size(36.dp).remoteHelpFocus()) {
+                        Icon(Icons.AutoMirrored.Filled.HelpOutline, "Установка и подключение: справка", Modifier.size(20.dp))
+                    }
+                }
+                CheckActionIcon(
+                    checking = serverDiagnosticsBusy,
+                    enabled = serverDiagnosticsBusy || !serverWorkflowBusy,
+                    idleIcon = Icons.Default.Search,
+                    description = "Проверить сервер",
+                    cancelDescription = "Остановить проверку сервера",
+                    onClick = { if (serverDiagnosticsBusy) cancelServerDiagnostics() else runServerDiagnostics() },
+                )
+                HintIconButton(hint = "Удаление сервера: открыть подтверждение",
+                    onClick = { showUninstallDialog = true },
+                    enabled = !serverWorkflowBusy && primarySshAccessReady,
+                    modifier = Modifier.size(40.dp).remoteIconButtonFocus(enabled = !serverWorkflowBusy && primarySshAccessReady),
+                ) {
+                    Icon(Icons.Default.Delete, "Удаление сервера: открыть подтверждение", Modifier.size(20.dp))
                 }
             }
-            if (primarySshPort !in 1..65535) {
-                InlineActionMessage("Откройте «Секреты» и укажите корректный SSH-порт от 1 до 65535.")
-            }
-
-            OutlinedButton(
-                onClick = { showSecretsDialog = true },
-                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
-                shape = RoundedCornerShape(16.dp),
-                colors = ButtonDefaults.outlinedButtonColors(
-                    containerColor = if (deploySecretsMissing) MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.surface,
-                    contentColor = if (deploySecretsMissing) MaterialTheme.colorScheme.onErrorContainer else MaterialTheme.colorScheme.onSurface
-                ),
-                border = BorderStroke(
-                    1.dp,
-                    if (deploySecretsMissing) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)
-                )
-            ) {
-                Icon(Icons.Default.Key, null, Modifier.size(18.dp))
-                Spacer(Modifier.width(8.dp))
+            if (serverDiagnosticsBusy) {
                 Text(
-                    "Секреты ($secretsDetails)",
-                    modifier = Modifier.weight(1f),
-                    fontWeight = FontWeight.SemiBold
+                    "Проверяю VPS. Обычно это занимает до минуты; проверка остановится через 95 секунд. Чтобы отменить её раньше, нажмите ×.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
-
-            Row(
-                modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Min),
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                Button(
+            SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+                listOf("install" to "Установить", "connect" to "Подключить").forEachIndexed { index, (mode, label) ->
+                    SegmentedButton(
+                        selected = serverAction == mode,
+                        onClick = { serverAction = mode },
+                        enabled = !serverWorkflowBusy,
+                        shape = SegmentedButtonDefaults.itemShape(index, 2),
+                        icon = { StableSegmentedButtonIcon(selected = serverAction == mode) },
+                    ) {
+                        Text(label, maxLines = 1, textAlign = TextAlign.Center)
+                    }
+                }
+            }
+            Text(
+                if (serverAction == "install") "Установка или обновление WDTT на своём сервере."
+                else "Получение настроек готового сервера без его изменения.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text(ip.ifBlank { "Сервер не указан" }, style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                    Text(
+                        if (primarySshAccessReady) "SSH · ${if (selectedSshAuthMode == "key") "ключ" else "пароль"} · порт $primarySshPort"
+                        else "Нужны настройки SSH",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                ServerSetupIcon(
+                    icon = Icons.Default.Key, label = "SSH", description = "Доступ к серверу",
+                    needsAttention = !primarySshAccessReady, enabled = !serverWorkflowBusy,
+                    onClick = { showServerAccessDialog = true },
+                )
+                ServerSetupIcon(
+                    icon = Icons.Default.Settings, label = "Параметры",
+                    description = if (serverAction == "install") "Параметры установки" else "Главный пароль администратора",
+                    needsAttention = !selectedSettingsReady, enabled = !serverWorkflowBusy,
+                    onClick = { showSecretsDialog = true },
+                )
+            }
+            if ((!primarySshAccessReady || !selectedSettingsReady) && (setupCompleted || serverAction == "connect" || selectedImportBackup != null)) {
+                Text(
+                    when {
+                        !primarySshAccessReady -> primarySshAccessIssue ?: "Заполните настройки SSH."
+                        serverAction == "install" -> "Укажите главный пароль в параметрах установки."
+                        else -> "Укажите главный пароль администратора в параметрах подключения."
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+            if (serverAction == "install") {
+                if (setupOpenError.isNotBlank()) InlineActionMessage(setupOpenError)
+                if (!updateCandidate && selectedImportBackup == null) {
+                    Button(onClick = { openSetup() }, enabled = !serverWorkflowBusy,
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 50.dp), shape = RoundedCornerShape(16.dp)) {
+                        Text(
+                            if (ip.isBlank() && savedIp.isBlank() && savedPassword.isBlank() &&
+                                savedSshPrivateKey.isBlank() && savedPeer.isBlank() &&
+                                savedConnectionPassword.isBlank() && savedVkHashes.isBlank() &&
+                                savedMainPass.isBlank() && savedAdminId.isBlank() && savedBotToken.isBlank()
+                            ) "Установка сервера" else "Настроить сервер",
+                            fontWeight = FontWeight.Bold,
+                        )
+                    }
+                    Text("Мастер поможет установить WDTT и проверит, есть ли на VPS прежние данные. Готовый сервер можно подключить кнопкой «Подключить» выше.", style = MaterialTheme.typography.bodySmall)
+                } else Button(
                     onClick = {
                         if (!primarySshAccessReady || !deploySecretsReady) return@Button
                         val effectiveLogin = if (login.isBlank()) "root" else login
@@ -2709,13 +2885,13 @@ fun DeployTab(
                         if (selectedImportBackup != null) {
                             pendingDeployImportRequest = request
                         } else {
-                            startDeployCheck(request)
+                            startDeployCheck(request, requireExistingServer = true)
                         }
                     },
-                    modifier = Modifier.weight(1f).fillMaxHeight().heightIn(min = 50.dp),
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 50.dp),
                     shape = RoundedCornerShape(16.dp),
                     colors = ButtonDefaults.buttonColors(contentColor = MaterialTheme.colorScheme.onPrimary),
-                    enabled = !isDeploying && !isCheckingExistingInstall && !migrationBusy && primarySshAccessReady && deploySecretsReady,
+                    enabled = !serverWorkflowBusy && primarySshAccessReady && deploySecretsReady,
                     contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp)
                 ) {
                     if (isDeploying || isCheckingExistingInstall) {
@@ -2728,155 +2904,362 @@ fun DeployTab(
                         when {
                             isDeploying -> "Установка"
                             isCheckingExistingInstall -> "Проверка..."
-                            else -> "Установить"
+                            else -> if (selectedImportBackup != null) "Установить" else "Обновить сервер"
                         },
                         fontWeight = FontWeight.Bold,
                         textAlign = TextAlign.Center
                     )
                 }
-
-                Button(
-                    onClick = {
-                        if (!primarySshAccessReady) return@Button
-                        showUninstallDialog = true
-                    },
-                    modifier = Modifier.weight(1f).fillMaxHeight().heightIn(min = 50.dp),
-                    shape = RoundedCornerShape(16.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = MaterialTheme.colorScheme.error,
-                        contentColor = MaterialTheme.colorScheme.onError
-                    ),
-                    enabled = !isDeploying && primarySshAccessReady,
-                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp)
-                ) {
-                    Icon(Icons.Default.Delete, null, Modifier.size(18.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text(
-                        "Удалить",
-                        fontWeight = FontWeight.Bold,
-                        textAlign = TextAlign.Center
+                if (updateCandidate && selectedImportBackup == null && !serverWorkflowBusy) {
+                    TextButton(onClick = { openSetup() }, modifier = Modifier.fillMaxWidth()) {
+                        Text("Изменить настройки")
+                    }
+                }
+                if (isCheckingExistingInstall || (isDeploying && !migrationBusy)) {
+                    DeployProgressPanel(
+                        title = if (isCheckingExistingInstall) "Проверяю сервер перед установкой..." else currentStep,
+                        progress = animatedProgress,
+                        determinate = !isCheckingExistingInstall
                     )
                 }
-            }
 
-            if (isCheckingExistingInstall || (isDeploying && !migrationBusy)) {
-                DeployProgressPanel(
-                    title = if (isCheckingExistingInstall) "Проверяю сервер перед установкой..." else currentStep,
-                    progress = animatedProgress,
-                    determinate = !isCheckingExistingInstall
-                )
-            }
+                if (!isDeploying &&
+                    !isCheckingExistingInstall &&
+                    lastDeployResult.isNotBlank() &&
+                    !lastDeployResult.equals("success", ignoreCase = true)
+                ) {
+                    DeployResultPanel(
+                        result = lastDeployResult,
+                        lastStep = currentStep
+                    )
+                }
 
-            if (!isDeploying &&
-                !isCheckingExistingInstall &&
-                lastDeployResult.isNotBlank() &&
-                !lastDeployResult.equals("success", ignoreCase = true)
-            ) {
-                DeployResultPanel(
-                    result = lastDeployResult,
-                    lastStep = currentStep
-                )
-            }
-
-            if (showSuccessBanner) {
-                DeploySuccessBanner(
-                    successCountdown = successCountdown,
-                    serverVersion = installedServerVersion
-                )
+                if (showSuccessBanner && successProfile == activeProfile) {
+                    DeploySuccessBanner(
+                        successCountdown = successCountdown,
+                        serverVersion = installedServerVersion,
+                        openTunnelAfterCountdown = firstInstallTunnelProfile == activeProfile
+                    )
+                }
+            } else {
+                Button(
+                    onClick = {
+                        if (!primarySshAccessReady) {
+                            existingConnectStatus = primarySshAccessIssue
+                                ?: "Проверьте доступ к серверу в настройках SSH."
+                            return@Button
+                        }
+                        if (savedMainPass.isBlank()) {
+                            existingConnectStatus = "Укажите главный пароль администратора в параметрах сервера, затем повторите подключение."
+                            return@Button
+                        }
+                        val connectProfile = activeProfile
+                        val target = OutboundSshTarget(ip.trim(), login.ifBlank { "root" }, sshCredentials.password,
+                            sshCredentials.privateKey, sshCredentials.privateKeyPassphrase, sshCredentials.allowPasswordAuthentication,
+                            primarySshPort, savedMainPass)
+                        val localProfile = currentOwnerProfile()
+                        val localPeer = savedPeer
+                        val localPassword = savedConnectionPassword
+                        val localAdminId = savedAdminId
+                        val localBotToken = savedBotToken
+                        val localDns1 = dns1
+                        val localDns2 = dns2
+                        existingConnectBusy = true
+                        existingConnectStatus = "Проверяю главный пароль и читаю настройки сервера..."
+                        scope.launch {
+                            try {
+                                val connection = readExistingServerConnection(
+                                    host = target.host,
+                                    user = target.user,
+                                    credentials = target.credentials,
+                                    port = target.port,
+                                    adminMainPassword = target.mainPassword
+                                )
+                                if (currentActiveProfile != connectProfile) return@launch
+                                val serverProfile = connection.adminProfile
+                                val diffLines = existingConnectionDiffLines(
+                                    connection = connection,
+                                    localPeer = localPeer,
+                                    localConnectionPassword = localPassword,
+                                    localAdminId = localAdminId,
+                                    localBotToken = localBotToken,
+                                    localDns1 = localDns1,
+                                    localDns2 = localDns2,
+                                    localProfile = localProfile
+                                )
+                                if (diffLines.isNotEmpty()) {
+                                    pendingExistingConnectionApply = PendingExistingConnectionApply(
+                                        connection = connection,
+                                        profileIndex = connectProfile,
+                                        target = target,
+                                        localProfile = localProfile,
+                                        serverProfile = serverProfile,
+                                        diffLines = diffLines
+                                    )
+                                    existingConnectStatus = "Данные сервера отличаются от локальных полей. Проверьте изменения перед восстановлением."
+                                } else {
+                                    val profile = if (serverProfile.hasSavedFields) serverProfile else localProfile
+                                    val source = if (serverProfile.hasSavedFields) OwnerProfileSource.Server else OwnerProfileSource.LocalOnly
+                                    applyExistingConnection(connection, connectProfile, target, profile, source)
+                                }
+                            } catch (e: Exception) {
+                                if (currentActiveProfile != connectProfile) return@launch
+                                existingConnectStatus = "Ошибка подключения к готовому серверу: ${friendlyDeployError(e, "подключение")}"
+                                DeployManager.writeError("Existing server connect error: ${e.message}")
+                            } finally {
+                                existingConnectBusy = false
+                            }
+                        }
+                    },
+                    enabled = !serverWorkflowBusy && primarySshAccessReady && savedMainPass.isNotBlank(),
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                    shape = RoundedCornerShape(16.dp)
+                ) {
+                    if (existingConnectBusy) {
+                        CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                    } else {
+                        Icon(Icons.Default.Key, contentDescription = null, modifier = Modifier.size(18.dp))
+                    }
+                    Spacer(Modifier.width(8.dp))
+                    Text("Подключиться", fontWeight = FontWeight.SemiBold)
+                }
+                if (existingConnectStatus.isNotBlank()) {
+                    InlineActionMessage(existingConnectStatus)
+                }
             }
         }
 
-        AppSectionCard(
-            contentPadding = PaddingValues(16.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
-            Text(
-                "Подключение к готовому серверу",
-                style = MaterialTheme.typography.titleSmall,
-                fontWeight = FontWeight.Bold,
-                color = MaterialTheme.colorScheme.onSurface
-            )
-            Text(
-                "Подключение без установки работает только в направлении сервер → приложение: WDTT Plus проверяет главный пароль, показывает отличия и после подтверждения заполняет локальные поля. На сервер ничего не записывается, пользовательские доступы не меняются.\n\nНаправление приложение → сервер используется при установке с сохранением данных или с нуля. Настройки выходного IP восстанавливаются отдельно кнопкой «Загрузить настройки» в соответствующем блоке.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            OutlinedButton(
-                onClick = {
-	                    if (!primarySshAccessReady) {
-                        existingConnectStatus = primarySshAccessIssue
-                            ?: "Проверьте доступ к серверу в верхнем блоке «Деплой»."
-                        return@OutlinedButton
+        if (showServerAccessDialog) {
+            SettingsDialogLayout(
+                title = "Доступ к серверу",
+                onDismiss = { showServerAccessDialog = false },
+                onHelp = { showSshAuthHelp = true },
+            ) {
+                var loginFocused by remember { mutableStateOf(false) }
+                var passwordFocused by remember { mutableStateOf(false) }
+                var sshPortInput by rememberSaveable(activeProfile) { mutableStateOf(savedSshPort.ifBlank { "22" }) }
+                val accessProfile = activeProfile
+                fun saveAccess() {
+                    val host = ip.trim(); val user = login; val pass = password; val port = sshPortInput
+                    val previousSave = accessSaveJob
+                    accessSaveJob = scope.launch {
+                        previousSave?.join()
+                        settingsStore.saveServerAccess(accessProfile, host, user, pass, port)
                     }
-                    if (savedMainPass.isBlank()) {
-                        existingConnectStatus = "Укажите главный пароль администратора в «Секретах», затем повторите подключение."
-                        return@OutlinedButton
-                    }
-                    val effectiveLogin = if (login.isBlank()) "root" else login
-                    existingConnectBusy = true
-                    existingConnectStatus = "Проверяю главный пароль и читаю настройки сервера..."
-                    scope.launch {
-                        try {
-                            val connection = readExistingServerConnection(
-	                                host = ip.trim(),
-                                user = effectiveLogin,
-                                credentials = sshCredentials,
-	                                port = primarySshPort,
-                                adminMainPassword = savedMainPass
+                }
+                Text("Настройки сохраняются сразу и используются для установки, подключения и управления сервером.",
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                OutlinedTextField(
+                    value = ip,
+                    onValueChange = {
+                        ip = it.filter { c -> !c.isWhitespace() }
+                        saveAccess()
+                    },
+                    label = { Text("IP сервера или домен (без порта)") },
+                    placeholder = { Text("site.ru или 1.2.3.4") },
+                    singleLine = true,
+                    isError = ip.isNotBlank() && !isServerAddressValid,
+                    supportingText = {
+                        if (ip.isNotBlank() && !isServerAddressValid) {
+                            Text("Укажите домен или IPv4 без https://, без / и без порта")
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp),
+                    enabled = !serverWorkflowBusy,
+                )
+
+                Text("Способ входа", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+                SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                    listOf("password" to "Пароль", "key" to "SSH-ключ").forEachIndexed { index, (mode, label) ->
+                        SegmentedButton(
+                            selected = selectedSshAuthMode == mode,
+                            onClick = {
+                                sshAuthMode = mode
+                                existingConnectStatus = ""
+                                val previousSave = accessSaveJob
+                                accessSaveJob = scope.launch { previousSave?.join(); settingsStore.saveDeploySshAuthMode(mode, accessProfile) }
+                            },
+                            shape = SegmentedButtonDefaults.itemShape(index, 2),
+                            enabled = !serverWorkflowBusy,
+                            icon = {
+                                StableSegmentedButtonIcon(selected = selectedSshAuthMode == mode)
+                            },
+                        ) {
+                            Text(
+                                label,
+                                modifier = Modifier.fillMaxWidth(),
+                                maxLines = 1,
+                                textAlign = TextAlign.Center,
                             )
-                            val localProfile = currentOwnerProfile()
-                            val serverProfile = connection.adminProfile
-                            val diffLines = existingConnectionDiffLines(
-                                connection = connection,
-                                localPeer = savedPeer,
-                                localConnectionPassword = savedConnectionPassword,
-                                localAdminId = savedAdminId,
-                                localBotToken = savedBotToken,
-                                localDns1 = dns1,
-                                localDns2 = dns2,
-                                localProfile = localProfile
-                            )
-                            if (diffLines.isNotEmpty()) {
-                                pendingExistingConnectionApply = PendingExistingConnectionApply(
-                                    connection = connection,
-                                    effectiveLogin = effectiveLogin,
-                                    localProfile = localProfile,
-                                    serverProfile = serverProfile,
-                                    diffLines = diffLines
-                                )
-                                existingConnectStatus = "Данные сервера отличаются от локальных полей. Проверьте изменения перед восстановлением."
-                            } else {
-                                val profile = if (serverProfile.hasSavedFields) serverProfile else localProfile
-                                val source = if (serverProfile.hasSavedFields) OwnerProfileSource.Server else OwnerProfileSource.LocalOnly
-                                applyExistingConnection(connection, effectiveLogin, profile, source)
-                            }
-                        } catch (e: Exception) {
-                            existingConnectStatus = "Ошибка подключения к готовому серверу: ${friendlyDeployError(e, "подключение")}"
-                            DeployManager.writeError("Existing server connect error: ${e.message}")
-                        } finally {
-                            existingConnectBusy = false
                         }
                     }
-                },
-                enabled = !isDeploying && !isCheckingExistingInstall && !migrationBusy && !existingConnectBusy,
-                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
-                shape = RoundedCornerShape(16.dp)
-            ) {
-                if (existingConnectBusy) {
-                    CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
-                } else {
-                    Icon(Icons.Default.Key, contentDescription = null, modifier = Modifier.size(18.dp))
                 }
-                Spacer(Modifier.width(8.dp))
-                Text("Подключиться (без установки)", fontWeight = FontWeight.SemiBold)
-            }
-            if (existingConnectStatus.isNotBlank()) {
-                InlineActionMessage(existingConnectStatus)
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    OutlinedTextField(
+                        value = login,
+                        onValueChange = {
+                            login = it.filter { c -> !c.isWhitespace() }
+                            saveAccess()
+                        },
+                        label = { Text("Логин") },
+                        placeholder = { Text("root") },
+                        singleLine = true,
+                        visualTransformation = if (loginFocused) VisualTransformation.None else PasswordVisualTransformation(),
+                        modifier = Modifier
+                            .weight(1f)
+                            .onFocusChanged { loginFocused = it.isFocused },
+                        shape = RoundedCornerShape(16.dp),
+                        enabled = !serverWorkflowBusy,
+                    )
+                    OutlinedTextField(
+                        value = password,
+                        onValueChange = {
+                            password = it
+                            saveAccess()
+                        },
+                        label = { Text(if (selectedSshAuthMode == "key") "Пароль sudo" else "Пароль SSH") },
+                        placeholder = { Text(if (selectedSshAuthMode == "key") "необязательно" else "password") },
+                        singleLine = true,
+                        visualTransformation = if (passwordFocused) VisualTransformation.None else PasswordVisualTransformation(),
+                        modifier = Modifier
+                            .weight(1f)
+                            .onFocusChanged { passwordFocused = it.isFocused },
+                        shape = RoundedCornerShape(16.dp),
+                        enabled = !serverWorkflowBusy,
+                    )
+                }
+
+                if (selectedSshAuthMode == "key") {
+                    OutlinedButton(
+                        onClick = { showSshKeyDialog = true },
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                        shape = RoundedCornerShape(16.dp),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            containerColor = if (!hasSshAuthentication) MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.surface,
+                            contentColor = if (!hasSshAuthentication) MaterialTheme.colorScheme.onErrorContainer else MaterialTheme.colorScheme.onSurface
+                        ),
+                        border = BorderStroke(
+                            1.dp,
+                            if (!hasSshAuthentication) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)
+                        )
+                    ) {
+                        Icon(Icons.Default.Key, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            when {
+                                savedSshPrivateKey.isNotBlank() && password.isNotBlank() -> "SSH-ключ добавлен · пароль sudo указан"
+                                savedSshPrivateKey.isNotBlank() -> "SSH-ключ добавлен"
+                                else -> "Добавить приватный SSH-ключ"
+                            },
+                            modifier = Modifier.weight(1f),
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                }
+
+                OutlinedTextField(
+                    value = sshPortInput,
+                    onValueChange = { value ->
+                        sshPortInput = value.filter(Char::isDigit).take(5)
+                        saveAccess()
+                    },
+                    label = { Text("Порт SSH") }, singleLine = true,
+                    enabled = !serverWorkflowBusy,
+                    placeholder = { Text("22") },
+                    isError = sshPortInput.isNotBlank() && (sshPortInput.toIntOrNull() ?: 0) !in 1..65535,
+                    modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp),
+                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.Number),
+                )
+                primarySshAccessIssue?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
             }
         }
+        if (showFirstServerSetup && visible) {
+            val setupProfile = activeProfile
+            var reviewedLocalSettings by remember(setupProfile) {
+                mutableStateOf<Pair<ServerAdminProfileInfo, OutboundProfileForms>?>(null)
+            }
+            FirstServerSetupDialog(
+                initial = checkNotNull(setupInitial),
+                onDismiss = { showFirstServerSetup = false },
+                onProbe = { draft ->
+                    check(currentActiveProfile == setupProfile) { "Выбран другой профиль. Откройте настройку заново." }
+                    val info = checkExistingInstall(draft.host.trim(), draft.user.ifBlank { "root" },
+                        sshCredentialsForMode(draft.authMode, draft.sshPassword, draft.privateKey, draft.keyPassphrase),
+                        draft.sshPort.ifBlank { "22" }.toInt(), "")
+                    check(currentActiveProfile == setupProfile) { "Выбран другой профиль. Откройте настройку заново." }
+                    settingsStore.recordProfileServerInstallation(setupProfile, draft.host, draft.sshPort.ifBlank { "22" }.toInt(), info.hasInstalledServer)
+                    classifyFirstServerSetup(info.hasAnyTrace, existingInstallOwnershipFromFlags(
+                        info.standaloneManaged, info.androidDeployManaged, info.legacyAndroidDeployCandidate,
+                        info.preservedAndroidData, info.incompleteAndroidDeployCandidate),
+                        info.updateRollbackState !is ServerUpdateRollbackState.None)
+                        ?: error("Найдены компоненты WDTT неизвестного происхождения. Автоматическая установка заблокирована. Проверьте сервер по значку лупы; готовый сервер можно подключить без установки.")
+                },
+                onReview = { draft, kind ->
+                    check(currentActiveProfile == setupProfile) { "Выбран другой профиль. Откройте настройку заново." }
+                    val request = draft.request()
+                    val localSettings = currentOwnerProfile() to currentOutboundProfileForms()
+                    reviewedLocalSettings = null
+                    val info = checkExistingInstall(request.host, request.user,
+                        SshCredentials(request.pass, request.privateKey, request.keyPassphrase, request.allowPasswordAuthentication),
+                        request.sshPort, request.mainPass)
+                    val currentKind = classifyFirstServerSetup(info.hasAnyTrace, existingInstallOwnershipFromFlags(
+                        info.standaloneManaged, info.androidDeployManaged, info.legacyAndroidDeployCandidate,
+                        info.preservedAndroidData, info.incompleteAndroidDeployCandidate),
+                        info.updateRollbackState !is ServerUpdateRollbackState.None)
+                    check(currentActiveProfile == setupProfile) { "Выбран другой профиль. Откройте настройку заново." }
+                    check(currentKind == kind) { "Состояние сервера изменилось. Вернитесь к шагу «Доступ» и проверьте VPS снова." }
+                    settingsStore.recordProfileServerInstallation(setupProfile, request.host, request.sshPort, info.hasInstalledServer)
+                    if (kind in setOf(ServerSetupKind.FRESH, ServerSetupKind.STANDALONE, ServerSetupKind.RECOVERY)) {
+                        reviewedLocalSettings = localSettings
+                        ServerSetupReview()
+                    } else {
+                        val ownerProfile = localSettings.first.copy(
+                            listenPort = request.localPort,
+                            ports = Triple(request.dtlsPort, request.wgPort, request.localPort).asPortsSpec()
+                        )
+                        val comparison = compareDeployWithServer(context, request, ownerProfile,
+                            localSettings.second, info.accessDbExists)
+                        check(currentActiveProfile == setupProfile) { "Выбран другой профиль. Откройте настройку заново." }
+                        check(comparison.checkError == null) {
+                            "Не удалось сравнить настройки с сервером: ${comparison.checkError}. Повторите проверку перед установкой."
+                        }
+                        check(localSettings == (currentOwnerProfile() to currentOutboundProfileForms())) {
+                            "Локальные настройки изменились. Повторите сравнение."
+                        }
+                        reviewedLocalSettings = localSettings
+                        ServerSetupReview(comparison.overwriteLines, comparison.notes)
+                    }
+                },
+                onInstall = { draft, kind ->
+                    check(reviewedLocalSettings == (currentOwnerProfile() to currentOutboundProfileForms())) {
+                        "Локальные настройки изменились. Повторите сравнение."
+                    }
+                    check(currentActiveProfile == setupProfile) { "Выбран другой профиль. Откройте настройку заново." }
+                    val request = draft.request()
+                    settingsStore.saveServerSetup(setupProfile, request.host, request.user, draft.sshPassword, request.sshPort,
+                        draft.privateKey, draft.keyPassphrase, draft.authMode, request.mainPass,
+                        request.adminId, request.botToken, request.dns1, request.dns2,
+                        request.dtlsPort, request.wgPort, request.localPort)
+                    check(currentActiveProfile == setupProfile) { "Выбран другой профиль. Настройки сохранены в исходном профиле; установка не запущена." }
+                    ip = request.host; login = request.user; password = draft.sshPassword
+                    dns1 = request.dns1; dns2 = request.dns2; sshAuthMode = draft.authMode
+                    showFirstServerSetup = false
+                    if (kind == ServerSetupKind.STANDALONE) serverAction = "connect"
+                    else startDeployCheck(request)
+                },
+            )
+        }
+        ServerSetupCompletionSection(settingsStore, setupCompletion, activeProfile, visible,
+            isDeploying, completionNavigation, otherServerWindowOpen)
+        if (showServerWorkflowHelp) ServerWorkflowHelpDialog { showServerWorkflowHelp = false }
 
         pendingExistingConnectionApply?.let { pending ->
-            AlertDialog(
+            BoundedAlertDialog(
                 onDismissRequest = {
                     if (!existingConnectBusy) {
                         pendingExistingConnectionApply = null
@@ -2922,6 +3305,7 @@ fun DeployTab(
                             existingConnectStatus = "Восстанавливаю данные с сервера в приложение..."
                             scope.launch {
                                 try {
+                                    check(currentActiveProfile == selected.profileIndex) { "Выбран другой профиль. Повторите подключение." }
                                     val source = if (selected.serverProfile.hasSavedFields) {
                                         OwnerProfileSource.Server
                                     } else {
@@ -2929,7 +3313,8 @@ fun DeployTab(
                                     }
                                     applyExistingConnection(
                                         connection = selected.connection,
-                                        effectiveLogin = selected.effectiveLogin,
+                                        profileIndex = selected.profileIndex,
+                                        target = selected.target,
                                         profile = if (selected.serverProfile.hasSavedFields) selected.serverProfile else selected.localProfile,
                                         source = source
                                     )
@@ -2963,15 +3348,16 @@ fun DeployTab(
                 enabled = visible && !isDeploying && !isCheckingExistingInstall && !migrationBusy && !outboundBusy,
                 hostValid = isServerAddressValid,
                 expanded = clientsExpanded,
-                modifier = Modifier.onGloballyPositioned { clientsSectionY = it.positionInParent().y },
+                modifier = Modifier.onGloballyPositioned {
+                    clientsSectionTopInWindow = it.boundsInWindow().top
+                },
                 onExpandedChange = { expanded ->
+                    clientsExpandedOverride = expanded
+                    revealClientsRequested = expanded
                     scope.launch { settingsStore.saveDeployClientsSectionExpanded(expanded) }
                 },
                 onExpanded = {
-                    scope.launch {
-                        kotlinx.coroutines.delay(80)
-                        deployScrollState.animateScrollTo((clientsSectionY - topRevealOffsetPx).toInt().coerceAtLeast(0))
-                    }
+                    revealClientsRequested = true
                 }
             )
         }
@@ -2984,21 +3370,20 @@ fun DeployTab(
                 lastCheckAttemptAt = outboundLastCheckAttemptAt,
                 lastCheckError = outboundLastCheckError,
                 status = if (outboundDialog == null && outboundStatusOwner == null) outboundStatus else "",
+                feedback = outboundFeedback,
                 actionTitle = outboundActionTitle,
                 accessIssue = primarySshAccessIssue,
                 enabled = !isDeploying && !migrationBusy && !outboundBusy && !outboundSnapshotBusy,
                 directEnabled = canReturnDirect(outboundSnapshot),
                 expanded = outboundExpanded,
-                modifier = Modifier.onGloballyPositioned { outboundSectionY = it.positionInParent().y },
+                modifier = Modifier.onGloballyPositioned {
+                    outboundSectionTopInWindow = it.boundsInWindow().top
+                },
                 onToggleExpanded = {
                     val willExpand = !outboundExpanded
+                    outboundExpandedOverride = willExpand
+                    revealOutboundRequested = willExpand
                     scope.launch { settingsStore.saveDeployOutboundSectionExpanded(willExpand) }
-                    if (willExpand) {
-                        scope.launch {
-                            kotlinx.coroutines.delay(80)
-                            deployScrollState.animateScrollTo((outboundSectionY - topRevealOffsetPx).toInt().coerceAtLeast(0))
-                        }
-                    }
                 },
                 onOpen = { openOutboundDialog(it) },
                 onRestore = { restoreOutboundFromServer() },
@@ -3013,6 +3398,7 @@ fun DeployTab(
                 OutboundDialog.LocalProxy -> LocalProxyDialog(
                     busy = outboundBusy,
                     status = dialogStatus(OutboundDialog.LocalProxy),
+                    feedback = outboundFeedback,
                     actionTitle = outboundActionTitle,
                     progressTitle = if (outboundProgressActive) currentStep else "",
                     progress = deployProgress,
@@ -3069,6 +3455,7 @@ fun DeployTab(
                 OutboundDialog.ExternalProxy -> ExternalProxyDialog(
                     busy = outboundBusy,
                     status = dialogStatus(OutboundDialog.ExternalProxy),
+                    feedback = outboundFeedback,
                     actionTitle = outboundActionTitle,
                     progressTitle = if (outboundProgressActive) currentStep else "",
                     progress = deployProgress,
@@ -3125,6 +3512,7 @@ fun DeployTab(
                     busy = outboundBusy,
                     candidatesBusy = tunCandidatesBusy,
                     status = dialogStatus(OutboundDialog.TunInterface),
+                    feedback = outboundFeedback,
                     actionTitle = outboundActionTitle,
                     progressTitle = if (outboundProgressActive) currentStep else "",
                     progress = deployProgress,
@@ -3178,6 +3566,7 @@ fun DeployTab(
                 OutboundDialog.WireGuardVps -> WireGuardExitVpsDialog(
                     busy = outboundBusy,
                     status = dialogStatus(OutboundDialog.WireGuardVps),
+                    feedback = outboundFeedback,
                     actionTitle = outboundActionTitle,
                     progressTitle = if (outboundProgressActive) currentStep else "",
                     progress = deployProgress,
@@ -3274,6 +3663,7 @@ fun DeployTab(
                 OutboundDialog.FreeWarp -> FreeWarpDialog(
                     busy = outboundBusy,
                     status = dialogStatus(OutboundDialog.FreeWarp),
+                    feedback = outboundFeedback,
                     actionTitle = outboundActionTitle,
                     progressTitle = if (outboundProgressActive) currentStep else "",
                     progress = deployProgress,
@@ -3326,6 +3716,7 @@ fun DeployTab(
                 OutboundDialog.ImportedWireGuard -> ImportedWireGuardDialog(
                     busy = outboundBusy,
                     status = dialogStatus(OutboundDialog.ImportedWireGuard),
+                    feedback = outboundFeedback,
                     actionTitle = outboundActionTitle,
                     progressTitle = if (outboundProgressActive) currentStep else "",
                     progress = deployProgress,
@@ -3377,6 +3768,7 @@ fun DeployTab(
                 OutboundDialog.Diagnostics -> OutboundDiagnosticsDialog(
                     busy = outboundBusy,
                     status = dialogStatus(OutboundDialog.Diagnostics),
+                    feedback = outboundFeedback,
                     actionTitle = outboundActionTitle,
                     progressTitle = if (outboundProgressActive) currentStep else "",
                     progress = deployProgress,
@@ -3391,29 +3783,27 @@ fun DeployTab(
         if (showSecretsDialog) {
             DeploySecretsDialog(
                 settingsStore = settingsStore,
+                profileIndex = activeProfile,
                 initialMainPass = savedMainPass,
                 initialAdminId = savedAdminId,
                 initialBotToken = savedBotToken,
-                initialSshPort = savedSshPort,
                 initialDns1 = dns1,
                 initialDns2 = dns2,
                 initialManualPortsEnabled = savedManualPorts,
                 initialServerDtlsPort = savedServerDtlsPort.toString(),
                 initialServerWgPort = savedServerWgPort.toString(),
-                deployIp = ip.trim(),
-                deployLogin = login,
-                deployPassword = password,
                 onSaved = { _, _ -> },
-                onDismiss = { showSecretsDialog = false }
+                onDismiss = { showSecretsDialog = false },
+                connectionOnly = serverAction == "connect",
             )
         }
 
-        serverDiagnosticsReport?.let { report ->
+        serverDiagnosticsReport?.takeIf { visible }?.let { report ->
             DeviceCompatibilityDialog(
                 report = report,
                 title = "Диагностика сервера",
-                subtitle = "Проверка подключается к серверу выбранным способом SSH и собирает безопасные сведения об ОС, systemd, сети, диске, памяти, WDTT-службах и компонентах внешнего выхода.",
-                note = "Пароли, приватные ключи, токены бота, WireGuard private key и содержимое конфигов не выводятся. Если какая-то команда отсутствует на конкретной Linux-системе, пункт помечается как недоступный, а не считается утечкой или ошибкой.",
+                subtitle = "Состояние выбранного VPS: служба WDTT, порты, маршрутизация, система и доступ сервера к интернету. При недоступном SSH проверка через работающий WDTT показывает только основные сведения.",
+                note = "Пароли, приватные ключи и токены не включаются в отчёт. Недоступные проверки отмечены отдельно; неполный ответ не подтверждает исправность сервера.",
                 onDismiss = { serverDiagnosticsReport = null },
                 onCopy = {
                     val clipboard = context.getSystemService(ClipboardManager::class.java)
@@ -3435,7 +3825,9 @@ fun DeployTab(
             )
 
             AppSectionCard(
-                modifier = Modifier.onGloballyPositioned { migrationSectionY = it.positionInParent().y },
+                modifier = Modifier.onGloballyPositioned {
+                    migrationSectionTopInWindow = it.boundsInWindow().top
+                },
                 contentPadding = PaddingValues(16.dp),
                 verticalArrangement = Arrangement.spacedBy(0.dp)
             ) {
@@ -3446,13 +3838,9 @@ fun DeployTab(
                         .remoteFocusOutline(RoundedCornerShape(24.dp))
                         .clickable {
                             val willExpand = !migrationExpanded
+                            migrationExpandedOverride = willExpand
+                            revealMigrationRequested = willExpand
                             scope.launch { settingsStore.saveDeployMigrationSectionExpanded(willExpand) }
-                            if (willExpand) {
-                                scope.launch {
-                                    kotlinx.coroutines.delay(80)
-                                    deployScrollState.animateScrollTo((migrationSectionY - topRevealOffsetPx).toInt().coerceAtLeast(0))
-                                }
-                            }
                         }
                         .padding(vertical = 2.dp),
                     horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -3487,8 +3875,8 @@ fun DeployTab(
 
             AnimatedVisibility(
                 visible = migrationExpanded,
-                enter = expandVertically() + fadeIn(),
-                exit = shrinkVertically() + fadeOut()
+                enter = expandVertically(animationSpec = tween(300)) + fadeIn(tween(300)),
+                exit = shrinkVertically(animationSpec = tween(225)) + fadeOut(tween(225))
             ) {
                 Column(
                     modifier = Modifier.padding(top = 12.dp),
@@ -3506,7 +3894,7 @@ fun DeployTab(
                         statusMessage = backupStatusMessage,
                         accessIssue = when {
                             !primarySshAccessReady -> primarySshAccessIssue
-                            savedMainPass.isBlank() -> "Укажите главный пароль в разделе «Секреты»."
+                            savedMainPass.isBlank() -> "Укажите главный пароль в разделе параметры сервера."
                             else -> null
                         },
                         enabledInput = backupEnabledInput,
@@ -3784,6 +4172,7 @@ fun DeployTab(
         }
 
         if (showSshKeyDialog) {
+            val keyProfile = activeProfile
             SshPrivateKeyDialog(
                 title = "SSH-ключ основного сервера",
                 initialPrivateKey = savedSshPrivateKey,
@@ -3792,9 +4181,10 @@ fun DeployTab(
                 user = login.ifBlank { "root" },
                 port = primarySshPort,
                 onSave = { privateKey, passphrase ->
-                    scope.launch {
-                        settingsStore.saveDeploySshKey(privateKey, passphrase)
-                        if (privateKey.isNotBlank()) settingsStore.saveDeploySshAuthMode("key")
+                    val previousSave = accessSaveJob
+                    accessSaveJob = scope.launch {
+                        previousSave?.join()
+                        settingsStore.saveDeploySshKey(privateKey, passphrase, keyProfile)
                         showSshKeyDialog = false
                     }
                 },
@@ -3933,26 +4323,61 @@ fun DeployTab(
         val deployRequest = pendingDeployRequest
         val installInfo = existingInstallInfo
         if (deployRequest != null && installInfo != null) {
-            ExistingInstallDialog(
-                info = installInfo,
-                importMode = selectedImportBackup?.let { selectedImportMode },
-                onDismiss = {
-                    pendingDeployRequest = null
-                    existingInstallInfo = null
-                },
-                onPreserve = {
-                    pendingDeployRequest = null
-                    existingInstallInfo = null
-                    launchDeploy(deployRequest, DeployMode.PreserveData)
-                },
-                onReset = {
-                    pendingDeployRequest = null
-                    existingInstallInfo = null
-                    launchDeploy(deployRequest, DeployMode.ResetAll)
-                }
-            )
+            val rollbackState = installInfo.updateRollbackState
+            if (rollbackState !is ServerUpdateRollbackState.None) {
+                ServerUpdateRollbackDialog(
+                    state = rollbackState,
+                    busy = rollbackResolutionBusy,
+                    statusMessage = rollbackResolutionMessage,
+                    onDismiss = {
+                        if (!rollbackResolutionBusy) {
+                            pendingDeployRequest = null
+                            existingInstallInfo = null
+                            rollbackResolutionMessage = ""
+                        }
+                    },
+                    onRestore = {
+                        runRollbackResolution(ServerUpdateRollbackAction.RestorePrevious)
+                    },
+                    onKeepCurrent = {
+                        runRollbackResolution(ServerUpdateRollbackAction.KeepCurrentAndDeleteBackup)
+                    },
+                )
+            } else {
+                ExistingInstallDialog(
+                    info = installInfo,
+                    importMode = selectedImportBackup?.let { selectedImportMode },
+                    onDismiss = {
+                        pendingDeployRequest = null
+                        existingInstallInfo = null
+                    },
+                    onPreserve = {
+                        pendingDeployRequest = null
+                        existingInstallInfo = null
+                        val owner = currentOwnerProfile().copy(listenPort = deployRequest.localPort,
+                            ports = Triple(deployRequest.dtlsPort, deployRequest.wgPort, deployRequest.localPort).asPortsSpec())
+                        if (pendingDeploySettings == (owner to currentOutboundProfileForms())) {
+                            launchDeploy(deployRequest, DeployMode.PreserveData)
+                        } else {
+                            startDeployCheck(deployRequest, requireExistingServer = true)
+                        }
+                    },
+                    onReset = {
+                        pendingDeployRequest = null
+                        existingInstallInfo = null
+                        val owner = currentOwnerProfile().copy(listenPort = deployRequest.localPort,
+                            ports = Triple(deployRequest.dtlsPort, deployRequest.wgPort, deployRequest.localPort).asPortsSpec())
+                        if (pendingDeploySettings == (owner to currentOutboundProfileForms())) {
+                            launchDeploy(deployRequest, DeployMode.ResetAll)
+                        } else {
+                            startDeployCheck(deployRequest, requireExistingServer = true)
+                        }
+                    }
+                )
+            }
         }
 
+    }
     }
 }
 
@@ -4066,7 +4491,7 @@ private fun DeployResultPanel(
 }
 
 @Composable
-private fun DeploySuccessBanner(successCountdown: Int, serverVersion: String) {
+private fun DeploySuccessBanner(successCountdown: Int, serverVersion: String, openTunnelAfterCountdown: Boolean) {
     Surface(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(16.dp),
@@ -4088,7 +4513,8 @@ private fun DeploySuccessBanner(successCountdown: Int, serverVersion: String) {
                     style = MaterialTheme.typography.bodyMedium
                 )
                 Text(
-                    text = "Серверная часть: WDTT Plus $serverVersion",
+                    text = if (openTunnelAfterCountdown) "Переход на вкладку «Туннель» через $successCountdown с"
+                    else "Серверная часть: WDTT Plus $serverVersion",
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     style = MaterialTheme.typography.bodySmall
                 )
@@ -4105,6 +4531,7 @@ private fun OutboundRoutingSection(
     lastCheckAttemptAt: Long,
     lastCheckError: String,
     status: String,
+    feedback: OutboundActionFeedback?,
     actionTitle: String,
     accessIssue: String?,
     enabled: Boolean,
@@ -4172,8 +4599,8 @@ private fun OutboundRoutingSection(
 
         AnimatedVisibility(
             visible = expanded,
-            enter = expandVertically() + fadeIn(),
-            exit = shrinkVertically() + fadeOut()
+            enter = expandVertically(animationSpec = tween(300)) + fadeIn(tween(300)),
+            exit = shrinkVertically(animationSpec = tween(225)) + fadeOut(tween(225))
         ) {
             Column(
                 modifier = Modifier.padding(top = 12.dp),
@@ -4292,7 +4719,7 @@ private fun OutboundRoutingSection(
                     }
                 }
                 if (status.isNotBlank()) {
-                    InlineActionMessage(status)
+                    if (feedback?.summary == status) OutboundActionMessage(feedback) else InlineActionMessage(status)
                 }
                 OutlinedButton(
                     onClick = { onOpen(OutboundDialog.Diagnostics) },
@@ -4534,6 +4961,7 @@ private fun outboundIndicatorColor(state: OutboundModeVisualState): Color = when
 private fun LocalProxyDialog(
     busy: Boolean,
     status: String,
+    feedback: OutboundActionFeedback?,
     actionTitle: String,
     progressTitle: String,
     progress: Float,
@@ -4557,7 +4985,7 @@ private fun LocalProxyDialog(
     var confirmRemove by rememberSaveable { mutableStateOf(false) }
     val port = portInput.toIntOrNull()?.takeIf { it in 1..65533 }
     val credentialsIssue = localProxyCredentialsIssue(loginInput, passwordInput)
-    OutboundDialogFrame("Прокси на этом VPS", status, progressTitle, progress, onDismiss) {
+    OutboundDialogFrame("Прокси на этом VPS", status, progressTitle, progress, onDismiss, feedback) {
         OutboundDialogStateBanner(indicator)
         Text(
             "На этом же VPS будут созданы два входа с одним логином и паролем: SOCKS5 и HTTP. Это удобно как прокси, но IP не маскирует: наружу будет виден текущий сервер.",
@@ -4661,7 +5089,7 @@ private fun LocalProxyDialog(
         }
     }
     if (confirmRemove) {
-        AlertDialog(
+        BoundedAlertDialog(
             onDismissRequest = { if (!busy) confirmRemove = false },
             title = { Text("Удалить прокси с этого VPS?") },
             text = {
@@ -4689,6 +5117,7 @@ private fun LocalProxyDialog(
 private fun ExternalProxyDialog(
     busy: Boolean,
     status: String,
+    feedback: OutboundActionFeedback?,
     actionTitle: String,
     progressTitle: String,
     progress: Float,
@@ -4716,7 +5145,7 @@ private fun ExternalProxyDialog(
     val port = portInput.toIntOrNull()?.takeIf { it in 1..65535 }
     val hostValid = hostInput.isValidPublicHost()
     val credentialsIssue = externalProxyCredentialsIssue(loginInput, passwordInput)
-    OutboundDialogFrame("Внешний TCP-прокси", status, progressTitle, progress, onDismiss) {
+    OutboundDialogFrame("Внешний TCP-прокси", status, progressTitle, progress, onDismiss, feedback) {
         OutboundDialogStateBanner(indicator)
         Text(
             "WDTT будет отправлять обычные TCP-подключения пользователей через выбранный прокси. UDP, QUIC и часть голосового/звонкового трафика могут идти напрямую.",
@@ -4799,7 +5228,8 @@ private fun ExternalProxyDialog(
                 onClick = onDisable,
                 enabled = !busy && disableEnabled,
                 modifier = Modifier.weight(1f).fillMaxHeight().heightIn(min = 48.dp),
-                shape = RoundedCornerShape(16.dp)
+                shape = RoundedCornerShape(16.dp),
+                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp)
             ) {
                 val disabling = actionTitle.contains("Возвращаю", ignoreCase = true)
                 if (disabling) {
@@ -4812,14 +5242,15 @@ private fun ExternalProxyDialog(
                 onClick = { confirmDelete = true },
                 enabled = !busy && deleteEnabled,
                 modifier = Modifier.weight(1f).fillMaxHeight().heightIn(min = 48.dp),
-                shape = RoundedCornerShape(16.dp)
+                shape = RoundedCornerShape(16.dp),
+                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp)
             ) {
                 Text("Удалить")
             }
         }
     }
     if (confirmDelete) {
-        AlertDialog(
+        BoundedAlertDialog(
             onDismissRequest = { if (!busy) confirmDelete = false },
             title = { Text("Удалить настройки внешнего прокси?") },
             text = {
@@ -4845,6 +5276,7 @@ private fun ExternalProxyDialog(
 private fun WireGuardExitVpsDialog(
     busy: Boolean,
     status: String,
+    feedback: OutboundActionFeedback?,
     actionTitle: String,
     progressTitle: String,
     progress: Float,
@@ -4879,7 +5311,7 @@ private fun WireGuardExitVpsDialog(
     val hostValid = hostInput.isValidPublicHost()
     val sshPort = sshPortInput.toIntOrNull()?.takeIf { it in 1..65535 }
     val wgPort = wgPortInput.toIntOrNull()?.takeIf { it in 1..65535 }
-    OutboundDialogFrame("Выход через другой сервер", status, progressTitle, progress, onDismiss) {
+    OutboundDialogFrame("Выход через другой сервер", status, progressTitle, progress, onDismiss, feedback) {
         OutboundDialogStateBanner(indicator)
         Text(
             "WDTT Plus подключит текущий сервер к другому VPS по WireGuard и будет выпускать пользователей WDTT в интернет через этот второй сервер. Это самый понятный вариант для отдельного выходного IP.",
@@ -4888,11 +5320,11 @@ private fun WireGuardExitVpsDialog(
         )
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
+            horizontalArrangement = Arrangement.spacedBy(2.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text("Вход на дополнительный VPS", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
-            IconButton(
+            Text("Вход на дополнительный VPS", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f, fill = false))
+            HintIconButton(hint = "Как работает вход по SSH",
                 onClick = onSshHelp,
                 modifier = Modifier.size(32.dp).remoteHelpFocus(),
             ) {
@@ -5034,7 +5466,7 @@ private fun WireGuardExitVpsDialog(
         }
     }
     if (confirmDelete) {
-        AlertDialog(
+        BoundedAlertDialog(
             onDismissRequest = { if (!busy) confirmDelete = false },
             title = { Text("Удалить выход через другой сервер?") },
             text = {
@@ -5062,6 +5494,7 @@ private fun WireGuardExitVpsDialog(
 private fun FreeWarpDialog(
     busy: Boolean,
     status: String,
+    feedback: OutboundActionFeedback?,
     actionTitle: String,
     progressTitle: String,
     progress: Float,
@@ -5087,7 +5520,7 @@ private fun FreeWarpDialog(
     var confirmDelete by rememberSaveable { mutableStateOf(false) }
     var confirmReset by rememberSaveable { mutableStateOf(false) }
     val mtu = mtuInput.toIntOrNull()?.takeIf { it in 1280..1500 }
-    OutboundDialogFrame("Бесплатный WARP", status, progressTitle, progress, onDismiss) {
+    OutboundDialogFrame("Бесплатный WARP", status, progressTitle, progress, onDismiss, feedback) {
         OutboundDialogStateBanner(indicator)
         Text(
             "WDTT Plus автоматически зарегистрирует бесплатный Cloudflare WARP и направит через него только трафик WDTT-пользователей. Второй сервер и готовый конфиг не нужны.",
@@ -5262,7 +5695,7 @@ private fun FreeWarpDialog(
         }
     }
     if (confirmReset) {
-        AlertDialog(
+        BoundedAlertDialog(
             onDismissRequest = { confirmReset = false },
             title = { Text("Сбросить регистрацию WARP?") },
             text = {
@@ -5280,7 +5713,7 @@ private fun FreeWarpDialog(
         )
     }
     if (confirmDelete) {
-        AlertDialog(
+        BoundedAlertDialog(
             onDismissRequest = { confirmDelete = false },
             title = { Text("Удалить бесплатный WARP?") },
             text = {
@@ -5304,6 +5737,7 @@ private fun TunInterfaceDialog(
     busy: Boolean,
     candidatesBusy: Boolean,
     status: String,
+    feedback: OutboundActionFeedback?,
     actionTitle: String,
     progressTitle: String,
     progress: Float,
@@ -5325,7 +5759,7 @@ private fun TunInterfaceDialog(
     var showSetupHelp by rememberSaveable { mutableStateOf(false) }
     val normalizedInterface = interfaceInput.trim()
     val interfaceIssue = tunInterfaceSelectionIssue(normalizedInterface, candidates)
-    OutboundDialogFrame("Существующий TUN-интерфейс", status, progressTitle, progress, onDismiss) {
+    OutboundDialogFrame("Существующий TUN-интерфейс", status, progressTitle, progress, onDismiss, feedback) {
         OutboundDialogStateBanner(indicator)
         Text(
             "Использует уже подготовленный на сервере TUN. WDTT Plus добавляет только собственные маршруты клиентской подсети и не меняет конфигурацию Xray, sing-box или другой службы.",
@@ -5339,15 +5773,16 @@ private fun TunInterfaceDialog(
         )
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
+            horizontalArrangement = Arrangement.spacedBy(2.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(
                 "Подготовка внешнего TUN",
                 style = MaterialTheme.typography.labelLarge,
-                fontWeight = FontWeight.SemiBold
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.weight(1f, fill = false)
             )
-            IconButton(
+            HintIconButton(hint = "Как подготовить TUN-интерфейс",
                 onClick = { showSetupHelp = true },
                 enabled = !busy,
                 modifier = Modifier.size(32.dp).remoteHelpFocus(enabled = !busy)
@@ -5473,61 +5908,19 @@ private fun TunInterfaceDialog(
         }
     }
     if (showSetupHelp) {
-        val configuration = LocalConfiguration.current
-        val television = isTelevisionDevice()
-        val helpScrollState = rememberScrollState()
-        val helpMaxHeight = if (television) {
-            (configuration.screenHeightDp.dp * 0.72f).coerceAtMost(620.dp)
-        } else {
-            (configuration.screenHeightDp.dp * 0.56f).coerceAtMost(460.dp)
+        SettingsDialogLayout(
+            title = "Как подготовить TUN-интерфейс",
+            onDismiss = { showSetupHelp = false },
+        ) {
+            Text("1. Создайте и запустите TUN-интерфейс в Xray, sing-box или другом приложении на этом сервере.")
+            Text("2. Настройте правила маршрутизации внутри этого приложения. Для правил по доменам включите распознавание доменов там же. WDTT Plus не меняет эти настройки.")
+            Text("3. Вернитесь сюда, обновите кандидатов и выберите имя поднятого интерфейса. Если его нет в списке, введите точное имя вручную. Системные интерфейсы сервера использовать нельзя.")
+            Text("4. После включения проверьте выход. Если внешний TUN остановится, клиентский трафик WDTT будет заблокирован до его восстановления или возврата в прямой режим.")
+            Text("5. Пока открыт блок или окно TUN, WDTT Plus перечитывает состояние сервера каждые 10 секунд. Если внешний TUN пропадёт, приложение покажет предупреждение, а трафик WDTT останется заблокированным до восстановления TUN или возврата в прямой режим.")
         }
-        AlertDialog(
-            onDismissRequest = { showSetupHelp = false },
-            modifier = Modifier.televisionDialogWidth(television),
-            title = {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.Top
-                ) {
-                    Text(
-                        "Как подготовить TUN-интерфейс",
-                        modifier = Modifier.weight(1f)
-                    )
-                    IconButton(
-                        onClick = { showSetupHelp = false },
-                        modifier = Modifier.size(36.dp).remoteIconButtonFocus()
-                    ) {
-                        Icon(
-                            Icons.Default.Close,
-                            contentDescription = "Закрыть",
-                            modifier = Modifier.size(22.dp)
-                        )
-                    }
-                }
-            },
-            text = {
-                Column(
-                    modifier = Modifier
-                        .heightIn(max = helpMaxHeight)
-                        .verticalScroll(helpScrollState)
-                        .tvDpadScrollable(helpScrollState, television),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    Text("1. Создайте и запустите TUN-интерфейс в Xray, sing-box или другом приложении на этом сервере.")
-                    Text("2. Настройте правила маршрутизации внутри этого приложения. Для правил по доменам включите распознавание доменов там же. WDTT Plus не меняет эти настройки.")
-                    Text("3. Вернитесь сюда, обновите кандидатов и выберите имя поднятого интерфейса. Если его нет в списке, введите точное имя вручную. Системные интерфейсы сервера использовать нельзя.")
-                    Text("4. После включения проверьте выход. Если внешний TUN остановится, клиентский трафик WDTT будет заблокирован до его восстановления или возврата в прямой режим.")
-                    Text("5. Пока открыт блок или окно TUN, WDTT Plus перечитывает состояние сервера каждые 10 секунд. Если внешний TUN пропадёт, приложение покажет предупреждение, а трафик WDTT останется заблокированным до восстановления TUN или возврата в прямой режим.")
-                }
-            },
-            confirmButton = {
-                TextButton(onClick = { showSetupHelp = false }) { Text("Понятно") }
-            },
-            properties = DialogProperties(usePlatformDefaultWidth = !television),
-        )
     }
     if (confirmDelete) {
-        AlertDialog(
+        BoundedAlertDialog(
             onDismissRequest = { if (!busy) confirmDelete = false },
             title = { Text("Удалить настройку TUN-выхода?") },
             text = {
@@ -5553,6 +5946,7 @@ private fun TunInterfaceDialog(
 private fun ImportedWireGuardDialog(
     busy: Boolean,
     status: String,
+    feedback: OutboundActionFeedback?,
     actionTitle: String,
     progressTitle: String,
     progress: Float,
@@ -5573,7 +5967,7 @@ private fun ImportedWireGuardDialog(
     var configText by rememberSaveable(initialConfig) { mutableStateOf(initialConfig) }
     var confirmDelete by rememberSaveable { mutableStateOf(false) }
     val valid = configText.isNotBlank() && validateWireGuardConfigText(configText).isSuccess
-    OutboundDialogFrame("VPN/WireGuard-файл", status, progressTitle, progress, onDismiss) {
+    OutboundDialogFrame("VPN/WireGuard-файл", status, progressTitle, progress, onDismiss, feedback) {
         OutboundDialogStateBanner(indicator)
         Text(
             "Можно выбрать готовый WireGuard .conf от VPN-провайдера, собственного WARP/WARP+ или другой совместимой службы. Для автоматической бесплатной регистрации WARP используйте отдельный вариант «Бесплатный WARP».",
@@ -5670,7 +6064,7 @@ private fun ImportedWireGuardDialog(
         }
     }
     if (confirmDelete) {
-        AlertDialog(
+        BoundedAlertDialog(
             onDismissRequest = { if (!busy) confirmDelete = false },
             title = { Text("Удалить VPN/WireGuard-файл?") },
             text = {
@@ -5698,6 +6092,7 @@ private fun ImportedWireGuardDialog(
 private fun OutboundDiagnosticsDialog(
     busy: Boolean,
     status: String,
+    feedback: OutboundActionFeedback?,
     actionTitle: String,
     progressTitle: String,
     progress: Float,
@@ -5706,7 +6101,7 @@ private fun OutboundDiagnosticsDialog(
     onRun: () -> Unit,
     onCleanup: () -> Unit
 ) {
-    OutboundDialogFrame("Диагностика выхода WDTT", status, progressTitle, progress, onDismiss) {
+    OutboundDialogFrame("Диагностика выхода WDTT", status, progressTitle, progress, onDismiss, feedback) {
         Text(
             "Диагностика показывает, какой выход сейчас включён, какой внешний IP видит сервер и какие сетевые правила применены для WDTT.",
             style = MaterialTheme.typography.bodySmall,
@@ -5777,6 +6172,7 @@ private fun OutboundDialogFrame(
     progressTitle: String,
     progress: Float,
     onDismiss: () -> Unit,
+    feedback: OutboundActionFeedback?,
     content: @Composable ColumnScope.() -> Unit
 ) {
     val scrollState = rememberScrollState()
@@ -5810,7 +6206,7 @@ private fun OutboundDialogFrame(
             }
         }
     }
-    androidx.compose.ui.window.Dialog(onDismissRequest = onDismiss) {
+    BoundedAppDialog(properties = androidx.compose.ui.window.DialogProperties(), onDismissRequest = onDismiss) {
         BoxWithConstraints(
             modifier = Modifier.fillMaxSize().padding(8.dp),
             contentAlignment = Alignment.Center
@@ -5866,10 +6262,9 @@ private fun OutboundDialogFrame(
                         }
                     }
                     if (status.isNotBlank()) {
-                        InlineActionMessage(
-                            status = status,
-                            modifier = Modifier.onGloballyPositioned { statusBounds = it.boundsInWindow() }
-                        )
+                        val resultModifier = Modifier.onGloballyPositioned { statusBounds = it.boundsInWindow() }
+                        if (feedback?.summary == status) OutboundActionMessage(feedback, resultModifier)
+                        else InlineActionMessage(status, resultModifier)
                     }
                     Spacer(Modifier.height(4.dp))
                 }
@@ -5955,6 +6350,7 @@ internal fun serverDiagnosticsScript(
     val clientPort = expectedClientPort?.takeIf { it in 1..65535 } ?: 9000
     return """
     set +e
+    ${outboundProbeFunctions().replace("\n", "\n    ")}
     WDTT_EXPECTED_DTLS_PORT="$dtlsPort"
     WDTT_EXPECTED_WG_PORT="$wgPort"
     WDTT_EXPECTED_CLIENT_PORT="$clientPort"
@@ -6037,7 +6433,7 @@ internal fun serverDiagnosticsScript(
     }
     wdtt_diag_public_ip() {
       if wdtt_diag_cmd curl; then
-        curl -4fsS --connect-timeout 5 --max-time 10 https://api.ipify.org 2>/dev/null
+        curl -4fsS --connect-timeout 3 --max-time 6 https://api.ipify.org 2>/dev/null
       fi
     }
     wdtt_diag_resolve_host() {
@@ -6046,9 +6442,17 @@ internal fun serverDiagnosticsScript(
         [0-9]*.[0-9]*.[0-9]*.[0-9]*) printf '%s' "${'$'}host"; return 0 ;;
       esac
       if wdtt_diag_cmd getent; then
-        getent ahostsv4 "${'$'}host" 2>/dev/null | awk '{print ${'$'}1; exit}'
+        if wdtt_diag_cmd timeout; then
+          timeout 3 getent ahostsv4 "${'$'}host" 2>/dev/null | awk '{print ${'$'}1; exit}'
+        else
+          getent ahostsv4 "${'$'}host" 2>/dev/null | awk '{print ${'$'}1; exit}'
+        fi
       elif wdtt_diag_cmd nslookup; then
-        nslookup "${'$'}host" 2>/dev/null | awk '/^Address: / {print ${'$'}2; exit}'
+        if wdtt_diag_cmd timeout; then
+          timeout 3 nslookup "${'$'}host" 2>/dev/null | awk '/^Address: / {print ${'$'}2; exit}'
+        else
+          nslookup "${'$'}host" 2>/dev/null | awk '/^Address: / {print ${'$'}2; exit}'
+        fi
       elif wdtt_diag_cmd ping; then
         ping -4 -c 1 -W 2 "${'$'}host" >/dev/null 2>&1 && printf 'ping-ok'
       fi
@@ -6060,7 +6464,7 @@ internal fun serverDiagnosticsScript(
         return 2
       fi
       errfile="/tmp/wdtt-diag-curl-${'$'}${'$'}.err"
-      code="${'$'}(curl -4sS -o /dev/null -w '%{http_code}' --connect-timeout 6 --max-time 12 "${'$'}url" 2>"${'$'}errfile")"
+      code="${'$'}(curl -4sS -o /dev/null -w '%{http_code}' --connect-timeout 3 --max-time 6 "${'$'}url" 2>"${'$'}errfile")"
       exit_code="${'$'}?"
       err="${'$'}(tr '\n\r|' '   ' <"${'$'}errfile" 2>/dev/null | cut -c1-180)"
       rm -f "${'$'}errfile"
@@ -6095,7 +6499,8 @@ internal fun serverDiagnosticsScript(
     wdtt_diag_udp_listen_port() {
       port="${'$'}1"
       if wdtt_diag_cmd ss; then
-        ss -H -lunu 2>/dev/null | awk -v needle=":${'$'}port" 'index(${'$'}0, needle) {found=1} END {exit found ? 0 : 1}'
+        sockets="${'$'}(ss -H -lun 2>/dev/null)" || return 2
+        printf '%s\n' "${'$'}sockets" | awk -v needle=":${'$'}port" '${'$'}4 ~ (needle "${'$'}") {found=1} END {exit found ? 0 : 1}'
         return "${'$'}?"
       fi
       return 2
@@ -6136,7 +6541,7 @@ internal fun serverDiagnosticsScript(
         echo "не выполнена: адрес интерфейса wdtt0 не найден"
         return 1
       fi
-      trace="${'$'}(curl -4fsS --interface "${'$'}source_ip" --connect-timeout 8 --max-time 15 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)"
+      trace="${'$'}(wdtt_routed_https "${'$'}source_ip" "wg-wdtt-exit" https://www.cloudflare.com/cdn-cgi/trace || true)"
       if [ -z "${'$'}trace" ]; then
         echo "не пройдена: HTTPS через маршрут WDTT не отвечает"
         return 1
@@ -6263,93 +6668,6 @@ internal fun serverDiagnosticsScript(
       DISK_INFO="${'$'}(df -h / /etc /tmp 2>/dev/null | awk 'NR>1 {printf "%s: свободно %s из %s; ", ${'$'}6, ${'$'}4, ${'$'}2}')"
     fi
     wdtt_diag_emit "INFO" "Диск" "${'$'}{DISK_INFO:-не удалось прочитать}" "Для установки нужны место под бинарник сервера, временные файлы, WireGuard/WARP-профили и журналы systemd." ""
-
-    PUBLIC_IP="${'$'}(wdtt_diag_public_ip)"
-    DEFAULT_ROUTE=""
-    if wdtt_diag_cmd ip; then
-      DEFAULT_ROUTE="${'$'}(ip -4 route show default 2>/dev/null | head -n 1)"
-    fi
-    NET_DETAILS="Публичный IPv4 самого сервера: ${'$'}{PUBLIC_IP:-не удалось определить}. Default route: ${'$'}{DEFAULT_ROUTE:-не определён}."
-    if [ -n "${'$'}PUBLIC_IP" ]; then
-      wdtt_diag_emit "OK" "Сеть сервера" "интернет доступен" "${'$'}NET_DETAILS" ""
-    else
-      wdtt_diag_emit "WARNING" "Сеть сервера" "публичный IPv4 не проверен" "${'$'}NET_DETAILS" "Проверьте исходящий HTTPS-доступ с сервера; он нужен для wgcf, WARP-проверок и обновлений."
-    fi
-
-    VK_DETAILS=""
-    for host in api.vk.me calls.okcdn.ru login.vk.ru api.vk.ru; do
-      resolved="${'$'}(wdtt_diag_resolve_host "${'$'}host")"
-      if [ -n "${'$'}resolved" ]; then
-        VK_DETAILS="${'$'}VK_DETAILS ${'$'}host DNS: ${'$'}resolved;"
-      else
-        VK_DETAILS="${'$'}VK_DETAILS ${'$'}host DNS: не разрешается;"
-      fi
-    done
-    VK_API_ME_HTTP="${'$'}(wdtt_diag_http_probe 'https://api.vk.me/method/users.get?v=5.276')"
-    VK_DETAILS="${'$'}VK_DETAILS основной api.vk.me HTTPS: ${'$'}VK_API_ME_HTTP;"
-    OK_HTTP="${'$'}(wdtt_diag_http_probe https://calls.okcdn.ru/fb.do)"
-    VK_DETAILS="${'$'}VK_DETAILS основной calls.okcdn.ru HTTPS: ${'$'}OK_HTTP;"
-    VK_LOGIN_HTTP="${'$'}(wdtt_diag_http_probe https://login.vk.ru/)"
-    VK_DETAILS="${'$'}VK_DETAILS legacy login.vk.ru HTTPS: ${'$'}VK_LOGIN_HTTP;"
-    VK_API_RU_HTTP="${'$'}(wdtt_diag_http_probe 'https://api.vk.ru/method/users.get?v=5.275')"
-    VK_DETAILS="${'$'}VK_DETAILS legacy api.vk.ru HTTPS: ${'$'}VK_API_RU_HTTP."
-    wdtt_diag_emit "INFO" "VK/OK с VPS (справочно)" "не влияет на основной VK-вход" "${'$'}VK_DETAILS Получение VK-токенов и решение капчи выполняются на телефоне, а не на VPS. Поэтому недоступность этих HTTPS-адресов именно с сервера не считается ошибкой туннеля; серверу важнее рабочая служба, UDP-порты, маршрутизация и выходной интернет." "Если туннель не стартует, запустите «Проверить устройство»: она проверяет api.vk.me, calls.okcdn.ru, DNS и резервную цепочку из реальной сети телефона."
-
-    TELEGRAM_CONFIGURED=0
-    if [ -r /etc/wdtt/access.json ] && grep -Eq '"bot_token"[[:space:]]*:[[:space:]]*"[^"]{10,}"' /etc/wdtt/access.json 2>/dev/null; then
-      TELEGRAM_CONFIGURED=1
-    fi
-    TG_HTTP="${'$'}(wdtt_diag_http_probe https://api.telegram.org/)"; TG_HTTP_CODE="${'$'}?"
-    if [ "${'$'}TG_HTTP_CODE" = "0" ]; then
-      wdtt_diag_emit "INFO" "Telegram API" "доступен" "api.telegram.org: ${'$'}TG_HTTP. Настроен ли бот на сервере: ${'$'}([ "${'$'}TELEGRAM_CONFIGURED" = "1" ] && echo да || echo нет)." ""
-    elif [ "${'$'}TELEGRAM_CONFIGURED" = "1" ]; then
-      wdtt_diag_emit "WARNING" "Telegram API" "недоступен" "На сервере найден признак настроенного Telegram-бота, но api.telegram.org не отвечает: ${'$'}TG_HTTP." "Если бот нужен, проверьте DNS/HTTPS-доступ к Telegram API с VPS или ограничения региона/провайдера."
-    else
-      wdtt_diag_emit "INFO" "Telegram API" "не проверен как обязательный" "api.telegram.org не отвечает: ${'$'}TG_HTTP. Бот на сервере не выглядит настроенным, поэтому это не мешает основному туннелю." ""
-    fi
-
-    WARP_WARN=0
-    WARP_DETAILS=""
-    WARP_API_HTTP="${'$'}(wdtt_diag_http_probe https://api.cloudflareclient.com/)"; WARP_API_HTTP_CODE="${'$'}?"
-    [ "${'$'}WARP_API_HTTP_CODE" = "0" ] || WARP_WARN=1
-    WARP_DETAILS="${'$'}WARP_DETAILS регистрация api.cloudflareclient.com: ${'$'}WARP_API_HTTP;"
-    CF_TRACE="${'$'}(curl -4fsS --connect-timeout 6 --max-time 12 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)"
-    if [ -n "${'$'}CF_TRACE" ]; then
-      CF_WARP="${'$'}(printf '%s\n' "${'$'}CF_TRACE" | sed -n 's/^warp=//p' | head -n 1)"
-      CF_COLO="${'$'}(printf '%s\n' "${'$'}CF_TRACE" | sed -n 's/^colo=//p' | head -n 1)"
-      WARP_DETAILS="${'$'}WARP_DETAILS Cloudflare trace доступен: warp=${'$'}{CF_WARP:-не указано}, colo=${'$'}{CF_COLO:-не указано};"
-    else
-      WARP_WARN=1
-      WARP_DETAILS="${'$'}WARP_DETAILS Cloudflare trace недоступен;"
-    fi
-    WGCF_HTTP="${'$'}(wdtt_diag_http_probe "${'$'}WDTT_WGCF_URL")"; WGCF_HTTP_CODE="${'$'}?"
-    [ "${'$'}WGCF_HTTP_CODE" = "0" ] || WARP_WARN=1
-    WARP_DETAILS="${'$'}WARP_DETAILS wgcf download: ${'$'}WGCF_HTTP;"
-    WGCF_API_HTTP="${'$'}(wdtt_diag_http_probe "${'$'}WDTT_WGCF_API")"; WGCF_API_HTTP_CODE="${'$'}?"
-    [ "${'$'}WGCF_API_HTTP_CODE" = "0" ] || WARP_WARN=1
-    WARP_DETAILS="${'$'}WARP_DETAILS GitHub API wgcf: ${'$'}WGCF_API_HTTP;"
-    ENGAGE_IP="${'$'}(wdtt_diag_resolve_host engage.cloudflareclient.com)"
-    if [ -n "${'$'}ENGAGE_IP" ]; then
-      WARP_DETAILS="${'$'}WARP_DETAILS engage.cloudflareclient.com DNS: ${'$'}ENGAGE_IP;"
-    else
-      WARP_WARN=1
-      WARP_DETAILS="${'$'}WARP_DETAILS engage.cloudflareclient.com DNS: не разрешается;"
-    fi
-    WARP_UDP_2408="${'$'}(wdtt_diag_udp_probe engage.cloudflareclient.com 2408)"; WARP_UDP_2408_CODE="${'$'}?"
-    [ "${'$'}WARP_UDP_2408_CODE" = "1" ] && WARP_WARN=1
-    WARP_DETAILS="${'$'}WARP_DETAILS UDP 2408: ${'$'}WARP_UDP_2408;"
-    WARP_UDP_500="${'$'}(wdtt_diag_udp_probe engage.cloudflareclient.com 500)"; WARP_UDP_500_CODE="${'$'}?"
-    [ "${'$'}WARP_UDP_500_CODE" = "1" ] && WARP_WARN=1
-    WARP_DETAILS="${'$'}WARP_DETAILS UDP 500: ${'$'}WARP_UDP_500;"
-    WARP_STACK="${'$'}(wdtt_diag_wireguard_kernel)"
-    WARP_STACK_CODE="${'$'}?"
-    [ "${'$'}WARP_STACK_CODE" = "0" ] || WARP_WARN=1
-    WARP_DETAILS="${'$'}WARP_DETAILS ${'$'}WARP_STACK; wg=${'$'}(wdtt_diag_cmd wg && echo есть || echo нет); wg-quick=${'$'}(wdtt_diag_cmd wg-quick && echo есть || echo нет)."
-    if [ "${'$'}WARP_WARN" = "0" ]; then
-      wdtt_diag_emit "OK" "Бесплатный WARP" "предпосылки выглядят рабочими" "${'$'}WARP_DETAILS" "Это не гарантирует регистрацию WARP: Cloudflare может временно ограничивать регион/VPS, но базовая сеть и инструменты выглядят пригодными."
-    else
-      wdtt_diag_emit "WARNING" "Бесплатный WARP" "есть риск, что не заработает" "${'$'}WARP_DETAILS" "Проверьте исходящий HTTPS к Cloudflare/GitHub, UDP к WARP endpoint, WireGuard-стек ядра и попробуйте другой MTU/endpoint или регион VPS."
-    fi
 
     OUT_MODE="${'$'}(wdtt_diag_outbound_mode)"
     WDTT_SERVICE_FOR_ROUTING="${'$'}(wdtt_diag_service_state wdtt.service)"
@@ -6488,7 +6806,7 @@ internal fun serverDiagnosticsScript(
       tun_interface)
         TUN_TEST_SOURCE="${'$'}(ip -4 -o addr show dev wdtt0 scope global 2>/dev/null | awk '{split(${'$'}4, value, "/"); print value[1]; exit}')"
         TUN_EXIT_IP=""
-        [ -n "${'$'}TUN_TEST_SOURCE" ] && TUN_EXIT_IP="${'$'}(curl -4fsS --interface "${'$'}TUN_TEST_SOURCE" --max-time 12 https://api.ipify.org 2>/dev/null || true)"
+        [ -n "${'$'}TUN_TEST_SOURCE" ] && TUN_EXIT_IP="${'$'}(wdtt_routed_public_ip "${'$'}TUN_TEST_SOURCE" "${'$'}TUN_INTERFACE" || true)"
         FIREWALL_DETAILS="${'$'}FIREWALL_DETAILS TUN-выход ${'$'}{TUN_INTERFACE:-не указан}: интерфейс=${'$'}TUN_INTERFACE_ACTIVE, служба=${'$'}TUN_SERVICE_ACTIVE, правило=${'$'}TUN_POLICY_RULE_ACTIVE, маршрут=${'$'}TUN_DEFAULT_ROUTE_ACTIVE, блокировка=${'$'}TUN_FAIL_CLOSED_ACTIVE, FORWARD=${'$'}TUN_FORWARD_RULES_ACTIVE, ip_forward=${'$'}TUN_IP_FORWARD_ACTIVE, проверочный IP=${'$'}{TUN_EXIT_IP:-нет}."
         if [ "${'$'}TUN_INTERFACE_ACTIVE" = "1" ] &&
            [ "${'$'}TUN_SERVICE_ACTIVE" = "1" ] &&
@@ -6607,7 +6925,7 @@ internal fun serverDiagnosticsScript(
     WDTT_SERVICE="${'$'}(wdtt_diag_service_state wdtt.service)"
     WDTT_BIN="${'$'}(wdtt_diag_file_state /usr/local/bin/wdtt-server)"
     WDTT_CONFIG="${'$'}(wdtt_diag_file_state /etc/wdtt)"
-    WDTT_ACCESS="${'$'}(wdtt_diag_file_state /etc/wdtt/access.json)"
+    WDTT_ACCESS="${'$'}(wdtt_diag_file_state /etc/wdtt/passwords.json)"
     if [ -S /run/wdtt/admin.sock ]; then
       WDTT_ADMIN_SOCKET="/run/wdtt/admin.sock есть"
     elif [ -S /etc/wdtt/admin.sock ]; then
@@ -6615,7 +6933,7 @@ internal fun serverDiagnosticsScript(
     else
       WDTT_ADMIN_SOCKET="не найден"
     fi
-    WDTT_DETAILS="wdtt.service: ${'$'}WDTT_SERVICE. /usr/local/bin/wdtt-server: ${'$'}WDTT_BIN. /etc/wdtt: ${'$'}WDTT_CONFIG. access.json: ${'$'}WDTT_ACCESS. admin socket: ${'$'}WDTT_ADMIN_SOCKET."
+    WDTT_DETAILS="wdtt.service: ${'$'}WDTT_SERVICE. /usr/local/bin/wdtt-server: ${'$'}WDTT_BIN. /etc/wdtt: ${'$'}WDTT_CONFIG. passwords.json: ${'$'}WDTT_ACCESS. admin socket: ${'$'}WDTT_ADMIN_SOCKET."
     case "${'$'}WDTT_SERVICE" in
       active)
         if [ "${'$'}WDTT_ADMIN_SOCKET" = "не найден" ]; then
@@ -6628,16 +6946,16 @@ internal fun serverDiagnosticsScript(
       *) wdtt_diag_emit "INFO" "WDTT сервер" "${'$'}WDTT_SERVICE" "${'$'}WDTT_DETAILS" "Если установка ещё не выполнялась — это нормально." ;;
     esac
 
-    PORT_EXPECT_DETAILS="Активный профиль приложения ожидает DTLS UDP ${'$'}WDTT_EXPECTED_DTLS_PORT и серверный WireGuard UDP ${'$'}WDTT_EXPECTED_WG_PORT. Локальный порт Android-клиента ${'$'}WDTT_EXPECTED_CLIENT_PORT проверяется на телефоне, а не на VPS."
+    PORT_EXPECT_DETAILS="Активный профиль приложения ожидает DTLS UDP ${'$'}WDTT_EXPECTED_DTLS_PORT и серверный WireGuard UDP ${'$'}WDTT_EXPECTED_WG_PORT. Локальный порт Android-клиента ${'$'}WDTT_EXPECTED_CLIENT_PORT проверяется на телефоне, а не на VPS. Режим TCP/TLS на телефоне не отменяет UDP на сервере; доступность портов извне здесь не проверяется."
     PORT_EXPECT_SEVERITY="INFO"
     PORT_EXPECT_STATUS="проверено частично"
     if wdtt_diag_udp_listen_port "${'$'}WDTT_EXPECTED_DTLS_PORT"; then
       PORT_EXPECT_DETAILS="${'$'}PORT_EXPECT_DETAILS DTLS-порт слушается на сервере."
-      [ "${'$'}WDTT_SERVICE" = "active" ] && PORT_EXPECT_SEVERITY="OK" && PORT_EXPECT_STATUS="порты совпадают"
+      [ "${'$'}WDTT_SERVICE" = "active" ] && PORT_EXPECT_SEVERITY="OK" && PORT_EXPECT_STATUS="UDP-порты слушаются"
     else
       PORT_LISTEN_CODE="${'$'}?"
       if [ "${'$'}PORT_LISTEN_CODE" = "2" ]; then
-        PORT_EXPECT_DETAILS="${'$'}PORT_EXPECT_DETAILS Не удалось проверить UDP listening: ss отсутствует."
+        PORT_EXPECT_DETAILS="${'$'}PORT_EXPECT_DETAILS Не удалось проверить UDP listening: ss отсутствует или вернул ошибку."
       else
         PORT_EXPECT_DETAILS="${'$'}PORT_EXPECT_DETAILS DTLS-порт ${'$'}WDTT_EXPECTED_DTLS_PORT не найден среди UDP listening sockets."
         [ "${'$'}WDTT_SERVICE" = "active" ] && PORT_EXPECT_SEVERITY="WARNING" && PORT_EXPECT_STATUS="порт не слушается"
@@ -6648,13 +6966,13 @@ internal fun serverDiagnosticsScript(
     else
       WG_LISTEN_CODE="${'$'}?"
       if [ "${'$'}WG_LISTEN_CODE" = "2" ]; then
-        PORT_EXPECT_DETAILS="${'$'}PORT_EXPECT_DETAILS Не удалось проверить WireGuard UDP listening: ss отсутствует."
+        PORT_EXPECT_DETAILS="${'$'}PORT_EXPECT_DETAILS Не удалось проверить WireGuard UDP listening: ss отсутствует или вернул ошибку."
       else
         PORT_EXPECT_DETAILS="${'$'}PORT_EXPECT_DETAILS WireGuard-порт ${'$'}WDTT_EXPECTED_WG_PORT не найден среди UDP listening sockets."
         [ "${'$'}WDTT_SERVICE" = "active" ] && PORT_EXPECT_SEVERITY="WARNING" && PORT_EXPECT_STATUS="часть портов не слушается"
       fi
     fi
-    wdtt_diag_emit "${'$'}PORT_EXPECT_SEVERITY" "Порты активного профиля" "${'$'}PORT_EXPECT_STATUS" "${'$'}PORT_EXPECT_DETAILS" "Если порты не совпадают, выполните установку/обновление с сохранением данных или проверьте ручные порты в «Секретах»."
+    wdtt_diag_emit "${'$'}PORT_EXPECT_SEVERITY" "Порты активного профиля" "${'$'}PORT_EXPECT_STATUS" "${'$'}PORT_EXPECT_DETAILS" "Если порты не совпадают, выполните установку/обновление с сохранением данных или проверьте ручные порты в параметрах сервера."
 
     LISTEN_INFO=""
     if wdtt_diag_cmd ss; then
@@ -6696,6 +7014,94 @@ internal fun serverDiagnosticsScript(
       VIRT_INFO="${'$'}(systemd-detect-virt 2>/dev/null || echo physical/unknown)"
     fi
     wdtt_diag_emit "INFO" "Виртуализация" "${'$'}{VIRT_INFO:-не определена}" "Некоторые VPS-провайдеры или регионы могут ограничивать WARP/UDP; этот пункт помогает сопоставлять отчёты." ""
+    PUBLIC_IP="${'$'}(wdtt_diag_public_ip)"
+    DEFAULT_ROUTE=""
+    if wdtt_diag_cmd ip; then
+      DEFAULT_ROUTE="${'$'}(ip -4 route show default 2>/dev/null | head -n 1)"
+    fi
+    NET_DETAILS="Публичный IPv4 самого сервера: ${'$'}{PUBLIC_IP:-не удалось определить}. Default route: ${'$'}{DEFAULT_ROUTE:-не определён}."
+    if [ -n "${'$'}PUBLIC_IP" ]; then
+      wdtt_diag_emit "OK" "Сеть сервера" "интернет доступен" "${'$'}NET_DETAILS" ""
+    else
+      wdtt_diag_emit "WARNING" "Сеть сервера" "публичный IPv4 не проверен" "${'$'}NET_DETAILS" "Проверьте исходящий HTTPS-доступ с сервера; он нужен для wgcf, WARP-проверок и обновлений."
+    fi
+
+    VK_DETAILS=""
+    for host in api.vk.me calls.okcdn.ru login.vk.ru api.vk.ru; do
+      resolved="${'$'}(wdtt_diag_resolve_host "${'$'}host")"
+      if [ -n "${'$'}resolved" ]; then
+        VK_DETAILS="${'$'}VK_DETAILS ${'$'}host DNS: ${'$'}resolved;"
+      else
+        VK_DETAILS="${'$'}VK_DETAILS ${'$'}host DNS: не разрешается;"
+      fi
+    done
+    VK_API_ME_HTTP="${'$'}(wdtt_diag_http_probe 'https://api.vk.me/method/users.get?v=5.276')"
+    VK_DETAILS="${'$'}VK_DETAILS основной api.vk.me HTTPS: ${'$'}VK_API_ME_HTTP;"
+    OK_HTTP="${'$'}(wdtt_diag_http_probe https://calls.okcdn.ru/fb.do)"
+    VK_DETAILS="${'$'}VK_DETAILS основной calls.okcdn.ru HTTPS: ${'$'}OK_HTTP;"
+    VK_LOGIN_HTTP="${'$'}(wdtt_diag_http_probe https://login.vk.ru/)"
+    VK_DETAILS="${'$'}VK_DETAILS legacy login.vk.ru HTTPS: ${'$'}VK_LOGIN_HTTP;"
+    VK_API_RU_HTTP="${'$'}(wdtt_diag_http_probe 'https://api.vk.ru/method/users.get?v=5.275')"
+    VK_DETAILS="${'$'}VK_DETAILS legacy api.vk.ru HTTPS: ${'$'}VK_API_RU_HTTP."
+    wdtt_diag_emit "INFO" "VK/OK с VPS (справочно)" "не влияет на основной VK-вход" "${'$'}VK_DETAILS Получение VK-токенов и решение капчи выполняются на телефоне, а не на VPS. Поэтому недоступность этих HTTPS-адресов именно с сервера не считается ошибкой туннеля; серверу важнее рабочая служба, UDP-порты, маршрутизация и выходной интернет." "Если туннель не стартует, запустите «Проверить устройство»: она проверяет api.vk.me, calls.okcdn.ru, DNS и резервную цепочку из реальной сети телефона."
+
+    TELEGRAM_CONFIGURED=0
+    if [ -r /etc/wdtt/passwords.json ] && grep -Eq '"bot_token"[[:space:]]*:[[:space:]]*"[^"]{10,}"' /etc/wdtt/passwords.json 2>/dev/null; then
+      TELEGRAM_CONFIGURED=1
+    fi
+    TG_HTTP="${'$'}(wdtt_diag_http_probe https://api.telegram.org/)"; TG_HTTP_CODE="${'$'}?"
+    if [ "${'$'}TG_HTTP_CODE" = "0" ]; then
+      wdtt_diag_emit "INFO" "Telegram API" "доступен" "api.telegram.org: ${'$'}TG_HTTP. Настроен ли бот на сервере: ${'$'}([ "${'$'}TELEGRAM_CONFIGURED" = "1" ] && echo да || echo нет)." ""
+    elif [ "${'$'}TELEGRAM_CONFIGURED" = "1" ]; then
+      wdtt_diag_emit "WARNING" "Telegram API" "недоступен" "На сервере найден признак настроенного Telegram-бота, но api.telegram.org не отвечает: ${'$'}TG_HTTP." "Если бот нужен, проверьте DNS/HTTPS-доступ к Telegram API с VPS или ограничения региона/провайдера."
+    else
+      wdtt_diag_emit "INFO" "Telegram API" "не проверен как обязательный" "api.telegram.org не отвечает: ${'$'}TG_HTTP. Бот на сервере не выглядит настроенным, поэтому это не мешает основному туннелю." ""
+    fi
+
+    WARP_WARN=0
+    WARP_DETAILS=""
+    WARP_API_HTTP="${'$'}(wdtt_diag_http_probe https://api.cloudflareclient.com/)"; WARP_API_HTTP_CODE="${'$'}?"
+    [ "${'$'}WARP_API_HTTP_CODE" = "0" ] || WARP_WARN=1
+    WARP_DETAILS="${'$'}WARP_DETAILS регистрация api.cloudflareclient.com: ${'$'}WARP_API_HTTP;"
+    CF_TRACE="${'$'}(curl -4fsS --connect-timeout 3 --max-time 6 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)"
+    if [ -n "${'$'}CF_TRACE" ]; then
+      CF_WARP="${'$'}(printf '%s\n' "${'$'}CF_TRACE" | sed -n 's/^warp=//p' | head -n 1)"
+      CF_COLO="${'$'}(printf '%s\n' "${'$'}CF_TRACE" | sed -n 's/^colo=//p' | head -n 1)"
+      WARP_DETAILS="${'$'}WARP_DETAILS Cloudflare trace доступен: warp=${'$'}{CF_WARP:-не указано}, colo=${'$'}{CF_COLO:-не указано};"
+    else
+      WARP_WARN=1
+      WARP_DETAILS="${'$'}WARP_DETAILS Cloudflare trace недоступен;"
+    fi
+    WGCF_HTTP="${'$'}(wdtt_diag_http_probe "${'$'}WDTT_WGCF_URL")"; WGCF_HTTP_CODE="${'$'}?"
+    [ "${'$'}WGCF_HTTP_CODE" = "0" ] || WARP_WARN=1
+    WARP_DETAILS="${'$'}WARP_DETAILS wgcf download: ${'$'}WGCF_HTTP;"
+    WGCF_API_HTTP="${'$'}(wdtt_diag_http_probe "${'$'}WDTT_WGCF_API")"; WGCF_API_HTTP_CODE="${'$'}?"
+    [ "${'$'}WGCF_API_HTTP_CODE" = "0" ] || WARP_WARN=1
+    WARP_DETAILS="${'$'}WARP_DETAILS GitHub API wgcf: ${'$'}WGCF_API_HTTP;"
+    ENGAGE_IP="${'$'}(wdtt_diag_resolve_host engage.cloudflareclient.com)"
+    if [ -n "${'$'}ENGAGE_IP" ]; then
+      WARP_DETAILS="${'$'}WARP_DETAILS engage.cloudflareclient.com DNS: ${'$'}ENGAGE_IP;"
+    else
+      WARP_WARN=1
+      WARP_DETAILS="${'$'}WARP_DETAILS engage.cloudflareclient.com DNS: не разрешается;"
+    fi
+    WARP_UDP_2408="${'$'}(wdtt_diag_udp_probe engage.cloudflareclient.com 2408)"; WARP_UDP_2408_CODE="${'$'}?"
+    [ "${'$'}WARP_UDP_2408_CODE" = "1" ] && WARP_WARN=1
+    WARP_DETAILS="${'$'}WARP_DETAILS UDP 2408: ${'$'}WARP_UDP_2408;"
+    WARP_UDP_500="${'$'}(wdtt_diag_udp_probe engage.cloudflareclient.com 500)"; WARP_UDP_500_CODE="${'$'}?"
+    [ "${'$'}WARP_UDP_500_CODE" = "1" ] && WARP_WARN=1
+    WARP_DETAILS="${'$'}WARP_DETAILS UDP 500: ${'$'}WARP_UDP_500;"
+    WARP_STACK="${'$'}(wdtt_diag_wireguard_kernel)"
+    WARP_STACK_CODE="${'$'}?"
+    [ "${'$'}WARP_STACK_CODE" = "0" ] || WARP_WARN=1
+    WARP_DETAILS="${'$'}WARP_DETAILS ${'$'}WARP_STACK; wg=${'$'}(wdtt_diag_cmd wg && echo есть || echo нет); wg-quick=${'$'}(wdtt_diag_cmd wg-quick && echo есть || echo нет)."
+    if [ "${'$'}WARP_WARN" = "0" ]; then
+      wdtt_diag_emit "OK" "Бесплатный WARP" "предпосылки выглядят рабочими" "${'$'}WARP_DETAILS" "Это не гарантирует регистрацию WARP: Cloudflare может временно ограничивать регион/VPS, но базовая сеть и инструменты выглядят пригодными."
+    else
+      wdtt_diag_emit "WARNING" "Бесплатный WARP" "есть риск, что не заработает" "${'$'}WARP_DETAILS" "Проверьте исходящий HTTPS к Cloudflare/GitHub, UDP к WARP endpoint, WireGuard-стек ядра и попробуйте другой MTU/endpoint или регион VPS."
+    fi
+
+    printf '%s\n' 'WDTT_SERVER_DIAG_COMPLETE=1'
     """.trimIndent()
 }
 
@@ -6721,6 +7127,61 @@ private fun parseServerDiagnosticsItems(output: String): List<DeviceCheckItem> =
             )
         }
         .toList()
+
+internal fun serverDiagnosticsOutputIssue(output: String): String? {
+    val lower = output.lowercase(Locale.ROOT)
+    return when {
+        "ssh channel closed before exit status" in lower ||
+            "ssh channel interrupted" in lower ||
+            "remote command exited with code -1" in lower ||
+            "session is down" in lower ->
+            "SSH-канал закрылся без подтверждения завершения команды. Ответ сервера может быть неполным."
+        "error: timeout" in lower ->
+            "Превышено время ожидания ответа VPS. Проверка остановлена; ответ может быть неполным."
+        Regex("(?m)^error: remote command exited with code [1-9]").containsMatchIn(lower) ->
+            "Команда проверки завершилась с ошибкой на VPS. Полученные пункты могут быть неполными."
+        output.lineSequence().any { it.trimStart().startsWith("error:", ignoreCase = true) } ->
+            "SSH-команда не завершилась. Ответ сервера может быть неполным."
+        else -> null
+    }
+}
+
+internal fun serverDiagnosticsSshInterrupted(output: String): Boolean {
+    val lower = output.lowercase(Locale.ROOT)
+    return "ssh channel closed before exit status" in lower ||
+        "ssh channel interrupted" in lower ||
+        "remote command exited with code -1" in lower ||
+        "session is down" in lower ||
+        "error: timeout" in lower
+}
+
+internal fun serverDiagnosticsCompletionItem(output: String, directInspection: Boolean): DeviceCheckItem? {
+    val issue = serverDiagnosticsOutputIssue(output)
+    return when {
+        issue != null -> DeviceCheckItem(
+            title = "Полнота диагностики",
+            status = "ответ прерван",
+            details = issue,
+            recommendation = "Повторите проверку при стабильном соединении. Полученные выше пункты сохраняются для анализа.",
+            severity = DeviceCheckSeverity.Warning,
+        )
+        markerValue(output, "WDTT_SERVER_DIAG_COMPLETE") == "1" -> null
+        !directInspection -> DeviceCheckItem(
+            title = "Объём диагностики",
+            status = "сокращённая проверка",
+            details = "Получены только доступные сведения сервера. Расширенные проверки ОС и сети не выполнялись.",
+            recommendation = "Для полной проверки откройте «Деплой» при доступном прямом SSH-подключении.",
+            severity = DeviceCheckSeverity.Info,
+        )
+        else -> DeviceCheckItem(
+            title = "Полнота диагностики",
+            status = "ответ не завершён",
+            details = "Полученные пункты сохранены, но сервер не подтвердил завершение полной проверки.",
+            recommendation = "Повторите проверку при стабильном SSH-соединении.",
+            severity = DeviceCheckSeverity.Warning,
+        )
+    }
+}
 
 private fun serverDiagnosticsErrorReport(
     title: String,
@@ -6784,9 +7245,9 @@ private suspend fun collectServerDiagnostics(
     profileIndex: Int,
     expectedDtlsPort: Int,
     expectedWgPort: Int,
-    expectedClientPort: Int
+    expectedClientPort: Int,
+    connectionProfile: com.wdtt.plus.TunnelProfileSnapshot?,
 ): DeviceCompatibilityReport = withContext(Dispatchers.IO) {
-    val checkedAt = System.currentTimeMillis()
     val authLabel = if (selectedAuthMode == "key") "SSH-ключ" else "логин/пароль"
     val localItems = mutableListOf(
         serverProfileDiagnosticItem(profileName, profileIndex),
@@ -6798,6 +7259,18 @@ private suspend fun collectServerDiagnostics(
             severity = DeviceCheckSeverity.Ok
         )
     )
+    connectionProfile?.let {
+        localItems += com.wdtt.plus.connectionModeDiagnostic(it.rtNetwork)
+    }
+    localItems += DeviceCheckItem(
+        title = "Границы проверки",
+        status = "проверяется сервер, а не сеть оператора",
+        details = "Режимы «UDP» и «TCP/TLS» относятся к внешнему пути телефона. Оба проверяют ответ сервера и восстанавливают потерянные каналы. На WDTT-сервере UDP-порты по-прежнему нужны. Прослушивание порта не доказывает его доступность извне или работу пути через TURN/MASQUE.",
+        recommendation = "Для проверки пути запустите подключение и откройте «Логи». «Проверить устройство» проверяет сеть телефона. Эта диагностика не определяет блокировку SIM.",
+        severity = DeviceCheckSeverity.Info,
+    )
+    var directInspection = false
+    val inspectionStartedAt = System.nanoTime()
     val output = runSafeInspection(
         target = target,
         relayOperation = listOf(
@@ -6806,8 +7279,9 @@ private suspend fun collectServerDiagnostics(
             expectedWgPort.toString(),
             expectedClientPort.toString(),
         ),
-        timeout = 150000L,
+        timeout = 80_000L,
     ) { ssh ->
+        directInspection = true
         ssh.exec(
             rootShCommand(
                 serverDiagnosticsScript(
@@ -6816,23 +7290,57 @@ private suspend fun collectServerDiagnostics(
                     expectedClientPort = expectedClientPort
                 )
             ),
-            timeout = 150000L
+            // Leave time to return the partial report before the outer deadline.
+            timeout = (85_000L - (System.nanoTime() - inspectionStartedAt) / 1_000_000L).coerceAtLeast(1_000L),
+            preservePartialOnFailure = true,
         )
     }.trim()
     val remoteItems = parseServerDiagnosticsItems(output)
+    val outputIssue = serverDiagnosticsOutputIssue(output)
+    if (!directInspection) {
+        localItems[1] = DeviceCheckItem(
+            title = "Доступ к серверу",
+            status = "через работающий WDTT",
+            details = "Прямое SSH-подключение не ответило. Сведения получены через безопасную проверку серверной части WDTT.",
+            recommendation = "Для расширенной диагностики нужен прямой SSH-доступ к выбранному VPS.",
+            severity = DeviceCheckSeverity.Info,
+        )
+    } else if (serverDiagnosticsSshInterrupted(output)) {
+        localItems[1] = localItems[1].copy(
+            status = "проверка прервана",
+            details = "SSH-подключение к ${target.host}:${target.port} было установлено. ${outputIssue.orEmpty()}",
+            recommendation = "Проверьте устойчивость сети телефона и повторите диагностику. Состояние VPS нельзя оценить по неполному ответу.",
+            severity = DeviceCheckSeverity.Warning,
+        )
+    }
     if (remoteItems.isNotEmpty()) {
-        DeviceCompatibilityReport(checkedAt = checkedAt, items = localItems + remoteItems)
+        val completionItem = serverDiagnosticsCompletionItem(output, directInspection)
+        DeviceCompatibilityReport(
+            checkedAt = System.currentTimeMillis(),
+            items = localItems + remoteItems + listOfNotNull(completionItem),
+        )
     } else {
+        val sudoFailure = friendlyAdminSudoError(output)
+        val commandTooLong = output.contains("Argument list too long", ignoreCase = true)
         localItems += DeviceCheckItem(
-            title = "Root/sudo диагностика",
+            title = if (sudoFailure != null) "Root/sudo диагностика" else "Серверная диагностика",
             status = "не выполнена",
-            details = compactRemoteTail(output).ifBlank {
-                "Сервер не вернул диагностические строки. Вероятно, не сработали root-права, sudo, bash или безопасный канал управления."
+            details = when {
+                sudoFailure != null -> sudoFailure
+                commandTooLong -> "Команда проверки превысила лимит аргументов оболочки сервера."
+                outputIssue != null -> outputIssue
+                else -> compactRemoteTail(output).ifBlank {
+                    "Сервер не вернул диагностические строки."
+                }
             },
-            recommendation = "Для полной диагностики и установки нужны root-права или рабочий sudo для выбранного SSH-пользователя. Серверы без bash/systemd могут потребовать ручной настройки.",
+            recommendation = when {
+                sudoFailure != null -> "Проверьте права выбранного SSH-пользователя и повторите проверку."
+                commandTooLong -> "Обновите приложение и запустите проверку снова."
+                else -> "Повторите проверку. Если ошибка сохраняется, проверьте SSH-соединение и откройте «Логи»."
+            },
             severity = DeviceCheckSeverity.Warning
         )
-        DeviceCompatibilityReport(checkedAt = checkedAt, items = localItems)
+        DeviceCompatibilityReport(checkedAt = System.currentTimeMillis(), items = localItems)
     }
 }
 
@@ -6900,7 +7408,7 @@ private suspend fun runSafeInspection(
         if (session != null) {
             // Команда выполняется только после успешного подключения. После её
             // отправки второй путь не запускается, чтобы ничего не дублировать.
-            return@withContext direct(SSHClient(session, target.pass)).trim()
+            return@withContext runInterruptible { direct(SSHClient(session, target.pass)).trim() }
         }
     } finally {
         runCatching { session?.disconnect() }
@@ -6909,7 +7417,7 @@ private suspend fun runSafeInspection(
     if (!relayReady) {
         throw IllegalStateException(
             relayAvailability?.unavailableMessage()
-                ?: "Откройте «Секреты» и укажите главный пароль администратора.",
+                ?: "Откройте параметры сервера и укажите главный пароль администратора.",
             directFailure,
         )
     }
@@ -6934,7 +7442,7 @@ private suspend fun runSafeInspection(
             var legacySession: Session? = null
             try {
                 legacySession = createSafeReadOnlySshSession(target)
-                return@withContext direct(SSHClient(legacySession, target.pass)).trim()
+                return@withContext runInterruptible { direct(SSHClient(legacySession, target.pass)).trim() }
             } finally {
                 runCatching { legacySession?.disconnect() }
             }
@@ -6963,23 +7471,44 @@ private fun createCriticalSshSession(
     routePolicy = SshRoutePolicy.SERVER_MUTATION_DIRECT_ONLY,
 )
 
+private fun recordRemoteCommandEvent(event: RemoteLogEvent) {
+    val safeMessage = remoteCommandOutputCapture.get()?.sanitize(event.message) ?: redactRemoteDiagnostics(event.message)
+    val userText = remoteEventUserText(event.copy(message = safeMessage))
+    when (event.category) {
+        RemoteLogCategory.Error -> {
+            DeployManager.writeError(userText)
+            TunnelManager.addDeployErrorLog(userText)
+        }
+        RemoteLogCategory.Warning -> TunnelManager.addDeployMessageLog(userText, warning = true)
+        RemoteLogCategory.Info -> if (event.message.startsWith("systemd:")) TunnelManager.addDeployMessageLog(userText)
+        RemoteLogCategory.Technical -> Unit // Preserved in command output for the caller.
+    }
+}
+
 private class SSHClient(private val session: Session, private val pass: String) {
 
-    fun exec(command: String, timeout: Long = CMD_TIMEOUT): String {
+    fun exec(
+        command: String,
+        timeout: Long = CMD_TIMEOUT,
+        preservePartialOnFailure: Boolean = false,
+    ): String {
         if (!session.isConnected) {
-            DeployManager.writeError("SSH exec: сессия разорвана перед командой: ${command.take(80)}")
+            DeployManager.writeError("SSH: соединение с сервером потеряно перед выполнением команды.")
             return "error: session is down"
         }
 
         var channel: ChannelExec? = null
         val result = StringBuilder()
+        val stderrLines = ArrayDeque<String>()
+        val startedAt = System.nanoTime()
 
         return try {
+            val plan = buildSshExecStdinPlan(command, pass)
             channel = session.openChannel("exec") as ChannelExec
             // Root-команды сами явно выбирают sudo -S. Нельзя переписывать
             // произвольный текст: строка `command -v sudo` — это проверка
             // наличия программы, а не её запуск.
-            val cmd = command
+            val cmd = plan?.command ?: command
 
             channel.setCommand(cmd)
             val outStream = channel.outputStream
@@ -6987,20 +7516,24 @@ private class SSHClient(private val session: Session, private val pass: String) 
             val err = channel.errStream
             channel.connect(15000)
 
-            if (cmd.contains("sudo -S")) {
-                outStream.write("$pass\n".toByteArray())
+            if (plan != null) {
+                outStream.write(plan.stdinPayload.toByteArray(Charsets.UTF_8))
                 outStream.flush()
+                outStream.close()
             }
 
             val reader = input.bufferedReader()
             val errReader = err.bufferedReader()
-            val startTime = System.currentTimeMillis()
             val progressRegex = Regex("^WDTT_PROGRESS\\|(\\d+\\.?\\d*)\\|(.+)$")
 
             while (!channel.isClosed || reader.ready() || errReader.ready()) {
-                if (System.currentTimeMillis() - startTime > timeout) {
-                    DeployManager.writeError("SSH timeout (${timeout/1000}s): ${command.take(80)}")
+                if ((System.nanoTime() - startedAt) / 1_000_000L > timeout) {
+                    DeployManager.writeError("SSH: сервер не завершил команду за ${timeout/1000} с.")
                     try { channel.disconnect() } catch (_: Exception) {}
+                    if (preservePartialOnFailure) {
+                        result.appendLine("error: timeout")
+                        return result.toString()
+                    }
                     return "error: timeout"
                 }
 
@@ -7014,9 +7547,9 @@ private class SSHClient(private val session: Session, private val pass: String) 
                         } else if (!line.contains("WDTT_PROGRESS")) {
                             val clean = line.replace(Regex("\u001B\\[[;\\d]*m"), "")
                             result.appendLine(clean)
-                            remoteErrorMessageForUserLog(clean)?.let { message ->
-                                DeployManager.writeError(message)
-                                TunnelManager.addDeployErrorLog(message)
+                            val event = classifyRemoteCommandLine(clean)
+                            if (event.category == RemoteLogCategory.Error || event.category == RemoteLogCategory.Warning) {
+                                recordRemoteCommandEvent(event)
                             }
                         }
                     }
@@ -7026,22 +7559,39 @@ private class SSHClient(private val session: Session, private val pass: String) 
                     if (line != null && !line.contains("password for")) {
                         val clean = line.replace(Regex("\u001B\\[[;\\d]*m"), "")
                         result.appendLine(clean)
-                        if (clean.isNotBlank() && !clean.startsWith("Warning:")) {
-                            val message = "Ошибка на сервере: $clean"
-                            DeployManager.writeError(message)
-                            TunnelManager.addDeployErrorLog(message)
-                        }
+                        // Defer unknown stderr severity until SSH reports the exit status.
+                        if (stderrLines.size == 200) stderrLines.removeFirst()
+                        stderrLines.addLast(clean)
                     }
                 }
                 if (!reader.ready() && !errReader.ready()) Thread.sleep(100)
             }
 
+            stderrLines.forEach { line ->
+                recordRemoteCommandEvent(classifyRemoteCommandLine(line, channel.exitStatus, stderr = true))
+            }
+            if (channel.exitStatus < 0) {
+                if (!preservePartialOnFailure) return "error: SSH channel closed before exit status"
+                result.appendLine("error: SSH channel closed before exit status")
+            } else if (channel.exitStatus != 0) {
+                result.appendLine("error: remote command exited with code ${channel.exitStatus}")
+            }
             result.toString()
+        } catch (e: InterruptedException) {
+            throw e
+        } catch (e: java.io.InterruptedIOException) {
+            throw e
         } catch (e: Exception) {
-            DeployManager.writeError("SSH exec error: ${e.message} | cmd: ${command.take(80)}")
-            TunnelManager.addDeployErrorLog("SSH exec error: ${e.message}")
+            remoteCommandOutputCapture.get()?.append("SSH: ${e.message}")
+            DeployManager.writeError("SSH: не удалось выполнить команду на сервере.")
+            TunnelManager.addDeployErrorLog("Не удалось выполнить команду по SSH. Подробности — в результате действия.")
+            if (preservePartialOnFailure && result.isNotEmpty()) {
+                result.appendLine("error: SSH channel interrupted")
+                return result.toString()
+            }
             "error: ${e.message}"
         } finally {
+            remoteCommandOutputCapture.get()?.append(result.toString())
             try { channel?.disconnect() } catch (_: Exception) {}
         }
     }
@@ -7123,7 +7673,8 @@ private suspend fun runRootScript(
                 directFile.delete()
             }
         }.also { output ->
-            markerValue(output, "WDTT_ERROR")?.let { throw IllegalStateException(output.take(1200)) }
+            remoteCommandOutputCapture.get()?.append(output)
+            markerValue(output, "WDTT_ERROR")?.let { throw IllegalStateException(rootScriptErrorExcerpt(output)) }
             if (output.startsWith("error:", true) || output.contains("\nerror:", true)) {
                 throw IllegalStateException(output.take(500))
             }
@@ -7145,7 +7696,7 @@ private suspend fun runRootScript(
             rootCommand("chmod 700 $remotePath; bash $remotePath; code=\$?; rm -f $remotePath; exit \$code"),
             timeout = timeout
         )
-        markerValue(output, "WDTT_ERROR")?.let { throw IllegalStateException(output.trim().take(1200)) }
+        markerValue(output, "WDTT_ERROR")?.let { throw IllegalStateException(rootScriptErrorExcerpt(output)) }
         if (output.startsWith("error:", ignoreCase = true) || output.contains("\nerror:", ignoreCase = true)) {
             throw IllegalStateException(output.trim().take(500))
         }
@@ -7167,9 +7718,9 @@ private suspend fun runCheckedRootScript(
         val output = runSafeInspection(target, relayOperation, timeout) { ssh ->
             ssh.exec(rootCommand(script), timeout = timeout)
         }.trim()
-        markerValue(output, "WDTT_ERROR")?.let { throw IllegalStateException(output.take(1200)) }
+        markerValue(output, "WDTT_ERROR")?.let { throw IllegalStateException(rootScriptErrorExcerpt(output)) }
         if (output.startsWith("error:", true) || output.contains("\nerror:", true)) {
-            throw IllegalStateException(output.take(1200))
+            throw IllegalStateException(rootScriptErrorExcerpt(output))
         }
         return@withContext output
     }
@@ -7184,12 +7735,12 @@ private suspend fun runCheckedRootScript(
             .exec(rootCommand(script), timeout = timeout)
             .trim()
         markerValue(output, "WDTT_ERROR")?.let {
-            throw IllegalStateException(output.take(1200))
+            throw IllegalStateException(rootScriptErrorExcerpt(output))
         }
         if (output.startsWith("error:", ignoreCase = true) ||
             output.contains("\nerror:", ignoreCase = true)
         ) {
-            throw IllegalStateException(output.take(1200))
+            throw IllegalStateException(rootScriptErrorExcerpt(output))
         }
         output
     } finally {
@@ -7273,6 +7824,7 @@ internal fun outboundShellPrelude(): String = """
     wdtt_clear_proxy_out() {
       if command -v iptables >/dev/null 2>&1; then
         while iptables -t nat -D PREROUTING -i "${'$'}WDTT_IFACE" -p tcp -j WDTT_PROXY_OUT 2>/dev/null; do :; done
+        while iptables -D INPUT -i "${'$'}WDTT_IFACE" -s "${'$'}WDTT_SUBNET" -p tcp --dport 12345 -m comment --comment WDTT_PROXY_OUT -j ACCEPT 2>/dev/null; do :; done
         iptables -t nat -F WDTT_PROXY_OUT 2>/dev/null || true
         iptables -t nat -X WDTT_PROXY_OUT 2>/dev/null || true
       fi
@@ -7284,6 +7836,8 @@ internal fun outboundShellPrelude(): String = """
       systemctl disable --now wdtt-warp-watchdog.timer 2>/dev/null || true
       systemctl disable --now wdtt-wg-exit.service 2>/dev/null || true
       if command -v iptables >/dev/null 2>&1; then
+        while iptables -D FORWARD -i "${'$'}WDTT_IFACE" -o "${'$'}WDTT_WG_IFACE" -s "${'$'}WDTT_SUBNET" -m comment --comment WDTT_EXIT_FORWARD -j ACCEPT 2>/dev/null; do :; done
+        while iptables -D FORWARD -i "${'$'}WDTT_WG_IFACE" -o "${'$'}WDTT_IFACE" -d "${'$'}WDTT_SUBNET" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment WDTT_EXIT_FORWARD -j ACCEPT 2>/dev/null; do :; done
         while iptables -t nat -D POSTROUTING -s "${'$'}WDTT_SUBNET" -o "${'$'}WDTT_WG_IFACE" -m comment --comment WDTT_EXIT -j MASQUERADE 2>/dev/null; do :; done
       fi
       while ip rule del from "${'$'}WDTT_SUBNET" table "${'$'}WDTT_TABLE" priority 100 2>/dev/null; do :; done
@@ -7365,9 +7919,11 @@ internal fun outboundShellPrelude(): String = """
       chain="${'$'}1"
       proxy_ip="${'$'}2"
       for net in 0.0.0.0/8 10.0.0.0/8 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4; do
-        iptables -t nat -A "${'$'}chain" -d "${'$'}net" -j RETURN
+        iptables -t nat -A "${'$'}chain" -d "${'$'}net" -j RETURN || return 1
       done
-      [ -n "${'$'}proxy_ip" ] && iptables -t nat -A "${'$'}chain" -d "${'$'}proxy_ip" -j RETURN 2>/dev/null || true
+      if [ -n "${'$'}proxy_ip" ]; then
+        iptables -t nat -A "${'$'}chain" -d "${'$'}proxy_ip" -j RETURN || return 1
+      fi
     }
     wdtt_cleanup_proxy_test() {
       cleanup_test_source="${'$'}{WDTT_PROXY_TEST_SOURCE:-}"
@@ -7376,31 +7932,13 @@ internal fun outboundShellPrelude(): String = """
       iptables -t nat -D OUTPUT -p tcp -m owner --uid-owner 0 -j WDTT_PROXY_TEST 2>/dev/null || true
       iptables -t nat -F WDTT_PROXY_TEST 2>/dev/null || true
       iptables -t nat -X WDTT_PROXY_TEST 2>/dev/null || true
+      if [ -n "${'$'}cleanup_test_source" ]; then
+        iptables -D INPUT -i lo -s "${'$'}cleanup_test_source" -d 127.0.0.1 -p tcp --dport 12345 -m comment --comment WDTT_PROXY_TEST -j ACCEPT 2>/dev/null || true
+      fi
       WDTT_PROXY_TEST_SOURCE=""
     }
-    wdtt_test_redsocks_path() {
-      proxy_ip="${'$'}1"
-      systemctl is-active --quiet wdtt-redsocks || { echo WDTT_ERROR=external_proxy_service_inactive; return 1; }
-      command -v curl >/dev/null 2>&1 || { echo WDTT_ERROR=curl_not_installed; return 1; }
-      test_source="${'$'}(wdtt_test_source)"
-      [ -n "${'$'}test_source" ] || { echo WDTT_ERROR=wdtt_iface_not_found; return 1; }
-      wdtt_cleanup_proxy_test
-      WDTT_PROXY_TEST_SOURCE="${'$'}test_source"
-      iptables -t nat -N WDTT_PROXY_TEST 2>/dev/null || true
-      iptables -t nat -F WDTT_PROXY_TEST
-      wdtt_proxy_reserved_returns WDTT_PROXY_TEST "${'$'}proxy_ip"
-      iptables -t nat -A WDTT_PROXY_TEST -p tcp -j REDIRECT --to-ports 12345
-      if ! iptables -t nat -I OUTPUT -s "${'$'}test_source" -p tcp -j WDTT_PROXY_TEST 2>/dev/null; then
-        wdtt_cleanup_proxy_test
-        echo WDTT_ERROR=external_proxy_test_rule_failed
-        return 1
-      fi
-      test_ip="${'$'}(curl --interface "${'$'}test_source" -4fsS --connect-timeout 5 --max-time 18 https://api.ipify.org 2>/tmp/wdtt-redsocks-test.err || true)"
-      wdtt_cleanup_proxy_test
-      [ -n "${'$'}test_ip" ] || { echo WDTT_ERROR=external_proxy_apply_failed; tail -n 20 /var/log/wdtt-redsocks.log 2>/dev/null || true; cat /tmp/wdtt-redsocks-test.err 2>/dev/null || true; return 1; }
-      echo "Проверка пути через внешний TCP-прокси успешна. IP через прокси: ${'$'}test_ip"
-      return 0
-    }
+    ${outboundProbeFunctions().replace("\n", "\n    ")}
+    ${externalProxyProbeFunctions().replace("\n", "\n    ")}
     wdtt_write_mode() {
       mode="${'$'}1"
       detail="${'$'}2"
@@ -7459,8 +7997,10 @@ internal fun outboundStatusScript(): String = shellScript(
         ;;
       warp_free|imported_wg|wireguard_vps|tun_interface)
         TEST_SOURCE="${'$'}(wdtt_test_source)"
+        STATUS_EXIT_IFACE=wg-wdtt-exit
+        [ "${'$'}MODE" != tun_interface ] || STATUS_EXIT_IFACE="${'$'}(cat "${'$'}WDTT_TUN_CONFIG_FILE" 2>/dev/null | head -n 1)"
         WDTT_EXIT_IP=""
-        [ -n "${'$'}TEST_SOURCE" ] && WDTT_EXIT_IP="${'$'}(curl -4fsS --interface "${'$'}TEST_SOURCE" --max-time 12 https://api.ipify.org 2>/dev/null || true)"
+        [ -n "${'$'}TEST_SOURCE" ] && WDTT_EXIT_IP="${'$'}(wdtt_routed_public_ip "${'$'}TEST_SOURCE" "${'$'}STATUS_EXIT_IFACE" || true)"
         if [ -n "${'$'}WDTT_EXIT_IP" ]; then
           echo "Проверочный выход WDTT: ${'$'}WDTT_EXIT_IP"
         else
@@ -7473,7 +8013,7 @@ internal fun outboundStatusScript(): String = shellScript(
         fi
         if [ "${'$'}MODE" = "warp_free" ]; then
           WARP_TRACE=""
-          [ -n "${'$'}TEST_SOURCE" ] && WARP_TRACE="${'$'}(curl -4fsS --interface "${'$'}TEST_SOURCE" --max-time 15 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
+          [ -n "${'$'}TEST_SOURCE" ] && WARP_TRACE="${'$'}(wdtt_routed_https "${'$'}TEST_SOURCE" "wg-wdtt-exit" https://www.cloudflare.com/cdn-cgi/trace || true)"
           WARP_STATE="${'$'}(printf '%s\n' "${'$'}WARP_TRACE" | sed -n 's/^warp=//p' | head -n 1)"
           echo "Cloudflare WARP: ${'$'}{WARP_STATE:-проверка не пройдена}"
           echo "Автопроверка WARP: ${'$'}(systemctl is-active wdtt-warp-watchdog.timer 2>/dev/null || echo не запущена)"
@@ -8249,9 +8789,9 @@ private suspend fun checkWireGuardExit(
             echo "WireGuard ${'$'}WDTT_WG_IFACE запущен."
             TEST_SOURCE="${'$'}(wdtt_test_source)"
             [ -n "${'$'}TEST_SOURCE" ] || { echo WDTT_ERROR=wdtt_test_source_missing; exit 3; }
-            EXIT_IP="${'$'}(curl -4fsS --interface "${'$'}TEST_SOURCE" --max-time 12 https://api.ipify.org 2>/dev/null || true)"
+            EXIT_IP="${'$'}(wdtt_routed_public_ip "${'$'}TEST_SOURCE" "wg-wdtt-exit" || true)"
             if [ -n "${'$'}EXIT_IP" ]; then
-              echo "Проверка успешна: WDTT-пользователи выходят через WireGuard. Проверочный IP: ${'$'}EXIT_IP"
+              echo "Проверка маршрута сервера через WireGuard успешна. Проверочный IP: ${'$'}EXIT_IP"
             else
               echo WDTT_ERROR=wireguard_exit_check_failed
               exit 3
@@ -8483,9 +9023,9 @@ internal fun buildTunInterfaceExitScript(interfaceName: String): String {
         }
         block() {
           blocked_status && return 0
-          ip route replace unreachable default table "${'$'}WDTT_TUN_TABLE"
+          ip route replace unreachable default table "${'$'}WDTT_TUN_TABLE" || exit 1
           policy_rule_present ||
-            ip rule add from "${'$'}WDTT_SUBNET" table "${'$'}WDTT_TUN_TABLE" priority "${'$'}WDTT_TUN_PRIORITY"
+            ip rule add from "${'$'}WDTT_SUBNET" table "${'$'}WDTT_TUN_TABLE" priority "${'$'}WDTT_TUN_PRIORITY" || exit 1
           blocked_status
         }
         case "${'$'}{1:-}" in
@@ -8496,7 +9036,7 @@ internal fun buildTunInterfaceExitScript(interfaceName: String): String {
             cleanup
             ;;
           status)
-            status
+            status || exit 1
             ;;
           up)
             if [ "${'$'}(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" != "1" ]; then
@@ -8510,15 +9050,15 @@ internal fun buildTunInterfaceExitScript(interfaceName: String): String {
             [ -n "${'$'}EXT_IFACE" ] && [ "${'$'}TUN_IFACE" != "${'$'}EXT_IFACE" ] || exit 1
             # Сначала удерживаем подсеть на unreachable-маршруте. Рабочий
             # default через TUN ставим только после полной подготовки правил.
-            ip route replace unreachable default table "${'$'}WDTT_TUN_TABLE"
+            ip route replace unreachable default table "${'$'}WDTT_TUN_TABLE" || exit 1
             policy_rule_present ||
-              ip rule add from "${'$'}WDTT_SUBNET" table "${'$'}WDTT_TUN_TABLE" priority "${'$'}WDTT_TUN_PRIORITY"
+              ip rule add from "${'$'}WDTT_SUBNET" table "${'$'}WDTT_TUN_TABLE" priority "${'$'}WDTT_TUN_PRIORITY" || exit 1
             trap 'code=${'$'}?; trap - 0; [ "${'$'}code" -eq 0 ] || block; exit "${'$'}code"' 0
             clear_forward_rules
-            iptables -A FORWARD -i "${'$'}WDTT_IFACE" -o "${'$'}TUN_IFACE" -m comment --comment WDTT_TUN_EXIT -j ACCEPT
-            iptables -A FORWARD -i "${'$'}TUN_IFACE" -o "${'$'}WDTT_IFACE" -m comment --comment WDTT_TUN_EXIT -j ACCEPT
-            ip route replace default dev "${'$'}TUN_IFACE" table "${'$'}WDTT_TUN_TABLE"
-            status
+            iptables -I FORWARD -i "${'$'}WDTT_IFACE" -o "${'$'}TUN_IFACE" -m comment --comment WDTT_TUN_EXIT -j ACCEPT || exit 1
+            iptables -I FORWARD -i "${'$'}TUN_IFACE" -o "${'$'}WDTT_IFACE" -m comment --comment WDTT_TUN_EXIT -j ACCEPT || exit 1
+            ip route replace default dev "${'$'}TUN_IFACE" table "${'$'}WDTT_TUN_TABLE" || exit 1
+            status || exit 1
             trap - 0
             ;;
           *) exit 2;;
@@ -8617,16 +9157,13 @@ internal fun buildTunInterfaceExitScript(interfaceName: String): String {
           echo WDTT_ERROR=wdtt_test_source_missing
           exit 3
         }
-        EXIT_IP="${'$'}(curl -4fsS --interface "${'$'}TEST_SOURCE" --connect-timeout 5 --max-time 18 https://api.ipify.org 2>/tmp/wdtt-tun-exit-test.err || true)"
+        EXIT_IP="${'$'}(wdtt_routed_public_ip "${'$'}TEST_SOURCE" "${'$'}TUN_IFACE" || true)"
         if [ -z "${'$'}EXIT_IP" ]; then
-          tail -n 10 /tmp/wdtt-tun-exit-test.err 2>/dev/null || true
-          rm -f /tmp/wdtt-tun-exit-test.err
           wdtt_clear_tun_out
           wdtt_write_mode "direct" "rollback after TUN traffic test error"
           echo WDTT_ERROR=tun_exit_check_failed
           exit 3
         fi
-        rm -f /tmp/wdtt-tun-exit-test.err
         echo "WDTT_PROGRESS|0.94|Сохраняю режим выхода через TUN-интерфейс..."
         wdtt_write_mode "tun_interface" "${'$'}TUN_IFACE"
         TUN_COMMITTED=1
@@ -8660,9 +9197,9 @@ internal fun checkTunInterfaceExitScript(interfaceName: String): String {
         /usr/local/lib/wdtt/tun-exit-route status >/dev/null 2>&1 || { echo WDTT_ERROR=tun_exit_route_inactive; exit 3; }
         TEST_SOURCE="${'$'}(wdtt_test_source)"
         [ -n "${'$'}TEST_SOURCE" ] || { echo WDTT_ERROR=wdtt_test_source_missing; exit 3; }
-        EXIT_IP="${'$'}(curl -4fsS --interface "${'$'}TEST_SOURCE" --connect-timeout 5 --max-time 18 https://api.ipify.org 2>/dev/null || true)"
+        EXIT_IP="${'$'}(wdtt_routed_public_ip "${'$'}TEST_SOURCE" "${'$'}TUN_IFACE" || true)"
         [ -n "${'$'}EXIT_IP" ] || { echo WDTT_ERROR=tun_exit_check_failed; exit 3; }
-        echo "Проверка успешна: WDTT-пользователи выходят через TUN-интерфейс ${'$'}TUN_IFACE. Проверочный IP: ${'$'}EXIT_IP"
+        echo "Проверка маршрута сервера через TUN-интерфейс ${'$'}TUN_IFACE. Проверочный IP: ${'$'}EXIT_IP"
         """
     )
 }
@@ -8921,8 +9458,9 @@ internal fun buildLocalProxyInstallScript(
         /usr/local/lib/wdtt/local-proxy-firewall up ||
           { echo WDTT_ERROR=local_proxy_firewall_failed; systemctl disable --now wdtt-3proxy 2>/dev/null || true; exit 3; }
         wdtt_progress 0.96 "Проверяю подключение через установленный SOCKS5..."
-        TEST_IP="${'$'}(curl --proxy-user "${'$'}PROXY_LOGIN:${'$'}PROXY_PASSWORD" --socks5-hostname "127.0.0.1:${'$'}PROXY_PORT" -4fsS --max-time 12 https://api.ipify.org 2>/dev/null || true)"
-        [ -n "${'$'}TEST_IP" ] ||
+        ${outboundProbeFunctions().replace("\n", "\n        ")}
+        TEST_IP="${'$'}(curl -q --noproxy '' --proxy-user "${'$'}PROXY_LOGIN:${'$'}PROXY_PASSWORD" --socks5-hostname "127.0.0.1:${'$'}PROXY_PORT" -4fsS --max-time 12 https://api.ipify.org 2>/dev/null)" || TEST_IP=""
+        wdtt_probe_ipv4 "${'$'}TEST_IP" ||
           { systemctl disable --now wdtt-3proxy 2>/dev/null || true; echo WDTT_ERROR=local_proxy_check_failed; exit 3; }
         SERVER_IP="${'$'}(curl -4fsS --max-time 8 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print ${'$'}1}')"
         cat >/etc/wdtt/local-proxy.json <<EOF
@@ -8983,8 +9521,9 @@ private suspend fun checkLocalProxy(
         echo "WDTT_PROGRESS|0.45|Проверяю curl на сервере..."
         command -v curl >/dev/null 2>&1 || { echo WDTT_ERROR=curl_not_installed; exit 2; }
         echo "WDTT_PROGRESS|0.70|Подключаюсь через SOCKS5 127.0.0.1:${'$'}PROXY_PORT..."
-        IP="${'$'}(curl --proxy-user "${'$'}PROXY_LOGIN:${'$'}PROXY_PASSWORD" --socks5-hostname "127.0.0.1:${'$'}PROXY_PORT" -4fsS --max-time 12 https://api.ipify.org 2>/dev/null || true)"
-        [ -n "${'$'}IP" ] || { echo WDTT_ERROR=local_proxy_check_failed; exit 3; }
+        ${outboundProbeFunctions().replace("\n", "\n        ")}
+        IP="${'$'}(curl -q --noproxy '' --proxy-user "${'$'}PROXY_LOGIN:${'$'}PROXY_PASSWORD" --socks5-hostname "127.0.0.1:${'$'}PROXY_PORT" -4fsS --max-time 12 https://api.ipify.org 2>/dev/null)" || IP=""
+        wdtt_probe_ipv4 "${'$'}IP" || { echo WDTT_ERROR=local_proxy_check_failed; exit 3; }
         echo "WDTT_PROGRESS|1.0|Прокси отвечает."
         echo "Проверка успешна: SOCKS5 на 127.0.0.1:${'$'}PROXY_PORT отвечает с указанными логином и паролем. Выходной IP: ${'$'}IP"
     """.trimIndent()
@@ -9074,22 +9613,25 @@ private suspend fun checkExternalProxy(
     }
     val scheme = if (kind == ProxyKind.Socks5) "socks5h" else "http"
     val proxyUri = "$scheme://$host:$port"
-    val script = """
+    val script = shellScript(externalProxyProbeFunctions(), """
         echo "WDTT_PROGRESS|0.25|Проверяю curl на сервере..."
         command -v curl >/dev/null 2>&1 || { echo WDTT_ERROR=curl_not_installed; exit 2; }
         echo "WDTT_PROGRESS|0.55|Пробую выйти в интернет через указанный ${kind.label}..."
         PROXY_URI=${shellQuote(proxyUri)}
         PROXY_LOGIN=${shellQuote(login)}
         PROXY_PASSWORD=${shellQuote(proxyPassword)}
+        CHECK_EXIT=0
         if [ -n "${'$'}PROXY_LOGIN" ]; then
-          IP="${'$'}(curl --proxy "${'$'}PROXY_URI" --proxy-user "${'$'}PROXY_LOGIN:${'$'}PROXY_PASSWORD" -4fsS --max-time 15 https://api.ipify.org 2>/dev/null || true)"
+          ${outboundProbeFunctions().replace("\n", "\n        ")}
+        IP="${'$'}(curl -q --noproxy '' --proxy "${'$'}PROXY_URI" --proxy-user "${'$'}PROXY_LOGIN:${'$'}PROXY_PASSWORD" -4fsS --max-time 15 https://api.ipify.org 2>/dev/null)" || CHECK_EXIT=${'$'}?
         else
-          IP="${'$'}(curl --proxy "${'$'}PROXY_URI" -4fsS --max-time 15 https://api.ipify.org 2>/dev/null || true)"
+          ${outboundProbeFunctions().replace("\n", "\n        ")}
+        IP="${'$'}(curl -q --noproxy '' --proxy "${'$'}PROXY_URI" -4fsS --max-time 15 https://api.ipify.org 2>/dev/null)" || CHECK_EXIT=${'$'}?
         fi
-        [ -n "${'$'}IP" ] || { echo WDTT_ERROR=external_proxy_check_failed; exit 3; }
+        [ "${'$'}CHECK_EXIT" = 0 ] && wdtt_valid_proxy_test_ip "${'$'}IP" || { echo WDTT_ERROR=external_proxy_check_failed; exit 3; }
         echo "WDTT_PROGRESS|1.0|Внешний TCP-прокси отвечает."
         echo "Проверка успешна: ${kind.label} отвечает, сервер смог открыть проверочный сайт через него. IP через прокси: ${'$'}IP"
-    """.trimIndent()
+    """.trimIndent())
     return runRootScript(
         context,
         target,
@@ -9113,7 +9655,10 @@ internal fun externalProxyRoutesScript(): String = """
     action="${'$'}{1:-}"
     PROXY_IP="${'$'}{2:-}"
     WDTT_IFACE=wdtt0
+    WDTT_SUBNET="${'$'}(ip -4 route show dev "${'$'}WDTT_IFACE" scope link | awk '{print ${'$'}1; exit}')"
+    [ -n "${'$'}WDTT_SUBNET" ] || WDTT_SUBNET=10.66.66.0/24
     cleanup() {
+      while iptables -D INPUT -i "${'$'}WDTT_IFACE" -s "${'$'}WDTT_SUBNET" -p tcp --dport 12345 -m comment --comment WDTT_PROXY_OUT -j ACCEPT 2>/dev/null; do :; done
       while iptables -t nat -D PREROUTING -i "${'$'}WDTT_IFACE" -p tcp -j WDTT_PROXY_OUT 2>/dev/null; do :; done
       iptables -t nat -F WDTT_PROXY_OUT 2>/dev/null || true
       iptables -t nat -X WDTT_PROXY_OUT 2>/dev/null || true
@@ -9131,6 +9676,7 @@ internal fun externalProxyRoutesScript(): String = """
     done
     iptables -t nat -A WDTT_PROXY_OUT -d "${'$'}PROXY_IP" -j RETURN
     iptables -t nat -A WDTT_PROXY_OUT -p tcp -j REDIRECT --to-ports 12345
+    iptables -I INPUT -i "${'$'}WDTT_IFACE" -s "${'$'}WDTT_SUBNET" -p tcp --dport 12345 -m comment --comment WDTT_PROXY_OUT -j ACCEPT
     iptables -t nat -A PREROUTING -i "${'$'}WDTT_IFACE" -p tcp -j WDTT_PROXY_OUT
 """.trimIndent() + "\n"
 
@@ -9393,7 +9939,7 @@ internal fun sanitizeWireGuardConfigForWdttExit(config: String): String {
     return out.joinToString("\n").trim() + "\n"
 }
 
-private fun wireGuardPolicyScript(mode: String, detail: String): String = shellScript(
+internal fun wireGuardPolicyScript(mode: String, detail: String): String = shellScript(
     outboundShellPrelude(),
     """
     [ -d /sys/class/net/"${'$'}WDTT_IFACE" ] || { echo WDTT_ERROR=wdtt_iface_not_found; exit 2; }
@@ -9421,6 +9967,8 @@ private fun wireGuardPolicyScript(mode: String, detail: String): String = shellS
       trap - 0
       if [ "${'$'}status" -ne 0 ]; then
         set +e
+        while iptables -D FORWARD -i "${'$'}WDTT_IFACE" -o "${'$'}WDTT_WG_IFACE" -s "${'$'}WDTT_SUBNET" -m comment --comment WDTT_EXIT_FORWARD -j ACCEPT 2>/dev/null; do :; done
+        while iptables -D FORWARD -i "${'$'}WDTT_WG_IFACE" -o "${'$'}WDTT_IFACE" -d "${'$'}WDTT_SUBNET" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment WDTT_EXIT_FORWARD -j ACCEPT 2>/dev/null; do :; done
         iptables -t nat -D POSTROUTING -s "${'$'}WDTT_SUBNET" -o "${'$'}WDTT_WG_IFACE" -m comment --comment WDTT_EXIT -j MASQUERADE 2>/dev/null
         while ip rule del from "${'$'}WDTT_SUBNET" table "${'$'}WDTT_TABLE" priority 100 2>/dev/null; do :; done
         ip route flush table "${'$'}WDTT_TABLE" 2>/dev/null
@@ -9436,6 +9984,10 @@ private fun wireGuardPolicyScript(mode: String, detail: String): String = shellS
     ip route replace default dev "${'$'}WDTT_WG_IFACE" table "${'$'}WDTT_TABLE"
     iptables -t nat -C POSTROUTING -s "${'$'}WDTT_SUBNET" -o "${'$'}WDTT_WG_IFACE" -m comment --comment WDTT_EXIT -j MASQUERADE 2>/dev/null || \
       iptables -t nat -A POSTROUTING -s "${'$'}WDTT_SUBNET" -o "${'$'}WDTT_WG_IFACE" -m comment --comment WDTT_EXIT -j MASQUERADE
+    while iptables -D FORWARD -i "${'$'}WDTT_IFACE" -o "${'$'}WDTT_WG_IFACE" -s "${'$'}WDTT_SUBNET" -m comment --comment WDTT_EXIT_FORWARD -j ACCEPT 2>/dev/null; do :; done
+    while iptables -D FORWARD -i "${'$'}WDTT_WG_IFACE" -o "${'$'}WDTT_IFACE" -d "${'$'}WDTT_SUBNET" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment WDTT_EXIT_FORWARD -j ACCEPT 2>/dev/null; do :; done
+    iptables -I FORWARD -i "${'$'}WDTT_IFACE" -o "${'$'}WDTT_WG_IFACE" -s "${'$'}WDTT_SUBNET" -m comment --comment WDTT_EXIT_FORWARD -j ACCEPT
+    iptables -I FORWARD -i "${'$'}WDTT_WG_IFACE" -o "${'$'}WDTT_IFACE" -d "${'$'}WDTT_SUBNET" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment WDTT_EXIT_FORWARD -j ACCEPT
     trap - 0
     WDTT_WG_UP
     cat >/usr/local/lib/wdtt/wg-exit-down <<'WDTT_WG_DOWN'
@@ -9445,6 +9997,8 @@ private fun wireGuardPolicyScript(mode: String, detail: String): String = shellS
     WDTT_TABLE=100
     WDTT_SUBNET="${'$'}(ip -4 route show dev "${'$'}WDTT_IFACE" scope link 2>/dev/null | awk '{print ${'$'}1; exit}')"
     [ -n "${'$'}WDTT_SUBNET" ] || WDTT_SUBNET=10.66.66.0/24
+    while iptables -D FORWARD -i "${'$'}WDTT_IFACE" -o "${'$'}WDTT_WG_IFACE" -s "${'$'}WDTT_SUBNET" -m comment --comment WDTT_EXIT_FORWARD -j ACCEPT 2>/dev/null; do :; done
+    while iptables -D FORWARD -i "${'$'}WDTT_WG_IFACE" -o "${'$'}WDTT_IFACE" -d "${'$'}WDTT_SUBNET" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment WDTT_EXIT_FORWARD -j ACCEPT 2>/dev/null; do :; done
     iptables -t nat -D POSTROUTING -s "${'$'}WDTT_SUBNET" -o "${'$'}WDTT_WG_IFACE" -m comment --comment WDTT_EXIT -j MASQUERADE 2>/dev/null || true
     ip rule del from "${'$'}WDTT_SUBNET" table "${'$'}WDTT_TABLE" priority 100 2>/dev/null || true
     ip route flush table "${'$'}WDTT_TABLE" 2>/dev/null || true
@@ -9483,6 +10037,15 @@ private fun wireGuardPolicyScript(mode: String, detail: String): String = shellS
       exit 3
     fi
     rm -f /tmp/wdtt-wg-exit-start.log
+    if [ ${shellQuote(mode)} != warp_free ]; then
+      TEST_SOURCE="${'$'}(wdtt_test_source)"
+      if ! wdtt_routed_public_ip "${'$'}TEST_SOURCE" "${'$'}WDTT_WG_IFACE" >/dev/null; then
+        wdtt_clear_wireguard_out
+        wdtt_write_mode direct "rollback after WireGuard route check error"
+        echo WDTT_ERROR=wireguard_exit_check_failed
+        exit 3
+      fi
+    fi
     echo "WDTT_PROGRESS|0.95|Сохраняю новый режим выхода WDTT..."
     wdtt_write_mode ${shellQuote(mode)} ${shellQuote(detail)}
     sleep 1
@@ -9623,6 +10186,7 @@ private fun freeWarpWatchdogInstallScript(): String = """
     cat >/usr/local/lib/wdtt/warp-watchdog <<'WDTT_WARP_WATCHDOG'
     #!/bin/sh
     set -u
+    ${outboundProbeFunctions().replace("\n", "\n    ")}
     MODE="${'$'}(sed -n 's/.*"outboundMode"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /etc/wdtt/outbound.json 2>/dev/null | head -n 1)"
     [ "${'$'}MODE" = warp_free ] || exit 0
     STATE_DIR=/etc/wdtt-plus/warp
@@ -9630,7 +10194,7 @@ private fun freeWarpWatchdogInstallScript(): String = """
     TEST_SOURCE="${'$'}(ip -4 -o addr show dev wdtt0 scope global 2>/dev/null | awk '{split(${'$'}4, value, "/"); print value[1]; exit}')"
     check_warp() {
       [ -n "${'$'}TEST_SOURCE" ] || return 1
-      trace="${'$'}(curl -4fsS --interface "${'$'}TEST_SOURCE" --connect-timeout 8 --max-time 20 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
+      trace="${'$'}(wdtt_routed_https "${'$'}TEST_SOURCE" "wg-wdtt-exit" https://www.cloudflare.com/cdn-cgi/trace || true)"
       printf '%s\n' "${'$'}trace" | grep -Eq '^warp=(on|plus)${'$'}'
     }
     write_state() {
@@ -9822,7 +10386,7 @@ private fun freeWarpAutoTuneScript(): String = """
       local source="${'$'}1"
       local trace
       [ -n "${'$'}source" ] || { WARP_LAST_REASON="wdtt_test_source_missing"; return 1; }
-      trace="${'$'}(curl -4fsS --interface "${'$'}source" --connect-timeout 6 --max-time 12 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
+      trace="${'$'}(wdtt_routed_https "${'$'}source" "wg-wdtt-exit" https://www.cloudflare.com/cdn-cgi/trace || true)"
       WARP_LAST_STATE="${'$'}(wdtt_warp_trace_state "${'$'}trace")"
       WARP_LAST_HANDSHAKE="${'$'}(wdtt_warp_latest_handshake || true)"
       case "${'$'}WARP_LAST_STATE" in
@@ -9867,7 +10431,7 @@ private fun freeWarpAutoTuneScript(): String = """
         if wdtt_warp_check_current "${'$'}source"; then
           WARP_SELECTED_MTU="${'$'}mtu"
           WARP_SELECTED_ENDPOINT="${'$'}endpoint"
-          WARP_LAST_EXIT_IP="${'$'}(curl -4fsS --interface "${'$'}source" --connect-timeout 6 --max-time 12 https://api.ipify.org 2>/dev/null || true)"
+          WARP_LAST_EXIT_IP="${'$'}(wdtt_routed_public_ip "${'$'}source" "wg-wdtt-exit" || true)"
           wdtt_warp_save_selected
           return 0
         fi
@@ -10081,7 +10645,7 @@ private suspend fun checkFreeWarp(
                 echo WDTT_ERROR=warp_trace_check_failed
                 exit 3
               fi
-              WARP_LAST_EXIT_IP="${'$'}(curl -4fsS --interface "${'$'}TEST_SOURCE" --connect-timeout 8 --max-time 20 https://api.ipify.org 2>/dev/null || true)"
+              WARP_LAST_EXIT_IP="${'$'}(wdtt_routed_public_ip "${'$'}TEST_SOURCE" "wg-wdtt-exit" || true)"
             fi
             WARP_KIND="${'$'}WARP_LAST_STATE"
             VERSION="${'$'}(cat "${'$'}WARP_DIR/wgcf-version" 2>/dev/null || echo неизвестна)"
@@ -10099,7 +10663,7 @@ private suspend fun checkFreeWarp(
             """
         )
         val output = ssh.exec(rootCommand(script), timeout = 45000L).trim()
-        markerValue(output, "WDTT_ERROR")?.let { throw IllegalStateException(output.take(1200)) }
+        markerValue(output, "WDTT_ERROR")?.let { throw IllegalStateException(rootScriptErrorExcerpt(output)) }
         output
     } finally {
         try { session?.disconnect() } catch (_: Exception) {}
@@ -10169,7 +10733,7 @@ private suspend fun resetFreeWarpRegistration(target: OutboundSshTarget): String
             """
         )
         val output = ssh.exec(rootCommand(script), timeout = 60000L).trim()
-        markerValue(output, "WDTT_ERROR")?.let { throw IllegalStateException(output.take(1200)) }
+        markerValue(output, "WDTT_ERROR")?.let { throw IllegalStateException(rootScriptErrorExcerpt(output)) }
         output
     } finally {
         try { session?.disconnect() } catch (_: Exception) {}
@@ -10245,7 +10809,7 @@ private suspend fun deleteFreeWarp(target: OutboundSshTarget): String = withCont
             """
         )
         val output = ssh.exec(rootCommand(script), timeout = 60000L).trim()
-        markerValue(output, "WDTT_ERROR")?.let { throw IllegalStateException(output.take(1200)) }
+        markerValue(output, "WDTT_ERROR")?.let { throw IllegalStateException(rootScriptErrorExcerpt(output)) }
         output
     } finally {
         try { session?.disconnect() } catch (_: Exception) {}
@@ -10437,6 +11001,7 @@ internal fun deleteWireGuardVpsForeignScript(): String = """
     fi
     if command -v iptables >/dev/null 2>&1 &&
        { iptables -S INPUT 2>/dev/null | grep -q WDTT_EXIT_FOREIGN ||
+         iptables -S FORWARD 2>/dev/null | grep -q WDTT_EXIT_FOREIGN ||
          iptables -t nat -S POSTROUTING 2>/dev/null | grep -q WDTT_EXIT_FOREIGN; }; then
       OWNED=1
     fi
@@ -10449,6 +11014,8 @@ internal fun deleteWireGuardVpsForeignScript(): String = """
     systemctl disable --now wg-quick@wg-wdtt-exit 2>/dev/null || true
     if command -v iptables >/dev/null 2>&1; then
       iptables -S INPUT 2>/dev/null | grep 'WDTT_EXIT_FOREIGN' | sed 's/^-A /iptables -D /' |
+        while read -r cmd; do ${'$'}cmd 2>/dev/null || true; done
+      iptables -S FORWARD 2>/dev/null | grep 'WDTT_EXIT_FOREIGN' | sed 's/^-A /iptables -D /' |
         while read -r cmd; do ${'$'}cmd 2>/dev/null || true; done
       iptables -t nat -S POSTROUTING 2>/dev/null | grep 'WDTT_EXIT_FOREIGN' | sed 's/^-A /iptables -t nat -D /' |
         while read -r cmd; do ${'$'}cmd 2>/dev/null || true; done
@@ -10470,6 +11037,7 @@ internal fun deleteWireGuardVpsForeignScript(): String = """
     [ -e /etc/wdtt-plus/wg-exit/public.key ] && FOREIGN_REMOVE_LEFT=1
     if command -v iptables >/dev/null 2>&1 &&
        { iptables -S INPUT 2>/dev/null | grep -q WDTT_EXIT_FOREIGN ||
+         iptables -S FORWARD 2>/dev/null | grep -q WDTT_EXIT_FOREIGN ||
          iptables -t nat -S POSTROUTING 2>/dev/null | grep -q WDTT_EXIT_FOREIGN; }; then
       FOREIGN_REMOVE_LEFT=1
     fi
@@ -10501,7 +11069,7 @@ private suspend fun deleteWireGuardExitVps(
         val currentOutput = SSHClient(currentSession, current.pass)
             .exec(rootCommand(deleteWireGuardVpsCurrentScript()), timeout = 30000L)
         markerValue(currentOutput, "WDTT_ERROR")?.let {
-            throw IllegalStateException(currentOutput.take(1200))
+            throw IllegalStateException(rootScriptErrorExcerpt(currentOutput))
         }
         require(markerValue(currentOutput, "WDTT_CURRENT_WG_REMOVED") == "1") {
             "текущий VPS не подтвердил удаление WireGuard-выхода"
@@ -10509,7 +11077,7 @@ private suspend fun deleteWireGuardExitVps(
         val foreignOutput = SSHClient(foreignSession, foreignCredentials.password)
             .exec(rootCommand(deleteWireGuardVpsForeignScript()), timeout = 30000L)
         markerValue(foreignOutput, "WDTT_ERROR")?.let {
-            throw IllegalStateException(foreignOutput.take(1200))
+            throw IllegalStateException(rootScriptErrorExcerpt(foreignOutput))
         }
         require(markerValue(foreignOutput, "WDTT_FOREIGN_WG_REMOVED") == "1") {
             "дополнительный VPS не подтвердил удаление WireGuard"
@@ -10576,7 +11144,7 @@ private suspend fun installWireGuardExitVps(
             throw IllegalStateException("WDTT_ERROR=wireguard_vps_previous_server_requires_removal")
         }
 
-        val prepareKeys = """
+        val prepareKeys = shellScript(outboundShellPrelude(), """
             echo "WDTT_PROGRESS|0.26|Готовлю WireGuard-инструменты и ключи..."
             wdtt_install_wireguard_tools || true
             command -v wg >/dev/null 2>&1 || { echo WDTT_ERROR=wireguard_tools_required; exit 2; }
@@ -10585,7 +11153,7 @@ private suspend fun installWireGuardExitVps(
             [ -f /etc/wdtt-plus/wg-exit/private.key ] || wg genkey >/etc/wdtt-plus/wg-exit/private.key
             wg pubkey </etc/wdtt-plus/wg-exit/private.key >/etc/wdtt-plus/wg-exit/public.key
             printf 'WDTT_WG_PUB='; cat /etc/wdtt-plus/wg-exit/public.key; printf '\n'
-        """.trimIndent()
+        """)
         DeployManager.updateProgress(0.28f, "Готовлю WireGuard-ключи на текущем сервере...")
         val currentPub = markerValue(currentSsh.exec(rootCommand(prepareKeys), timeout = CMD_TIMEOUT), "WDTT_WG_PUB")
             ?: throw IllegalStateException("текущий сервер не отдал публичный ключ WireGuard")
@@ -10618,10 +11186,13 @@ private suspend fun installWireGuardExitVps(
             systemctl is-active --quiet wg-quick@wg-wdtt-exit 2>/dev/null && touch "${'$'}BACKUP_DIR/was_active" || true
             systemctl is-enabled --quiet wg-quick@wg-wdtt-exit 2>/dev/null && touch "${'$'}BACKUP_DIR/was_enabled" || true
             iptables -S INPUT 2>/dev/null | grep 'WDTT_EXIT_FOREIGN' >"${'$'}BACKUP_DIR/input.rules" || true
+            iptables -S FORWARD 2>/dev/null | grep 'WDTT_EXIT_FOREIGN' >"${'$'}BACKUP_DIR/forward.rules" || true
             iptables -t nat -S POSTROUTING 2>/dev/null | grep 'WDTT_EXIT_FOREIGN' >"${'$'}BACKUP_DIR/nat.rules" || true
             chmod 600 "${'$'}BACKUP_DIR"/*
             systemctl stop wg-quick@wg-wdtt-exit 2>/dev/null || true
             iptables -S INPUT 2>/dev/null | grep 'WDTT_EXIT_FOREIGN' | sed 's/^-A /iptables -D /' |
+              while read -r cmd; do ${'$'}cmd 2>/dev/null || true; done
+            iptables -S FORWARD 2>/dev/null | grep 'WDTT_EXIT_FOREIGN' | sed 's/^-A /iptables -D /' |
               while read -r cmd; do ${'$'}cmd 2>/dev/null || true; done
             iptables -t nat -S POSTROUTING 2>/dev/null | grep 'WDTT_EXIT_FOREIGN' | sed 's/^-A /iptables -t nat -D /' |
               while read -r cmd; do ${'$'}cmd 2>/dev/null || true; done
@@ -10639,6 +11210,10 @@ private suspend fun installWireGuardExitVps(
             PrivateKey = ${'$'}PRIV
             PostUp = iptables -C INPUT -p udp --dport ${'$'}WG_PORT -m comment --comment WDTT_EXIT_FOREIGN -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport ${'$'}WG_PORT -m comment --comment WDTT_EXIT_FOREIGN -j ACCEPT
             PostUp = iptables -t nat -C POSTROUTING -s 10.77.77.0/30 -o ${'$'}EXT_IFACE -m comment --comment WDTT_EXIT_FOREIGN -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s 10.77.77.0/30 -o ${'$'}EXT_IFACE -m comment --comment WDTT_EXIT_FOREIGN -j MASQUERADE
+            PostUp = iptables -I FORWARD -i wg-wdtt-exit -o ${'$'}EXT_IFACE -s 10.77.77.0/30 -m comment --comment WDTT_EXIT_FOREIGN -j ACCEPT
+            PostDown = iptables -D FORWARD -i wg-wdtt-exit -o ${'$'}EXT_IFACE -s 10.77.77.0/30 -m comment --comment WDTT_EXIT_FOREIGN -j ACCEPT 2>/dev/null || true
+            PostUp = iptables -I FORWARD -i ${'$'}EXT_IFACE -o wg-wdtt-exit -d 10.77.77.0/30 -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment WDTT_EXIT_FOREIGN -j ACCEPT
+            PostDown = iptables -D FORWARD -i ${'$'}EXT_IFACE -o wg-wdtt-exit -d 10.77.77.0/30 -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment WDTT_EXIT_FOREIGN -j ACCEPT 2>/dev/null || true
             PostDown = iptables -D INPUT -p udp --dport ${'$'}WG_PORT -m comment --comment WDTT_EXIT_FOREIGN -j ACCEPT 2>/dev/null || true
             PostDown = iptables -t nat -D POSTROUTING -s 10.77.77.0/30 -o ${'$'}EXT_IFACE -m comment --comment WDTT_EXIT_FOREIGN -j MASQUERADE 2>/dev/null || true
 
@@ -10655,6 +11230,8 @@ private suspend fun installWireGuardExitVps(
             systemctl is-active --quiet wg-quick@wg-wdtt-exit ||
               { echo WDTT_ERROR=foreign_wireguard_start_failed; exit 3; }
             iptables -C INPUT -p udp --dport "${'$'}WG_PORT" -m comment --comment WDTT_EXIT_FOREIGN -j ACCEPT 2>/dev/null &&
+              iptables -C FORWARD -i wg-wdtt-exit -o ${'$'}EXT_IFACE -s 10.77.77.0/30 -m comment --comment WDTT_EXIT_FOREIGN -j ACCEPT 2>/dev/null &&
+              iptables -C FORWARD -i ${'$'}EXT_IFACE -o wg-wdtt-exit -d 10.77.77.0/30 -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment WDTT_EXIT_FOREIGN -j ACCEPT 2>/dev/null &&
               iptables -t nat -C POSTROUTING -s 10.77.77.0/30 -o "${'$'}EXT_IFACE" -m comment --comment WDTT_EXIT_FOREIGN -j MASQUERADE 2>/dev/null ||
               { echo WDTT_ERROR=foreign_firewall_failed; exit 3; }
             echo WDTT_FOREIGN_READY=1
@@ -10664,7 +11241,7 @@ private suspend fun installWireGuardExitVps(
         DeployManager.updateProgress(0.48f, "Настраиваю WireGuard на другом сервере...")
         foreignTouched = true
         val foreignOutput = foreignSsh.exec(rootCommand(foreignConfigScript), timeout = CMD_TIMEOUT)
-        markerValue(foreignOutput, "WDTT_ERROR")?.let { throw IllegalStateException(foreignOutput.trim().take(1200)) }
+        markerValue(foreignOutput, "WDTT_ERROR")?.let { throw IllegalStateException(rootScriptErrorExcerpt(foreignOutput)) }
         require(markerValue(foreignOutput, "WDTT_FOREIGN_READY") == "1") {
             "другой сервер не подтвердил запуск WireGuard"
         }
@@ -10725,7 +11302,7 @@ private suspend fun installWireGuardExitVps(
         DeployManager.updateProgress(0.72f, "Применяю WireGuard-выход на текущем сервере...")
         currentTouched = true
         val output = currentSsh.exec(rootCommand(currentConfigScript), timeout = CMD_TIMEOUT)
-        if (output.contains("WDTT_ERROR=")) throw IllegalStateException(output.trim().take(400))
+        if (output.contains("WDTT_ERROR=") || output.lineSequence().any { it.startsWith("error:") }) throw IllegalStateException(rootScriptErrorExcerpt(output))
         currentSsh.exec(rootCommand("rm -rf ${shellQuote("/etc/wdtt-plus/wg-exit/transactions/$transactionId")}"), timeout = 15000L)
         foreignSsh.exec(rootCommand("rm -rf ${shellQuote("/etc/wdtt-plus/wg-exit/transactions/$transactionId")}"), timeout = 15000L)
         currentTouched = false
@@ -10742,6 +11319,8 @@ private suspend fun installWireGuardExitVps(
                 systemctl disable --now wg-quick@wg-wdtt-exit 2>/dev/null || true
                 if command -v iptables >/dev/null 2>&1; then
                   iptables -S INPUT 2>/dev/null | grep 'WDTT_EXIT_FOREIGN' | sed 's/^-A /iptables -D /' |
+                    while read -r cmd; do ${'$'}cmd 2>/dev/null || true; done
+                  iptables -S FORWARD 2>/dev/null | grep 'WDTT_EXIT_FOREIGN' | sed 's/^-A /iptables -D /' |
                     while read -r cmd; do ${'$'}cmd 2>/dev/null || true; done
                   iptables -t nat -S POSTROUTING 2>/dev/null | grep 'WDTT_EXIT_FOREIGN' | sed 's/^-A /iptables -t nat -D /' |
                     while read -r cmd; do ${'$'}cmd 2>/dev/null || true; done
@@ -10771,9 +11350,17 @@ private suspend fun installWireGuardExitVps(
                 if command -v iptables >/dev/null 2>&1; then
                   iptables -S INPUT 2>/dev/null | grep 'WDTT_EXIT_FOREIGN' | sed 's/^-A /iptables -D /' |
                     while read -r cmd; do ${'$'}cmd 2>/dev/null || true; done
+                  iptables -S FORWARD 2>/dev/null | grep 'WDTT_EXIT_FOREIGN' | sed 's/^-A /iptables -D /' |
+                    while read -r cmd; do ${'$'}cmd 2>/dev/null || true; done
                   iptables -t nat -S POSTROUTING 2>/dev/null | grep 'WDTT_EXIT_FOREIGN' | sed 's/^-A /iptables -t nat -D /' |
                     while read -r cmd; do ${'$'}cmd 2>/dev/null || true; done
                   while IFS= read -r rule; do [ -z "${'$'}rule" ] || iptables ${'$'}rule 2>/dev/null || true; done <"${'$'}BACKUP_DIR/input.rules"
+                  while IFS= read -r rule; do
+                    [ -z "${'$'}rule" ] && continue
+                    # Owned ACCEPT rules must precede a pre-existing terminal DROP.
+                    rule="${'$'}(printf '%s\n' "${'$'}rule" | sed 's/^-A /-I /')"
+                    iptables ${'$'}rule 2>/dev/null || exit 3
+                  done <"${'$'}BACKUP_DIR/forward.rules"
                   while IFS= read -r rule; do [ -z "${'$'}rule" ] || iptables -t nat ${'$'}rule 2>/dev/null || true; done <"${'$'}BACKUP_DIR/nat.rules"
                 fi
                 if [ -f "${'$'}BACKUP_DIR/was_active" ] &&
@@ -10949,13 +11536,14 @@ private suspend fun checkExistingInstall(
 		verifyRootAccess(ssh)
 		ssh.exec(
 			rootCommand(
-				"printf 'SERVICE=%s\\n' \"$([ -f /etc/systemd/system/wdtt.service ] && echo 1 || echo 0)\"; " +
-					"printf 'BINARY=%s\\n' \"$([ -f /usr/local/bin/wdtt-server ] && echo 1 || echo 0)\"; " +
-					"printf 'CONFIG_DIR=%s\\n' \"$([ -d /etc/wdtt ] && echo 1 || echo 0)\"; " +
-					"printf 'ACCESS_DB=%s\\n' \"$([ -f /etc/wdtt/passwords.json ] && echo 1 || echo 0)\"; " +
-					"printf 'WG_KEYS=%s\\n' \"$([ -f /etc/wdtt/wg-keys.dat ] && echo 1 || echo 0)\"; " +
+				"printf 'SERVICE=%s\\n' \"$([ -e /etc/systemd/system/wdtt.service ] || [ -L /etc/systemd/system/wdtt.service ] || [ -e /lib/systemd/system/wdtt.service ] || [ -e /run/systemd/system/wdtt.service ] && echo 1 || echo 0)\"; " +
+					"printf 'BINARY=%s\\n' \"$([ -e /usr/local/bin/wdtt-server ] || [ -L /usr/local/bin/wdtt-server ] && echo 1 || echo 0)\"; " +
+					"printf 'CONFIG_DIR=%s\\n' \"$([ -e /etc/wdtt ] || [ -L /etc/wdtt ] || [ -e /var/lib/wdtt-server-installer ] || [ -L /var/lib/wdtt-server-installer ] || [ -e /sys/class/net/wdtt0 ] && echo 1 || echo 0)\"; " +
+					"printf 'ACCESS_DB=%s\\n' \"$([ -e /etc/wdtt/passwords.json ] || [ -L /etc/wdtt/passwords.json ] && echo 1 || echo 0)\"; " +
+					"printf 'WG_KEYS=%s\\n' \"$([ -e /etc/wdtt/wg-keys.dat ] || [ -L /etc/wdtt/wg-keys.dat ] && echo 1 || echo 0)\"; " +
 					"printf 'ACTIVE=%s\\n' \"$(systemctl is-active wdtt 2>/dev/null || true)\"; " +
-                    standaloneInstallerOwnershipProbeScript()
+                    standaloneInstallerOwnershipProbeScript() + "\n" +
+                    serverUpdateRollbackProbeScript()
 			),
 			timeout = 15000L
 		)
@@ -10963,6 +11551,7 @@ private suspend fun checkExistingInstall(
 	if (output.startsWith("error:", ignoreCase = true) || output.contains("\nerror:", ignoreCase = true)) {
 		throw IllegalStateException(output.trim().take(300))
 	}
+    validateExistingInstallProbe(output)
 		fun flag(name: String): Boolean = Regex("^$name=1$", RegexOption.MULTILINE).containsMatchIn(output)
 	ExistingInstallInfo(
 			serviceExists = flag("SERVICE"),
@@ -10978,8 +11567,21 @@ private suspend fun checkExistingInstall(
             incompleteAndroidDeployCandidate = markerValue(
                 output,
                 "WDTT_INCOMPLETE_ANDROID_DEPLOY_CANDIDATE"
-            ) == "1"
+            ) == "1",
+            updateRollbackState = parseServerUpdateRollbackState(output),
 	)
+}
+
+internal fun validateExistingInstallProbe(output: String) {
+    val flags = listOf("SERVICE", "BINARY", "CONFIG_DIR", "ACCESS_DB", "WG_KEYS",
+        "WDTT_STANDALONE_MANAGED", "WDTT_ANDROID_DEPLOY_MANAGED", "WDTT_LEGACY_ANDROID_DEPLOY_CANDIDATE",
+        "WDTT_ANDROID_DATA_PRESERVED", "WDTT_INCOMPLETE_ANDROID_DEPLOY_CANDIDATE")
+    require(flags.all { name ->
+        val matches = Regex("^$name=([01])$", RegexOption.MULTILINE).findAll(output).toList()
+        matches.size == 1
+    } && markerValue(output, "ACTIVE") != null && markerValue(output, "WDTT_UPDATE_BACKUP_STATUS") != null) {
+        "Проверка VPS вернула неполные сведения. Установка не запущена; повторите проверку."
+    }
 }
 
 private fun markerValue(output: String, name: String): String? =
@@ -11128,8 +11730,20 @@ private fun deploymentOwnership(ssh: SSHClient): DeploymentOwnership {
 
 private fun verifyRootAccess(ssh: SSHClient) {
     val output = ssh.exec(rootCommand("printf 'WDTT_ROOT_ACCESS=ok\\n'"), timeout = 20_000L)
-    require(markerValue(output, "WDTT_ROOT_ACCESS") == "ok") {
-        "SSH-подключение установлено, но root-права не получены. Проверьте пароль sudo и права выбранного пользователя."
+    validateRootAccessOutput(output)
+}
+
+internal fun validateRootAccessOutput(output: String) {
+    // A missing marker does not prove a permission denial: the SSH command may
+    // have timed out or lost its channel before returning a complete answer.
+    friendlyAdminSudoError(output)?.let { throw IllegalStateException(it) }
+    val commandErrors = output.lineSequence()
+        .map(String::trim)
+        .filter { it.startsWith("error:", ignoreCase = true) }
+        .joinToString("\n")
+    check(commandErrors.isBlank()) { commandErrors.take(2000) }
+    check(markerValue(output, "WDTT_ROOT_ACCESS") == "ok") {
+        "Сервер не подтвердил проверку прав администратора. Установка не запущена; проверьте соединение и повторите проверку."
     }
 }
 
@@ -11213,25 +11827,6 @@ private fun assertAndroidDeployMayManageServer(ssh: SSHClient, operation: String
     }
 }
 
-private val remoteMachineMarkerRegex = Regex("^[A-Z][A-Z0-9_]*=.*$")
-
-internal fun shouldWriteRemoteErrorToUserLog(line: String): Boolean {
-    val clean = line.trim()
-    if (clean.isBlank() || remoteMachineMarkerRegex.matches(clean)) return false
-    return clean.contains("[✗]") ||
-        clean.contains("FAIL") ||
-        (clean.contains("error", true) && !clean.contains("2>/dev/null"))
-}
-
-internal fun remoteErrorMessageForUserLog(line: String): String? {
-    if (!shouldWriteRemoteErrorToUserLog(line)) return null
-    val detail = line.trim()
-        .removePrefix("FAIL:")
-        .removePrefix("[✗]")
-        .trim()
-    return "Ошибка на сервере: ${detail.ifBlank { "операция не выполнена" }}"
-}
-
 private fun compactRemoteTail(raw: String): String {
     val lines = raw.lineSequence()
         .map { it.trim() }
@@ -11240,7 +11835,7 @@ private fun compactRemoteTail(raw: String): String {
     return lines.takeLast(4).joinToString(" ").take(260)
 }
 
-private fun friendlyDeployError(error: Throwable, operation: String): String {
+internal fun friendlyDeployError(error: Throwable, operation: String): String {
     val rawFull = listOfNotNull(error.message, error.cause?.message)
         .joinToString(" ")
         .ifBlank { error.toString() }
@@ -11318,7 +11913,11 @@ private fun friendlyDeployError(error: Throwable, operation: String): String {
         "external_proxy_route_install_failed" in lower ->
             "служба внешнего прокси запустилась, но сервер не применил постоянное правило маршрутизации WDTT. Режим отключён и прямой выход сохранён."
         "external_proxy_apply_failed" in lower ->
-            withTail("внешний TCP-прокси отвечает напрямую, но путь WDTT через redsocks не заработал. Приложение откатило правила и вернуло прямой выход, чтобы VPN-интернет не пропал.")
+            externalProxyFailureMessage(rawFull)
+        "external_proxy_test_not_redirected" in lower ->
+            "проверочный запрос не прошёл через правило перенаправления redsocks. Внешний прокси отключён, восстановлен прямой выход WDTT."
+        "external_proxy_test_temp_failed" in lower ->
+            "не удалось создать временный файл проверки прокси. Внешний выход отключён; проверьте свободное место и права в /tmp на сервере."
         "external_proxy_test_rule_failed" in lower ->
             "сервер не разрешил создать временное правило для проверки пути WDTT через внешний прокси. Режим не считается проверенным и был отключён."
         "external_proxy_remove_failed" in lower ->
@@ -11459,7 +12058,11 @@ private fun friendlyDeployError(error: Throwable, operation: String): String {
         "network is unreachable" in lower ||
             "no route to host" in lower ->
             "Сервер недоступен из текущей сети. Проверьте интернет, IP и правила межсетевого экрана."
-        "session is down" in lower ->
+        "session is down" in lower || "ssh-сессия разорвана" in lower ||
+            "ssh channel closed before exit status" in lower ||
+            "connection reset" in lower || "socket closed" in lower ||
+            "pipe closed" in lower || "broken pipe" in lower ||
+            "channel is not opened" in lower ->
             "SSH-сессия оборвалась во время операции. Повторите действие после проверки соединения."
         "no_passwords_json" in lower ||
             "passwords.json" in lower && ("не найден" in lower || "не отдал" in lower) ->
@@ -11514,7 +12117,7 @@ private fun String.isValidPortsSpec(): Boolean {
     return parts.size == 3 && parts.all { it.toIntOrNull()?.let { port -> port in 1..65535 } == true }
 }
 
-private fun String.isValidPublicHost(): Boolean {
+internal fun String.isValidPublicHost(): Boolean {
     val value = trim()
     if (value.isBlank() || value.length > 253 || value.any { it == '/' || it == '\\' || it == ':' || it == '@' }) return false
     val ipv4 = Regex("^(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)(\\.(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)){3}$")
@@ -11739,7 +12342,7 @@ internal fun validatePasswordsDbForPreserving(
         return false
     }
     require(replacementMainPassword.isNotBlank()) {
-        "main_password пустой; укажите главный пароль в «Секретах»"
+        "main_password пустой; укажите главный пароль в параметрах сервера"
     }
     val validatedCopy = JSONObject(db.toString())
         .put("main_password", replacementMainPassword)
@@ -12428,10 +13031,10 @@ private fun ownerProfileDiffLines(server: ServerAdminProfileInfo, local: ServerA
     val localComparable = local.comparableOwnerProfile()
     val lines = mutableListOf<String>()
     if (serverComparable.vkHashes != localComparable.vkHashes) {
-        lines += "VK-хеши: сервер — ${secretPresenceLabel(serverComparable.vkHashes)}, приложение — ${secretPresenceLabel(localComparable.vkHashes)}"
+        lines += "ВК-хеши: сервер — ${secretPresenceLabel(serverComparable.vkHashes)}, приложение — ${secretPresenceLabel(localComparable.vkHashes)}"
     }
     if (serverComparable.secondaryVkHash != localComparable.secondaryVkHash) {
-        lines += "Резервный VK-хеш: сервер — ${secretPresenceLabel(serverComparable.secondaryVkHash)}, приложение — ${secretPresenceLabel(localComparable.secondaryVkHash)}"
+        lines += "Резервный ВК-хеш: сервер — ${secretPresenceLabel(serverComparable.secondaryVkHash)}, приложение — ${secretPresenceLabel(localComparable.secondaryVkHash)}"
     }
     if (serverComparable.profileName.isNotBlank() && serverComparable.profileName != localComparable.profileName) {
         lines += "Название профиля: сервер — ${serverComparable.profileName.ifBlank { "стандартное" }}, приложение — ${localComparable.profileName.ifBlank { "стандартное" }}"
@@ -12474,10 +13077,10 @@ private fun ownerProfileInstallDiffLines(
     val localComparable = local.comparableOwnerProfile()
     return buildList {
         if (localComparable.vkHashes.isNotBlank() && serverComparable.vkHashes != localComparable.vkHashes) {
-            add("VK-хеши: сервер — ${secretPresenceLabel(serverComparable.vkHashes)}, приложение — ${secretPresenceLabel(localComparable.vkHashes)}")
+            add("ВК-хеши: сервер — ${secretPresenceLabel(serverComparable.vkHashes)}, приложение — ${secretPresenceLabel(localComparable.vkHashes)}")
         }
         if (localComparable.secondaryVkHash.isNotBlank() && serverComparable.secondaryVkHash != localComparable.secondaryVkHash) {
-            add("Резервный VK-хеш: сервер — ${secretPresenceLabel(serverComparable.secondaryVkHash)}, приложение — ${secretPresenceLabel(localComparable.secondaryVkHash)}")
+            add("Резервный ВК-хеш: сервер — ${secretPresenceLabel(serverComparable.secondaryVkHash)}, приложение — ${secretPresenceLabel(localComparable.secondaryVkHash)}")
         }
         if (localComparable.profileName.isNotBlank() && serverComparable.profileName != localComparable.profileName) {
             add("Название профиля: сервер — ${serverComparable.profileName.ifBlank { "стандартное" }}, приложение — ${localComparable.profileName}")
@@ -12664,10 +13267,10 @@ private suspend fun compareDeployWithServer(
                         overwriteLines += "Главный пароль владельца"
                     }
                     if (request.adminId.isNotBlank() && db.optString("admin_id") != request.adminId) {
-                        overwriteLines += "Telegram Admin ID"
+                        overwriteLines += "Telegram ID администратора: сервер — ${db.optString("admin_id").ifBlank { "не задан" }}, будет — ${request.adminId}"
                     }
                     if (request.botToken.isNotBlank() && db.optString("bot_token") != request.botToken) {
-                        overwriteLines += "Telegram Bot Token"
+                        overwriteLines += "Токен Telegram-бота: будет ${if (db.optString("bot_token").isBlank()) "добавлен" else "заменён"}"
                     }
                     val serverDns = normalizeDnsValues(db.optString("dns"))
                     val localDns = normalizeDnsValues(
@@ -12681,8 +13284,13 @@ private suspend fun compareDeployWithServer(
                     }
 
                     val defaultPorts = db.optString("default_ports").ifBlank { "56000,56001,9000" }
+                    val requestedPorts = Triple(request.dtlsPort, request.wgPort, request.localPort).asPortsSpec()
+                    if (defaultPorts != requestedPorts) {
+                        overwriteLines += "Порты подключения: сервер — $defaultPorts, будет — $requestedPorts"
+                    }
                     val serverProfile = parseOwnerProfileFromDb(db.optJSONObject("admin_profile"), defaultPorts)
                     val ownerInstallDiff = ownerProfileInstallDiffLines(serverProfile, localOwnerProfile)
+                        .filterNot { it.startsWith("Порты ссылки:") || it.startsWith("Локальный порт:") }
                     if (serverProfile.hasSavedFields && ownerInstallDiff.isNotEmpty()) {
                         overwriteLines += ownerProfileOverwriteLines(ownerInstallDiff)
                     } else if (!serverProfile.hasSavedFields && hasMeaningfulAdminProfileFields(localOwnerProfile)) {
@@ -13200,6 +13808,74 @@ private suspend fun performServerImportNow(
 
 private const val SERVER_UPDATE_BACKUP_DIR = "/var/tmp/wdtt-plus-update-backup"
 
+internal fun serverUpdateRollbackProbeScript(
+    backupDir: String = SERVER_UPDATE_BACKUP_DIR,
+): String = """
+    BACKUP=${shellQuote(backupDir)}
+    wdtt_backup_result() {
+      printf 'WDTT_UPDATE_BACKUP_STATUS=%s\n' "${'$'}1"
+      printf 'WDTT_UPDATE_BACKUP_DIAGNOSTIC=%s\n' "${'$'}2"
+      exit 0
+    }
+    if [ ! -e "${'$'}BACKUP" ] && [ ! -L "${'$'}BACKUP" ]; then
+      wdtt_backup_result none absent
+    fi
+    if [ -L "${'$'}BACKUP" ] || [ ! -d "${'$'}BACKUP" ]; then
+      wdtt_backup_result prepared_corrupted unsafe_backup_path
+    fi
+    if [ ! -f "${'$'}BACKUP/state" ] || [ -L "${'$'}BACKUP/state" ]; then
+      wdtt_backup_result prepared_corrupted missing_or_unsafe_state
+    fi
+    backup_state=${'$'}(cat "${'$'}BACKUP/state" 2>/dev/null || true)
+    if [ "${'$'}backup_state" != prepared ]; then
+      wdtt_backup_result unknown_state state_not_prepared
+    fi
+    for marker in had_config had_binary had_service was_active was_enabled; do
+      marker_path="${'$'}BACKUP/${'$'}marker"
+      if [ -e "${'$'}marker_path" ] || [ -L "${'$'}marker_path" ]; then
+        [ -f "${'$'}marker_path" ] && [ ! -L "${'$'}marker_path" ] ||
+          wdtt_backup_result prepared_corrupted unsafe_marker
+      fi
+    done
+    if [ -f "${'$'}BACKUP/had_config" ]; then
+      [ -d "${'$'}BACKUP/config" ] && [ ! -L "${'$'}BACKUP/config" ] ||
+        wdtt_backup_result prepared_corrupted missing_config
+      unsafe=${'$'}(find "${'$'}BACKUP/config" -mindepth 1 \( -type l -o ! \( -type f -o -type d \) \) -print -quit 2>/dev/null || true)
+      [ -z "${'$'}unsafe" ] || wdtt_backup_result prepared_corrupted unsafe_config_tree
+    elif [ -e "${'$'}BACKUP/config" ] || [ -L "${'$'}BACKUP/config" ]; then
+      wdtt_backup_result prepared_corrupted unexpected_config
+    fi
+    if [ -f "${'$'}BACKUP/had_binary" ]; then
+      [ -f "${'$'}BACKUP/wdtt-server" ] && [ ! -L "${'$'}BACKUP/wdtt-server" ] ||
+        wdtt_backup_result prepared_corrupted missing_binary
+    elif [ -e "${'$'}BACKUP/wdtt-server" ] || [ -L "${'$'}BACKUP/wdtt-server" ]; then
+      wdtt_backup_result prepared_corrupted unexpected_binary
+    fi
+    if [ -f "${'$'}BACKUP/had_service" ]; then
+      [ -f "${'$'}BACKUP/wdtt.service" ] && [ ! -L "${'$'}BACKUP/wdtt.service" ] ||
+        wdtt_backup_result prepared_corrupted missing_service
+    elif [ -e "${'$'}BACKUP/wdtt.service" ] || [ -L "${'$'}BACKUP/wdtt.service" ]; then
+      wdtt_backup_result prepared_corrupted unexpected_service
+    fi
+    if { [ -f "${'$'}BACKUP/was_active" ] || [ -f "${'$'}BACKUP/was_enabled" ]; } &&
+       [ ! -f "${'$'}BACKUP/had_service" ]; then
+      wdtt_backup_result prepared_corrupted service_state_without_service
+    fi
+    unknown=${'$'}(find "${'$'}BACKUP" -mindepth 1 -maxdepth 1 \
+      ! -name state ! -name had_config ! -name config \
+      ! -name had_binary ! -name wdtt-server \
+      ! -name had_service ! -name wdtt.service \
+      ! -name was_active ! -name was_enabled -print -quit 2>/dev/null || true)
+    [ -z "${'$'}unknown" ] || wdtt_backup_result prepared_corrupted unknown_backup_entry
+    printf 'WDTT_UPDATE_BACKUP_STATUS=prepared_valid\n'
+    printf 'WDTT_UPDATE_BACKUP_DIAGNOSTIC=prepared\n'
+    printf 'WDTT_UPDATE_BACKUP_HAD_CONFIG=%s\n' "$([ -f "${'$'}BACKUP/had_config" ] && echo 1 || echo 0)"
+    printf 'WDTT_UPDATE_BACKUP_HAD_BINARY=%s\n' "$([ -f "${'$'}BACKUP/had_binary" ] && echo 1 || echo 0)"
+    printf 'WDTT_UPDATE_BACKUP_HAD_SERVICE=%s\n' "$([ -f "${'$'}BACKUP/had_service" ] && echo 1 || echo 0)"
+    printf 'WDTT_UPDATE_BACKUP_WAS_ACTIVE=%s\n' "$([ -f "${'$'}BACKUP/was_active" ] && echo 1 || echo 0)"
+    printf 'WDTT_UPDATE_BACKUP_WAS_ENABLED=%s\n' "$([ -f "${'$'}BACKUP/was_enabled" ] && echo 1 || echo 0)"
+""".trimIndent()
+
 private fun sha256File(file: File): String {
     val digest = MessageDigest.getInstance("SHA-256")
     file.inputStream().use { input ->
@@ -13264,11 +13940,23 @@ private fun prepareServerUpdateRollback(ssh: SSHClient) {
     }
 }
 
+private fun inspectServerUpdateRollback(ssh: SSHClient): ServerUpdateRollbackState {
+    val output = ssh.exec(
+        rootCommand(serverUpdateRollbackProbeScript()),
+        timeout = 15_000L,
+    )
+    return parseServerUpdateRollbackState(output)
+}
+
 private fun cleanupServerUpdateRollback(ssh: SSHClient) {
+    require(inspectServerUpdateRollback(ssh) is ServerUpdateRollbackState.PreparedValid) {
+        "страховочная копия изменилась или повреждена; автоматическое удаление запрещено"
+    }
     val command = """
         set -e
         BACKUP=${shellQuote(SERVER_UPDATE_BACKUP_DIR)}
-        [ -f "${'$'}BACKUP/state" ] && [ "${'$'}(cat "${'$'}BACKUP/state")" = prepared ] || exit 2
+        [ -d "${'$'}BACKUP" ] && [ ! -L "${'$'}BACKUP" ] || exit 2
+        [ -f "${'$'}BACKUP/state" ] && [ ! -L "${'$'}BACKUP/state" ] && [ "${'$'}(cat "${'$'}BACKUP/state")" = prepared ] || exit 2
         printf 'committed\n' > "${'$'}BACKUP/state"
         rm -rf "${'$'}BACKUP"
     """.trimIndent()
@@ -13276,14 +13964,17 @@ private fun cleanupServerUpdateRollback(ssh: SSHClient) {
 }
 
 private fun rollbackServerUpdate(ssh: SSHClient) {
+    require(inspectServerUpdateRollback(ssh) is ServerUpdateRollbackState.PreparedValid) {
+        "страховочная копия не прошла повторную проверку; восстановление остановлено"
+    }
     val command = """
         set -e
         BACKUP=${shellQuote(SERVER_UPDATE_BACKUP_DIR)}
-        [ -d "${'$'}BACKUP" ] || { echo WDTT_ROLLBACK=missing; exit 2; }
-        [ -f "${'$'}BACKUP/state" ] && [ "${'$'}(cat "${'$'}BACKUP/state")" = prepared ] || { echo WDTT_ROLLBACK=unsafe_state; exit 2; }
-        [ ! -e "${'$'}BACKUP/had_config" ] || [ -d "${'$'}BACKUP/config" ] || { echo WDTT_ROLLBACK=incomplete_config; exit 2; }
-        [ ! -e "${'$'}BACKUP/had_binary" ] || [ -f "${'$'}BACKUP/wdtt-server" ] || { echo WDTT_ROLLBACK=incomplete_binary; exit 2; }
-        [ ! -e "${'$'}BACKUP/had_service" ] || [ -f "${'$'}BACKUP/wdtt.service" ] || { echo WDTT_ROLLBACK=incomplete_service; exit 2; }
+        [ -d "${'$'}BACKUP" ] && [ ! -L "${'$'}BACKUP" ] || { echo WDTT_ROLLBACK=missing; exit 2; }
+        [ -f "${'$'}BACKUP/state" ] && [ ! -L "${'$'}BACKUP/state" ] && [ "${'$'}(cat "${'$'}BACKUP/state")" = prepared ] || { echo WDTT_ROLLBACK=unsafe_state; exit 2; }
+        [ ! -e "${'$'}BACKUP/had_config" ] || { [ -d "${'$'}BACKUP/config" ] && [ ! -L "${'$'}BACKUP/config" ]; } || { echo WDTT_ROLLBACK=incomplete_config; exit 2; }
+        [ ! -e "${'$'}BACKUP/had_binary" ] || { [ -f "${'$'}BACKUP/wdtt-server" ] && [ ! -L "${'$'}BACKUP/wdtt-server" ]; } || { echo WDTT_ROLLBACK=incomplete_binary; exit 2; }
+        [ ! -e "${'$'}BACKUP/had_service" ] || { [ -f "${'$'}BACKUP/wdtt.service" ] && [ ! -L "${'$'}BACKUP/wdtt.service" ]; } || { echo WDTT_ROLLBACK=incomplete_service; exit 2; }
         systemctl stop wdtt 2>/dev/null || true
         if [ -f "${'$'}BACKUP/had_binary" ]; then install -m 755 "${'$'}BACKUP/wdtt-server" /usr/local/bin/wdtt-server; else rm -f /usr/local/bin/wdtt-server; fi
         if [ -f "${'$'}BACKUP/had_service" ]; then install -m 644 "${'$'}BACKUP/wdtt.service" /etc/systemd/system/wdtt.service; else rm -f /etc/systemd/system/wdtt.service; fi
@@ -13291,12 +13982,111 @@ private fun rollbackServerUpdate(ssh: SSHClient) {
         systemctl daemon-reload
         if [ -f "${'$'}BACKUP/was_enabled" ]; then systemctl enable wdtt >/dev/null 2>&1; else systemctl disable wdtt >/dev/null 2>&1 || true; fi
         if [ -f "${'$'}BACKUP/was_active" ]; then systemctl restart wdtt; sleep 2; systemctl is-active --quiet wdtt; fi
+        if [ -f "${'$'}BACKUP/had_binary" ]; then
+          [ -f /usr/local/bin/wdtt-server ] && [ ! -L /usr/local/bin/wdtt-server ] && [ -x /usr/local/bin/wdtt-server ] || { echo WDTT_ROLLBACK=verify_binary; exit 3; }
+        else
+          [ ! -e /usr/local/bin/wdtt-server ] && [ ! -L /usr/local/bin/wdtt-server ] || { echo WDTT_ROLLBACK=verify_binary_absent; exit 3; }
+        fi
+        if [ -f "${'$'}BACKUP/had_service" ]; then
+          [ -f /etc/systemd/system/wdtt.service ] && [ ! -L /etc/systemd/system/wdtt.service ] || { echo WDTT_ROLLBACK=verify_service; exit 3; }
+        else
+          [ ! -e /etc/systemd/system/wdtt.service ] && [ ! -L /etc/systemd/system/wdtt.service ] || { echo WDTT_ROLLBACK=verify_service_absent; exit 3; }
+        fi
+        if [ -f "${'$'}BACKUP/had_config" ]; then
+          [ -d /etc/wdtt ] && [ ! -L /etc/wdtt ] || { echo WDTT_ROLLBACK=verify_config; exit 3; }
+        else
+          [ ! -e /etc/wdtt ] && [ ! -L /etc/wdtt ] || { echo WDTT_ROLLBACK=verify_config_absent; exit 3; }
+        fi
+        if [ -f "${'$'}BACKUP/was_active" ]; then
+          systemctl is-active --quiet wdtt || { echo WDTT_ROLLBACK=verify_active; exit 3; }
+        else
+          ! systemctl is-active --quiet wdtt || { echo WDTT_ROLLBACK=verify_inactive; exit 3; }
+        fi
         rm -rf "${'$'}BACKUP"
         echo WDTT_ROLLBACK=ok
     """.trimIndent()
     val output = ssh.exec(rootCommand(command), timeout = 60000L)
     require(Regex("^WDTT_ROLLBACK=ok$", RegexOption.MULTILINE).containsMatchIn(output)) {
         "сервер не подтвердил откат обновления"
+    }
+}
+
+private fun cleanupAbandonedServerUpdateRollback(ssh: SSHClient) {
+    require(inspectServerUpdateRollback(ssh) is ServerUpdateRollbackState.PreparedValid) {
+        "страховочная копия не прошла повторную проверку; удаление запрещено"
+    }
+    val output = ssh.exec(
+        rootCommand(
+            """
+            set -e
+            BACKUP=${shellQuote(SERVER_UPDATE_BACKUP_DIR)}
+            [ -d "${'$'}BACKUP" ] && [ ! -L "${'$'}BACKUP" ] || { echo WDTT_BACKUP_CLEANUP=unsafe_backup; exit 2; }
+            [ -f /usr/local/bin/wdtt-server ] && [ ! -L /usr/local/bin/wdtt-server ] && [ -x /usr/local/bin/wdtt-server ] || { echo WDTT_BACKUP_CLEANUP=missing_binary; exit 3; }
+            [ -f /etc/systemd/system/wdtt.service ] && [ ! -L /etc/systemd/system/wdtt.service ] || { echo WDTT_BACKUP_CLEANUP=missing_service; exit 3; }
+            [ -f /etc/wdtt/passwords.json ] && [ ! -L /etc/wdtt/passwords.json ] && [ -s /etc/wdtt/passwords.json ] || { echo WDTT_BACKUP_CLEANUP=missing_config; exit 3; }
+            systemctl is-active --quiet wdtt || { echo WDTT_BACKUP_CLEANUP=service_inactive; exit 3; }
+            rm -rf "${'$'}BACKUP"
+            echo WDTT_BACKUP_CLEANUP=ok
+            """.trimIndent(),
+        ),
+        timeout = 30_000L,
+    )
+    require(markerValue(output, "WDTT_BACKUP_CLEANUP") == "ok") {
+        "текущее состояние WDTT не прошло проверку; страховочная копия сохранена"
+    }
+}
+
+internal enum class ServerUpdateRollbackAction {
+    RestorePrevious,
+    KeepCurrentAndDeleteBackup,
+}
+
+private suspend fun resolveServerUpdateRollback(
+    request: DeployRequest,
+    action: ServerUpdateRollbackAction,
+): String = withContext(Dispatchers.IO) {
+    val actionName = when (action) {
+        ServerUpdateRollbackAction.RestorePrevious -> "restore_previous"
+        ServerUpdateRollbackAction.KeepCurrentAndDeleteBackup -> "keep_current_delete_backup"
+    }
+    DeployManager.writeError("Server update rollback action selected: $actionName")
+    var session: Session? = null
+    try {
+        session = createCriticalSshSession(
+            request.host,
+            request.user,
+            SshCredentials(
+                password = request.pass,
+                privateKey = request.privateKey,
+                privateKeyPassphrase = request.keyPassphrase,
+                allowPasswordAuthentication = request.allowPasswordAuthentication,
+            ),
+            request.sshPort,
+        )
+        val ssh = SSHClient(session, request.pass)
+        verifyRootAccess(ssh)
+        when (action) {
+            ServerUpdateRollbackAction.RestorePrevious -> rollbackServerUpdate(ssh)
+            ServerUpdateRollbackAction.KeepCurrentAndDeleteBackup ->
+                cleanupAbandonedServerUpdateRollback(ssh)
+        }
+        check(inspectServerUpdateRollback(ssh) is ServerUpdateRollbackState.None) {
+            "операция завершилась, но каталог страховочной копии всё ещё найден"
+        }
+        DeployManager.writeError("Server update rollback action result: $actionName=success")
+        when (action) {
+            ServerUpdateRollbackAction.RestorePrevious ->
+                "Прежнее состояние WDTT Plus восстановлено и проверено. Страховочная копия удалена."
+            ServerUpdateRollbackAction.KeepCurrentAndDeleteBackup ->
+                "Текущее состояние WDTT Plus проверено. Удалена только страховочная копия."
+        }
+    } catch (error: Exception) {
+        DeployManager.writeError(
+            "Server update rollback action result: $actionName=failed; ${error.message}",
+        )
+        throw error
+    } finally {
+        try { session?.disconnect() } catch (_: Exception) {}
     }
 }
 
@@ -14178,7 +14968,7 @@ private fun ServerBackupExportPasswordDialog(
         else -> null
     }
 
-    AlertDialog(
+    BoundedAlertDialog(
         onDismissRequest = { if (!busy) onDismiss() },
         title = {
             DialogTitleWithClose(
@@ -14259,7 +15049,7 @@ private fun ServerBackupImportPasswordDialog(
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
 
-    AlertDialog(
+    BoundedAlertDialog(
         onDismissRequest = { if (!busy) onDismiss() },
         title = {
             DialogTitleWithClose(
@@ -14565,7 +15355,7 @@ private fun ServerImportConfirmDialog(
         else -> "не трогать WG-ключи текущего сервера"
     }
 
-    androidx.compose.ui.window.Dialog(onDismissRequest = onDismiss) {
+    BoundedAppDialog(properties = androidx.compose.ui.window.DialogProperties(), onDismissRequest = onDismiss) {
         BoxWithConstraints(
             modifier = Modifier.fillMaxSize().padding(8.dp),
             contentAlignment = Alignment.Center
@@ -14699,7 +15489,7 @@ private fun SshAuthenticationHelpDialog(
 ) {
     val television = isTelevisionDevice()
     val scrollState = rememberScrollState()
-    androidx.compose.ui.window.Dialog(
+    BoundedAppDialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = !television),
     ) {
@@ -14757,7 +15547,7 @@ private fun SshAuthenticationHelpDialog(
                     )
                     if (!additionalServer) {
                         Text(
-                            "«Пароль туннеля» требуется отдельно: SSH открывает доступ к системе, а пароль туннеля подтверждает владельца WDTT.",
+                            "Главный пароль администратора требуется отдельно: SSH открывает доступ к системе, а главный пароль подтверждает владельца WDTT.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -14809,7 +15599,7 @@ private fun SshPrivateKeyDialog(
         }
     }
 
-    androidx.compose.ui.window.Dialog(onDismissRequest = { if (!checking) onDismiss() }) {
+    BoundedAppDialog(properties = androidx.compose.ui.window.DialogProperties(), onDismissRequest = { if (!checking) onDismiss() }) {
         Surface(
             modifier = Modifier
                 .fillMaxWidth()
@@ -15024,29 +15814,27 @@ private suspend fun readSshPrivateKeyFromUri(context: Context, uri: Uri): String
 @Composable
 fun DeploySecretsDialog(
     settingsStore: SettingsStore,
+    profileIndex: Int,
     initialMainPass: String,
     initialAdminId: String,
     initialBotToken: String,
-    initialSshPort: String,
     initialDns1: String,
     initialDns2: String,
     initialManualPortsEnabled: Boolean,
     initialServerDtlsPort: String,
     initialServerWgPort: String,
-    deployIp: String,
-    deployLogin: String,
-    deployPassword: String,
     onSaved: (String, String) -> Unit,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
+    connectionOnly: Boolean = false,
 ) {
     val scope = rememberCoroutineScope()
+    var savingParameters by remember { mutableStateOf(false) }
     var passInput by rememberSaveable { mutableStateOf(initialMainPass) }
     var adminIdInput by rememberSaveable { mutableStateOf(initialAdminId) }
     var botTokenInput by rememberSaveable { mutableStateOf(initialBotToken) }
     var showTelegramBotHelp by rememberSaveable { mutableStateOf(false) }
     var passInputFocused by remember { mutableStateOf(false) }
     var botTokenFocused by remember { mutableStateOf(false) }
-    var sshPortInput by rememberSaveable { mutableStateOf(if (initialSshPort.isBlank()) "22" else initialSshPort) }
     var dns1Input by rememberSaveable { mutableStateOf(initialDns1.ifBlank { "1.1.1.1" }) }
     var dns2Input by rememberSaveable { mutableStateOf(initialDns2.ifBlank { "1.0.0.1" }) }
     var manualDnsInput by rememberSaveable {
@@ -15055,7 +15843,6 @@ fun DeploySecretsDialog(
                 initialDns2.isNotBlank() && initialDns2 != "1.0.0.1"
         )
     }
-    var manualSshInput by rememberSaveable { mutableStateOf(initialSshPort.isNotBlank() && initialSshPort != "22") }
     var manualPortsInput by rememberSaveable {
         mutableStateOf(
             initialManualPortsEnabled &&
@@ -15070,7 +15857,7 @@ fun DeploySecretsDialog(
         return value.toIntOrNull()?.takeIf { it in 1..65535 }?.toString() ?: fallback
     }
 
-    androidx.compose.ui.window.Dialog(onDismissRequest = onDismiss) {
+    BoundedAppDialog(properties = androidx.compose.ui.window.DialogProperties(), onDismissRequest = onDismiss) {
         BoxWithConstraints(
             modifier = Modifier.fillMaxSize().padding(8.dp),
             contentAlignment = Alignment.Center
@@ -15088,7 +15875,7 @@ fun DeploySecretsDialog(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text("Секреты Деплоя", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                    Text(if (connectionOnly) "Пароль администратора" else "Параметры установки", modifier = Modifier.weight(1f), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                     IconButton(
                         onClick = onDismiss,
                         modifier = Modifier.remoteIconButtonFocus(),
@@ -15099,8 +15886,11 @@ fun DeploySecretsDialog(
 
                 Spacer(Modifier.height(16.dp))
 
+                val portsInputValid = connectionOnly || !manualPortsInput ||
+                    ((dtlsPortInput.toIntOrNull() ?: 0) in 1..65535 && (wgPortInput.toIntOrNull() ?: 0) in 1..65535 &&
+                        dtlsPortInput.toIntOrNull() != wgPortInput.toIntOrNull())
                 val isPasswordValid = passInput.isNotEmpty() && passInput.matches(Regex("^[a-zA-Z0-9_.!?:#/-]+$"))
-                val dnsInputIssue = if (manualDnsInput) {
+                val dnsInputIssue = if (!connectionOnly && manualDnsInput) {
                     runCatching { normalizedDeployDns(dns1Input, dns2Input) }
                         .exceptionOrNull()?.message
                 } else {
@@ -15110,8 +15900,8 @@ fun DeploySecretsDialog(
                 OutlinedTextField(
                     value = passInput,
                     onValueChange = { passInput = it.filter { c -> !c.isWhitespace() } },
-                    label = { Text("Задайте пароль туннеля (любой)") },
-                    placeholder = { Text("Придумайте надежный пароль") },
+                    label = { Text("Главный пароль администратора") },
+                    placeholder = { Text(if (connectionOnly) "Пароль работающего сервера" else "Придумайте надёжный пароль") },
                     singleLine = true,
                     visualTransformation = if (passInputFocused) VisualTransformation.None else PasswordVisualTransformation(),
                     modifier = Modifier
@@ -15124,7 +15914,8 @@ fun DeploySecretsDialog(
                     if (passInput.isNotEmpty() && !isPasswordValid) {
                         "Разрешены только буквы, цифры и симв: _ . ! ? : # - /"
                     } else {
-                        "Это первый пароль для подключения к VPN, обычно пароль администратора сервера."
+                        if (connectionOnly) "Введите главный пароль работающего WDTT-сервера. Это отдельный пароль, а не пароль SSH."
+                        else "Для новой установки задайте пароль администратора; для обновления используйте текущий пароль сервера."
                     },
                     style = MaterialTheme.typography.bodySmall,
                     color = if (passInput.isNotEmpty() && !isPasswordValid) {
@@ -15135,244 +15926,207 @@ fun DeploySecretsDialog(
                     modifier = Modifier.padding(top = 4.dp)
                 )
 
-                Spacer(Modifier.height(16.dp))
-                HorizontalDivider()
-                Spacer(Modifier.height(8.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Text(
-                        "Telegram-бот для управления",
-                        color = MaterialTheme.colorScheme.primary,
-                        fontWeight = FontWeight.SemiBold,
-                        style = MaterialTheme.typography.titleSmall,
-                        modifier = Modifier.weight(1f)
-                    )
-                    IconButton(
-                        onClick = { showTelegramBotHelp = true },
-                        modifier = Modifier.size(36.dp).remoteHelpFocus()
-                    ) {
-                        Icon(
-                            Icons.AutoMirrored.Filled.HelpOutline,
-                            contentDescription = "Как создать и подключить Telegram-бота",
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.size(20.dp)
-                        )
-                    }
-                }
-                Text(
-                    "Можно оставить пустым, если бот не нужен. При подключении без установки приложение проверяет SSH-доступ и главный пароль, а Telegram-поля читает с сервера и подставляет автоматически.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                Spacer(Modifier.height(8.dp))
-
-                OutlinedTextField(
-                    value = adminIdInput,
-                    onValueChange = { adminIdInput = it },
-                    label = { Text("ID Админа (опционально)") },
-                    placeholder = { Text("ID из @userinfobot") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(16.dp),
-                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
-                        keyboardType = androidx.compose.ui.text.input.KeyboardType.Number
-                    )
-                )
-
-                Spacer(Modifier.height(8.dp))
-
-                OutlinedTextField(
-                    value = botTokenInput,
-                    onValueChange = { botTokenInput = it },
-                    label = { Text("Токен Бота (опционально)") },
-                    placeholder = { Text("Токен от BotFather") },
-                    singleLine = true,
-                    visualTransformation = if (botTokenFocused) VisualTransformation.None else PasswordVisualTransformation(),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .onFocusChanged { botTokenFocused = it.isFocused },
-                    shape = RoundedCornerShape(16.dp)
-                )
-
-                Spacer(Modifier.height(16.dp))
-                HorizontalDivider()
-                Spacer(Modifier.height(8.dp))
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .remoteToggleableRow(value = manualDnsInput) { manualDnsInput = it }
-                        .padding(horizontal = 8.dp, vertical = 6.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text("DNS сервера", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.SemiBold)
-                        Text(
-                            "Оставьте выключенным, если подходят стандартные DNS 1.1.1.1 и 1.0.0.1.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                    Switch(
-                        checked = manualDnsInput,
-                        onCheckedChange = null,
-                    )
-                }
-
-                if (manualDnsInput) {
+                if (!connectionOnly) {
+                    Spacer(Modifier.height(16.dp))
+                    HorizontalDivider()
                     Spacer(Modifier.height(8.dp))
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
+                        Text(
+                            "Telegram-бот для управления",
+                            color = MaterialTheme.colorScheme.primary,
+                            fontWeight = FontWeight.SemiBold,
+                            style = MaterialTheme.typography.titleSmall,
+                            modifier = Modifier.weight(1f, fill = false)
+                        )
+                        HintIconButton(hint = "Как создать и подключить Telegram-бота",
+                            onClick = { showTelegramBotHelp = true },
+                            modifier = Modifier.size(36.dp).remoteHelpFocus()
+                        ) {
+                            Icon(
+                                Icons.AutoMirrored.Filled.HelpOutline,
+                                contentDescription = "Как создать и подключить Telegram-бота",
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
+                    }
+                    Text(
+                        "Можно оставить пустым, если бот не нужен. При подключении без установки приложение проверяет SSH-доступ и главный пароль, а Telegram-поля читает с сервера и подставляет автоматически.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(Modifier.height(8.dp))
+
+                    OutlinedTextField(
+                        value = adminIdInput,
+                        onValueChange = { adminIdInput = it },
+                        label = { Text("ID Админа (опционально)") },
+                        placeholder = { Text("ID из @userinfobot") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(16.dp),
+                        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                            keyboardType = androidx.compose.ui.text.input.KeyboardType.Number
+                        )
+                    )
+
+                    Spacer(Modifier.height(8.dp))
+
+                    OutlinedTextField(
+                        value = botTokenInput,
+                        onValueChange = { botTokenInput = it },
+                        label = { Text("Токен Бота (опционально)") },
+                        placeholder = { Text("Токен от BotFather") },
+                        singleLine = true,
+                        visualTransformation = if (botTokenFocused) VisualTransformation.None else PasswordVisualTransformation(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .onFocusChanged { botTokenFocused = it.isFocused },
+                        shape = RoundedCornerShape(16.dp)
+                    )
+
+                    Spacer(Modifier.height(16.dp))
+                    HorizontalDivider()
+                    Spacer(Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .remoteToggleableRow(value = manualDnsInput) { manualDnsInput = it }
+                            .padding(horizontal = 8.dp, vertical = 6.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("DNS сервера", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.SemiBold)
+                            Text(
+                                "Оставьте выключенным, если подходят стандартные DNS 1.1.1.1 и 1.0.0.1.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(
+                            checked = manualDnsInput,
+                            onCheckedChange = null,
+                        )
+                    }
+
+                    if (manualDnsInput) {
+                        Spacer(Modifier.height(8.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            OutlinedTextField(
+                                value = dns1Input,
+                                onValueChange = { dns1Input = it.filter { c -> !c.isWhitespace() } },
+                                label = { Text("Основной DNS") },
+                                placeholder = { Text("1.1.1.1") },
+                                singleLine = true,
+                                modifier = Modifier.weight(1f),
+                                shape = RoundedCornerShape(16.dp)
+                            )
+                            OutlinedTextField(
+                                value = dns2Input,
+                                onValueChange = { dns2Input = it.filter { c -> !c.isWhitespace() } },
+                                label = { Text("Резервный DNS") },
+                                placeholder = { Text("1.0.0.1") },
+                                singleLine = true,
+                                modifier = Modifier.weight(1f),
+                                shape = RoundedCornerShape(16.dp)
+                            )
+                        }
+                        if (dnsInputIssue != null) {
+                            Text(
+                                text = dnsInputIssue,
+                                modifier = Modifier.padding(top = 4.dp),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error
+                            )
+                        }
+                    }
+
+                    Spacer(Modifier.height(16.dp))
+                    HorizontalDivider()
+                    Spacer(Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .remoteToggleableRow(value = manualPortsInput) { manualPortsInput = it }
+                            .padding(horizontal = 8.dp, vertical = 6.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Порты сервера", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.SemiBold)
+                            Text(
+                                "Оставьте выключенным, если подходят стандартные порты: DTLS 56000 и WireGuard 56001.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(
+                            checked = manualPortsInput,
+                            onCheckedChange = null,
+                        )
+                    }
+
+                    if (manualPortsInput) {
+                        if (!portsInputValid) Text("Укажите два разных порта от 1 до 65535.", color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodySmall)
+                        Spacer(Modifier.height(8.dp))
                         OutlinedTextField(
-                            value = dns1Input,
-                            onValueChange = { dns1Input = it.filter { c -> !c.isWhitespace() } },
-                            label = { Text("Основной DNS") },
-                            placeholder = { Text("1.1.1.1") },
+                            value = dtlsPortInput,
+                            onValueChange = { dtlsPortInput = it.filter(Char::isDigit).take(5) },
+                            label = { Text("Порт DTLS сервера") },
+                            placeholder = { Text("56000") },
                             singleLine = true,
-                            modifier = Modifier.weight(1f),
-                            shape = RoundedCornerShape(16.dp)
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(16.dp),
+                            keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                                keyboardType = androidx.compose.ui.text.input.KeyboardType.Number
+                            )
                         )
+                        Spacer(Modifier.height(8.dp))
                         OutlinedTextField(
-                            value = dns2Input,
-                            onValueChange = { dns2Input = it.filter { c -> !c.isWhitespace() } },
-                            label = { Text("Резервный DNS") },
-                            placeholder = { Text("1.0.0.1") },
+                            value = wgPortInput,
+                            onValueChange = { wgPortInput = it.filter(Char::isDigit).take(5) },
+                            label = { Text("Порт WireGuard сервера") },
+                            placeholder = { Text("56001") },
                             singleLine = true,
-                            modifier = Modifier.weight(1f),
-                            shape = RoundedCornerShape(16.dp)
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(16.dp),
+                            keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                                keyboardType = androidx.compose.ui.text.input.KeyboardType.Number
+                            )
                         )
                     }
-                    if (dnsInputIssue != null) {
-                        Text(
-                            text = dnsInputIssue,
-                            modifier = Modifier.padding(top = 4.dp),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.error
-                        )
-                    }
-                }
 
-                Spacer(Modifier.height(16.dp))
-                HorizontalDivider()
-                Spacer(Modifier.height(8.dp))
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .remoteToggleableRow(value = manualSshInput) { manualSshInput = it }
-                        .padding(horizontal = 8.dp, vertical = 6.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text("SSH-порт", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.SemiBold)
-                        Text(
-                            "Оставьте выключенным, если SSH работает на стандартном порту 22.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                    Switch(
-                        checked = manualSshInput,
-                        onCheckedChange = null,
-                    )
-                }
-
-                if (manualSshInput) {
-                    Spacer(Modifier.height(8.dp))
-                    OutlinedTextField(
-                        value = sshPortInput,
-                        onValueChange = { sshPortInput = it.filter(Char::isDigit).take(5) },
-                        label = { Text("Порт для деплоя SSH") },
-                        placeholder = { Text("22") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(16.dp),
-                        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
-                            keyboardType = androidx.compose.ui.text.input.KeyboardType.Number
-                        )
-                    )
-                }
-
-                Spacer(Modifier.height(16.dp))
-                HorizontalDivider()
-                Spacer(Modifier.height(8.dp))
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .remoteToggleableRow(value = manualPortsInput) { manualPortsInput = it }
-                        .padding(horizontal = 8.dp, vertical = 6.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text("Порты сервера", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.SemiBold)
-                        Text(
-                            "Оставьте выключенным, если подходят стандартные порты: DTLS 56000 и WireGuard 56001.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                    Switch(
-                        checked = manualPortsInput,
-                        onCheckedChange = null,
-                    )
-                }
-
-                if (manualPortsInput) {
-                    Spacer(Modifier.height(8.dp))
-                    OutlinedTextField(
-                        value = dtlsPortInput,
-                        onValueChange = { dtlsPortInput = it.filter(Char::isDigit).take(5) },
-                        label = { Text("Порт DTLS сервера") },
-                        placeholder = { Text("56000") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(16.dp),
-                        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
-                            keyboardType = androidx.compose.ui.text.input.KeyboardType.Number
-                        )
-                    )
-                    Spacer(Modifier.height(8.dp))
-                    OutlinedTextField(
-                        value = wgPortInput,
-                        onValueChange = { wgPortInput = it.filter(Char::isDigit).take(5) },
-                        label = { Text("Порт WireGuard сервера") },
-                        placeholder = { Text("56001") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(16.dp),
-                        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
-                            keyboardType = androidx.compose.ui.text.input.KeyboardType.Number
-                        )
-                    )
                 }
 
                 Spacer(Modifier.height(24.dp))
                 Button(
                     onClick = {
-                        val finalPort = if (manualSshInput) normalizePort(sshPortInput, "22") else "22"
                         val finalDtls = if (manualPortsInput) normalizePort(dtlsPortInput, "56000") else "56000"
                         val finalWg = if (manualPortsInput) normalizePort(wgPortInput, "56001") else "56001"
                         val finalDns1 = if (manualDnsInput) dns1Input.trim().ifBlank { "1.1.1.1" } else "1.1.1.1"
                         val finalDns2 = if (manualDnsInput) dns2Input.trim().ifBlank { "1.0.0.1" } else "1.0.0.1"
-                        val effectiveManualPorts = manualPortsInput && (finalDtls != "56000" || finalWg != "56001")
+                        savingParameters = true
                         scope.launch {
-                            settingsStore.saveDeploySecrets(passInput, adminIdInput, botTokenInput, finalPort)
-                            settingsStore.saveDeploy(deployIp, deployLogin, deployPassword, finalPort, finalDns1, finalDns2)
-                            settingsStore.saveManualPortsEnabled(effectiveManualPorts)
-                            settingsStore.savePorts(finalDtls.toInt(), finalWg.toInt(), settingsStore.listenPort.first())
-                            onSaved(finalDtls, finalWg)
+                            settingsStore.saveServerParameters(profileIndex, passInput, adminIdInput, botTokenInput,
+                                dns1 = finalDns1.takeUnless { connectionOnly }, dns2 = finalDns2.takeUnless { connectionOnly },
+                                dtlsPort = finalDtls.toInt().takeUnless { connectionOnly },
+                                wgPort = finalWg.toInt().takeUnless { connectionOnly })
+                            if (!connectionOnly) onSaved(finalDtls, finalWg)
                             onDismiss()
                         }
                     },
                     modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
                     shape = RoundedCornerShape(16.dp),
-                    enabled = isPasswordValid && dnsInputIssue == null,
+                    enabled = isPasswordValid && dnsInputIssue == null && portsInputValid && !savingParameters,
                     colors = ButtonDefaults.buttonColors(contentColor = MaterialTheme.colorScheme.onPrimary)
                 ) { Text("Сохранить", fontWeight = FontWeight.SemiBold) }
                     Spacer(Modifier.height(4.dp))
@@ -15389,7 +16143,6 @@ fun DeploySecretsDialog(
 @Composable
 private fun TelegramBotHelpDialog(onDismiss: () -> Unit) {
     val context = LocalContext.current
-    val television = isTelevisionDevice()
 
     fun openTelegramBot(username: String, miniApp: Boolean = false) {
         val tgUri = if (miniApp) {
@@ -15422,94 +16175,43 @@ private fun TelegramBotHelpDialog(onDismiss: () -> Unit) {
         Toast.makeText(context, "$handle скопирован", Toast.LENGTH_SHORT).show()
     }
 
-    androidx.compose.ui.window.Dialog(
-        onDismissRequest = onDismiss,
-        properties = DialogProperties(usePlatformDefaultWidth = !television),
+    SettingsDialogLayout(
+        title = "Подключение Telegram-бота",
+        onDismiss = onDismiss,
     ) {
-        BoxWithConstraints(
-            modifier = Modifier.fillMaxSize().padding(8.dp),
-            contentAlignment = Alignment.Center
-        ) {
-            Surface(
-                modifier = Modifier
-                    .televisionDialogWidth(television)
-                    .heightIn(max = maxHeight * 0.92f),
-                shape = RoundedCornerShape(24.dp),
-                color = MaterialTheme.colorScheme.surface,
-                contentColor = MaterialTheme.colorScheme.onSurface,
-                tonalElevation = 8.dp
-            ) {
-                Column(
-                    modifier = Modifier
-                        .padding(22.dp)
-                        .fillMaxWidth()
-                        .verticalScroll(rememberScrollState()),
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            "Подключение Telegram-бота",
-                            style = MaterialTheme.typography.titleLarge,
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.weight(1f)
-                        )
-                    IconButton(
-                        onClick = onDismiss,
-                        modifier = Modifier.remoteIconButtonFocus(),
-                    ) {
-                        Icon(Icons.Default.Close, contentDescription = "Закрыть")
-                        }
-                    }
+        Text(
+            "1. Откройте мини-приложение BotFather и создайте бота без ручной отправки команд. Если мини-приложение недоступно в вашей версии Telegram, откройте обычный чат @BotFather, нажмите «Запустить» и отправьте /newbot. Задайте имя и username, который заканчивается на bot, затем скопируйте выданный токен.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        TelegramBotFatherRows(
+            onOpenMiniApp = { openTelegramBot("BotFather", miniApp = true) },
+            onOpenChat = { openTelegramBot("BotFather") },
+            onCopy = { copyTelegramHandle("@BotFather") }
+        )
 
-                    Text(
-                        "1. Откройте мини-приложение BotFather и создайте бота без ручной отправки команд. Если мини-приложение недоступно в вашей версии Telegram, откройте обычный чат @BotFather, нажмите «Запустить» и отправьте /newbot. Задайте имя и username, который заканчивается на bot, затем скопируйте выданный токен.",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    TelegramBotFatherRows(
-                        onOpenMiniApp = { openTelegramBot("BotFather", miniApp = true) },
-                        onOpenChat = { openTelegramBot("BotFather") },
-                        onCopy = { copyTelegramHandle("@BotFather") }
-                    )
+        Text(
+            "2. Откройте @userinfobot, нажмите «Запустить» и скопируйте свой числовой Telegram ID.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        TelegramBotActionRow(
+            buttonText = "Открыть @userinfobot",
+            handle = "@userinfobot",
+            onOpen = { openTelegramBot("userinfobot") },
+            onCopy = { copyTelegramHandle("@userinfobot") }
+        )
 
-                    Text(
-                        "2. Откройте @userinfobot, нажмите «Запустить» и скопируйте свой числовой Telegram ID.",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    TelegramBotActionRow(
-                        buttonText = "Открыть @userinfobot",
-                        handle = "@userinfobot",
-                        onOpen = { openTelegramBot("userinfobot") },
-                        onCopy = { copyTelegramHandle("@userinfobot") }
-                    )
-
-                    Text(
-                        "3. Вставьте ID в поле администратора, токен — в поле бота и нажмите «Сохранить». Чтобы передать эти данные серверу, выполните установку во вкладке «Деплой» — при обновлении сервера можно выбрать установку с сохранением данных.",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Text(
-                        "Токен даёт доступ к управлению ботом. Не отправляйте его другим людям и не публикуйте; при утечке перевыпустите токен через @BotFather.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.error
-                    )
-
-                    Button(
-                        onClick = onDismiss,
-                        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
-                        shape = RoundedCornerShape(16.dp)
-                    ) {
-                        Text("Понятно", fontWeight = FontWeight.Bold)
-                    }
-                }
-            }
-        }
+        Text(
+            "3. В «Деплой» выберите «Установить» и откройте «Параметры». Вставьте ID в поле администратора, токен — в поле бота и нажмите «Сохранить». Чтобы передать эти данные серверу, выполните установку во вкладке «Деплой» — при обновлении сервера можно выбрать установку с сохранением данных.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Text(
+            "Токен даёт доступ к управлению ботом. Не отправляйте его другим людям и не публикуйте; при утечке перевыпустите токен через @BotFather.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.error
+        )
     }
 }
 
@@ -15547,7 +16249,7 @@ private fun TelegramBotFatherRows(
                 Text("Обычный чат @BotFather", textAlign = TextAlign.Center)
             }
         }
-        FilledTonalIconButton(
+        HintFilledTonalIconButton(hint = "Скопировать @BotFather",
             onClick = onCopy,
             modifier = Modifier.size(48.dp)
         ) {
@@ -15581,7 +16283,7 @@ private fun TelegramBotActionRow(
         ) {
             Text(buttonText, textAlign = TextAlign.Center)
         }
-        FilledTonalIconButton(
+        HintFilledTonalIconButton(hint = "Скопировать $handle",
             onClick = onCopy,
             modifier = Modifier.size(48.dp)
         ) {
@@ -15601,7 +16303,7 @@ private fun ServerBackupDeleteConfirmDialog(
     onDismiss: () -> Unit,
     onConfirm: () -> Unit
 ) {
-    AlertDialog(
+    BoundedAlertDialog(
         onDismissRequest = onDismiss,
         title = {
             DialogTitleWithClose(
@@ -16196,6 +16898,127 @@ private fun SelectedBackupApplyCard(
     }
 }
 
+@Composable
+private fun ServerUpdateRollbackDialog(
+    state: ServerUpdateRollbackState,
+    busy: Boolean,
+    statusMessage: String,
+    onDismiss: () -> Unit,
+    onRestore: () -> Unit,
+    onKeepCurrent: () -> Unit,
+) {
+    val television = isTelevisionDevice()
+    val scrollState = rememberScrollState()
+    BoundedAppDialog(properties = androidx.compose.ui.window.DialogProperties(), onDismissRequest = { if (!busy) onDismiss() }) {
+        BoxWithConstraints(
+            modifier = Modifier.fillMaxSize().padding(8.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Surface(
+                modifier = Modifier.heightIn(max = maxHeight * 0.92f),
+                shape = RoundedCornerShape(24.dp),
+                color = MaterialTheme.colorScheme.surface,
+                tonalElevation = 8.dp,
+            ) {
+                Column(
+                    modifier = Modifier
+                        .padding(24.dp)
+                        .fillMaxWidth()
+                        .verticalScroll(scrollState)
+                        .tvDpadScrollable(scrollState, television),
+                    verticalArrangement = Arrangement.spacedBy(14.dp),
+                ) {
+                    DialogTitleWithClose(
+                        title = "Незавершённое обновление",
+                        onDismiss = onDismiss,
+                        enabled = !busy,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                    Text(
+                        "Обнаружено незавершённое обновление WDTT Plus. На сервере сохранена страховочная копия предыдущего состояния.",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    when (state) {
+                        is ServerUpdateRollbackState.PreparedValid -> {
+                            Surface(
+                                shape = RoundedCornerShape(14.dp),
+                                color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f),
+                                border = BorderStroke(
+                                    1.dp,
+                                    MaterialTheme.colorScheme.primary.copy(alpha = 0.25f),
+                                ),
+                            ) {
+                                Column(
+                                    modifier = Modifier.fillMaxWidth().padding(12.dp),
+                                    verticalArrangement = Arrangement.spacedBy(5.dp),
+                                ) {
+                                    Text("Копия проверена и готова к восстановлению.", fontWeight = FontWeight.SemiBold)
+                                    InstallTraceLine("Конфигурация", state.markers.hadConfig)
+                                    InstallTraceLine("Бинарник", state.markers.hadBinary)
+                                    InstallTraceLine("Служба systemd", state.markers.hadService)
+                                    InstallTraceLine("Служба была активна", state.markers.wasActive)
+                                }
+                            }
+                            Button(
+                                onClick = onRestore,
+                                enabled = !busy,
+                                modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp),
+                                shape = RoundedCornerShape(16.dp),
+                            ) {
+                                Text("Восстановить прежнее состояние", fontWeight = FontWeight.Bold)
+                            }
+                            Text(
+                                "Если текущая установка уже полностью работает, можно удалить только эту копию. " +
+                                    "Приложение сначала проверит бинарник, конфигурацию, unit и активную службу; рабочая установка не удаляется.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            DangerousServerHoldButton(
+                                actionLabel = "Текущее состояние работает — удалить копию",
+                                enabled = !busy,
+                                guardKey = "server-update-backup-cleanup",
+                                buttonWidthFraction = 1f,
+                                actionLabelMaxLines = 2,
+                                onConfirmed = onKeepCurrent,
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        }
+                        is ServerUpdateRollbackState.PreparedCorrupted -> {
+                            Text(
+                                "Страховочная копия повреждена: ${state.diagnostic}. Автоматическое восстановление, удаление и обычный деплой заблокированы. Нужна ручная проверка сервера по SSH.",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                        }
+                        is ServerUpdateRollbackState.UnknownState -> {
+                            Text(
+                                "Состояние страховочной копии не распознано: ${state.diagnostic}. Ничего не удалено; обычный деплой заблокирован до ручной проверки по SSH.",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                        }
+                        ServerUpdateRollbackState.None -> Unit
+                    }
+                    if (busy) {
+                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                    }
+                    if (statusMessage.isNotBlank()) {
+                        Text(
+                            statusMessage,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (busy) {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            } else {
+                                MaterialTheme.colorScheme.error
+                            },
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ExistingInstallDialog(
@@ -16218,16 +17041,16 @@ private fun ExistingInstallDialog(
 	)
 	val preservingUpdateAllowed = existingInstallAllowsPreservingUpdate(
 		ownership = ownership,
-		checkSucceeded = checkError == null
+		checkSucceeded = checkError == null && info.comparison?.checkError == null
 	)
 	val resetAllowed = existingInstallAllowsReset(
 		ownership = ownership,
-		checkSucceeded = checkError == null
+		checkSucceeded = checkError == null && info.comparison?.checkError == null
 	)
 	LaunchedEffect(resetAllowed) {
 		if (!resetAllowed) showResetConfirmation = false
 	}
-	androidx.compose.ui.window.Dialog(onDismissRequest = onDismiss) {
+	BoundedAppDialog(properties = androidx.compose.ui.window.DialogProperties(), onDismissRequest = onDismiss) {
 		BoxWithConstraints(
 			modifier = Modifier.fillMaxSize().padding(8.dp),
 			contentAlignment = Alignment.Center
@@ -16349,7 +17172,7 @@ private fun ExistingInstallDialog(
 							border = BorderStroke(1.dp, MaterialTheme.colorScheme.error.copy(alpha = 0.35f))
 						) {
 							Text(
-								"Не удалось сравнить сохранённые поля сервера с приложением. При продолжении они могут быть заменены локальными значениями: ${comparison.checkError.take(180)}",
+								"Не удалось сравнить сохранённые поля сервера с приложением. Повторите проверку перед обновлением: ${comparison.checkError.take(180)}",
 								modifier = Modifier.fillMaxWidth().padding(12.dp),
 								style = MaterialTheme.typography.bodySmall,
 								color = MaterialTheme.colorScheme.onErrorContainer
@@ -16367,7 +17190,7 @@ private fun ExistingInstallDialog(
 								Text("Будут заменены серверные значения:", fontWeight = FontWeight.SemiBold)
 								comparison.overwriteLines.forEach { Text("• $it", style = MaterialTheme.typography.bodySmall) }
 								Text(
-									"Если нужны значения сервера, отмените установку и сначала выполните «Подключиться (без установки)». Для выходного IP используйте «Загрузить настройки».",
+									"Если нужны значения сервера, отмените установку и сначала выполните режим «Подключить». Для выходного IP используйте «Загрузить настройки».",
 									style = MaterialTheme.typography.bodySmall
 								)
 							}
@@ -16469,7 +17292,7 @@ private fun ServerResetConfirmDialog(
 	onDismiss: () -> Unit,
 	onConfirm: () -> Unit
 ) {
-	AlertDialog(
+	BoundedAlertDialog(
 		onDismissRequest = onDismiss,
 		title = {
 			DialogTitleWithClose(
@@ -16545,7 +17368,7 @@ private fun UninstallConfirmDialog(
 ) {
     val television = isTelevisionDevice()
     val scrollState = rememberScrollState()
-    androidx.compose.ui.window.Dialog(onDismissRequest = onDismiss) {
+    BoundedAppDialog(properties = androidx.compose.ui.window.DialogProperties(), onDismissRequest = onDismiss) {
         BoxWithConstraints(
             modifier = Modifier.fillMaxSize().padding(8.dp),
             contentAlignment = Alignment.Center

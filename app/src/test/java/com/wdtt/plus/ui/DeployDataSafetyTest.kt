@@ -6,8 +6,60 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.nio.file.Files
 
 class DeployDataSafetyTest {
+    @Test
+    fun `server update rollback probe distinguishes valid corrupted and unknown backups`() {
+        val root = Files.createTempDirectory("wdtt-update-backup-test").toFile()
+        try {
+            val missing = runRollbackProbe(File(root, "missing"))
+            assertTrue(missing is ServerUpdateRollbackState.None)
+
+            val backup = File(root, "backup").apply { mkdirs() }
+            File(backup, "state").writeText("prepared\n")
+            File(backup, "had_config").createNewFile()
+            File(backup, "config").mkdir()
+            val valid = runRollbackProbe(backup)
+            assertTrue(valid is ServerUpdateRollbackState.PreparedValid)
+            assertTrue((valid as ServerUpdateRollbackState.PreparedValid).markers.hadConfig)
+
+            File(backup, "config").delete()
+            val corrupted = runRollbackProbe(backup)
+            assertTrue(corrupted is ServerUpdateRollbackState.PreparedCorrupted)
+
+            File(backup, "had_config").delete()
+            File(backup, "state").writeText("committed\n")
+            val unknown = runRollbackProbe(backup)
+            assertTrue(unknown is ServerUpdateRollbackState.UnknownState)
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `unfinished update backup requires explicit recovery UI`() {
+        val source = sequenceOf(
+            File("app/src/main/java/com/wdtt/plus/ui/DeployTab.kt"),
+            File("src/main/java/com/wdtt/plus/ui/DeployTab.kt")
+        ).first(File::isFile).readText()
+
+        assertTrue("ServerUpdateRollbackDialog(" in source)
+        assertTrue("Восстановить прежнее состояние" in source)
+        assertTrue("server-update-backup-cleanup" in source)
+        assertTrue("systemctl is-active --quiet wdtt" in source)
+        assertTrue("WDTT_UPDATE_BACKUP=stale" in source)
+    }
+
+    private fun runRollbackProbe(backup: File): ServerUpdateRollbackState {
+        val process = ProcessBuilder("bash", "-c", serverUpdateRollbackProbeScript(backup.absolutePath))
+            .redirectErrorStream(true)
+            .start()
+        val output = process.inputStream.bufferedReader().readText()
+        assertEquals(0, process.waitFor())
+        return parseServerUpdateRollbackState(output)
+    }
+
     @Test
     fun `single owner profile difference is shown without a whole-profile warning`() {
         assertEquals(
@@ -41,7 +93,12 @@ class DeployDataSafetyTest {
             .filter { it.isFile && it.extension in setOf("kt", "java") }
             .joinToString("\n") { it.readText() }
 
-        assertFalse("own-VPN Network socket binding reintroduces EPERM", "network.socketFactory" in deploySources)
+        val sshSources = sourceRoot.walkTopDown()
+            .filter { it.isFile && (it.name.contains("Ssh") || it.name == "DeployTab.kt") }
+            .joinToString("\n") { it.readText() }
+        // A provider HTTP client may deliberately bind a physical Network.
+        // This regression protects SSH/deploy, not every socket in the app.
+        assertFalse("own-VPN Network socket binding reintroduces EPERM", "network.socketFactory" in sshSources)
         assertFalse("removed SSH VPN socket factory was restored", "WdttVpnSocketFactory" in deploySources)
         assertFalse("removed SSH VPN network selector was restored", "WdttVpnSshFallback" in deploySources)
         assertTrue(
@@ -224,6 +281,34 @@ class DeployDataSafetyTest {
             "backup settings status must not use its old permanently reserved height",
             ".fillMaxWidth()\n                    .height(48.dp)" in backupCardSource
         )
+    }
+
+    @Test
+    fun `deploy expandable sections scroll while expanding without persistence delay`() {
+        val source = sequenceOf(
+            File("app/src/main/java/com/wdtt/plus/ui/DeployTab.kt"),
+            File("src/main/java/com/wdtt/plus/ui/DeployTab.kt")
+        ).first(File::isFile).readText()
+
+        assertTrue("all deploy sections must use post-layout window coordinates",
+            listOf(
+                "clientsSectionTopInWindow = it.boundsInWindow().top",
+                "outboundSectionTopInWindow = it.boundsInWindow().top",
+                "migrationSectionTopInWindow = it.boundsInWindow().top",
+            ).all(source::contains))
+        assertFalse("scrolling must not wait for expansion to settle",
+            "framesSinceGrowth" in source || "stableFrames" in source)
+        assertTrue("scrolling must follow the expanding scroll range",
+            "deployScrollState.maxValue.toFloat()" in source && "scrollBy(next - deployScrollState.value)" in source)
+        assertTrue("local section state must update before asynchronous persistence",
+            listOf("clientsExpandedOverride = expanded", "outboundExpandedOverride = willExpand",
+                "migrationExpandedOverride = willExpand").all(source::contains))
+        assertTrue("each section state must trigger the shared reveal path",
+            source.split("revealExpandedSection").size - 1 >= 4)
+        assertFalse("section reveal must not race DataStore with a fixed delay",
+            "animateScrollTo((clientsSectionY" in source ||
+                "animateScrollTo((outboundSectionY" in source ||
+                "animateScrollTo((migrationSectionY" in source)
     }
 
     @Test

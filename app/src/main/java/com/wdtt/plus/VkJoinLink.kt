@@ -46,6 +46,13 @@ object VkJoinLink {
         return values.map(::extractHash).distinct().joinToString(",")
     }
 
+    /** True only when the profile already contains four distinct valid call hashes. */
+    fun hasCompleteHashSet(input: String): Boolean =
+        normalizeHashes(input)
+            ?.split(',')
+            ?.filter(String::isNotBlank)
+            ?.size == 4
+
     fun extractValidHash(input: String): String =
         extractHash(input).takeIf { isValidInput(input) }.orEmpty()
 }

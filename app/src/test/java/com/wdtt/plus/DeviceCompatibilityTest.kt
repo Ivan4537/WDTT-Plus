@@ -39,7 +39,7 @@ class DeviceCompatibilityTest {
     }
 
     @Test
-    fun processExitHistoryKeepsSystemKillVisibleAfterPackageUpdate() {
+    fun systemKillRemainsVisibleWithoutClaimingCurrentRestrictions() {
         val now = 1_800_000_000_000L
         val systemKill = ProcessExitRecord(
             timestampMs = now - 2_000L,
@@ -57,15 +57,16 @@ class DeviceCompatibilityTest {
             manufacturer = "OnePlus",
             backgroundRestricted = false,
             batteryOptimizationsIgnored = true,
+            nowMs = now,
         )
 
         assertEquals(packageUpdate, history.latest)
         assertEquals(systemKill, history.latestUnexpected)
-        assertEquals(DeviceCheckSeverity.Warning, item.severity)
+        assertEquals(DeviceCheckSeverity.Info, item.severity)
         assertTrue(item.details.contains("o-kill(6)"))
-        assertTrue(item.details.contains("более новое штатное событие"))
+        assertTrue(item.details.contains("более новое завершение процесса"))
         assertTrue(!item.details.contains("private-value-must-not-leak"))
-        assertTrue(item.recommendation.contains("OxygenOS"))
+        assertTrue(item.recommendation.contains("Повторно менять эти разрешения не нужно"))
     }
 
     @Test
@@ -104,6 +105,64 @@ class DeviceCompatibilityTest {
         assertTrue(recommendation.contains("ограниченное в фоне"))
         assertTrue(recommendation.contains("Без ограничений"))
         assertTrue(recommendation.contains("автозапуск"))
+    }
+
+    @Test
+    fun oldCrashIsHistoryWhileRecentCrashAffectsTheConclusion() {
+        val now = 1_800_000_000_000L
+        fun check(age: Long): DeviceCheckItem = processExitHistoryItem(
+            history = processExitHistory(listOf(ProcessExitRecord(
+                timestampMs = now - age,
+                reason = ApplicationExitInfo.REASON_CRASH,
+            )), now),
+            manufacturer = "OnePlus",
+            backgroundRestricted = false,
+            batteryOptimizationsIgnored = true,
+            nowMs = now,
+        )
+        val old = check(2L * 24 * 60 * 60 * 1000)
+        val recent = check(60_000)
+        assertEquals(DeviceCheckSeverity.Info, old.severity)
+        assertTrue(DeviceCompatibilityReport(now, listOf(old)).problemItems.isEmpty())
+        assertEquals(DeviceCheckSeverity.Error, recent.severity)
+        assertTrue(DeviceCompatibilityReport(now, listOf(recent)).hasErrors)
+    }
+
+    @Test
+    fun recentSystemExitWithCurrentRestrictionsStillWarns() {
+        val now = 1_800_000_000_000L
+        val item = processExitHistoryItem(
+            history = processExitHistory(listOf(ProcessExitRecord(
+                timestampMs = now - 60_000,
+                reason = ApplicationExitInfo.REASON_OTHER,
+                description = "o-kill(6)",
+            )), now),
+            manufacturer = "OnePlus",
+            backgroundRestricted = true,
+            batteryOptimizationsIgnored = false,
+            nowMs = now,
+        )
+        assertEquals(DeviceCheckSeverity.Warning, item.severity)
+        assertEquals(DeviceCheckAction.BatterySettings, item.action)
+        assertTrue(item.recommendation.contains("ограниченное в фоне"))
+    }
+
+    @Test
+    fun unknownVendorExitWithoutReportedRestrictionsDoesNotInventAPermissionProblem() {
+        val now = 1_800_000_000_000L
+        val item = processExitHistoryItem(
+            history = processExitHistory(listOf(ProcessExitRecord(
+                timestampMs = now - 60_000,
+                reason = ApplicationExitInfo.REASON_UNKNOWN,
+            )), now),
+            manufacturer = "OnePlus",
+            backgroundRestricted = null,
+            batteryOptimizationsIgnored = null,
+            nowMs = now,
+        )
+        assertEquals(DeviceCheckSeverity.Info, item.severity)
+        assertEquals(null, item.action)
+        assertTrue(item.recommendation.contains("дополнительных действий не требуется"))
     }
 
     @Test

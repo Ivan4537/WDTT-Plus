@@ -1,5 +1,6 @@
 package com.wdtt.plus
 
+import android.content.Context
 import android.net.Uri
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -8,7 +9,6 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URI
-import java.net.URL
 import java.util.TimeZone
 
 data class RemoteDocumentLink(val url: String)
@@ -89,6 +89,41 @@ internal fun eligibleRemoteAttachmentDocument(
 
 internal fun profileAttachmentRequired(value: String?): Boolean = value?.trim() == "1"
 
+internal data class RemoteDocumentHttpResponse(
+    val status: Int,
+    val body: String,
+    val profileAttachmentRequired: Boolean = false,
+)
+
+internal suspend fun requestRemoteDocumentWithTunnelFallback(
+    directRequest: () -> RemoteDocumentHttpResponse,
+    tunnelRequest: suspend () -> OpaqueHttpsRelayResult,
+    preferTunnel: Boolean = false,
+): RemoteDocumentHttpResponse {
+    if (preferTunnel) {
+        when (val relayed = tunnelRequest()) {
+            is OpaqueHttpsRelayResult.Success -> return RemoteDocumentHttpResponse(
+                status = relayed.status,
+                body = relayed.body,
+            )
+            is OpaqueHttpsRelayResult.Unavailable -> Unit
+        }
+    }
+    return try {
+        directRequest()
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (directError: Exception) {
+        when (val relayed = tunnelRequest()) {
+            is OpaqueHttpsRelayResult.Success -> RemoteDocumentHttpResponse(
+                status = relayed.status,
+                body = relayed.body,
+            )
+            is OpaqueHttpsRelayResult.Unavailable -> throw directError
+        }
+    }
+}
+
 object RemoteDocumentGateway {
     private const val MAX_RESPONSE_CHARS = 32 * 1024
 
@@ -120,6 +155,7 @@ object RemoteDocumentGateway {
         localBindings: Collection<String>? = null,
         localDocument: String? = null,
         profileAttachment: Boolean = false,
+        context: Context? = null,
     ): RemoteDocumentDelivery {
         require(extractLink(link.url) != null) { "Ссылка повреждена или неполна." }
         require(validDevice(device)) { "Не удалось определить текущее устройство." }
@@ -146,31 +182,31 @@ object RemoteDocumentGateway {
             val payload = request
                 .toString()
                 .toByteArray(Charsets.UTF_8)
-            var connection: HttpURLConnection? = null
             try {
-                connection = URL(link.url).openConnection() as HttpURLConnection
-                connection.requestMethod = "POST"
-                connection.connectTimeout = 10_000
-                connection.readTimeout = 12_000
-                connection.doOutput = true
-                connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
-                connection.setRequestProperty("Accept", "application/json")
-                connection.outputStream.use { it.write(payload) }
-                val status = connection.responseCode
-                val body = readBody(connection, status)
-                if (status !in 200..299) {
-                    val failure = parseFailure(body)
+                val response = requestRemoteDocumentWithTunnelFallback(
+                    directRequest = {
+                        requestDirect(
+                            context = context,
+                            url = link.url,
+                            payload = payload,
+                        )
+                    },
+                    tunnelRequest = {
+                        TunnelManager.postOpaqueHttpsStatusThroughTunnel(link.url, payload)
+                    },
+                    preferTunnel = TunnelManager.isUpdateRelayAvailable(),
+                )
+                if (response.status !in 200..299) {
+                    val failure = parseFailure(response.body)
                     throw RemoteDocumentFailure(
                         failure.first.ifBlank {
                             "Ссылка недоступна. Получите новую ссылку подключения."
                         },
                         failure.second,
-                        profileAttachmentRequired = profileAttachmentRequired(
-                            connection.getHeaderField("X-WDTT-Profile-Required")
-                        ),
+                        profileAttachmentRequired = response.profileAttachmentRequired,
                     )
                 }
-                parse(body)
+                parse(response.body)
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
@@ -178,9 +214,35 @@ object RemoteDocumentGateway {
                 throw IllegalStateException(
                     "Не удалось связаться с WDTT Plus. Проверьте интернет и попробуйте ещё раз."
                 )
-            } finally {
-                connection?.disconnect()
             }
+        }
+    }
+
+    private fun requestDirect(
+        context: Context?,
+        url: String,
+        payload: ByteArray,
+    ): RemoteDocumentHttpResponse {
+        var connection: HttpURLConnection? = null
+        return try {
+            connection = openDefaultHttpConnection(context, url)
+            connection.requestMethod = "POST"
+            connection.connectTimeout = 4_000
+            connection.readTimeout = 8_000
+            connection.doOutput = true
+            connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+            connection.setRequestProperty("Accept", "application/json")
+            connection.outputStream.use { it.write(payload) }
+            val status = connection.responseCode
+            RemoteDocumentHttpResponse(
+                status = status,
+                body = readBody(connection, status),
+                profileAttachmentRequired = profileAttachmentRequired(
+                    connection.getHeaderField("X-WDTT-Profile-Required")
+                ),
+            )
+        } finally {
+            connection?.disconnect()
         }
     }
 

@@ -257,7 +257,9 @@ func sessionTURNCandidatesForAttempt(
 		}
 	}
 
-	if preferStream {
+	// The shared policy sets the order and needs every fallback candidate,
+	// including TCP at an address advertised by the provider as UDP-only.
+	if preferStream || (tp != nil && tp.Auto != nil) {
 		addStreamCandidates(true)
 		addLegacyUDP()
 	} else {

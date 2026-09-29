@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"wdtt.local/pathprobe"
 )
 
 type workerPolicyLimitError struct {
@@ -65,6 +66,7 @@ func RequestConfig(
 	ctx context.Context,
 	conn net.Conn,
 	localPort, deviceID, password, deviceInfo, transportSession string,
+	worker ...pathprobe.Worker,
 ) (string, error) {
 	payload := fmt.Sprintf("GETCONF:%s|%s|%s", localPort, deviceID, password)
 	safeDeviceInfo := strings.ReplaceAll(strings.TrimSpace(deviceInfo), "|", " ")
@@ -74,6 +76,9 @@ func RequestConfig(
 	}
 	if safeTransportSession != "" {
 		payload += "|" + safeTransportSession
+		if len(worker) > 0 && worker[0].Valid() {
+			payload += "|" + worker[0].String()
+		}
 	}
 	if _, err := conn.Write([]byte(payload)); err != nil {
 		return "", fmt.Errorf("отправка GETCONF: %w", err)

@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -18,6 +19,30 @@ const proxyMaxClients = 64
 type proxyListener struct {
 	listener net.Listener
 	access   proxyAccessPolicy
+}
+
+type proxyListenError struct {
+	Address string
+	Err     error
+}
+
+func (err *proxyListenError) Error() string {
+	return fmt.Sprintf("прокси не смог занять %s: %v", err.Address, err.Err)
+}
+
+func (err *proxyListenError) Unwrap() error {
+	return err.Err
+}
+
+func proxyPortInUseAddress(err error) (string, bool) {
+	if !errors.Is(err, syscall.EADDRINUSE) {
+		return "", false
+	}
+	var listenErr *proxyListenError
+	if !errors.As(err, &listenErr) || listenErr.Address == "" {
+		return "", false
+	}
+	return listenErr.Address, true
 }
 
 type bufferedProxyConn struct {
@@ -106,7 +131,7 @@ func runUnifiedProxyServer(
 			for _, opened := range listeners {
 				_ = opened.listener.Close()
 			}
-			return fmt.Errorf("прокси не смог занять %s: %w", address, listenErr)
+			return &proxyListenError{Address: address, Err: listenErr}
 		}
 		listeners = append(listeners, proxyListener{listener: listener, access: policies[index]})
 	}

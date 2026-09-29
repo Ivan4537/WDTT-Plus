@@ -69,7 +69,6 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.SaveAlt
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Smartphone
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -173,7 +172,7 @@ private data class ClientQrData(
 private fun vkHashInputError(value: String): String? {
     if (value.isBlank()) return null
     return if (VkJoinLink.normalizeHashes(value) == null) {
-        "Проверьте VK-хеш: допустимы латинские буквы, цифры, _ и - либо ссылка VK-звонка."
+        "Проверьте ВК-хеш: допустимы латинские буквы, цифры, _ и - либо ссылка ВК-звонка."
     } else {
         null
     }
@@ -188,8 +187,8 @@ internal fun serverClientsAccessIssue(
     sshPrivateKey: String = "",
     allowPasswordAuthentication: Boolean = true
 ): String? {
-    if (host.isBlank()) return "Укажите IP-адрес или домен сервера в верхнем блоке «Деплой»."
-    if (!hostValid) return "Проверьте IP-адрес или домен сервера в верхнем блоке «Деплой»."
+    if (host.isBlank()) return "Укажите IP-адрес или домен сервера в настройках SSH."
+    if (!hostValid) return "Проверьте IP-адрес или домен сервера в настройках SSH."
     val credentials = SshCredentials(
         password = sshPassword,
         privateKey = sshPrivateKey,
@@ -202,10 +201,10 @@ internal fun serverClientsAccessIssue(
             privateKey = sshPrivateKey,
             passwordLabel = "SSH-пароль",
             privateKeyLabel = "приватный SSH-ключ"
-        ) ?: "Укажите SSH-пароль или приватный SSH-ключ в верхнем блоке «Деплой»."
+        ) ?: "Укажите SSH-пароль или приватный SSH-ключ в настройках SSH."
     }
     if (sshPort !in 1..65535) return "Укажите корректный SSH-порт от 1 до 65535."
-    if (mainPassword.isBlank()) return "Откройте «Секреты» и укажите главный пароль администратора."
+    if (mainPassword.isBlank()) return "Откройте параметры сервера и укажите главный пароль администратора."
     return null
 }
 
@@ -652,8 +651,8 @@ fun ServerClientsSection(
 
         AnimatedVisibility(
             visible = expanded,
-            enter = expandVertically() + fadeIn(),
-            exit = shrinkVertically() + fadeOut()
+            enter = expandVertically(animationSpec = tween(300)) + fadeIn(tween(300)),
+            exit = shrinkVertically(animationSpec = tween(225)) + fadeOut(tween(225))
         ) {
             Column(
                 modifier = Modifier.padding(top = 12.dp),
@@ -766,6 +765,7 @@ fun ServerClientsSection(
                             modifier = Modifier
                                 .width(if (activeFilterCount > 0) 72.dp else 56.dp)
                                 .requiredHeight(56.dp)
+                                .iconHoldHint("Фильтры списка клиентов")
                                 .remoteFocusOutline(RoundedCornerShape(18.dp))
                         ) {
                             Row(
@@ -1049,12 +1049,12 @@ fun ServerClientsSection(
         val transferResult = remember(client) { runCatching { ClientTransferCodec.encode(ClientTransferCodec.fromClient(client)) } }
         val transfer = transferResult.getOrNull()
         if (transfer == null) {
-            AlertDialog(
+            BoundedAlertDialog(
                 onDismissRequest = { exportClient = null },
                 title = { DialogTitle("Экспорт невозможен", { exportClient = null }) },
                 text = {
                     Text(
-                        transferResult.exceptionOrNull()?.message ?: "Проверьте пароль и VK-хеши клиента.",
+                        transferResult.exceptionOrNull()?.message ?: "Проверьте пароль и ВК-хеши клиента.",
                         color = MaterialTheme.colorScheme.error
                     )
                 },
@@ -1466,7 +1466,7 @@ private fun ServerClientCard(
             )
             if (client.vkHash.isBlank()) {
                 Text(
-                    "VK-хеш не задан: доступ можно передать, но клиенту нужно добавить свой перед запуском.",
+                    "ВК-хеш не задан: доступ можно передать, но клиенту нужно добавить свой перед запуском.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.error
                 )
@@ -1488,7 +1488,8 @@ private fun ClientFiltersDialog(
     onClear: () -> Unit,
     onDismiss: () -> Unit
 ) {
-    AlertDialog(
+    BoundedAlertDialog(
+        scrollableText = false,
         onDismissRequest = onDismiss,
         title = { DialogTitle("Фильтры клиентов", onDismiss) },
         text = {
@@ -1560,7 +1561,7 @@ private fun ClientFiltersPanel(
                 ClientFilterChip("Бессрочные", expiryFilter == ClientExpiryFilter.Unlimited) { onExpiryFilterChange(ClientExpiryFilter.Unlimited) }
             }
 
-            FilterGroupTitle("VK-хеш")
+            FilterGroupTitle("ВК-хеш")
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 ClientFilterChip("Все", vkHashFilter == ClientVkHashFilter.All) { onVkHashFilterChange(ClientVkHashFilter.All) }
                 ClientFilterChip("С хешем", vkHashFilter == ClientVkHashFilter.Present) { onVkHashFilterChange(ClientVkHashFilter.Present) }
@@ -1765,7 +1766,7 @@ private fun AccessResultDialog(
     onQr: () -> Unit,
     onFile: () -> Unit
 ) {
-    AlertDialog(
+    BoundedAlertDialog(
         onDismissRequest = onDismiss,
         title = { DialogTitle(title, onDismiss) },
         text = {
@@ -1793,9 +1794,9 @@ private fun AccessResultDialog(
                 } else {
                     Text(
                         if (missingVkHashes) {
-                            "VK-хеш не задан. Передать можно, но клиенту нужно добавить свой перед запуском."
+                            "ВК-хеш не задан. Передать можно, но клиенту нужно добавить свой перед запуском."
                         } else {
-                            "Ссылка содержит пароль и VK-хеш. Не публикуйте её."
+                            "Ссылка содержит пароль и ВК-хеш. Не публикуйте её."
                         },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.error
@@ -1840,7 +1841,8 @@ private fun ClientDetailsDialog(
         client.connectionLink(fallbackHost, publicHost, sourceProfileName)
     }
 
-    AlertDialog(
+    BoundedAlertDialog(
+        scrollableText = false,
         onDismissRequest = onDismiss,
         title = { DialogTitle(client.displayName(), onDismiss, enabled = !busy) },
         text = {
@@ -1878,7 +1880,7 @@ private fun ClientDetailsDialog(
                                     InfoLine("Статус", when (client.status) { "active" -> "активен"; "deactivated" -> "отключён"; "expired" -> "истёк"; else -> client.status })
                                     InfoLine("Срок", formatExpiry(client.expiresAt))
                                     InfoLine("Порты", client.ports)
-                                    InfoLine("VK-хеш", client.vkHash.ifBlank { "не задан" })
+                                    InfoLine("ВК-хеш", client.vkHash.ifBlank { "не задан" })
                                     HorizontalDivider()
                                     TrafficPeriodBlock(client.traffic)
                                 }
@@ -1937,7 +1939,7 @@ private fun ClientDetailsDialog(
                                     OutlinedTextField(
                                         value = hash,
                                         onValueChange = { hash = it.take(4096) },
-                                        label = { Text("VK-хеш или ссылка") },
+                                        label = { Text("ВК-хеш или ссылка") },
                                         supportingText = { hashError?.let { Text(it) } },
                                         isError = hashError != null,
                                         minLines = 2,
@@ -2018,7 +2020,8 @@ private fun ServerToolsDialog(
     val limit = limitText.toIntOrNull()
     val networkValid = dns.isNotBlank() && limit != null && limit in 1..500 && ports.isPortsSpec()
 
-    AlertDialog(
+    BoundedAlertDialog(
+        scrollableText = false,
         onDismissRequest = onDismiss,
         title = { DialogTitle("Управление сервером", onDismiss, enabled = !busy) },
         text = {
@@ -2062,8 +2065,8 @@ private fun ServerToolsDialog(
 	                                    HorizontalDivider()
 	                                    Text("Сохранено на сервере", fontWeight = FontWeight.Bold)
 	                                    InfoLine("Состояние", if (state.adminProfile.hasSavedFields) "сохранён ${formatDateTime(state.adminProfile.updatedAt)}" else "ещё не сохранён")
-	                                    InfoLine("VK-хеши владельца", secretPresenceLabel(state.adminProfile.vkHashes))
-	                                    InfoLine("Резервный VK-хеш", secretPresenceLabel(state.adminProfile.secondaryVkHash))
+	                                    InfoLine("ВК-хеши владельца", secretPresenceLabel(state.adminProfile.vkHashes))
+	                                    InfoLine("Резервный ВК-хеш", secretPresenceLabel(state.adminProfile.secondaryVkHash))
 	                                    InfoLine("Порты", state.adminProfile.ports)
 	                                    InfoLine("Потоки", state.adminProfile.workersPerHash.toString())
 	                                    InfoLine("Протокол", state.adminProfile.protocol)
@@ -2072,8 +2075,8 @@ private fun ServerToolsDialog(
 	                                    InfoLine("DNS внутри VPN", state.adminProfile.vpnDnsDisplayLabel)
 	                                    HorizontalDivider()
 	                                    Text("Будет записано при установке", fontWeight = FontWeight.Bold)
-	                                    InfoLine("VK-хеши владельца", secretPresenceLabel(localAdminProfile.vkHashes))
-	                                    InfoLine("Резервный VK-хеш", secretPresenceLabel(localAdminProfile.secondaryVkHash))
+	                                    InfoLine("ВК-хеши владельца", secretPresenceLabel(localAdminProfile.vkHashes))
+	                                    InfoLine("Резервный ВК-хеш", secretPresenceLabel(localAdminProfile.secondaryVkHash))
 	                                    InfoLine("Порты", localAdminProfile.ports)
 	                                    InfoLine("Потоки", localAdminProfile.workersPerHash.toString())
 	                                    InfoLine("Протокол", localAdminProfile.protocol)
@@ -2411,7 +2414,7 @@ private fun ClientImportMethodsDialog(
     onFile: () -> Unit,
     onPaste: () -> Unit
 ) {
-    AlertDialog(
+    BoundedAlertDialog(
         onDismissRequest = onDismiss,
         title = { DialogTitle("Импорт клиента", onDismiss) },
         text = {
@@ -2457,13 +2460,13 @@ private fun ClientTransferExportDialog(
     onQr: () -> Unit,
     onFile: () -> Unit
 ) {
-    AlertDialog(
+    BoundedAlertDialog(
         onDismissRequest = onDismiss,
         title = { DialogTitle("Экспорт клиента", onDismiss) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text("Клиент: ${client.displayName()}", fontWeight = FontWeight.Bold)
-                Text("Переносятся пароль, название, VK-хеши, срок и состояние доступа.")
+                Text("Переносятся пароль, название, ВК-хеши, срок и состояние доступа.")
                 Text(
                     "Не переносятся устройство, WireGuard-ключи, адрес, порты, трафик и история. На новом сервере используются его настройки, а устройство привяжется при первом подключении.",
                     style = MaterialTheme.typography.bodySmall,
@@ -2521,7 +2524,8 @@ private fun ClientImportConfirmDialog(
         if (targetHost.isBlank()) add("Не определён адрес нового сервера.")
         if (!targetPorts.isPortsSpec()) add("На новом сервере указаны некорректные порты.")
     }
-    AlertDialog(
+    BoundedAlertDialog(
+        scrollableText = false,
         onDismissRequest = onDismiss,
         title = { DialogTitle("Проверка импорта", onDismiss) },
         text = {
@@ -2535,7 +2539,7 @@ private fun ClientImportConfirmDialog(
                 InfoLine("Пароль", "${payload.password.take(3)}••••${payload.password.takeLast(3)}")
                 InfoLine("Срок", formatExpiry(payload.expiresAt))
                 InfoLine("Состояние", if (payload.deactivated) "Отключён" else "Активен")
-                InfoLine("VK-хеши", if (payload.vkHash.isBlank()) "не заданы" else "заданы")
+                InfoLine("ВК-хеши", if (payload.vkHash.isBlank()) "не заданы" else "заданы")
                 HorizontalDivider()
                 InfoLine("Новый сервер", targetHost.ifBlank { "не определён" })
                 InfoLine("Порты нового сервера", targetPorts.ifBlank { "не заданы" })
@@ -2572,7 +2576,8 @@ private fun ChangeClientPasswordDialog(
         value in existingPasswords -> "Клиент с таким паролем уже существует."
         else -> null
     }
-    AlertDialog(
+    BoundedAlertDialog(
+        scrollableText = false,
         onDismissRequest = onDismiss,
         title = { DialogTitle("Сменить пароль", onDismiss) },
         text = {
@@ -2613,7 +2618,7 @@ private fun ChangeClientPasswordDialog(
                     )
                 }
                 Text(
-                    "Старые ссылки перестанут работать, активное соединение этого клиента завершится. Название, срок, VK-хеши и привязка устройства сохранятся; остальные клиенты не затрагиваются.",
+                    "Старые ссылки перестанут работать, активное соединение этого клиента завершится. Название, срок, ВК-хеши и привязка устройства сохранятся; остальные клиенты не затрагиваются.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.error
                 )
@@ -2654,7 +2659,7 @@ private fun CreateClientWizardDialog(
     }
     val passwordValid = useAutoPassword || (customPassword.isNotEmpty() && passwordError == null)
 
-    AlertDialog(
+    BoundedAlertDialog(
         onDismissRequest = onDismiss,
         title = { DialogTitle("Новый клиент", onDismiss, enabled = !busy) },
         text = {
@@ -2712,13 +2717,13 @@ private fun CreateClientWizardDialog(
                                 ClientWizardStep.Hash -> {
                                     Text("Хеши клиентской ссылки", fontWeight = FontWeight.Bold)
                                     Text(
-                                        "VK-хеши владельца не наследуются. Лучше добавить хеши перед передачей. Без них доступ тоже можно отправить, но клиенту придётся добавить свои.",
+                                        "ВК-хеши владельца не наследуются. Можно указать до 4 хешей или ссылок ВК Звонков: с новой строки, через пробел или запятую. Поле можно оставить пустым — тогда клиент добавит свои.",
                                         style = MaterialTheme.typography.bodySmall
                                     )
                                     OutlinedTextField(
                                         value = vkHash,
                                         onValueChange = { vkHash = it.take(4096) },
-                                        label = { Text("Хеш или ссылка") },
+                                        label = { Text("До 4 хешей или ссылок") },
                                         supportingText = { hashError?.let { Text(it) } },
                                         isError = hashError != null,
                                         minLines = 2,
@@ -2781,12 +2786,12 @@ private fun CreateClientWizardDialog(
                                     Text("Проверка", fontWeight = FontWeight.Bold)
                                     Text("Срок: ${if (days == 0) "бессрочно" else "$days дн."}")
                                     Text("Название: ${label.ifBlank { "без имени" }}")
-                                    Text("VK-хеш: ${if (vkHash.isBlank()) "не задан" else "задан"}")
+                                    Text("ВК-хеш: ${if (vkHash.isBlank()) "не задан" else "задан"}")
                                     Text("Порты: $effectivePorts")
                                     Text("Пароль: ${if (useAutoPassword) "будет создан автоматически" else customPassword}")
                                     if (vkHash.isBlank()) {
                                         Text(
-                                            "Без VK-хеша клиент добавит свой перед запуском.",
+                                            "Без ВК-хеша клиент добавит свой перед запуском.",
                                             style = MaterialTheme.typography.bodySmall,
                                             color = MaterialTheme.colorScheme.error
                                         )
@@ -2860,7 +2865,7 @@ private fun ConfirmClientActionDialog(
     onDismiss: () -> Unit,
     onConfirm: () -> Unit
 ) {
-    AlertDialog(
+    BoundedAlertDialog(
         onDismissRequest = onDismiss,
         title = { DialogTitle(action.confirmLabel, onDismiss) },
         text = { Text(action.message) },
@@ -2887,7 +2892,7 @@ private fun ExtendClientDialog(
 ) {
     var customDays by rememberSaveable { mutableStateOf("") }
     val parsedDays = customDays.toIntOrNull()?.takeIf { it in 1..365 }
-    AlertDialog(
+    BoundedAlertDialog(
         onDismissRequest = onDismiss,
         title = { DialogTitle("Продлить", onDismiss) },
         text = {
@@ -2931,7 +2936,7 @@ private fun ClientQrDialog(
         if (granted) onSave()
         else Toast.makeText(context, "Без разрешения Android 9 не может сохранить QR-код.", Toast.LENGTH_LONG).show()
     }
-    AlertDialog(
+    BoundedAlertDialog(
         onDismissRequest = onDismiss,
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -2950,9 +2955,9 @@ private fun ClientQrDialog(
                 }
                 Text(
                     if (missingVkHashes) {
-                        "VK-хеш не задан. Клиенту нужно добавить свой перед запуском."
+                        "ВК-хеш не задан. Клиенту нужно добавить свой перед запуском."
                     } else {
-                        "QR содержит пароль и VK-хеш. Не публикуйте изображение."
+                        "QR содержит пароль и ВК-хеш. Не публикуйте изображение."
                     },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.error

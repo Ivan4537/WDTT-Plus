@@ -4,9 +4,11 @@
 из Linux-терминала, без передачи SSH-логина, root-пароля или приватного ключа
 Android-приложению.
 
-Текущая версия автономного установщика — `0.20.0`. Она совместима только с
-`wdtt-server` версии `17` и контрактом Android-деплоя `1`. Номера версий у
-скрипта и сервера разные по замыслу: важна именно эта совместимая комбинация.
+Комплект для выпуска **WDTT Plus 19** содержит `wdtt-server` версии `19` и
+автономный установщик `0.20.2`, совместимый с контрактом Android-деплоя `1`.
+Версии приложения и сервера совпадают; версия скрипта учитывается отдельно,
+поскольку он может обновляться без изменения сервера. Используйте файлы из
+одного выпуска.
 
 ```bash
 bash server-installer/install.sh --version
@@ -23,7 +25,7 @@ VK-хеш.
 Для установки нужен совместимый комплект:
 
 - `install.sh`;
-- исполняемый бинарник `wdtt-server` версии `17` для Linux `amd64`
+- исполняемый бинарник `wdtt-server` версии `19` для Linux `amd64`
   (`x86_64`);
 - `SHA256SUMS` для проверки скрипта и бинарника.
 
@@ -41,8 +43,8 @@ VK-хеш.
 На странице выпуска WDTT Plus в разделе **Assets**, рядом с APK, публикуются:
 
 ```text
-WDTT-Plus-server-v17-installer-0.20.0-linux-amd64.tar.gz
-WDTT-Plus-server-v17-installer-0.20.0-linux-amd64.tar.gz.sha256
+WDTT-Plus-server-v19-installer-0.20.2-linux-amd64.tar.gz
+WDTT-Plus-server-v19-installer-0.20.2-linux-amd64.tar.gz.sha256
 ```
 
 При канонической предрелизной подготовке эти файлы создаются вместе с четырьмя
@@ -57,9 +59,9 @@ app/build/outputs/release-ready/
 архив:
 
 ```bash
-sha256sum -c WDTT-Plus-server-v17-installer-0.20.0-linux-amd64.tar.gz.sha256
-tar -xzf WDTT-Plus-server-v17-installer-0.20.0-linux-amd64.tar.gz
-cd WDTT-Plus-server-v17-installer-0.20.0-linux-amd64
+sha256sum -c WDTT-Plus-server-v19-installer-0.20.2-linux-amd64.tar.gz.sha256
+tar -xzf WDTT-Plus-server-v19-installer-0.20.2-linux-amd64.tar.gz
+cd WDTT-Plus-server-v19-installer-0.20.2-linux-amd64
 ```
 
 После распаковки внутри находятся три согласованных файла:
@@ -70,7 +72,7 @@ wdtt-server
 SHA256SUMS
 ```
 
-Это статический Linux `amd64`-файл `wdtt-server` версии `17`; внешние
+Это статический Linux `amd64`-файл `wdtt-server` версии `19`; внешние
 динамические библиотеки ему не нужны. Проверьте внутренние файлы и их версии:
 
 ```bash
@@ -80,7 +82,7 @@ bash install.sh --version
 ```
 
 Проверка должна сообщить `install.sh: OK`, `wdtt-server: OK`, версию
-установщика `0.20.0` и версию сервера `17`.
+установщика `0.20.2` и версию сервера `19`.
 
 Готовые бинарник и контрольные суммы публикуются как файлы конкретного
 выпуска, но не хранятся в истории Git. Так пользователь получает проверенный
@@ -386,7 +388,7 @@ VPS. Пока сервер принадлежит ручному установ�
 
 ### Резервные копии после ручной установки
 
-Совместимый `wdtt-server` v17 поддерживает тот же менеджер резервных копий и
+Совместимый `wdtt-server` v19 поддерживает тот же менеджер резервных копий и
 после установки через этот скрипт. Управление находится в Android-приложении:
 **«Деплой» → «Резервные копии и перенос»**. Для административных действий
 нужны SSH-доступ к VPS и главный пароль WDTT; обычное VPN-подключение по-прежнему
@@ -679,8 +681,12 @@ kernel или userspace.
 - маркеры Android-деплоя, сохранённых Android-данных и ручной установки.
 
 Проверка [compatibility_test.sh](tests/compatibility_test.sh) сверяет контракт,
-`install.sh`, Android `deploy.sh` и `server.go`. Если один путь изменён, а
-другой не обновлён, Gradle-сборка должна остановиться до создания APK.
+`install.sh`, Android `deploy.sh` и `server.go`. Отдельная проверка
+[version_sync_test.sh](tests/version_sync_test.sh) сверяет номер выпуска у
+Android-приложения, `wdtt-server` и верхней записи `CHANGELOG.md`, а также
+целевую версию сервера в обоих установщиках, контракте и инструкции. Версия
+самого скрипта остаётся отдельной. Если один путь изменён, а другой не обновлён,
+Gradle-сборка останавливается до создания серверного бинарника и APK.
 
 При изменении серверного протокола или цепочки Android-деплоя обновляйте
 одновременно:
@@ -698,11 +704,19 @@ kernel или userspace.
 ```bash
 bash -n server-installer/install.sh server-installer/tests/install_test.sh
 bash -n server-installer/release_bundle.sh
+bash server-installer/tests/version_sync_test.sh
 bash server-installer/tests/compatibility_test.sh
 bash server-installer/tests/install_test.sh
 go test ./...
 (cd go_client && go test ./...)
 git diff --check -- server-installer/install.sh server-installer/README.md
+```
+
+Если серверный бинарник уже собран, локальный standalone-комплект без сборки
+APK синхронизируется канонической командой:
+
+```bash
+server-installer/release_bundle.sh sync-local
 ```
 
 ### Предрелизная подготовка
@@ -846,6 +860,10 @@ SSH нужен только для ручной установки, админи
 
 ## Версии ручного установщика
 
+- `0.20.2` — добавлена совместимость с `wdtt-server` v19 и Android-деплоем
+  выпуска 19; обновление сохраняет данные, ключи, настройки и резервные копии.
+- `0.20.1` — добавлена совместимость с `wdtt-server` v18; обновление сохраняет
+  существующие данные, ключи, настройки и резервные копии.
 - `0.20.0` — ручной установщик распознаёт данные, оставленные командой Android
   «Удалить сервер, сохранить данные», и может явно принять их через
   `adopt-android`. Перед восстановлением создаётся полная проверенная копия;

@@ -7,6 +7,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
@@ -199,6 +200,25 @@
                 android:resource="@xml/vpn_widget_compact_info" />
         </receiver>
             
+        <service android:name="com.wdtt.plus.vk.NativeVkBrokerService" android:exported="false" />
+        <activity android:name="com.wdtt.plus.vk.ModernVkProfile0Activity"
+            android:exported="false" android:process=":local_web_auth_p0" android:launchMode="singleTop"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" android:configChanges="orientation|screenSize|keyboardHidden|uiMode" />
+        <activity android:name="com.wdtt.plus.vk.ModernVkProfile1Activity"
+            android:exported="false" android:process=":local_web_auth_p1" android:launchMode="singleTop"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" android:configChanges="orientation|screenSize|keyboardHidden|uiMode" />
+        <activity android:name="com.wdtt.plus.vk.ModernVkProfile2Activity"
+            android:exported="false" android:process=":local_web_auth_p2" android:launchMode="singleTop"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" android:configChanges="orientation|screenSize|keyboardHidden|uiMode" />
+        <activity android:name="com.wdtt.plus.vk.NativeVkProfile0Activity"
+            android:exported="false" android:process=":local_web_auth_p0" android:launchMode="singleTop"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" android:configChanges="orientation|screenSize|keyboardHidden|uiMode" />
+        <activity android:name="com.wdtt.plus.vk.NativeVkProfile1Activity"
+            android:exported="false" android:process=":local_web_auth_p1" android:launchMode="singleTop"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" android:configChanges="orientation|screenSize|keyboardHidden|uiMode" />
+        <activity android:name="com.wdtt.plus.vk.NativeVkProfile2Activity"
+            android:exported="false" android:process=":local_web_auth_p2" android:launchMode="singleTop"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" android:configChanges="orientation|screenSize|keyboardHidden|uiMode" />
     </application>
 
 </manifest>

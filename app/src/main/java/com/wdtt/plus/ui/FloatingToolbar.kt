@@ -64,7 +64,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Share
-import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import android.widget.Toast
 import kotlinx.coroutines.delay
@@ -83,6 +82,15 @@ internal fun floatingToolbarMaxOffset(
 ): Float = (
     parentHeightPx - safeBottomPx - navigationReservePx - toolbarHeightPx - bottomGapPx
     ).coerceAtLeast(minOffsetY)
+
+internal fun floatingToolbarOffset(fraction: Float, minOffset: Float, maxOffset: Float): Float {
+    val normalized = if (fraction.isFinite() && fraction >= 0f) fraction.coerceIn(0f, 1f) else 1f
+    return minOffset + (maxOffset - minOffset).coerceAtLeast(0f) * normalized
+}
+
+internal fun floatingToolbarFraction(offset: Float, minOffset: Float, maxOffset: Float, previous: Float): Float =
+    if (maxOffset > minOffset) ((offset - minOffset) / (maxOffset - minOffset)).coerceIn(0f, 1f)
+    else previous
 
 @OptIn(ExperimentalLayoutApi::class, ExperimentalFoundationApi::class)
 @Composable
@@ -106,6 +114,7 @@ fun FloatingToolbar(
     activeClientIds: String,
     onClientIdsChange: (String) -> Unit,
     onTransferRequested: () -> Unit,
+    onOpened: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -140,8 +149,7 @@ fun FloatingToolbar(
     }
     var parentHeightPx by remember { mutableFloatStateOf(0f) }
     var tabHeightPx by remember { mutableFloatStateOf(0f) }
-    var offsetY by remember { mutableFloatStateOf(-1f) }
-    var toolbarPositionRestored by remember { mutableStateOf(false) }
+    var toolbarYFraction by remember { mutableFloatStateOf(-2f) }
     var isExpanded by rememberSaveable { mutableStateOf(false) }
     var renamingProfile by remember { mutableStateOf<Int?>(null) }
     var resettingProfile by remember { mutableStateOf<Int?>(null) }
@@ -191,32 +199,17 @@ fun FloatingToolbar(
         minOffsetY = minOffsetY,
     )
 
-    LaunchedEffect(savedToolbarYFraction, minOffsetY, maxOffsetY) {
-        if (savedToolbarYFraction < -1f) return@LaunchedEffect
-        offsetY = if (!toolbarPositionRestored || offsetY < 0f) {
-            if (savedToolbarYFraction >= 0f && maxOffsetY > minOffsetY) {
-                minOffsetY + (maxOffsetY - minOffsetY) * savedToolbarYFraction
-            } else {
-                // A new installation starts above the bottom navigation, as
-                // shown in the main tunnel layout. The thumb remains freely
-                // movable along the right edge and its chosen position is saved.
-                maxOffsetY
-            }
-        } else {
-            offsetY.coerceIn(minOffsetY, maxOffsetY)
+    // Keep the relative position while window insets and measured height settle after startup.
+    val toolbarPositionRestored = toolbarYFraction >= 0f
+    val offsetY = floatingToolbarOffset(toolbarYFraction, minOffsetY, maxOffsetY)
+    LaunchedEffect(savedToolbarYFraction) {
+        if (!toolbarPositionRestored && savedToolbarYFraction >= -1f) {
+            toolbarYFraction = if (savedToolbarYFraction >= 0f) savedToolbarYFraction else 1f
         }
-        toolbarPositionRestored = true
     }
 
     fun persistToolbarPosition() {
-        if (!toolbarPositionRestored) return
-        val availableRange = maxOffsetY - minOffsetY
-        val fraction = if (availableRange > 0f) {
-            ((offsetY - minOffsetY) / availableRange).coerceIn(0f, 1f)
-        } else {
-            0f
-        }
-        scope.launch { settingsStore.saveFloatingToolbarYFraction(fraction) }
+        if (toolbarYFraction >= 0f) settingsStore.saveFloatingToolbarYFraction(toolbarYFraction)
     }
 
     val tabShape = RoundedCornerShape(topStart = 14.dp, bottomStart = 14.dp)
@@ -229,21 +222,25 @@ fun FloatingToolbar(
             }
     ) {
         Surface(
-            onClick = { isExpanded = !isExpanded },
+            onClick = { if (!isExpanded) onOpened(); isExpanded = !isExpanded },
             modifier = Modifier
+                .iconHoldHint("Настройки приложения и профилей")
                 .align(Alignment.TopEnd)
                 .offset { IntOffset(0, offsetY.coerceAtLeast(minOffsetY).roundToInt()) }
                 .remoteCompactFocus(tabShape)
                 .onGloballyPositioned { coordinates ->
                     tabHeightPx = coordinates.size.height.toFloat()
                 }
-                .pointerInput(minOffsetY, maxOffsetY) {
+                .pointerInput(minOffsetY, maxOffsetY, toolbarPositionRestored) {
                     detectDragGestures(
                         onDragEnd = { persistToolbarPosition() },
                         onDragCancel = { persistToolbarPosition() },
                         onDrag = { change, dragAmount ->
                             change.consume()
-                            offsetY = (offsetY + dragAmount.y).coerceIn(minOffsetY, maxOffsetY)
+                            if (toolbarYFraction >= 0f) {
+                                val movedOffset = floatingToolbarOffset(toolbarYFraction, minOffsetY, maxOffsetY) + dragAmount.y
+                                toolbarYFraction = floatingToolbarFraction(movedOffset, minOffsetY, maxOffsetY, toolbarYFraction)
+                            }
                         },
                     )
                 },
@@ -266,7 +263,7 @@ fun FloatingToolbar(
         }
 
         if (isExpanded) {
-            Dialog(
+            BoundedAppDialog(
                 onDismissRequest = { isExpanded = false },
                 properties = DialogProperties(usePlatformDefaultWidth = false)
             ) {
@@ -306,7 +303,7 @@ fun FloatingToolbar(
                         ) {
                             Icon(
                                 Icons.Filled.Close,
-                                contentDescription = "Close",
+                                contentDescription = "Закрыть",
                                 tint = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
@@ -694,15 +691,15 @@ fun FloatingToolbar(
                     ) {
                         Column(modifier = Modifier.weight(1f).padding(end = 10.dp)) {
                             Text(
-                                "Клиенты VK",
+                                "Клиенты ВК",
                                 style = MaterialTheme.typography.bodyMedium,
                                 fontWeight = FontWeight.SemiBold,
                                 color = MaterialTheme.colorScheme.onSurface
                             )
                             Text(
                                 when {
-                                    !customVkCredentialsEnabled -> "VKCalls → встроенный резерв"
-                                    customVkCredentialsComplete -> "VKCalls → свой → встроенный резерв"
+                                    !customVkCredentialsEnabled -> "ВК Звонки → встроенный резерв"
+                                    customVkCredentialsComplete -> "ВК Звонки → свой → встроенный резерв"
                                     else -> "Заполните резервные реквизиты"
                                 },
                                 style = MaterialTheme.typography.bodySmall,
@@ -895,7 +892,7 @@ private fun ProfileMenuDialog(
     onSave: () -> Unit,
     onDismiss: () -> Unit
 ) {
-    Dialog(
+    BoundedAppDialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false)
     ) {
@@ -982,7 +979,7 @@ private fun ProfileResetDialog(
     onConfirm: () -> Unit,
     onDismiss: () -> Unit
 ) {
-    Dialog(
+    BoundedAppDialog(
         onDismissRequest = { if (!inProgress) onDismiss() },
         properties = DialogProperties(usePlatformDefaultWidth = false)
     ) {
@@ -1032,7 +1029,7 @@ private fun ProfileResetDialog(
                                     style = MaterialTheme.typography.bodyLarge
                                 )
                                 Text(
-                                    "Удалятся настройки подключения, VK-хеши, ссылки, пароли и SSH-ключи, параметры сервера, списки приложений и остальные данные этого профиля.",
+                                    "Удалятся настройки подключения, ВК-хеши, ссылки, пароли и SSH-ключи, параметры сервера, списки приложений и остальные данные этого профиля.",
                                     style = MaterialTheme.typography.bodyMedium
                                 )
                                 Text(
@@ -1135,6 +1132,7 @@ private fun ThemeOption(
         else MaterialTheme.colorScheme.surface,
         modifier = modifier
             .height(42.dp)
+            .iconHoldHint(contentDescription)
             .remoteFocusOutline(RoundedCornerShape(24.dp), focusedScale = 1.04f)
     ) {
         Box(

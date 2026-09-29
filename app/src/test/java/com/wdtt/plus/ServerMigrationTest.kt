@@ -11,6 +11,25 @@ import org.junit.Test
 
 class ServerMigrationTest {
     @Test
+    fun cleanVpsDoesNotRequireAnUpdateWhenCredentialsHaveBeenFilled() {
+        val state = ServerMigrationState(19, 17, 0, 2, installationPresent = false)
+        assertFalse(state.profileUpdateRequired)
+        assertFalse(state.shouldShowNoticeForProfile(2))
+        assertEquals(0, state.completedLevel)
+        assertTrue(state.copy(installationPresent = true).profileUpdateRequired)
+        assertFalse(state.copy(installationPresent = true, completedLevel = 19).profileUpdateRequired)
+    }
+
+    @Test
+    fun probePresenceIsOnlyReusedForTheSameServerAndSshPort() {
+        assertEquals(false, resolveServerInstallationPresence(false, " VPS.EXAMPLE ", 22, "vps.example", 22))
+        assertEquals(null, resolveServerInstallationPresence(false, "vps.example", 22, "other.example", 22))
+        assertEquals(null, resolveServerInstallationPresence(false, "vps.example", 22, "vps.example", 2222))
+        assertEquals(null, resolveServerInstallationPresence(false, "", 22, "", 22))
+        assertEquals(null, resolveServerInstallationPresence(null, null, null, "vps.example", 22))
+    }
+
+    @Test
     fun currentServerSnapshotWithBackupPolicyIsAccepted() {
         fun file(path: String, value: String): JSONObject {
             val data = value.toByteArray()
@@ -198,6 +217,38 @@ class ServerMigrationTest {
 
         assertFalse(state.noticeRequired)
         assertTrue(state.profileUpdateRequired)
+    }
+
+    @Test
+    fun release19RequiresUpdateFrom18() {
+        val result = resolveServerMigrationInitialization(19, true, 18, 17, 17, 5)
+        assertEquals(19, result.pendingLevel)
+        assertEquals(17, result.acknowledgedLevel)
+        assertEquals(19, latestServerMigrationLevel(19))
+    }
+
+    @Test
+    fun freshInstall19DoesNotShowAnUpdateNotice() {
+        val result = resolveServerMigrationInitialization(19, false, null, 0, null, 0)
+        assertEquals(0, result.pendingLevel)
+        assertEquals(19, result.lastSeenAppVersionCode)
+    }
+
+    @Test
+    fun acknowledged19IsNotRepeatedButIncompleteProfilesStillNeedUpdating() {
+        val result = resolveServerMigrationInitialization(19, true, 19, 19, 19, 5)
+        val state = ServerMigrationState(result.pendingLevel, result.acknowledgedLevel, 17, 2)
+        assertFalse(state.shouldShowNoticeForProfile(2))
+        assertTrue(state.profileUpdateRequired)
+    }
+
+    @Test
+    fun noticeOnlyBelongsToTheCurrentUnfinishedProfile() {
+        val pending = ServerMigrationState(19, 17, 17, 2)
+        assertTrue(pending.shouldShowNoticeForProfile(2))
+        assertFalse(pending.shouldShowNoticeForProfile(1))
+        assertFalse(pending.copy(completedLevel = 19).shouldShowNoticeForProfile(2))
+        assertTrue(pending.copy(completedLevel = 19).noticeRequired)
     }
 
     @Test

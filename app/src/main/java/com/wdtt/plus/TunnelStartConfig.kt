@@ -232,6 +232,7 @@ internal fun buildTunnelParams(saved: TunnelProfileSnapshot): TunnelParams? {
             connectionPassword = linkParts.password,
             protocol = saved.protocol,
             vkCallsPreflight = saved.vkCallsPreflight,
+            transportExperiment = effectiveTransportExperiment(saved.transportExperiment, normalizeTunnelMode(saved.proxyMode)),
             rtNetwork = saved.rtNetwork,
             rtMasque = saved.rtMasque,
             rtMasqueServerBootstrap =
@@ -276,6 +277,7 @@ internal fun buildTunnelParams(saved: TunnelProfileSnapshot): TunnelParams? {
             connectionPassword = password,
             protocol = saved.protocol,
             vkCallsPreflight = saved.vkCallsPreflight,
+            transportExperiment = effectiveTransportExperiment(saved.transportExperiment, normalizeTunnelMode(saved.proxyMode)),
             rtNetwork = saved.rtNetwork,
             rtMasque = saved.rtMasque,
             rtMasqueServerBootstrap =
@@ -319,6 +321,7 @@ suspend fun buildTunnelStartIntentFromSettings(
         putExtra("connection_password", params.connectionPassword)
         putExtra("protocol", params.protocol)
         putExtra("vkcalls_preflight", params.vkCallsPreflight)
+        putExtra("transport_experiment", params.transportExperiment)
         putExtra("rt_network", params.rtNetwork)
         putExtra("rt_masque", params.rtMasque)
         putExtra("rt_masque_server_bootstrap", params.rtMasqueServerBootstrap)

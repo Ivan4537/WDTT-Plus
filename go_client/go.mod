@@ -3,6 +3,7 @@ module wg-turn-client
 go 1.26
 
 require (
+	wdtt.local/pathprobe v0.0.0
 	github.com/Diniboy1123/connect-ip-go v0.0.0-20260613064811-66cba32d7d33
 	github.com/bogdanfinn/fhttp v0.6.8
 	github.com/bogdanfinn/tls-client v1.15.1
@@ -17,6 +18,7 @@ require (
 	golang.org/x/net v0.58.0
 	golang.zx2c4.com/wireguard v0.0.0-20260522210424-ecfc5a8d5446
 )
+
 
 require (
 	github.com/andybalholm/brotli v1.2.0 // indirect
@@ -40,3 +42,5 @@ require (
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
 	gvisor.dev/gvisor v0.0.0-20250503011706-39ed1f5ac29c // indirect
 )
+
+replace wdtt.local/pathprobe => ../pathprobe
