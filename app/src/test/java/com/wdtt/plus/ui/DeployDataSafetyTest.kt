@@ -16,7 +16,7 @@ class DeployDataSafetyTest {
             val missing = runRollbackProbe(File(root, "missing"))
             assertTrue(missing is ServerUpdateRollbackState.None)
 
-            val backup = File(root, "backup").apply { mkdirs() }
+            val backup = File(root, "backup").apply { mkdirs(); setReadable(false, false); setWritable(false, false); setExecutable(false, false); setReadable(true, true); setWritable(true, true); setExecutable(true, true) }
             File(backup, "state").writeText("prepared\n")
             File(backup, "had_config").createNewFile()
             File(backup, "config").mkdir()
@@ -48,7 +48,7 @@ class DeployDataSafetyTest {
         assertTrue("Восстановить прежнее состояние" in source)
         assertTrue("server-update-backup-cleanup" in source)
         assertTrue("systemctl is-active --quiet wdtt" in source)
-        assertTrue("WDTT_UPDATE_BACKUP=stale" in source)
+        assertTrue("WDTT_UPDATE_BACKUP=stale" in prepareServerUpdateRollbackScript())
     }
 
     private fun runRollbackProbe(backup: File): ServerUpdateRollbackState {
@@ -136,7 +136,7 @@ class DeployDataSafetyTest {
         assertTrue(
             "managed Android reset must prepare rollback",
             "DeploymentOwnership.IncompleteAndroidDeploy" in source &&
-                "prepareServerUpdateRollback(ssh)" in source
+                "prepareServerUpdateRollback(ssh, updateAttemptId)" in source
         )
     }
 

@@ -534,6 +534,8 @@ internal data class ServerUpdateRollbackMarkers(
 
 internal sealed class ServerUpdateRollbackState {
     data object None : ServerUpdateRollbackState()
+    data object PreparationIncomplete : ServerUpdateRollbackState()
+    data object Committed : ServerUpdateRollbackState()
     data class PreparedValid(val markers: ServerUpdateRollbackMarkers) : ServerUpdateRollbackState()
     data class PreparedCorrupted(val diagnostic: String) : ServerUpdateRollbackState()
     data class UnknownState(val diagnostic: String) : ServerUpdateRollbackState()
@@ -547,6 +549,8 @@ internal fun parseServerUpdateRollbackState(output: String): ServerUpdateRollbac
         .orEmpty()
     return when (markerValue(output, "WDTT_UPDATE_BACKUP_STATUS")) {
         "none" -> ServerUpdateRollbackState.None
+        "preparation_incomplete" -> ServerUpdateRollbackState.PreparationIncomplete
+        "committed_valid" -> ServerUpdateRollbackState.Committed
         "prepared_valid" -> ServerUpdateRollbackState.PreparedValid(
             ServerUpdateRollbackMarkers(
                 hadConfig = flag("WDTT_UPDATE_BACKUP_HAD_CONFIG"),
@@ -2137,6 +2141,8 @@ fun DeployTab(
                 settingsStore.recordProfileServerInstallation(checkProfile, request.host, request.sshPort, info.hasInstalledServer)
                 if (info.updateRollbackState !is ServerUpdateRollbackState.None) {
                     val validation = when (val rollback = info.updateRollbackState) {
+                        ServerUpdateRollbackState.PreparationIncomplete -> "preparation_incomplete"
+                        ServerUpdateRollbackState.Committed -> "committed_valid"
                         is ServerUpdateRollbackState.PreparedValid -> "prepared_valid"
                         is ServerUpdateRollbackState.PreparedCorrupted ->
                             "prepared_corrupted:${rollback.diagnostic}"
@@ -2147,9 +2153,7 @@ fun DeployTab(
                     DeployManager.writeError(
                         "Server update rollback backup found; validation=$validation",
                     )
-                    TunnelManager.addDeployErrorLog(
-                        "На сервере найдена страховочная копия обновления: $validation",
-                    )
+                    TunnelManager.addDeployErrorLog("На сервере осталось незавершённое действие обновления. Нужна проверка страховочной копии.")
                     pendingDeployRequest = request
                     existingInstallInfo = info
                     rollbackResolutionMessage = ""
@@ -2229,6 +2233,7 @@ fun DeployTab(
             rollbackResolutionBusy = false
         }
     }
+
 
     fun currentOutboundTarget(): OutboundSshTarget? {
         if (!primarySshAccessReady) {
@@ -4325,8 +4330,8 @@ fun DeployTab(
         if (deployRequest != null && installInfo != null) {
             val rollbackState = installInfo.updateRollbackState
             if (rollbackState !is ServerUpdateRollbackState.None) {
-                ServerUpdateRollbackDialog(
-                    state = rollbackState,
+                ServerUpdateRollbackHost(
+                    info = installInfo,
                     busy = rollbackResolutionBusy,
                     statusMessage = rollbackResolutionMessage,
                     onDismiss = {
@@ -4336,12 +4341,14 @@ fun DeployTab(
                             rollbackResolutionMessage = ""
                         }
                     },
-                    onRestore = {
-                        runRollbackResolution(ServerUpdateRollbackAction.RestorePrevious)
+                    onAction = ::runRollbackResolution,
+                    onRetryInspection = {
+                        pendingDeployRequest = null
+                        existingInstallInfo = null
+                        rollbackResolutionMessage = ""
+                        startDeployCheck(deployRequest, requireExistingServer = true)
                     },
-                    onKeepCurrent = {
-                        runRollbackResolution(ServerUpdateRollbackAction.KeepCurrentAndDeleteBackup)
-                    },
+                    onDiagnosticStatus = { rollbackResolutionMessage = it },
                 )
             } else {
                 ExistingInstallDialog(
@@ -7486,6 +7493,30 @@ private fun recordRemoteCommandEvent(event: RemoteLogEvent) {
 }
 
 private class SSHClient(private val session: Session, private val pass: String) {
+
+    /** Critical mutations must not mistake partial output or a nonzero remote exit for success. */
+    fun execChecked(command: String, timeout: Long = CMD_TIMEOUT): String {
+        val output = exec(command, timeout, preservePartialOnFailure = true)
+        if (Regex("^error:", RegexOption.MULTILINE).containsMatchIn(output)) {
+            val detail = serverUpdateFailureDetail(output).let {
+                if (pass.isNotBlank()) it.replace(pass, "[скрыто]") else it
+            }
+            DeployManager.writeError("Ошибка выполнения серверной операции:\n$detail")
+            throw IllegalStateException("Серверная операция не завершена:\n$detail")
+        }
+        return output
+    }
+
+    fun createPrivateStagingDirectory(): String {
+        val path = "/tmp/wdtt-deploy-${java.util.UUID.randomUUID()}"
+        val channel = session.openChannel("sftp") as ChannelSftp
+        try {
+            channel.connect(15_000)
+            channel.mkdir(path) // Refuse an existing path; do not follow/adopt it.
+            channel.chmod(0b111000000, path)
+            return path
+        } finally { channel.disconnect() }
+    }
 
     fun exec(
         command: String,
@@ -13561,7 +13592,8 @@ private fun applyServerImport(
     backup: ServerBackup,
     mode: ServerImportMode,
     restartService: Boolean,
-    standaloneManaged: Boolean = false
+    standaloneManaged: Boolean = false,
+    updateAttemptId: String? = null,
 ) {
     val currentDb = if (mode == ServerImportMode.Merge) readRemotePasswordsJson(ssh) else null
     val preparedDb = normalizeDbForTarget(backup, currentDb, mode, request)
@@ -13569,10 +13601,11 @@ private fun applyServerImport(
     val wgFile = File.createTempFile("wdtt-import-wg-keys-", ".dat", context.cacheDir)
     val outboundFile = File.createTempFile("wdtt-import-outbound-", ".env", context.cacheDir)
     val policyFile = File.createTempFile("wdtt-import-backup-policy-", ".json", context.cacheDir)
-    val remoteDbFile = "/tmp/wdtt-import-passwords.json"
-    val remoteWgFile = "/tmp/wdtt-import-wg-keys.dat"
-    val remoteOutboundFile = "/tmp/wdtt-import-outbound.env"
-    val remotePolicyFile = "/tmp/wdtt-import-backup-policy.json"
+    val staging = ssh.createPrivateStagingDirectory()
+    val remoteDbFile = "$staging/passwords.json"
+    val remoteWgFile = "$staging/wg-keys.dat"
+    val remoteOutboundFile = "$staging/outbound.env"
+    val remotePolicyFile = "$staging/backup-policy.json"
     listOf(dbFile, wgFile, outboundFile, policyFile).forEach { file ->
         file.setReadable(false, false)
         file.setWritable(false, false)
@@ -13610,7 +13643,7 @@ private fun applyServerImport(
         }
         val command = buildString {
             append("set -e; ")
-            append("systemctl stop wdtt 2>/dev/null || true; ")
+            append("wdtt_stop_service; ")
             append("mkdir -p -m 700 /etc/wdtt; [ -d /etc/wdtt ] && [ ! -L /etc/wdtt ]; ")
             append("install -m 600 ${shellQuote(remoteDbFile)} /etc/wdtt/.passwords.json.import; ")
             append("mv -f /etc/wdtt/.passwords.json.import /etc/wdtt/passwords.json; ")
@@ -13645,7 +13678,10 @@ private fun applyServerImport(
         } else {
             command
         }
-        val output = ssh.exec(rootCommand(serializedCommand), timeout = 60000L)
+        val guardedCommand = if (updateAttemptId != null) {
+            serverUpdateApplyGuardScript(serializedCommand, updateAttemptId)
+        } else serverUpdateShellContext() + "\nwdtt_lock\n" + serializedCommand
+        val output = ssh.execChecked(rootCommand(guardedCommand), timeout = SERVER_UPDATE_PREPARE_TIMEOUT_MS)
         if (markerValue(output, "WDTT_IMPORT_FILES") != "1") {
             throw IllegalStateException(
                 compactRemoteTail(output).ifBlank { "сервер не подтвердил запись импортируемых файлов" }
@@ -13677,7 +13713,7 @@ private fun applyServerImport(
     } finally {
         runCatching {
             ssh.exec(
-                rootCommand("rm -f ${shellQuote(remoteDbFile)} ${shellQuote(remoteWgFile)} ${shellQuote(remoteOutboundFile)} ${shellQuote(remotePolicyFile)}"),
+                rootCommand("rm -f ${shellQuote(remoteDbFile)} ${shellQuote(remoteWgFile)} ${shellQuote(remoteOutboundFile)} ${shellQuote(remotePolicyFile)}; rmdir -- ${shellQuote(staging)}"),
                 timeout = 10_000L
             )
         }
@@ -13733,8 +13769,9 @@ private suspend fun performServerImportNow(
     onProgress: (Float, String) -> Unit
 ): Boolean = withContext(Dispatchers.IO) {
     var session: Session? = null
-    var sshClient: SSHClient? = null
-    var rollbackPrepared = false
+    var preparationStarted = false
+    val updateAttemptId = java.util.UUID.randomUUID().toString()
+    var importVerified = false
     try {
         onProgress(0.05f, "Подключение...")
         session = createCriticalSshSession(
@@ -13750,7 +13787,6 @@ private suspend fun performServerImportNow(
         )
         DeployManager.activeSession = session
         val ssh = SSHClient(session, request.pass)
-        sshClient = ssh
         onProgress(0.10f, "Проверяю владельца установки...")
         val ownership = deploymentOwnership(ssh)
         if (ownership != DeploymentOwnership.AndroidDeploy && ownership != DeploymentOwnership.StandaloneInstaller) {
@@ -13763,16 +13799,18 @@ private suspend fun performServerImportNow(
         onProgress(0.12f, "Создаю постоянную копию перед восстановлением...")
         createPersistentSafetyBackup(request, "pre_restore")
         onProgress(0.15f, "Проверяю текущую базу и создаю страховочную копию...")
-        val beforeJson = readRemotePasswordsJson(ssh)?.also {
+        readRemotePasswordsJson(ssh)?.also {
             validatePasswordsDbStructure(JSONObject(it))
         }
-        prepareServerUpdateRollback(ssh)
-        rollbackPrepared = true
+        preparationStarted = true
+        prepareServerUpdateRollback(ssh, updateAttemptId)
+        val beforeJson = readRemotePasswordsJson(ssh)?.also { validatePasswordsDbStructure(JSONObject(it)) }
         onProgress(0.35f, "Подготовка импорта...")
         applyServerImport(
             context, ssh, request, backup, mode,
             restartService = true,
-            standaloneManaged = standaloneManaged
+            standaloneManaged = standaloneManaged,
+            updateAttemptId = updateAttemptId,
         )
         onProgress(0.85f, "Проверяю импортированные данные и службу...")
         val afterJson = readRemotePasswordsJson(ssh)
@@ -13783,17 +13821,17 @@ private suspend fun performServerImportNow(
             afterJson = afterJson,
             replace = mode == ServerImportMode.Replace
         )
-        cleanupServerUpdateRollback(ssh)
-        rollbackPrepared = false
+        importVerified = true
+        runCatching { cleanupServerUpdateRollback(ssh, updateAttemptId) }
+            .onFailure { DeployManager.writeError("Импорт проверен; очистка страховочной копии не завершена: ${it.message}") }
         onProgress(1.0f, "Импорт завершён")
         DeployManager.stopDeploy("success")
         TunnelManager.addDeploySuccessLog("Импорт состояния WDTT Plus завершён.")
         true
     } catch (e: Exception) {
-        if (rollbackPrepared) {
-            runCatching { sshClient?.let(::rollbackServerUpdate) }
+        if (preparationStarted && !importVerified) {
+            runCatching { recoverServerUpdateAfterFailure(session, updateAttemptId, request) }
                 .onFailure { rollbackError -> DeployManager.writeError("Import rollback failed: ${rollbackError.message}") }
-            rollbackPrepared = false
         }
         DeployManager.writeError("Server import critical: ${e.message}\n${e.stackTraceToString().take(500)}")
         DeployManager.stopDeploy("Ошибка импорта")
@@ -13810,8 +13848,7 @@ private const val SERVER_UPDATE_BACKUP_DIR = "/var/tmp/wdtt-plus-update-backup"
 
 internal fun serverUpdateRollbackProbeScript(
     backupDir: String = SERVER_UPDATE_BACKUP_DIR,
-): String = """
-    BACKUP=${shellQuote(backupDir)}
+): String = serverUpdateShellContext(ServerUpdatePaths(backup = backupDir)) + "\n" + """
     wdtt_backup_result() {
       printf 'WDTT_UPDATE_BACKUP_STATUS=%s\n' "${'$'}1"
       printf 'WDTT_UPDATE_BACKUP_DIAGNOSTIC=%s\n' "${'$'}2"
@@ -13823,12 +13860,30 @@ internal fun serverUpdateRollbackProbeScript(
     if [ -L "${'$'}BACKUP" ] || [ ! -d "${'$'}BACKUP" ]; then
       wdtt_backup_result prepared_corrupted unsafe_backup_path
     fi
+    wdtt_private_backup || wdtt_backup_result prepared_corrupted unsafe_backup_permissions
     if [ ! -f "${'$'}BACKUP/state" ] || [ -L "${'$'}BACKUP/state" ]; then
       wdtt_backup_result prepared_corrupted missing_or_unsafe_state
     fi
     backup_state=${'$'}(cat "${'$'}BACKUP/state" 2>/dev/null || true)
-    if [ "${'$'}backup_state" != prepared ]; then
+    if [ "${'$'}backup_state" = preparing ] || [ "${'$'}backup_state" = preparation_failed ]; then
+      wdtt_regular "${'$'}BACKUP/format" && [ "${'$'}(cat "${'$'}BACKUP/format")" = 2 ] ||
+        wdtt_backup_result unknown_state unknown_preparation
+      wdtt_safe_tree "${'$'}BACKUP" || wdtt_backup_result prepared_corrupted unsafe_preparation
+      unknown=${'$'}(find "${'$'}BACKUP" -mindepth 1 -maxdepth 1 \
+        ! -name state ! -name state.next ! -name format ! -name attempt ! -name checksums ! -name failure \
+        ! -name config ! -name wdtt-server ! -name wdtt.service \
+        ! -name had_config ! -name had_binary ! -name had_service \
+        ! -name was_active ! -name was_enabled -print -quit)
+      [ -z "${'$'}unknown" ] || wdtt_backup_result prepared_corrupted unknown_backup_entry
+      wdtt_backup_result preparation_incomplete preparation_not_finished
+    fi
+    if [ "${'$'}backup_state" != prepared ] && [ "${'$'}backup_state" != applying ] &&
+       [ "${'$'}backup_state" != rolling_back ] && [ "${'$'}backup_state" != committed ]; then
       wdtt_backup_result unknown_state state_not_prepared
+    fi
+    if [ "${'$'}backup_state" != prepared ]; then
+      wdtt_regular "${'$'}BACKUP/format" && [ "${'$'}(cat "${'$'}BACKUP/format")" = 2 ] ||
+        wdtt_backup_result unknown_state legacy_state_not_prepared
     fi
     for marker in had_config had_binary had_service was_active was_enabled; do
       marker_path="${'$'}BACKUP/${'$'}marker"
@@ -13840,7 +13895,8 @@ internal fun serverUpdateRollbackProbeScript(
     if [ -f "${'$'}BACKUP/had_config" ]; then
       [ -d "${'$'}BACKUP/config" ] && [ ! -L "${'$'}BACKUP/config" ] ||
         wdtt_backup_result prepared_corrupted missing_config
-      unsafe=${'$'}(find "${'$'}BACKUP/config" -mindepth 1 \( -type l -o ! \( -type f -o -type d \) \) -print -quit 2>/dev/null || true)
+      unsafe=${'$'}(find "${'$'}BACKUP/config" -mindepth 1 \( -type l -o ! \( -type f -o -type d \) \) -print -quit) ||
+        wdtt_backup_result prepared_corrupted unreadable_config_tree
       [ -z "${'$'}unsafe" ] || wdtt_backup_result prepared_corrupted unsafe_config_tree
     elif [ -e "${'$'}BACKUP/config" ] || [ -L "${'$'}BACKUP/config" ]; then
       wdtt_backup_result prepared_corrupted unexpected_config
@@ -13865,8 +13921,11 @@ internal fun serverUpdateRollbackProbeScript(
       ! -name state ! -name had_config ! -name config \
       ! -name had_binary ! -name wdtt-server \
       ! -name had_service ! -name wdtt.service \
-      ! -name was_active ! -name was_enabled -print -quit 2>/dev/null || true)
+      ! -name was_active ! -name was_enabled ! -name format ! -name attempt ! -name checksums \
+      ! -name failure -print -quit)
     [ -z "${'$'}unknown" ] || wdtt_backup_result prepared_corrupted unknown_backup_entry
+    ${serverUpdateManifestProbe()}
+    if [ "${'$'}backup_state" = committed ]; then wdtt_backup_result committed_valid committed; fi
     printf 'WDTT_UPDATE_BACKUP_STATUS=prepared_valid\n'
     printf 'WDTT_UPDATE_BACKUP_DIAGNOSTIC=prepared\n'
     printf 'WDTT_UPDATE_BACKUP_HAD_CONFIG=%s\n' "$([ -f "${'$'}BACKUP/had_config" ] && echo 1 || echo 0)"
@@ -13889,42 +13948,37 @@ private fun sha256File(file: File): String {
     return digest.digest().joinToString("") { "%02x".format(it) }
 }
 
-private fun prepareServerUpdateRollback(ssh: SSHClient) {
-    val command = """
-        set -e
-        BACKUP=${shellQuote(SERVER_UPDATE_BACKUP_DIR)}
-        [ ! -e "${'$'}BACKUP" ] || { echo WDTT_UPDATE_BACKUP=stale; exit 3; }
-        if [ -d /etc/wdtt ]; then
-            [ ! -L /etc/wdtt ] || { echo WDTT_UPDATE_BACKUP=unsafe_config; exit 4; }
-            unsafe=${'$'}(find /etc/wdtt -mindepth 1 \( -type l -o ! \( -type f -o -type d \) \) -print -quit 2>/dev/null || true)
-            [ -z "${'$'}unsafe" ] || { echo WDTT_UPDATE_BACKUP=unsafe_config; exit 4; }
-        fi
-        install -d -m 700 "${'$'}BACKUP"
-        if [ -d /etc/wdtt ]; then
-            cp -a /etc/wdtt "${'$'}BACKUP/config"
-            while IFS= read -r -d '' source; do
-                relative=${'$'}{source#/etc/wdtt/}
-                cmp -s "${'$'}source" "${'$'}BACKUP/config/${'$'}relative" || exit 5
-            done < <(find /etc/wdtt -type f -print0)
-            touch "${'$'}BACKUP/had_config"
-        fi
-        if [ -f /usr/local/bin/wdtt-server ] && [ ! -L /usr/local/bin/wdtt-server ]; then
-            cp -a /usr/local/bin/wdtt-server "${'$'}BACKUP/wdtt-server"
-            cmp -s /usr/local/bin/wdtt-server "${'$'}BACKUP/wdtt-server" || exit 5
-            touch "${'$'}BACKUP/had_binary"
-        fi
-        if [ -f /etc/systemd/system/wdtt.service ] && [ ! -L /etc/systemd/system/wdtt.service ]; then
-            cp -a /etc/systemd/system/wdtt.service "${'$'}BACKUP/wdtt.service"
-            cmp -s /etc/systemd/system/wdtt.service "${'$'}BACKUP/wdtt.service" || exit 5
-            touch "${'$'}BACKUP/had_service"
-        fi
-        if systemctl is-active --quiet wdtt; then touch "${'$'}BACKUP/was_active"; fi
-        if systemctl is-enabled --quiet wdtt; then touch "${'$'}BACKUP/was_enabled"; fi
-        printf 'prepared\n' > "${'$'}BACKUP/state"
-        chmod 600 "${'$'}BACKUP/state"
-        echo WDTT_UPDATE_BACKUP=ready
-    """.trimIndent()
-    val output = ssh.exec(rootCommand(command), timeout = 30000L)
+private fun recoverServerUpdateAfterFailure(session: Session?, attemptId: String, request: DeployRequest) {
+    // One recovery connection, never a retry of install/copy. Ownership is checked again
+    // so a stale attempt cannot roll back another device's update.
+    val recoverySession = session?.takeIf { it.isConnected } ?: createCriticalSshSession(
+        request.host, request.user,
+        SshCredentials(request.pass, request.privateKey, request.keyPassphrase, request.allowPasswordAuthentication),
+        request.sshPort,
+    )
+    try {
+        val ssh = SSHClient(recoverySession, request.pass)
+        val own = ssh.execChecked(rootCommand(serverUpdateShellContext() + "\n" + """
+            if wdtt_regular "${'$'}BACKUP/attempt" && [ "${'$'}(cat "${'$'}BACKUP/attempt")" = ${shellQuote(attemptId)} ]; then
+              echo WDTT_UPDATE_ATTEMPT_OWNED=1
+            fi
+        """.trimIndent()), timeout = 15_000L)
+        if (markerValue(own, "WDTT_UPDATE_ATTEMPT_OWNED") != "1") return
+        when (inspectServerUpdateRollback(ssh)) {
+            is ServerUpdateRollbackState.PreparedValid -> rollbackServerUpdate(ssh, attemptId)
+            ServerUpdateRollbackState.PreparationIncomplete ->
+                ssh.execChecked(rootCommand(cancelServerUpdatePreparationScript(attemptId = attemptId)), timeout = SERVER_UPDATE_PREPARE_TIMEOUT_MS)
+            ServerUpdateRollbackState.Committed, ServerUpdateRollbackState.None -> Unit
+            else -> error("Страховочная копия не прошла проверку; автоматический откат запрещён")
+        }
+    } finally { if (recoverySession !== session) recoverySession.disconnect() }
+}
+
+private fun prepareServerUpdateRollback(ssh: SSHClient, attemptId: String) {
+    val output = ssh.execChecked(
+        rootCommand(prepareServerUpdateRollbackScript(attemptId = attemptId)),
+        timeout = SERVER_UPDATE_PREPARE_TIMEOUT_MS,
+    )
     markerValue(output, "WDTT_UPDATE_BACKUP")?.takeIf { it != "ready" }?.let { state ->
         throw IllegalStateException(
             if (state == "stale") {
@@ -13948,90 +14002,39 @@ private fun inspectServerUpdateRollback(ssh: SSHClient): ServerUpdateRollbackSta
     return parseServerUpdateRollbackState(output)
 }
 
-private fun cleanupServerUpdateRollback(ssh: SSHClient) {
-    require(inspectServerUpdateRollback(ssh) is ServerUpdateRollbackState.PreparedValid) {
+private fun cleanupServerUpdateRollback(ssh: SSHClient, attemptId: String) {
+    val state = inspectServerUpdateRollback(ssh)
+    require(state is ServerUpdateRollbackState.PreparedValid || state is ServerUpdateRollbackState.Committed) {
         "страховочная копия изменилась или повреждена; автоматическое удаление запрещено"
     }
-    val command = """
-        set -e
-        BACKUP=${shellQuote(SERVER_UPDATE_BACKUP_DIR)}
-        [ -d "${'$'}BACKUP" ] && [ ! -L "${'$'}BACKUP" ] || exit 2
-        [ -f "${'$'}BACKUP/state" ] && [ ! -L "${'$'}BACKUP/state" ] && [ "${'$'}(cat "${'$'}BACKUP/state")" = prepared ] || exit 2
-        printf 'committed\n' > "${'$'}BACKUP/state"
-        rm -rf "${'$'}BACKUP"
-    """.trimIndent()
-    ssh.exec(rootCommand(command), timeout = 10000L)
+    val command = cleanupServerUpdateBackupScript(attemptId = attemptId)
+    val output = ssh.execChecked(rootCommand(command), timeout = 30_000L)
+    check(markerValue(output, "WDTT_UPDATE_CLEANUP") == "ok") { "Удаление страховочной копии не подтверждено" }
 }
 
-private fun rollbackServerUpdate(ssh: SSHClient) {
+private fun rollbackServerUpdate(ssh: SSHClient, attemptId: String? = null) {
     require(inspectServerUpdateRollback(ssh) is ServerUpdateRollbackState.PreparedValid) {
         "страховочная копия не прошла повторную проверку; восстановление остановлено"
     }
-    val command = """
-        set -e
-        BACKUP=${shellQuote(SERVER_UPDATE_BACKUP_DIR)}
-        [ -d "${'$'}BACKUP" ] && [ ! -L "${'$'}BACKUP" ] || { echo WDTT_ROLLBACK=missing; exit 2; }
-        [ -f "${'$'}BACKUP/state" ] && [ ! -L "${'$'}BACKUP/state" ] && [ "${'$'}(cat "${'$'}BACKUP/state")" = prepared ] || { echo WDTT_ROLLBACK=unsafe_state; exit 2; }
-        [ ! -e "${'$'}BACKUP/had_config" ] || { [ -d "${'$'}BACKUP/config" ] && [ ! -L "${'$'}BACKUP/config" ]; } || { echo WDTT_ROLLBACK=incomplete_config; exit 2; }
-        [ ! -e "${'$'}BACKUP/had_binary" ] || { [ -f "${'$'}BACKUP/wdtt-server" ] && [ ! -L "${'$'}BACKUP/wdtt-server" ]; } || { echo WDTT_ROLLBACK=incomplete_binary; exit 2; }
-        [ ! -e "${'$'}BACKUP/had_service" ] || { [ -f "${'$'}BACKUP/wdtt.service" ] && [ ! -L "${'$'}BACKUP/wdtt.service" ]; } || { echo WDTT_ROLLBACK=incomplete_service; exit 2; }
-        systemctl stop wdtt 2>/dev/null || true
-        if [ -f "${'$'}BACKUP/had_binary" ]; then install -m 755 "${'$'}BACKUP/wdtt-server" /usr/local/bin/wdtt-server; else rm -f /usr/local/bin/wdtt-server; fi
-        if [ -f "${'$'}BACKUP/had_service" ]; then install -m 644 "${'$'}BACKUP/wdtt.service" /etc/systemd/system/wdtt.service; else rm -f /etc/systemd/system/wdtt.service; fi
-        if [ -f "${'$'}BACKUP/had_config" ]; then rm -rf /etc/wdtt; cp -a "${'$'}BACKUP/config" /etc/wdtt; else rm -rf /etc/wdtt; fi
-        systemctl daemon-reload
-        if [ -f "${'$'}BACKUP/was_enabled" ]; then systemctl enable wdtt >/dev/null 2>&1; else systemctl disable wdtt >/dev/null 2>&1 || true; fi
-        if [ -f "${'$'}BACKUP/was_active" ]; then systemctl restart wdtt; sleep 2; systemctl is-active --quiet wdtt; fi
-        if [ -f "${'$'}BACKUP/had_binary" ]; then
-          [ -f /usr/local/bin/wdtt-server ] && [ ! -L /usr/local/bin/wdtt-server ] && [ -x /usr/local/bin/wdtt-server ] || { echo WDTT_ROLLBACK=verify_binary; exit 3; }
-        else
-          [ ! -e /usr/local/bin/wdtt-server ] && [ ! -L /usr/local/bin/wdtt-server ] || { echo WDTT_ROLLBACK=verify_binary_absent; exit 3; }
-        fi
-        if [ -f "${'$'}BACKUP/had_service" ]; then
-          [ -f /etc/systemd/system/wdtt.service ] && [ ! -L /etc/systemd/system/wdtt.service ] || { echo WDTT_ROLLBACK=verify_service; exit 3; }
-        else
-          [ ! -e /etc/systemd/system/wdtt.service ] && [ ! -L /etc/systemd/system/wdtt.service ] || { echo WDTT_ROLLBACK=verify_service_absent; exit 3; }
-        fi
-        if [ -f "${'$'}BACKUP/had_config" ]; then
-          [ -d /etc/wdtt ] && [ ! -L /etc/wdtt ] || { echo WDTT_ROLLBACK=verify_config; exit 3; }
-        else
-          [ ! -e /etc/wdtt ] && [ ! -L /etc/wdtt ] || { echo WDTT_ROLLBACK=verify_config_absent; exit 3; }
-        fi
-        if [ -f "${'$'}BACKUP/was_active" ]; then
-          systemctl is-active --quiet wdtt || { echo WDTT_ROLLBACK=verify_active; exit 3; }
-        else
-          ! systemctl is-active --quiet wdtt || { echo WDTT_ROLLBACK=verify_inactive; exit 3; }
-        fi
-        rm -rf "${'$'}BACKUP"
-        echo WDTT_ROLLBACK=ok
-    """.trimIndent()
-    val output = ssh.exec(rootCommand(command), timeout = 60000L)
+    val command = rollbackServerUpdateScript(attemptId = attemptId)
+    val output = ssh.execChecked(rootCommand(command), timeout = SERVER_UPDATE_PREPARE_TIMEOUT_MS)
     require(Regex("^WDTT_ROLLBACK=ok$", RegexOption.MULTILINE).containsMatchIn(output)) {
         "сервер не подтвердил откат обновления"
     }
 }
 
 private fun cleanupAbandonedServerUpdateRollback(ssh: SSHClient) {
-    require(inspectServerUpdateRollback(ssh) is ServerUpdateRollbackState.PreparedValid) {
+    val state = inspectServerUpdateRollback(ssh)
+    require(state is ServerUpdateRollbackState.PreparedValid || state is ServerUpdateRollbackState.Committed) {
         "страховочная копия не прошла повторную проверку; удаление запрещено"
     }
-    val output = ssh.exec(
+    val output = ssh.execChecked(
         rootCommand(
-            """
-            set -e
-            BACKUP=${shellQuote(SERVER_UPDATE_BACKUP_DIR)}
-            [ -d "${'$'}BACKUP" ] && [ ! -L "${'$'}BACKUP" ] || { echo WDTT_BACKUP_CLEANUP=unsafe_backup; exit 2; }
-            [ -f /usr/local/bin/wdtt-server ] && [ ! -L /usr/local/bin/wdtt-server ] && [ -x /usr/local/bin/wdtt-server ] || { echo WDTT_BACKUP_CLEANUP=missing_binary; exit 3; }
-            [ -f /etc/systemd/system/wdtt.service ] && [ ! -L /etc/systemd/system/wdtt.service ] || { echo WDTT_BACKUP_CLEANUP=missing_service; exit 3; }
-            [ -f /etc/wdtt/passwords.json ] && [ ! -L /etc/wdtt/passwords.json ] && [ -s /etc/wdtt/passwords.json ] || { echo WDTT_BACKUP_CLEANUP=missing_config; exit 3; }
-            systemctl is-active --quiet wdtt || { echo WDTT_BACKUP_CLEANUP=service_inactive; exit 3; }
-            rm -rf "${'$'}BACKUP"
-            echo WDTT_BACKUP_CLEANUP=ok
-            """.trimIndent(),
+            cleanupServerUpdateBackupScript(),
         ),
         timeout = 30_000L,
     )
-    require(markerValue(output, "WDTT_BACKUP_CLEANUP") == "ok") {
+    require(markerValue(output, "WDTT_UPDATE_CLEANUP") == "ok") {
         "текущее состояние WDTT не прошло проверку; страховочная копия сохранена"
     }
 }
@@ -14039,6 +14042,8 @@ private fun cleanupAbandonedServerUpdateRollback(ssh: SSHClient) {
 internal enum class ServerUpdateRollbackAction {
     RestorePrevious,
     KeepCurrentAndDeleteBackup,
+    CancelPreparation,
+    ArchiveLegacyPreparation,
 }
 
 private suspend fun resolveServerUpdateRollback(
@@ -14048,6 +14053,8 @@ private suspend fun resolveServerUpdateRollback(
     val actionName = when (action) {
         ServerUpdateRollbackAction.RestorePrevious -> "restore_previous"
         ServerUpdateRollbackAction.KeepCurrentAndDeleteBackup -> "keep_current_delete_backup"
+        ServerUpdateRollbackAction.CancelPreparation -> "cancel_preparation"
+        ServerUpdateRollbackAction.ArchiveLegacyPreparation -> "archive_legacy_preparation"
     }
     DeployManager.writeError("Server update rollback action selected: $actionName")
     var session: Session? = null
@@ -14069,6 +14076,20 @@ private suspend fun resolveServerUpdateRollback(
             ServerUpdateRollbackAction.RestorePrevious -> rollbackServerUpdate(ssh)
             ServerUpdateRollbackAction.KeepCurrentAndDeleteBackup ->
                 cleanupAbandonedServerUpdateRollback(ssh)
+            ServerUpdateRollbackAction.CancelPreparation -> {
+                check(inspectServerUpdateRollback(ssh) is ServerUpdateRollbackState.PreparationIncomplete)
+                val output = ssh.execChecked(rootCommand(cancelServerUpdatePreparationScript()), timeout = SERVER_UPDATE_PREPARE_TIMEOUT_MS)
+                check(markerValue(output, "WDTT_UPDATE_PREPARATION") == "cancelled")
+            }
+            ServerUpdateRollbackAction.ArchiveLegacyPreparation -> {
+                val state = inspectServerUpdateRollback(ssh)
+                check(state is ServerUpdateRollbackState.PreparedCorrupted && state.diagnostic == "missing or unsafe state")
+                check(deploymentOwnership(ssh) in setOf(DeploymentOwnership.AndroidDeploy, DeploymentOwnership.LegacyAndroidDeploy))
+                val current = readRemotePasswordsJson(ssh) ?: error("Рабочая база сервера не найдена")
+                validatePasswordsDbForPreserving(JSONObject(current), request.mainPass)
+                val output = ssh.execChecked(rootCommand(archiveLegacyUpdatePreparationScript()), timeout = 30_000L)
+                check(markerValue(output, "WDTT_UPDATE_PREPARATION") == "archived")
+            }
         }
         check(inspectServerUpdateRollback(ssh) is ServerUpdateRollbackState.None) {
             "операция завершилась, но каталог страховочной копии всё ещё найден"
@@ -14079,6 +14100,10 @@ private suspend fun resolveServerUpdateRollback(
                 "Прежнее состояние WDTT Plus восстановлено и проверено. Страховочная копия удалена."
             ServerUpdateRollbackAction.KeepCurrentAndDeleteBackup ->
                 "Текущее состояние WDTT Plus проверено. Удалена только страховочная копия."
+            ServerUpdateRollbackAction.CancelPreparation ->
+                "Подготовка отменена. Состояние службы проверено; незавершённая копия сохранена отдельно. Можно повторить обновление."
+            ServerUpdateRollbackAction.ArchiveLegacyPreparation ->
+                "Рабочая установка проверена. Незавершённая копия сохранена отдельно; можно повторить обновление."
         }
     } catch (error: Exception) {
         DeployManager.writeError(
@@ -14529,9 +14554,13 @@ private suspend fun performDeploy(
     var session: Session? = null
     var sshClient: SSHClient? = null
     var rollbackPrepared = false
+    var preparationStarted = false
+    val updateAttemptId = java.util.UUID.randomUUID().toString()
+    var installationVerified = false
     var preservedDbJson: String? = null
     var preImportDbJson: String? = null
     var stagedDatabaseFile: File? = null
+    var remoteStagingDirectory: String? = null
     try {
         onProgress(0.02f, "Подключение...")
 	        session = createCriticalSshSession(
@@ -14614,7 +14643,7 @@ private suspend fun performDeploy(
             ))
 		) {
 			onProgress(0.055f, "Проверка сохранённых данных...")
-			val currentDbJson = readRemotePasswordsJson(ssh)?.also {
+            var currentDbJson = readRemotePasswordsJson(ssh)?.also {
 				if (ownership == DeploymentOwnership.IncompleteAndroidDeploy) {
 					validatePasswordsDbStructure(JSONObject(it))
 				} else {
@@ -14627,13 +14656,23 @@ private suspend fun performDeploy(
                         "создание пустой базы вместо неизвестного состояния запрещено"
                 )
             }
+            preparationStarted = true
+            prepareServerUpdateRollback(ssh, updateAttemptId)
+            rollbackPrepared = true
+            // The first read was preflight only. The daemon has now flushed and stopped:
+            // use this stable database, including its latest devices and traffic counters.
+            currentDbJson = readRemotePasswordsJson(ssh)?.also {
+                if (ownership == DeploymentOwnership.IncompleteAndroidDeploy) validatePasswordsDbStructure(JSONObject(it))
+                else validatePasswordsDbForPreserving(JSONObject(it), mainPass)
+            }
+            if (mode == DeployMode.PreserveData && currentDbJson == null) {
+                throw IllegalStateException("После подготовки копии база сервера не найдена; обновление остановлено")
+            }
             currentDbJsonForDeploy = currentDbJson
             if (mode == DeployMode.PreserveData) {
                 if (importPlan == null) preservedDbJson = currentDbJson
                 if (importPlan?.mode == ServerImportMode.Merge) preImportDbJson = currentDbJson
             }
-            prepareServerUpdateRollback(ssh)
-            rollbackPrepared = true
             if (ownership == DeploymentOwnership.PreservedAndroidData) {
                 markPreservedAndroidData(ssh)
             }
@@ -14659,9 +14698,11 @@ private suspend fun performDeploy(
         }
 
         onProgress(0.06f, "Загрузка на сервер...")
-        ssh.upload(scriptFile, "/tmp/deploy.sh")
-        ssh.upload(serverFile, "/tmp/wdtt-server")
-        stagedDatabaseFile?.let { ssh.upload(it, "/tmp/wdtt-passwords.json.new", permissions = 0b110000000) }
+        val staging = ssh.createPrivateStagingDirectory()
+        remoteStagingDirectory = staging
+        ssh.upload(scriptFile, "$staging/deploy.sh", permissions = 0b110000000)
+        ssh.upload(serverFile, "$staging/server", permissions = 0b111000000)
+        stagedDatabaseFile?.let { ssh.upload(it, "$staging/passwords.json", permissions = 0b110000000) }
         scriptFile.delete()
         serverFile.delete()
 
@@ -14673,13 +14714,15 @@ private suspend fun performDeploy(
 				"состояние установки изменилось после проверки; сброс остановлен"
 			}
 			assertDeploymentMayBeUpdated(resetOwnership, DeployMode.ResetAll)
-			ssh.exec(
+			ssh.execChecked(
 				rootCommand(
-					"systemctl stop wdtt 2>/dev/null || true; " +
+                    serverUpdateApplyGuardScript(
+					"wdtt_stop_service; " +
 						"pkill -x wdtt-server 2>/dev/null || true; " +
 						"rm -rf /etc/wdtt; " +
 						"rm -f /etc/systemd/system/wdtt.service /usr/local/bin/wdtt-server; " +
-						"systemctl daemon-reload 2>/dev/null || true"
+						"systemctl daemon-reload",
+                    updateAttemptId)
 				),
 				timeout = 30000L
 			)
@@ -14708,11 +14751,11 @@ private suspend fun performDeploy(
                 ),
                 backup = importPlan.backup,
                 mode = importPlan.mode,
-                restartService = false
+                restartService = false,
+                updateAttemptId = updateAttemptId,
             )
         }
-		val output = ssh.exec(
-			rootCommand(
+        val installCommand =
                 "env WDTT_DTLS_PORT=$dtlsPort WDTT_WG_PORT=$wgPort WDTT_SSH_PORT=$port " +
                     "WDTT_INSTALL_MODE=${when (mode) {
                         DeployMode.FreshInstall -> "fresh"
@@ -14720,13 +14763,15 @@ private suspend fun performDeploy(
                         DeployMode.ResetAll -> "reset"
                     }} " +
                     "WDTT_PRESERVE_DATA=${if (mode == DeployMode.PreserveData) 1 else 0} " +
-                    "${if (stagedDatabaseFile != null) "WDTT_STAGED_DB=/tmp/wdtt-passwords.json.new " else ""}" +
-                    "bash /tmp/deploy.sh"
-            ),
+                    "WDTT_STAGED_SERVER=${shellQuote("$staging/server")} " +
+                    "${if (stagedDatabaseFile != null) "WDTT_STAGED_DB=${shellQuote("$staging/passwords.json")} " else ""}" +
+                    "bash ${shellQuote("$staging/deploy.sh")}"
+		val output = ssh.execChecked(
+			rootCommand(if (rollbackPrepared) serverUpdateApplyGuardScript(installCommand, updateAttemptId) else serverUpdateShellContext() + "\nwdtt_lock\n" + installCommand),
 			timeout = CMD_TIMEOUT
         )
 
-        if (output.contains("✅") || output.contains("Деплой успешно") || output.contains("active")) {
+        if (markerValue(output, "WDTT_INSTALL_RESULT") == "success") {
 			val verifyOutput = ssh.exec(
 				rootCommand(
 					"sleep 2; printf 'BINARY=%s\\n' \"$([ -x /usr/local/bin/wdtt-server ] && echo 1 || echo 0)\"; " +
@@ -14771,9 +14816,16 @@ private suspend fun performDeploy(
 					replace = plan.mode == ServerImportMode.Replace
 				)
 			}
+            installationVerified = true
 			if (rollbackPrepared) {
-				cleanupServerUpdateRollback(ssh)
+                // Data, binary identity and service have been verified. Cleanup failure
+                // is not installation failure and must not revert a working new server.
 				rollbackPrepared = false
+                runCatching { cleanupServerUpdateRollback(ssh, updateAttemptId) }
+                    .onFailure {
+                        DeployManager.writeError("Обновление проверено; очистка страховочной копии не завершена: ${it.message}")
+                        TunnelManager.addDeployMessageLog("Сервер обновлён. Очистка страховочной копии не завершена; подробности — в журнале ошибок.", warning = true)
+                    }
 			}
 			DeployManager.installedServerVersion.value = installedServerVersion
             return@withContext true
@@ -14782,12 +14834,19 @@ private suspend fun performDeploy(
             throw IllegalStateException("скрипт установки вернул ошибку; подробности сохранены в errors.log")
         } else {
             DeployManager.writeError("Deploy unclear output: ${output.take(500)}")
-            throw IllegalStateException("не удалось подтвердить установку: нет признака active/успеха от скрипта")
+            throw IllegalStateException("не удалось подтвердить установку: нет итогового подтверждения скрипта")
         }
 
 	} catch (e: Exception) {
-		if (rollbackPrepared) {
-			runCatching { sshClient?.let(::rollbackServerUpdate) }
+        if (preparationStarted && !installationVerified) {
+            runCatching {
+                recoverServerUpdateAfterFailure(session, updateAttemptId, DeployRequest(
+                    host = host, user = user, pass = pass, privateKey = privateKey, keyPassphrase = keyPassphrase,
+                    allowPasswordAuthentication = allowPasswordAuthentication, sshPort = port,
+                    mainPass = mainPass, adminId = adminId, botToken = botToken,
+                    dtlsPort = dtlsPort, wgPort = wgPort, localPort = localPort, dns1 = dns1, dns2 = dns2,
+                ))
+            }
 				.onFailure { rollbackError -> DeployManager.writeError("Update rollback failed: ${rollbackError.message}") }
 			rollbackPrepared = false
 		}
@@ -14797,10 +14856,10 @@ private suspend fun performDeploy(
     } finally {
         stagedDatabaseFile?.delete()
         runCatching {
-            sshClient?.exec(
-                rootCommand("rm -f /tmp/wdtt-server /tmp/wdtt-passwords.json.new"),
+            remoteStagingDirectory?.let { staging -> sshClient?.exec(
+                rootCommand("rm -f -- ${shellQuote("$staging/deploy.sh")} ${shellQuote("$staging/server")} ${shellQuote("$staging/passwords.json")}; rmdir -- ${shellQuote(staging)}"),
                 timeout = 10_000L
-            )
+            ) }
         }
         try { session?.disconnect() } catch (_: Exception) {}
         DeployManager.activeSession = null
@@ -16899,14 +16958,92 @@ private fun SelectedBackupApplyCard(
 }
 
 @Composable
+private fun ServerUpdateRollbackHost(
+    info: ExistingInstallInfo,
+    busy: Boolean,
+    statusMessage: String,
+    onDismiss: () -> Unit,
+    onAction: (ServerUpdateRollbackAction) -> Unit,
+    onRetryInspection: () -> Unit,
+    onDiagnosticStatus: (String) -> Unit,
+) {
+    ServerUpdateRollbackDialog(
+        info = info,
+        busy = busy,
+        statusMessage = statusMessage,
+        onDismiss = onDismiss,
+        onRestore = { onAction(ServerUpdateRollbackAction.RestorePrevious) },
+        onKeepCurrent = {
+            onAction(when (info.updateRollbackState) {
+                ServerUpdateRollbackState.PreparationIncomplete -> ServerUpdateRollbackAction.CancelPreparation
+                is ServerUpdateRollbackState.PreparedCorrupted -> ServerUpdateRollbackAction.ArchiveLegacyPreparation
+                else -> ServerUpdateRollbackAction.KeepCurrentAndDeleteBackup
+            })
+        },
+        onRetryInspection = onRetryInspection,
+        onDiagnosticStatus = onDiagnosticStatus,
+    )
+}
+
+@Composable
 private fun ServerUpdateRollbackDialog(
-    state: ServerUpdateRollbackState,
+    info: ExistingInstallInfo,
     busy: Boolean,
     statusMessage: String,
     onDismiss: () -> Unit,
     onRestore: () -> Unit,
     onKeepCurrent: () -> Unit,
+    onRetryInspection: () -> Unit,
+    onDiagnosticStatus: (String) -> Unit,
 ) {
+    val state = info.updateRollbackState
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var reportForExport by remember(info) { mutableStateOf<String?>(null) }
+    val diagnosticLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("text/plain")
+    ) { uri: Uri? ->
+        val report = reportForExport
+        reportForExport = null
+        if (uri == null) {
+            onDiagnosticStatus("Сохранение диагностики отменено.")
+        } else if (report == null) {
+            onDiagnosticStatus("Отчёт больше не доступен. Повторите сохранение.")
+        } else {
+            scope.launch {
+                runCatching {
+                    withContext(Dispatchers.IO) {
+                        val output = context.contentResolver.openOutputStream(uri, "w")
+                            ?: error("Не удалось открыть выбранный файл")
+                        output.bufferedWriter(Charsets.UTF_8).use { it.write(report) }
+                    }
+                }.onSuccess {
+                    onDiagnosticStatus("Диагностика сохранена в выбранный файл.")
+                }.onFailure {
+                    onDiagnosticStatus("Не удалось сохранить диагностику. Выберите другой файл.")
+                }
+            }
+        }
+    }
+    fun saveDiagnostics() {
+        val snapshot = ServerUpdateDiagnosticSnapshot(
+            rollbackState = info.updateRollbackState,
+            serviceExists = info.serviceExists,
+            binaryExists = info.binaryExists,
+            configDirExists = info.configDirExists,
+            accessDbExists = info.accessDbExists,
+            wgKeysExist = info.wgKeysExist,
+            serviceActive = info.active,
+            inspectionSucceeded = info.checkError == null,
+        )
+        reportForExport = buildServerUpdateDiagnosticReport(
+            snapshot = snapshot,
+            generatedAt = Instant.now().toString(),
+            appVersion = BuildConfig.VERSION_NAME,
+        )
+        val filename = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.ROOT).format(Date())
+        diagnosticLauncher.launch("WDTT-Plus-update-diagnostic-$filename.txt")
+    }
     val television = isTelevisionDevice()
     val scrollState = rememberScrollState()
     BoundedAppDialog(properties = androidx.compose.ui.window.DialogProperties(), onDismissRequest = { if (!busy) onDismiss() }) {
@@ -16935,10 +17072,34 @@ private fun ServerUpdateRollbackDialog(
                         color = MaterialTheme.colorScheme.error,
                     )
                     Text(
-                        "Обнаружено незавершённое обновление WDTT Plus. На сервере сохранена страховочная копия предыдущего состояния.",
+                        "На сервере остались данные предыдущей попытки обновления WDTT Plus. Приложение проверит их перед продолжением.",
                         style = MaterialTheme.typography.bodyMedium,
                     )
                     when (state) {
+                        ServerUpdateRollbackState.PreparationIncomplete -> {
+                            Text("Подготовка страховочной копии была прервана до замены сервера. Можно восстановить прежнее состояние службы и сохранить незавершённую копию отдельно. Настройки и бинарник не заменяются.")
+                            DangerousServerHoldButton(
+                                actionLabel = "Восстановить работу и сохранить копию отдельно",
+                                enabled = !busy,
+                                guardKey = "server-update-preparation-cancel",
+                                buttonWidthFraction = 1f,
+                                actionLabelMaxLines = 3,
+                                onConfirmed = onKeepCurrent,
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        }
+                        ServerUpdateRollbackState.Committed -> {
+                            Text("Обновление было подтверждено, но удаление страховочной копии не завершилось. Приложение проверит рабочую установку перед удалением только этой копии.")
+                            DangerousServerHoldButton(
+                                actionLabel = "Проверить сервер и удалить копию",
+                                enabled = !busy,
+                                guardKey = "server-update-committed-cleanup",
+                                buttonWidthFraction = 1f,
+                                actionLabelMaxLines = 2,
+                                onConfirmed = onKeepCurrent,
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        }
                         is ServerUpdateRollbackState.PreparedValid -> {
                             Surface(
                                 shape = RoundedCornerShape(14.dp),
@@ -16985,10 +17146,24 @@ private fun ServerUpdateRollbackDialog(
                         }
                         is ServerUpdateRollbackState.PreparedCorrupted -> {
                             Text(
-                                "Страховочная копия повреждена: ${state.diagnostic}. Автоматическое восстановление, удаление и обычный деплой заблокированы. Нужна ручная проверка сервера по SSH.",
+                                "Страховочная копия неполная или не прошла проверку: ${state.diagnostic}. Восстановление и автоматическое удаление заблокированы.",
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.error,
                             )
+                            if (state.diagnostic == "missing or unsafe state") {
+                                Text("Если сервер работает, приложение может проверить установку и сохранить старую незавершённую копию отдельно, не удаляя её. При небезопасной структуре действие будет остановлено.", style = MaterialTheme.typography.bodySmall)
+                                DangerousServerHoldButton(
+                                    actionLabel = "Проверить сервер и сохранить копию отдельно",
+                                    enabled = !busy,
+                                    guardKey = "server-update-legacy-preparation-archive",
+                                    buttonWidthFraction = 1f,
+                                    actionLabelMaxLines = 3,
+                                    onConfirmed = onKeepCurrent,
+                                    modifier = Modifier.fillMaxWidth(),
+                                )
+                            } else {
+                                Text("Нужна ручная проверка сервера по SSH.", style = MaterialTheme.typography.bodySmall)
+                            }
                         }
                         is ServerUpdateRollbackState.UnknownState -> {
                             Text(
@@ -16998,6 +17173,28 @@ private fun ServerUpdateRollbackDialog(
                             )
                         }
                         ServerUpdateRollbackState.None -> Unit
+                    }
+                    if (state is ServerUpdateRollbackState.PreparedCorrupted ||
+                        state is ServerUpdateRollbackState.UnknownState
+                    ) {
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                        Text(
+                            "Без изменений на сервере",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        OutlinedButton(
+                            onClick = onRetryInspection,
+                            enabled = !busy,
+                            modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp),
+                            shape = RoundedCornerShape(16.dp),
+                        ) { Text("Повторить проверку") }
+                        OutlinedButton(
+                            onClick = ::saveDiagnostics,
+                            enabled = !busy,
+                            modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp),
+                            shape = RoundedCornerShape(16.dp),
+                        ) { Text("Сохранить диагностику") }
                     }
                     if (busy) {
                         LinearProgressIndicator(modifier = Modifier.fillMaxWidth())

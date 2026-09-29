@@ -22,12 +22,16 @@ import com.wdtt.plus.RemoteLaunchTarget
 import com.wdtt.plus.SecureStringStore
 import com.wdtt.plus.TemporaryDirectRouteLease
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
@@ -39,6 +43,7 @@ private class ModernVkSafeFallbackException : IllegalStateException("Нужен 
 /** Device-side provider adapter. Entitlements and result delivery remain server-authoritative. */
 @Keep
 object VkContinuationExecutor : LocalContinuationExtension {
+    private val statisticsScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private data class ActiveCallback(val result: CompletableDeferred<Uri?>)
     private data class PendingCompletion(
         val completion: RemoteActionCompletion,
@@ -104,6 +109,7 @@ object VkContinuationExecutor : LocalContinuationExtension {
         }
         try {
             savePending(activity, PendingCompletion(target.completion, deviceId))
+            recordStatistics(target, deviceId, "primary_start")
             val modernResult = try {
                 runModernContainer(
                     activity = activity,
@@ -115,6 +121,7 @@ object VkContinuationExecutor : LocalContinuationExtension {
                     retainFallbackWindow = { closeModernWindow = it },
                 )
             } catch (_: ModernVkSafeFallbackException) {
+                recordStatistics(target, deviceId, "primary_fallback")
                 noteVkEvent("Основной способ недоступен до создания ссылок. Открываю резервный способ внутри приложения.")
                 progress(onProgress, "Открываю резервный способ внутри приложения…")
                 null
@@ -124,6 +131,7 @@ object VkContinuationExecutor : LocalContinuationExtension {
             callback = replaceCallback(callback)
             val native = nativeContinuationOrNull()
             if (native != null) {
+                recordStatistics(target, deviceId, "compatible_start")
                 try {
                     return native.execute(
                         activity,
@@ -133,16 +141,42 @@ object VkContinuationExecutor : LocalContinuationExtension {
                         onProgress,
                     ).also { markReadyDocument(activity, it) }
                 } catch (_: LocalContinuationSafeFallbackException) {
+                    recordStatistics(target, deviceId, "compatible_fallback")
                     noteVkEvent("Встроенный резервный способ не подошёл до создания ссылок. Открываю ВК в браузере.")
                     progress(onProgress, "Открываю резервный способ в браузере…")
                 }
             }
             callback = replaceCallback(callback)
+            recordStatistics(target, deviceId, "browser_start")
             return runBrowserFallback(activity, target, deviceId, onProgress, callback)
+        } catch (cancelled: CancellationException) {
+            recordStatistics(target, deviceId, "cancelled")
+            throw cancelled
+        } catch (error: Exception) {
+            recordStatistics(target, deviceId, "failed")
+            throw error
         } finally {
             closeModernWindow?.invoke()
             synchronized(callbackLock) {
                 if (activeCallback === callback) activeCallback = null
+            }
+        }
+    }
+
+    private fun recordStatistics(target: RemoteLaunchTarget, deviceId: String, event: String) {
+        // Observational only: telemetry must never delay VK login, a call permit,
+        // result delivery, or a safe fallback. The backend authenticates the
+        // opaque flow and deduplicates this closed set; it owns success counts.
+        statisticsScope.launch {
+            runCatching {
+                NativeVkBackend.post(
+                    NativeVkProtocol.payload(
+                        target.completion.key,
+                        deviceId,
+                        "event",
+                        JSONObject().put("e", event),
+                    ),
+                )
             }
         }
     }

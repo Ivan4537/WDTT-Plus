@@ -22,10 +22,10 @@ internal object NativeVkProtocol {
     fun payload(key: String, device: String, op: String, extras: JSONObject = JSONObject()): String {
         require(Regex("[A-Za-z0-9_.-]{24,100}").matches(key))
         require(Regex("[A-Za-z0-9_.:-]{8,128}").matches(device))
-        require(op in setOf("prepare", "auth", "permit", "result", "finish"))
+        require(op in setOf("prepare", "auth", "permit", "result", "finish", "event"))
         val result = JSONObject().put("k", key).put("d", device).put("o", op)
         extras.keys().forEach { field ->
-            require(field in setOf("a", "v", "i", "n"))
+            require(field in setOf("a", "v", "i", "n", "e"))
             result.put(field, extras.get(field))
         }
         return result.toString().also { require(it.toByteArray(Charsets.UTF_8).size <= 768) }

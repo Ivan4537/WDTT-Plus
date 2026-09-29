@@ -48,7 +48,7 @@ class NativeVkBrokerService : Service() {
 internal object NativeVkBackend {
     suspend fun post(raw: String): JSONObject = withContext(Dispatchers.IO) {
         val json = JSONObject(raw)
-        require(json.optString("o") in setOf("prepare", "auth", "permit", "result", "finish"))
+        require(json.optString("o") in setOf("prepare", "auth", "permit", "result", "finish", "event"))
         val encrypted = NativeVkCrypto.exchange(raw)
         val bytes = encrypted.request.toByteArray(Charsets.UTF_8)
         val url = "https://wdttplus.ru/api/client/native"

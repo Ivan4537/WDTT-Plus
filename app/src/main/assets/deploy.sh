@@ -11,7 +11,7 @@ set -euo pipefail
 
 readonly SCRIPT_VERSION="3.13"
 readonly WDTT_DEPLOY_CONTRACT_VERSION="1"
-readonly WDTT_SERVER_VERSION="19"
+readonly WDTT_SERVER_VERSION="20"
 readonly WDTT_SERVER_BINARY_PATH="/usr/local/bin/wdtt-server"
 readonly WDTT_SYSTEMD_UNIT_PATH="/etc/systemd/system/wdtt.service"
 readonly WDTT_ANDROID_DEPLOY_MARKER="Managed by WDTT Plus Android deploy"
@@ -29,6 +29,7 @@ readonly MAX_HANDSHAKES="${WDTT_MAX_HANDSHAKES:-32}"
 readonly HANDSHAKE_RATE="${WDTT_HANDSHAKE_RATE:-24}"
 readonly MAX_CLIENT_MBPS="${WDTT_MAX_CLIENT_MBPS:-0}"
 readonly WG_BACKEND="${WDTT_WG_BACKEND:-auto}"
+readonly WDTT_DNS="${WDTT_DNS:-}"
 readonly WDTT_PRESERVE_DATA="${WDTT_PRESERVE_DATA:-0}"
 readonly WDTT_INSTALL_MODE="${WDTT_INSTALL_MODE:-}"
 readonly WDTT_IFACE="wdtt0"
@@ -37,6 +38,7 @@ readonly WDTT_ACCESS_DB="passwords.json"
 readonly WDTT_ACCESS_DB_PREVIOUS="passwords.json.previous"
 readonly WDTT_WG_KEYS="wg-keys.dat"
 readonly WDTT_STAGED_DB="${WDTT_STAGED_DB:-}"
+readonly WDTT_STAGED_SERVER="${WDTT_STAGED_SERVER:-/tmp/wdtt-server}"
 readonly IPT_COMMENT="WDTT_MANAGED"
 readonly IPT_MIRROR_COMMENT="WDTT_MIRRORED"
 
@@ -51,6 +53,18 @@ validate_port() {
 }
 
 validate_runtime_limits() {
+    if [ -n "$WDTT_DNS" ]; then
+        [ "${#WDTT_DNS}" -le 255 ] || die "WDTT_DNS слишком длинный"
+        case "$WDTT_DNS" in
+            *[!0-9a-fA-F:.,]*|,*|*,|*,,*) die "WDTT_DNS должен содержать только адреса DNS" ;;
+        esac
+        local dns_rest="$WDTT_DNS" dns_count=1
+        while [ "$dns_rest" != "${dns_rest#*,}" ]; do
+            dns_count=$((dns_count + 1))
+            dns_rest="${dns_rest#*,}"
+        done
+        [ "$dns_count" -le 4 ] || die "WDTT_DNS содержит слишком много адресов"
+    fi
     for item in \
         "WDTT_MAX_PASSWORDS:$MAX_PASSWORDS" \
         "WDTT_MAX_HANDSHAKES:$MAX_HANDSHAKES"; do
@@ -560,17 +574,17 @@ setup_wdtt_binary() {
     prog 0.60 "Бинарник..."
     echo "📦 Установка wdtt-server..."
 
-    if [ -f /tmp/wdtt-server ]; then
-        [ ! -L /tmp/wdtt-server ] && [ -s /tmp/wdtt-server ] || die "/tmp/wdtt-server отсутствует или небезопасен"
-        chmod +x /tmp/wdtt-server
+    if [ -f "$WDTT_STAGED_SERVER" ]; then
+        [ ! -L "$WDTT_STAGED_SERVER" ] && [ -s "$WDTT_STAGED_SERVER" ] || die "Загруженный wdtt-server отсутствует или небезопасен"
+        chmod +x "$WDTT_STAGED_SERVER"
         local staged_version
-        staged_version="$(/tmp/wdtt-server --version 2>/dev/null | head -n 1 || true)"
+        staged_version="$("$WDTT_STAGED_SERVER" --version 2>/dev/null | head -n 1 || true)"
         [ "$staged_version" = "$WDTT_SERVER_VERSION" ] ||
             die "Загружен wdtt-server несовместимой версии: ожидается $WDTT_SERVER_VERSION, получено ${staged_version:-не определено}"
         rm -f /usr/local/bin/.wdtt-server.new
-        install -m 0755 /tmp/wdtt-server /usr/local/bin/.wdtt-server.new || die "Не удалось подготовить новый wdtt-server"
+        install -m 0755 "$WDTT_STAGED_SERVER" /usr/local/bin/.wdtt-server.new || die "Не удалось подготовить новый wdtt-server"
         mv -f /usr/local/bin/.wdtt-server.new /usr/local/bin/wdtt-server || die "Не удалось атомарно заменить wdtt-server"
-        rm -f /tmp/wdtt-server
+        rm -f -- "$WDTT_STAGED_SERVER"
         echo "✓ wdtt-server установлен"
     elif [ -f /usr/local/bin/wdtt-server ]; then
         echo "✓ wdtt-server уже установлен"
@@ -604,6 +618,8 @@ setup_wdtt_service() {
     echo "🔧 Создание systemd-сервиса WDTT Plus..."
 
 local unit_tmp="/etc/systemd/system/.wdtt.service.new"
+local dns_arg=""
+[ -z "$WDTT_DNS" ] || dns_arg=" -dns ${WDTT_DNS}"
 rm -f "$unit_tmp"
 cat > "$unit_tmp" << WDTTSVC
 # ${WDTT_ANDROID_DEPLOY_MARKER}
@@ -617,7 +633,7 @@ Wants=network-online.target
 Type=simple
 ExecStartPre=-/usr/bin/env bash -c "ip link show ${WDTT_IFACE} >/dev/null 2>&1 && ip link del ${WDTT_IFACE} 2>/dev/null || true"
 ExecStartPre=-/usr/bin/env bash -c "if command -v iptables >/dev/null 2>&1; then iptables -C INPUT -p udp --dport ${DTLS_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport ${DTLS_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT; iptables -C INPUT -p udp --dport ${WG_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport ${WG_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT; iptables -C INPUT -p tcp --dport ${SSH_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport ${SSH_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT; fi"
-ExecStart=${WDTT_SERVER_BINARY_PATH} -listen 0.0.0.0:${DTLS_PORT} -wg-port ${WG_PORT} -config-dir ${WDTT_CONFIG_DIR} -max-passwords ${MAX_PASSWORDS} -max-workers-per-access ${MAX_WORKERS_PER_ACCESS} -max-handshakes ${MAX_HANDSHAKES} -handshake-rate ${HANDSHAKE_RATE} -max-client-mbps ${MAX_CLIENT_MBPS} -wg-backend ${WG_BACKEND}
+ExecStart=${WDTT_SERVER_BINARY_PATH} -listen 0.0.0.0:${DTLS_PORT} -wg-port ${WG_PORT} -config-dir ${WDTT_CONFIG_DIR} -max-passwords ${MAX_PASSWORDS} -max-workers-per-access ${MAX_WORKERS_PER_ACCESS} -max-handshakes ${MAX_HANDSHAKES} -handshake-rate ${HANDSHAKE_RATE} -max-client-mbps ${MAX_CLIENT_MBPS} -wg-backend ${WG_BACKEND}${dns_arg}
 Restart=always
 RestartSec=5
 LimitNOFILE=65535
@@ -659,6 +675,7 @@ start_wdtt() {
     if [ "$status" = "active" ]; then
         rm -f "$WDTT_CONFIG_DIR/.android-deploy-preserved"
         echo "✅ Деплой успешно завершён!"
+        echo "WDTT_INSTALL_RESULT=success"
         echo "   NAT:  MASQUERADE (стандартный)"
         echo "   DTLS: порт ${DTLS_PORT}"
         echo "   WG:   порт ${WG_PORT}"

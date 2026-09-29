@@ -23,8 +23,8 @@ ensure_utf8_locale() {
 
 ensure_utf8_locale
 
-readonly INSTALLER_VERSION="0.20.2"
-readonly SUPPORTED_SERVER_VERSION="19"
+readonly INSTALLER_VERSION="0.20.3"
+readonly SUPPORTED_SERVER_VERSION="20"
 readonly DEPLOY_COMPATIBILITY_VERSION="1"
 readonly MANAGED_MARKER="Managed by WDTT Plus standalone server installer"
 readonly ANDROID_DEPLOY_MARKER="Managed by WDTT Plus Android deploy"
