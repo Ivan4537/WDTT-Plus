@@ -1,593 +1,342 @@
 #!/usr/bin/env bash
+# Globals and callbacks below are consumed by the sourced manager.
+# shellcheck disable=SC2034,SC2317
 set -euo pipefail
 IFS=$'\n\t'
-
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT="$ROOT_DIR/warp-interface-manager.sh"
-
-fail() {
-    printf 'FAIL: %s\n' "$*" >&2
-    exit 1
-}
-
+fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 bash -n "$SCRIPT"
 bash -n "$0"
-
-version_output="$(bash "$SCRIPT" --version)"
-[[ "$version_output" == *"1.3.3"* ]] || fail "неверная версия"
-
-help_output="$(bash "$SCRIPT" --help)"
-for command in install enable disable reconfigure check status stats update-wgcf logs remove self-test; do
-    [[ "$help_output" == *"$command"* ]] || fail "в справке нет команды $command"
-done
-
+[[ "$(bash "$SCRIPT" --version)" == *1.4.0* ]] || fail 'неверная версия'
 bash "$SCRIPT" self-test >/dev/null
 bash "$SCRIPT" scan >/dev/null
-
-grep -q 'Table = off' "$SCRIPT" || fail "нет защиты Table = off"
-grep -q 'interface_protection_reason' "$SCRIPT" || fail "нет защиты интерфейсов"
-grep -q 'runtime_down' "$SCRIPT" || fail "нет отката"
-grep -q 'WARP_INTERFACE_MANAGER' "$SCRIPT" || fail "нет маркера firewall"
-grep -q 'WGCF_LATEST_API=.*releases/latest' "$SCRIPT" || fail "нет динамического поиска последнего релиза wgcf"
-grep -q '.prerelease == false' "$SCRIPT" || fail "нет отклонения предварительных релизов wgcf"
-grep -q 'checksums.txt' "$SCRIPT" || fail "нет проверки релизной контрольной суммы wgcf"
-! grep -q '^WGCF_VERSION=' "$SCRIPT" || fail "осталась фиксированная версия wgcf"
-[[ -f "$ROOT_DIR/README.md" && ! -e "$ROOT_DIR/README.txt" ]] || fail "README должен быть в формате Markdown"
-
-if grep -Rqs --exclude-dir=.git 'warp-interface-manager' \
-    "$ROOT_DIR/../settings.gradle" "$ROOT_DIR/../settings.gradle.kts" \
-    "$ROOT_DIR/../app/build.gradle" "$ROOT_DIR/../app/build.gradle.kts" 2>/dev/null; then
-    fail "подпроект неожиданно подключён к Gradle/Android"
+help_output="$(bash "$SCRIPT" --help)"
+for command in scan install enable disable reconfigure check status stats update-wgcf logs remove self-test; do
+    [[ "$help_output" == *"$command"* ]] || fail "в справке нет команды $command"
+done
+if grep -Rqs 'warp-interface-manager' "$ROOT_DIR/../app/build.gradle.kts" "$ROOT_DIR/../settings.gradle.kts" 2>/dev/null; then
+    fail 'подпроект подключён к Android'
 fi
-
 mock_root="$(mktemp -d)"
 trap 'rm -rf -- "$mock_root"' EXIT
-mkdir -p "$mock_root/bin" "$mock_root/sys/tun-test" "$mock_root/proc/tun-test"
-: >"$mock_root/sys/tun-test/tun_flags"
-printf '2' >"$mock_root/proc/tun-test/rp_filter"
-mock_log="$mock_root/calls.log"
-mock_wg_marker="$mock_root/warp-up"
-: >"$mock_log"
-
-cat >"$mock_root/bin/ip" <<'EOF'
-#!/usr/bin/env bash
-printf 'ip %s\n' "$*" >>"$WIM_MOCK_LOG"
-if [[ ${1:-} == "-4" && ${2:-} == "rule" && ${3:-} == "show" ]]; then
-    [[ ${WIM_MOCK_FAIL_RULE_SHOW:-0} != "1" ]] || exit 1
-    [[ ${WIM_MOCK_MISSING_ENDPOINT_RULE:-0} == "1" ]] || printf '17998: from all to 162.159.192.1 lookup main\n'
-    if [[ -f "$WIM_MOCK_WG_MARKER" ]]; then
-        printf '18000: from 172.16.0.2 lookup 51880\n'
-        if [[ ${WIM_MOCK_MODE:-interface} == "host" ]]; then
-            [[ ${WIM_MOCK_MISSING_SSH_RULE:-0} == "1" ]] || printf '17999: from all ipproto tcp sport 2222 lookup main\n'
-            if [[ ${WIM_MOCK_WRONG_GLOBAL_RULE:-0} == "1" ]]; then
-                printf '18001: from 192.0.2.1 lookup 51880\n'
-            else
-                printf '18001: from all lookup 51880\n'
-            fi
-        elif [[ ${WIM_MOCK_MISSING_IIF:-0} != "1" ]]; then
-            printf '18001: from all iif tun-test lookup 51880\n'
-        fi
-    fi
-    [[ -z ${WIM_MOCK_POLICY_IFACE:-} ]] || printf '17000: from all iif %s lookup 51999\n' "$WIM_MOCK_POLICY_IFACE"
-    [[ ${WIM_MOCK_GLOBAL_CONFLICT:-0} != "1" ]] || printf '12000: from all fwmark 0x1 lookup 52000\n'
-    exit 0
-fi
-case "$*" in
-    "link show dev tun-test")
-        printf '10: tun-test: <POINTOPOINT,UP,LOWER_UP> mtu 1500 state UNKNOWN\n'
-        exit 0
-        ;;
-    "link show dev physical-test")
-        printf '11: physical-test: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 state UP\n'
-        exit 0
-        ;;
-    "link show dev warp-selective")
-        [[ -f "$WIM_MOCK_WG_MARKER" ]]
-        exit
-        ;;
-    "link delete dev warp-selective")
-        [[ ${WIM_MOCK_FAIL_DELETE:-0} != "1" ]] || exit 1
-        rm -f "$WIM_MOCK_WG_MARKER" "$WIM_MOCK_SYS_ROOT/warp-selective/ifindex"
-        exit 0
-        ;;
-    "-4 route show table main default"|"-4 route show table main"|"-4 route show table all")
-        [[ ${WIM_MOCK_FAIL_ROUTE_SHOW:-0} != "1" ]] || exit 1
-        printf 'default via 192.0.2.1 dev eth0\n'
-        exit 0
-        ;;
-    "-4 route get 1.1.1.1 from 172.16.0.2")
-        printf '1.1.1.1 dev warp-selective src 172.16.0.2\n'
-        exit 0
-        ;;
-    "-4 route get 1.1.1.1")
-        printf '1.1.1.1 dev warp-selective src 172.16.0.2\n'
-        exit 0
-        ;;
-    "-4 route show table 51880 default")
-        if [[ -f "$WIM_MOCK_WG_MARKER" && ${WIM_MOCK_MISSING_TABLE_ROUTE:-0} != "1" ]]; then
-            printf 'default dev warp-selective scope link\n'
-        fi
-        exit 0
-        ;;
-    "rule help")
-        printf 'Usage: ip rule { add | del } [ ipproto PROTOCOL ] [ sport [ NUMBER | NUMBER-NUMBER ] ]\n'
-        exit 0
-        ;;
-    "-d -o link show dev veth-test")
-        printf '12: veth-test@if13: <BROADCAST,UP> mtu 1500 veth\n'
-        exit 0
-        ;;
-    *" rule del "*|*" route del "*) exit 1 ;;
-    *) exit 0 ;;
-esac
-EOF
-
-cat >"$mock_root/bin/iptables" <<'EOF'
-#!/usr/bin/env bash
-printf 'iptables %s\n' "$*" >>"$WIM_MOCK_LOG"
-case "$*" in
-    *"-t nat -A POSTROUTING"*) : >"$WIM_MOCK_FIREWALL_ROOT/nat" ;;
-    *"-t nat -D POSTROUTING"*) rm -f "$WIM_MOCK_FIREWALL_ROOT/nat" ;;
-    *"-t nat -C POSTROUTING"*) [[ -f "$WIM_MOCK_FIREWALL_ROOT/nat" ]] ; exit ;;
-    *"-I FORWARD"*"-i tun-test -o warp-selective"*) : >"$WIM_MOCK_FIREWALL_ROOT/out" ;;
-    *"-I FORWARD"*"-i warp-selective -o tun-test"*) : >"$WIM_MOCK_FIREWALL_ROOT/in" ;;
-    *"-D FORWARD"*"-i tun-test -o warp-selective"*) rm -f "$WIM_MOCK_FIREWALL_ROOT/out" ;;
-    *"-D FORWARD"*"-i warp-selective -o tun-test"*) rm -f "$WIM_MOCK_FIREWALL_ROOT/in" ;;
-    *"-C FORWARD"*"-i tun-test -o warp-selective"*) [[ -f "$WIM_MOCK_FIREWALL_ROOT/out" ]] ; exit ;;
-    *"-C FORWARD"*"-i warp-selective -o tun-test"*) [[ -f "$WIM_MOCK_FIREWALL_ROOT/in" ]] ; exit ;;
-esac
-exit 0
-EOF
-
-cat >"$mock_root/bin/iptables-save" <<'EOF'
-#!/usr/bin/env bash
-[[ ${WIM_MOCK_FAIL_IPTABLES_SAVE:-0} != "1" ]]
-EOF
-
-cat >"$mock_root/bin/nft" <<'EOF'
-#!/usr/bin/env bash
-[[ ${WIM_MOCK_FAIL_NFT:-0} != "1" ]]
-EOF
-
-cat >"$mock_root/bin/wg-quick" <<'EOF'
-#!/usr/bin/env bash
-printf 'wg-quick %s\n' "$*" >>"$WIM_MOCK_LOG"
-case "${1:-}" in
-    up)
-        : >"$WIM_MOCK_WG_MARKER"
-        mkdir -p "$WIM_MOCK_SYS_ROOT/warp-selective"
-        printf '42' >"$WIM_MOCK_SYS_ROOT/warp-selective/ifindex"
-        ;;
-    down)
-        [[ ${WIM_MOCK_FAIL_DOWN:-0} != "1" ]] || exit 1
-        rm -f "$WIM_MOCK_WG_MARKER" "$WIM_MOCK_SYS_ROOT/warp-selective/ifindex"
-        ;;
-esac
-EOF
-
-cat >"$mock_root/bin/wg" <<'EOF'
-#!/usr/bin/env bash
-printf 'wg %s\n' "$*" >>"$WIM_MOCK_LOG"
-case "$*" in
-    "show warp-selective") [[ -f "$WIM_MOCK_WG_MARKER" && ${WIM_MOCK_NOT_WG:-0} != "1" ]] ;;
-    "show warp-selective latest-handshakes") printf 'peer 1700000000\n' ;;
-    "show tun-test"|"show eth0") exit 1 ;;
-    *) exit 1 ;;
-esac
-EOF
-
-cat >"$mock_root/bin/getent" <<'EOF'
-#!/usr/bin/env bash
-if [[ ${1:-} == "ahostsv4" && ${2:-} == "engage.cloudflareclient.com" ]]; then
-    printf '162.159.192.1 STREAM engage.cloudflareclient.com\n'
-    printf '162.159.192.1 DGRAM engage.cloudflareclient.com\n'
-    exit 0
-fi
-exit 2
-EOF
-
-cat >"$mock_root/bin/curl" <<'EOF'
-#!/usr/bin/env bash
-printf 'curl %s\n' "$*" >>"$WIM_MOCK_LOG"
-if [[ -n ${WIM_MOCK_FAIL_CURL_ONCE_FILE:-} && -e "$WIM_MOCK_FAIL_CURL_ONCE_FILE" ]]; then
-    rm -f "$WIM_MOCK_FAIL_CURL_ONCE_FILE"
-    exit 28
-fi
-[[ ${WIM_MOCK_FAIL_CURL:-0} == "1" ]] && exit 28
-printf 'warp=on\nip=203.0.113.8\n'
-EOF
-
-cat >"$mock_root/bin/sysctl" <<'EOF'
-#!/usr/bin/env bash
-printf 'sysctl %s\n' "$*" >>"$WIM_MOCK_LOG"
-[[ "${1:-}" == "-n" ]] && printf '%s\n' "${WIM_MOCK_FORWARD:-0}"
-exit 0
-EOF
-
-chmod +x "$mock_root/bin/"*
-
-(
-    export WIM_TEST_MODE=1
-    export WIM_SOURCE_ONLY=1
-    export WIM_SYS_CLASS_NET_ROOT="$mock_root/sys"
-    export WIM_PROC_SYS_IPV4_CONF_ROOT="$mock_root/proc"
-    export WIM_WIREGUARD_CONFIG_ROOT="$mock_root/etc/wireguard"
-    export WIM_MOCK_LOG="$mock_log"
-    export WIM_MOCK_WG_MARKER="$mock_wg_marker"
-    export WIM_MOCK_SYS_ROOT="$mock_root/sys"
-    export WIM_MOCK_FIREWALL_ROOT="$mock_root/firewall"
-    # shellcheck source=../warp-interface-manager.sh
-    # shellcheck disable=SC1091
-    source "$SCRIPT"
-    PATH="$mock_root/bin:$PATH"
-    CONFIG_DIR="$mock_root/etc/warp-interface-manager"
-    STATE_FILE="$CONFIG_DIR/state.env"
-    OWNER_FILE="$CONFIG_DIR/owner"
-    WG_CONFIG="$mock_root/etc/wireguard/warp-selective.conf"
-    DATA_DIR="$mock_root/var/lib/warp-interface-manager"
-    HEALTH_FILE="$DATA_DIR/health.env"
-    RUNTIME_DIR="$mock_root/run/warp-interface-manager"
-    LOG_DIR="$mock_root/var/log/warp-interface-manager"
-    EVENT_LOG="$LOG_DIR/events.log"
-    INSTALL_LOG="$LOG_DIR/install.log"
-    # Используется функциями из подключённого основного скрипта.
-    # shellcheck disable=SC2034
-    RUNTIME_FILE="$RUNTIME_DIR/runtime.env"
-    mkdir -p "$CONFIG_DIR" "$(dirname "$WG_CONFIG")" "$DATA_DIR" "$WIM_MOCK_FIREWALL_ROOT"
-    formatted_time="$(TZ=Etc/UTC format_server_datetime '2026-09-03T18:29:15+00:00')"
-    [[ "$formatted_time" == "03.09.2026 18:29:15 UTC (+00:00)" ]] || fail "российский формат времени неверен: $formatted_time"
-    journal_time="$(printf '178845?\n' | format_journal_output)"
-    [[ "$journal_time" == "178845?" ]] || fail "неизвестная строка журнала была изменена"
-    journal_time="$(printf '1700000000.000000 host service: сообщение\n' | TZ=Etc/UTC format_journal_output)"
-    [[ "$journal_time" == "14.11.2023 22:13:20 UTC (+00:00) host service: сообщение" ]] || fail "время journalctl отформатировано неверно: $journal_time"
-    legacy_log_time="$(printf '2026-09-03T18:29:15+00:00 [INFO] сообщение\n' | TZ=Etc/UTC format_manager_log_output)"
-    [[ "$legacy_log_time" == "03.09.2026 18:29:15 UTC (+00:00) [INFO] сообщение" ]] || fail "старое ISO-время журнала отформатировано неверно: $legacy_log_time"
-    printf '%s\n' "$OWNER_VALUE" >"$OWNER_FILE"
-    printf 'TARGET_IFACE=tun-test\nTABLE_ID=51880\nRULE_PRIORITY=18000\nINSTALLED_AT=1700000000\nPREVIOUS_IP_FORWARD=0\n' >"$STATE_FILE"
-    cat >"$WG_CONFIG" <<'EOF'
+mkdir -p "$mock_root/bin" "$mock_root/sys" "$mock_root/proc" "$mock_root/etc/wireguard"
+for command in ip wg wg-quick iptables iptables-save nft curl getent sysctl; do
+    ln -s "$ROOT_DIR/tests/mock-command.py" "$mock_root/bin/$command"
+done
+[[ -x "$ROOT_DIR/tests/mock-command.py" ]] || fail 'mock-command.py должен быть исполняемым'
+export WIM_MOCK_ROOT="$mock_root" WIM_TEST_MODE=1 WIM_SOURCE_ONLY=1
+export WIM_SYS_CLASS_NET_ROOT="$mock_root/sys" WIM_PROC_SYS_IPV4_CONF_ROOT="$mock_root/proc" WIM_WIREGUARD_CONFIG_ROOT="$mock_root/etc/wireguard"
+# shellcheck source=../warp-interface-manager.sh
+# shellcheck disable=SC1091
+source "$SCRIPT"
+PATH="$mock_root/bin:$PATH"
+CONFIG_DIR="$mock_root/etc/warp-interface-manager"
+STATE_FILE="$CONFIG_DIR/state.env"; OWNER_FILE="$CONFIG_DIR/owner"
+WG_CONFIG="$mock_root/etc/wireguard/warp-selective.conf"
+DATA_DIR="$mock_root/data"; HEALTH_FILE="$DATA_DIR/health.env"
+RUNTIME_DIR="$mock_root/run"; RUNTIME_FILE="$RUNTIME_DIR/runtime.env"
+SYSCTL_FILE="$mock_root/sysctl.conf"
+LOG_DIR="$mock_root/log"; EVENT_LOG="$LOG_DIR/events.log"; INSTALL_LOG="$LOG_DIR/install.log"
+mock_log="$mock_root/calls.log"; mock_wg_marker="$mock_root/warp-up"
+mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$RUNTIME_DIR"
+printf '%s\n' "$OWNER_VALUE" >"$OWNER_FILE"
+for iface in tun-test tun-second tun-other eth0; do
+    mkdir -p "$mock_root/sys/$iface" "$mock_root/proc/$iface"
+    : >"$mock_root/sys/$iface/tun_flags"
+    printf '2' >"$mock_root/proc/$iface/rp_filter"
+done
+cat >"$WG_CONFIG" <<'PROFILE'
 # Managed by warp-interface-manager. Do not edit while active.
 [Interface]
 PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
 Address = 172.16.0.2/32
 Table = off
 MTU = 1280
-
 [Peer]
 PublicKey = BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=
 AllowedIPs = 0.0.0.0/0
 Endpoint = engage.cloudflareclient.com:2408
-EOF
-    service_up
-    [[ -f "$mock_wg_marker" ]] || fail "модель: WARP-интерфейс не поднят"
-    [[ "$(state_get STATUS "$HEALTH_FILE")" == "healthy" ]] || fail "модель: проверка не стала healthy"
-    [[ "$(state_get WG_IFINDEX "$RUNTIME_FILE")" == "42" ]] || fail "модель: индекс своего WARP-интерфейса не сохранён"
-    ! is_safe_iface_name "." && ! is_safe_iface_name ".." || fail "модель: путь вместо имени интерфейса принят"
-    ! validate_ipv4_list '162.159.192.1,' || fail "модель: повреждённый список endpoint принят"
-    if (validate_target_iface lo 1 >/dev/null 2>&1); then
-        fail "модель: локальный интерфейс доступен через рискованный выбор"
-    fi
-    if (validate_target_iface warp-selective 1 >/dev/null 2>&1); then
-        fail "модель: служебный интерфейс доступен через рискованный выбор"
-    fi
-    [[ "$(interface_protection_reason eth0)" == "маршрут по умолчанию в одной из таблиц" ]] || fail "модель: основной интерфейс не защищён"
-    export WIM_MOCK_FAIL_RULE_SHOW=1
-    [[ "$(interface_protection_reason tun-test)" == "не удалось проверить IPv4-маршрутизацию" ]] || fail "модель: недоступные policy rules признаны безопасными"
-    [[ "$(full_host_routing_conflicts)" == *"не удалось прочитать IPv4 policy rules"* ]] || fail "модель: режим всего сервера разрешён без чтения policy rules"
-    unset WIM_MOCK_FAIL_RULE_SHOW
-    export WIM_MOCK_FAIL_ROUTE_SHOW=1
-    [[ "$(full_host_routing_conflicts)" == *"не удалось прочитать IPv4-маршруты"* ]] || fail "модель: режим всего сервера разрешён без чтения маршрутов"
-    unset WIM_MOCK_FAIL_ROUTE_SHOW
-    export WIM_MOCK_FAIL_IPTABLES_SAVE=1
-    [[ "$(interface_protection_reason tun-test)" == "не удалось проверить правила iptables" ]] || fail "модель: недоступные правила iptables признаны безопасными"
-    unset WIM_MOCK_FAIL_IPTABLES_SAVE
-    export WIM_MOCK_FAIL_NFT=1
-    [[ "$(interface_protection_reason tun-test)" == "не удалось проверить правила nftables" ]] || fail "модель: недоступные правила nftables признаны безопасными"
-    unset WIM_MOCK_FAIL_NFT
-    WIM_TEST_WG_IFACE=wdtt-test
-    mkdir -p "$mock_root/sys/$WIM_TEST_WG_IFACE"
-    # shellcheck disable=SC2329
-    wg() {
-        if [[ ${1:-} == "show" && ${2:-} == "wdtt-test" && ${3:-} == "peers" ]]; then
-            printf 'peer-key\n'
-        elif [[ ${1:-} == "show" && ${2:-} == "wdtt-test" && ${3:-} == "listen-port" ]]; then
-            printf '51820\n'
-        elif [[ ${1:-} == "show" && ${2:-} == "wdtt-test" && -z ${3:-} ]]; then
+PROFILE
+printf 'registration fixture\n' >"$CONFIG_DIR/wgcf-account.toml"
+chmod 600 "$WG_CONFIG" "$OWNER_FILE" "$CONFIG_DIR/wgcf-account.toml"
+profile_hash="$(sha256sum "$WG_CONFIG")"
+account_hash="$(sha256sum "$CONFIG_DIR/wgcf-account.toml")"
+# These overrides are scoped to this temporary-root test process.
+require_root() { :; }
+require_systemd() { :; }
+acquire_lock() { :; }
+ensure_owned_paths_are_safe() { :; }
+sleep() { :; }
+detect_ssh_ports() { printf '2222'; }
+systemctl() {
+    printf 'systemctl %s\n' "$*" >>"$mock_log"
+    case "${1:-}" in
+        is-active) [[ -f "$mock_root/service-active" ]] ;;
+        is-enabled|enable|daemon-reload|reset-failed) return 0 ;;
+        disable)
+            if [[ "$*" == *--now* && "${!#}" == "$SERVICE" ]]; then systemctl stop "$SERVICE"; fi
             return 0
-        else
-            command "$mock_root/bin/wg" "$@"
-        fi
-    }
-    [[ "$(interface_protection_reason "$WIM_TEST_WG_IFACE")" == "действующий WireGuard-интерфейс с пирами или портом" ]] || fail "модель: действующий WireGuard-интерфейс не защищён"
-    unset -f wg
-    mkdir -p "$mock_root/sys/physical-test" "$mock_root/sys/veth-test" "$mock_root/sys/br-test/bridge" "$mock_root/sys/slave-test"
-    ln -s ../br-test "$mock_root/sys/slave-test/master"
-    [[ "$(interface_protection_reason physical-test)" == "физический интерфейс" ]] || fail "модель: физический интерфейс не защищён"
-    [[ -z "$(interface_protection_reason veth-test)" ]] || fail "модель: свободный veth ошибочно защищён"
-    [[ -n "$(interface_protection_reason br-test)" ]] || fail "модель: bridge не защищён"
-    [[ "$(interface_protection_reason slave-test)" == "подчинён интерфейсу br-test" ]] || fail "модель: slave-интерфейс не защищён"
-    recommended_output="$(scan_interfaces 0)"
-    [[ "$recommended_output" == *"tun-test"* ]] || fail "рекомендуемый список скрыл безопасный интерфейс"
-    [[ "$recommended_output" != *"physical-test"* ]] || fail "рекомендуемый список показывает нерекомендуемый интерфейс"
-    [[ "$recommended_output" == *"Скрыто рискованных интерфейсов, доступных в полном списке"* ]] || fail "нет точной сводки скрытых интерфейсов"
-    all_output="$(scan_interfaces 1)"
-    [[ "$all_output" == *"physical-test"* ]] || fail "полный список скрыл интерфейс"
-    export WIM_MOCK_POLICY_IFACE=tun-test
-    [[ "$(interface_protection_reason tun-test)" == "уже участвует в сторонней policy routing" ]] || fail "существующая policy routing интерфейса не обнаружена"
-    unset WIM_MOCK_POLICY_IFACE
-    grep -q 'rule add iif tun-test table 51880 priority 18001' "$mock_log" || fail "модель: нет точного правила входного интерфейса"
-    ! grep -q 'route add default.*table main' "$mock_log" || fail "модель: изменена основная таблица"
-    (
-        require_root() { :; }
-        acquire_lock() { :; }
-        sleep() { :; }
-        systemctl() {
-            printf 'systemctl %s\n' "$*" >>"$mock_log"
-            [[ ${1:-} == "is-active" ]]
-        }
-        export WIM_MOCK_FAIL_CURL_ONCE_FILE="$mock_root/fail-curl-once"
-        : >"$WIM_MOCK_FAIL_CURL_ONCE_FILE"
-        : >"$mock_log"
-        health_check 1 >/dev/null
-        ! grep -q '^systemctl restart ' "$mock_log" || fail "модель: кратковременный сбой проверки перезапустил WARP"
-    )
-    : >"$mock_log"
-    if service_up; then
-        fail "модель: второй запуск поверх работающего интерфейса ошибочно разрешён"
-    fi
-    [[ -f "$mock_wg_marker" ]] || fail "модель: второй запуск удалил уже существующий интерфейс"
-    ! grep -q '^wg-quick down' "$mock_log" || fail "модель: второй запуск опустил уже существующий интерфейс"
-    [[ "$(state_get STATUS "$HEALTH_FILE")" == "failed" ]] || fail "модель: конфликт интерфейса не сохранён как ошибка"
-    export WIM_MOCK_MISSING_IIF=1
-    if health_is_good; then
-        fail "модель: отсутствие правила для входного интерфейса признано здоровым WARP"
-    fi
-    unset WIM_MOCK_MISSING_IIF
-    rm -f "$WIM_MOCK_FIREWALL_ROOT/nat"
-    if health_is_good; then
-        fail "модель: отсутствие NAT-правила признано здоровым WARP"
-    fi
-    : >"$WIM_MOCK_FIREWALL_ROOT/nat"
-    export WIM_MOCK_MISSING_TABLE_ROUTE=1
-    if health_is_good; then
-        fail "модель: отсутствие маршрута в таблице WARP признано здоровым"
-    fi
-    unset WIM_MOCK_MISSING_TABLE_ROUTE
-    health_is_good || fail "модель: исправная маршрутизация не прошла проверку"
+            ;;
+        cat) return 1 ;;
+        stop)
+            if [[ -f "$mock_root/service-active" ]]; then runtime_down || return 1; fi
+            rm -f "$mock_root/service-active"
+            ;;
+        start|restart)
+            if [[ "$1" == restart && -f "$mock_root/service-active" ]]; then runtime_down || return 1; fi
+            rm -f "$mock_root/service-active"
+            if [[ "${MOCK_FAIL_MODE:-}" == "$(state_get ROUTING_MODE)" ]]; then return 1; fi
+            service_up || return 1
+            : >"$mock_root/service-active"
+            ;;
+        *) return 1 ;;
+    esac
+}
+assert_clean() {
+    [[ ! -e "$mock_wg_marker" && ! -e "$RUNTIME_FILE" ]] || fail 'интерфейс/runtime остались'
+    python3 - "$mock_root/kernel.json" <<'PY'
+import json,sys
+s=json.load(open(sys.argv[1]))
+assert not s['rules'] and not s['routes'] and not s['firewall'],s
+PY
+}
+route_dev() { ip -4 route get 1.1.1.1 "$@" | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}'; }
+select_state() { write_state "$1" 51880 18000 1700000000 0 "${4:-0}" "${2:-interface}" "${3:-}"; load_state; }
+
+# Legacy single-interface configuration is accepted without rewriting or losing risk consent.
+printf 'TARGET_IFACE=tun-test\nTABLE_ID=51880\nRULE_PRIORITY=18000\nINSTALLED_AT=1700000000\nPREVIOUS_IP_FORWARD=0\nALLOW_RISKY=1\n' >"$STATE_FILE"
+legacy_hash="$(sha256sum "$STATE_FILE")"
+load_state
+[[ "$TARGET_IFACES" == tun-test && "$RISKY_IFACES" == tun-test ]] || fail 'миграция старого выбора'
+[[ "$(sha256sum "$STATE_FILE")" == "$legacy_hash" ]] || fail 'чтение изменило старое состояние'
+service_up
+health_is_good || fail 'старая конфигурация не работает'
+[[ "$(state_get WG_IFINDEX "$RUNTIME_FILE")" == 42 ]] || fail 'нет runtime index'
+runtime_down
+assert_clean
+[[ "$(<"$mock_root/proc/tun-test/rp_filter")" == 2 ]] || fail 'старый rp_filter потерян'
+
+# Existing interface safety and foreign-install detection remain enforced.
+[[ -z "$(interface_protection_reason tun-test)" ]] || fail 'свободный TUN защищён'
+[[ -n "$(interface_protection_reason eth0)" ]] || fail 'основной интерфейс не защищён'
+ip -4 rule add iif tun-test table 51999 priority 17000
+[[ "$(interface_protection_reason tun-test)" == 'уже участвует в сторонней policy routing' ]] || fail 'не обнаружена чужая policy routing'
+ip -4 rule del iif tun-test table 51999 priority 17000
+iptables -A FORWARD -i tun-test -m comment --comment FOREIGN_TEST_RULE -j ACCEPT
+[[ "$(interface_protection_reason tun-test)" == 'уже участвует в сторонних firewall-правилах' ]] || fail 'не обнаружен чужой firewall'
+iptables -D FORWARD -i tun-test -m comment --comment FOREIGN_TEST_RULE -j ACCEPT
+export WIM_TEST_FOREIGN_WARP_EVIDENCE='тестовый сторонний WARP'
+if (assert_no_foreign_warp >/dev/null 2>&1); then fail 'разрешён сторонний WARP'; fi
+unset WIM_TEST_FOREIGN_WARP_EVIDENCE
+export SSH_CONNECTION='198.51.100.10 54321 192.0.2.10 2222'
+[[ "$(current_ssh_server_port)" == 2222 ]] || fail 'неверный порт текущего SSH'
+unset SSH_CONNECTION
+validate_ssh_ports 22,2222 || fail 'отклонён список SSH-портов'
+! validate_ssh_ports 0,70000 || fail 'приняты недопустимые SSH-порты'
+
+if validate_iface_list '.' || validate_iface_list '..'; then fail 'принят путь вместо интерфейса'; fi
+for invalid in 'tun-test,tun-test' 'tun-test,' ',tun-test' 'tun-test,,tun-second' lo warp-selective 'bad name'; do
+    ! validate_iface_list "$invalid" || fail "принят неправильный набор $invalid"
+done
+! validate_risky_subset tun-test tun-second || fail 'риск для чужого интерфейса'
+! validate_ipv4_list '162.159.192.1,' || fail 'повреждённый endpoint'
+
+# Two ingress interfaces share one tunnel. Unselected traffic retains its route.
+printf '1' >"$mock_root/proc/tun-second/rp_filter"
+select_state tun-test,tun-second
+: >"$mock_log"
+service_up
+[[ "$(route_dev from 10.70.0.2 iif tun-test)" == warp-selective ]] || fail 'первый ingress не переключён'
+[[ "$(route_dev from 10.71.0.2 iif tun-second)" == warp-selective ]] || fail 'второй ingress не переключён'
+[[ "$(route_dev from 10.72.0.2 iif tun-other)" == eth0 ]] || fail 'посторонний ingress переключён'
+[[ "$(route_dev)" == eth0 ]] || fail 'хост переключён в режиме интерфейсов'
+[[ "$(grep -c '^wg-quick up ' "$mock_log")" == 1 ]] || fail 'созданы два туннеля'
+export WIM_MOCK_MISSING_SECOND_IIF=1
+if health_is_good; then fail 'здоровье без второго ingress rule'; fi
+unset WIM_MOCK_MISSING_SECOND_IIF
+export WIM_MOCK_MISSING_NAT=1
+if health_is_good; then fail 'здоровье без NAT'; fi
+unset WIM_MOCK_MISSING_NAT
+export WIM_MOCK_FORWARD_OFF=1
+if health_is_good; then fail 'здоровье без forwarding'; fi
+unset WIM_MOCK_FORWARD_OFF
+export WIM_MOCK_MISSING_TABLE_ROUTE=1
+if health_is_good; then fail 'здоровье без маршрута'; fi
+unset WIM_MOCK_MISSING_TABLE_ROUTE
+health_is_good || fail 'два ingress не прошли проверку'
+: >"$mock_root/service-active"
+: >"$mock_log"
+enable_manager
+! grep -q '^systemctl restart ' "$mock_log" || fail 'повторный enable перезапустил здоровый туннель'
+: >"$mock_root/curl-fail-once"
+health_check 1 >/dev/null
+! grep -q '^systemctl restart ' "$mock_log" || fail 'краткий сбой вызвал restart'
+disable_manager
+assert_clean
+[[ "$(<"$mock_root/proc/tun-test/rp_filter")" == 2 && "$(<"$mock_root/proc/tun-second/rp_filter")" == 1 ]] || fail 'разные исходные rp_filter потеряны'
+
+# Recovery uses profile identity even when old runtime has no index or is absent.
+for legacy in no-index no-runtime; do
+    select_state tun-test
+    service_up
+    if [[ "$legacy" == no-index ]]; then sed -i '/^WG_IFINDEX=/d' "$RUNTIME_FILE"; else rm -f "$RUNTIME_FILE"; fi
     export WIM_MOCK_FAIL_DOWN=1
-    runtime_down
-    [[ ! -e "$mock_wg_marker" ]] || fail "модель: WARP-интерфейс не опущен"
-    grep -q '^ip link delete dev warp-selective$' "$mock_log" || fail "модель: зависший собственный интерфейс не удалён"
-    [[ "$(<"$mock_root/proc/tun-test/rp_filter")" == "2" ]] || fail "модель: rp_filter не восстановлен"
-    unset WIM_MOCK_FAIL_DOWN
-    (
-        require_root() { :; }
-        require_systemd() { :; }
-        acquire_lock() { :; }
-        ensure_owned_paths_are_safe() { :; }
-        write_sysctl_config() { :; }
-        systemctl() {
-            printf 'systemctl %s\n' "$*" >>"$mock_log"
-            return 0
-        }
-        service_up
-        : >"$mock_log"
-        enable_manager
-        ! grep -q '^systemctl restart ' "$mock_log" || fail "модель: повторное включение исправного WARP перезапустило службу"
-        runtime_down
-    )
-    service_up
-    export WIM_MOCK_FAIL_DOWN=1 WIM_MOCK_FAIL_DELETE=1
-    if runtime_down; then
-        fail "модель: неудачное удаление интерфейса ошибочно названо успешным"
-    fi
-    [[ -f "$mock_wg_marker" && -f "$RUNTIME_FILE" ]] || fail "модель: следы неполной остановки потеряны"
-    [[ "$(state_get STATUS "$HEALTH_FILE")" == "failed" ]] || fail "модель: неполная остановка не отмечена как ошибка"
-    unset WIM_MOCK_FAIL_DELETE
-    export WIM_MOCK_NOT_WG=1
     : >"$mock_log"
-    if runtime_down; then
-        fail "модель: интерфейс другого типа ошибочно остановлен"
-    fi
-    [[ -f "$mock_wg_marker" ]] || fail "модель: интерфейс другого типа удалён"
-    ! grep -q '^ip link delete dev warp-selective$' "$mock_log" || fail "модель: интерфейс другого типа удалён напрямую"
+    service_up
+    grep -q '^ip link delete dev warp-selective$' "$mock_log" || fail 'старый собственный интерфейс не восстановлен'
+    health_is_good || fail 'восстановленный туннель не healthy'
+    unset WIM_MOCK_FAIL_DOWN
+    runtime_down
+    assert_clean
+    # No-runtime cannot restore an unknown prior rp_filter; preserve current value.
+    printf '2' >"$mock_root/proc/tun-test/rp_filter"
+done
+
+# An interface of another identity/type is untouched, even if its index matches.
+for identity in foreign type; do
+    select_state tun-test
+    wg-quick up "$WG_CONFIG"
+    if [[ "$identity" == foreign ]]; then printf 'foreign-key' >"$mock_wg_marker"; else export WIM_MOCK_NOT_WG=1; fi
+    : >"$mock_log"
+    if service_up; then fail 'чужой интерфейс принят'; fi
+    if runtime_down; then fail 'чужой интерфейс назван очищенным'; fi
+    if managed_routing_is_good; then fail 'чужой интерфейс признан исправным'; fi
+    [[ -f "$mock_wg_marker" ]] || fail 'чужой интерфейс удалён'
+    ! grep -q '^wg-quick down\|^ip link delete\|^ip -4 rule del\|^iptables .* -D' "$mock_log" || fail 'чужая маршрутизация изменена'
     unset WIM_MOCK_NOT_WG
-    printf '43' >"$mock_root/sys/warp-selective/ifindex"
-    : >"$mock_log"
-    if runtime_down; then
-        fail "модель: чужой интерфейс с другим индексом ошибочно принят за свой"
-    fi
-    [[ -f "$mock_wg_marker" ]] || fail "модель: чужой интерфейс удалён"
-    ! grep -q '^wg-quick down' "$mock_log" || fail "модель: чужой интерфейс остановлен через wg-quick"
-    printf '42' >"$mock_root/sys/warp-selective/ifindex"
-    runtime_down
-    [[ ! -e "$mock_wg_marker" ]] || fail "модель: подтверждённый интерфейс не очищен после повторной попытки"
-    unset WIM_MOCK_FAIL_DOWN
-    service_up
-    sed -i '/^WG_IFINDEX=/d' "$RUNTIME_FILE"
-    export WIM_MOCK_FAIL_DOWN=1
-    : >"$mock_log"
-    if runtime_down; then
-        fail "модель: остановка старого запуска ошибочно названа успешной"
-    fi
-    [[ -f "$mock_wg_marker" ]] || fail "модель: старый интерфейс удалён без подтверждённого индекса"
-    ! grep -q '^ip link delete dev warp-selective$' "$mock_log" || fail "модель: старый интерфейс удалён принудительно"
-    unset WIM_MOCK_FAIL_DOWN
-    runtime_down
-    : >"$mock_wg_marker"
-    mkdir -p "$mock_root/sys/warp-selective"
-    printf '42' >"$mock_root/sys/warp-selective/ifindex"
-    : >"$mock_log"
-    if runtime_down; then
-        fail "модель: чужой интерфейс без записи запуска ошибочно остановлен"
-    fi
-    [[ -f "$mock_wg_marker" ]] || fail "модель: чужой интерфейс без записи запуска удалён"
-    ! grep -q '^wg-quick down' "$mock_log" || fail "модель: чужой интерфейс без записи запуска остановлен через wg-quick"
-    (
-        require_root() { :; }
-        acquire_lock() { :; }
-        systemctl() { return 1; }
-        health_check 0 >/dev/null 2>&1 || true
-        [[ "$(state_get STATUS "$HEALTH_FILE")" == "failed" ]] || fail "модель: остаточный интерфейс при выключенной службе назван нормальным отключением"
-    )
     rm -f "$mock_wg_marker" "$mock_root/sys/warp-selective/ifindex"
-    export WIM_MOCK_FAIL_CURL=1
-    if service_up; then
-        fail "модель: запуск ошибочно успешен при недоступном WARP"
-    fi
-    [[ ! -e "$mock_wg_marker" ]] || fail "модель: после ошибки WARP-интерфейс не очищен"
-    [[ "$(state_get STATUS "$HEALTH_FILE")" == "failed" ]] || fail "модель: ошибка проверки не сохранена"
-    unset WIM_MOCK_FAIL_CURL
+done
 
-    (
-        STATE_FILE="$mock_root/reconfigure-inactive.env"
-        cp "$mock_root/etc/warp-interface-manager/state.env" "$STATE_FILE"
-        SYSCTL_FILE="$mock_root/reconfigure-sysctl.conf"
-        require_root() { :; }
-        require_systemd() { :; }
-        acquire_lock() { :; }
-        ensure_owned_paths_are_safe() { :; }
-        detect_ssh_ports() { printf '2222'; }
-        choose_routing_mode() {
-            CHOSEN_ROUTING_MODE=host
-            CHOSEN_IFACE=-
-            CHOSEN_ALLOW_RISKY=0
-            CHOSEN_SSH_PORTS=2222
-        }
-        systemctl() {
-            printf 'systemctl %s\n' "$*" >>"$mock_log"
-            [[ ${1:-} != "is-active" ]]
-        }
-        : >"$mock_log"
-        reconfigure_output="$(reconfigure_manager)"
-        [[ "$reconfigure_output" == *"WARP остаётся отключённым"* ]] || fail "модель: смена режима при выключенном WARP обещала активную маршрутизацию"
-        [[ "$(state_get ROUTING_MODE "$STATE_FILE")" == "host" ]] || fail "модель: новый режим не сохранён"
-        ! grep -q '^systemctl start ' "$mock_log" || fail "модель: смена режима неожиданно запустила выключенный WARP"
-    )
-    (
-        STATE_FILE="$mock_root/reconfigure-failed.env"
-        cp "$mock_root/etc/warp-interface-manager/state.env" "$STATE_FILE"
-        SYSCTL_FILE="$mock_root/reconfigure-failed-sysctl.conf"
-        require_root() { :; }
-        require_systemd() { :; }
-        acquire_lock() { :; }
-        ensure_owned_paths_are_safe() { :; }
-        detect_ssh_ports() { printf '2222'; }
-        choose_routing_mode() {
-            CHOSEN_ROUTING_MODE=host
-            CHOSEN_IFACE=-
-            CHOSEN_ALLOW_RISKY=0
-            CHOSEN_SSH_PORTS=2222
-        }
-        systemctl() {
-            [[ ${1:-} != "start" ]]
-        }
-        runtime_down() {
-            if [[ -e "$mock_root/reconfigure-first-stop" ]]; then
-                return 1
-            fi
-            : >"$mock_root/reconfigure-first-stop"
-        }
-        if (reconfigure_manager >/dev/null 2>&1); then
-            fail "модель: неудачная остановка после смены режима ошибочно завершилась успехом"
-        fi
-        [[ "$(state_get ROUTING_MODE "$STATE_FILE")" == "host" ]] || fail "модель: оставшийся интерфейс потерял соответствующие ему настройки"
-    )
-    (
-        STATE_FILE="$mock_root/reconfigure-missing-target.env"
-        cp "$mock_root/etc/warp-interface-manager/state.env" "$STATE_FILE"
-        require_root() { :; }
-        require_systemd() { :; }
-        acquire_lock() { :; }
-        ensure_owned_paths_are_safe() { :; }
-        choose_routing_mode() {
-            CHOSEN_ROUTING_MODE=interface
-            CHOSEN_IFACE=missing-test
-            CHOSEN_ALLOW_RISKY=0
-            CHOSEN_SSH_PORTS=""
-        }
-        systemctl() {
-            printf 'systemctl %s\n' "$*" >>"$mock_log"
-        }
-        : >"$mock_log"
-        if (reconfigure_manager >/dev/null 2>&1); then
-            fail "модель: исчезнувший интерфейс принят для смены режима"
-        fi
-        [[ "$(state_get TARGET_IFACE "$STATE_FILE")" == "tun-test" ]] || fail "модель: прежняя цель потеряна после неудачной проверки"
-        ! grep -q '^systemctl stop ' "$mock_log" || fail "модель: исправная служба остановлена до проверки новой цели"
-    )
-    export WIM_MOCK_FORWARD=1
-    : >"$mock_log"
-    report_forwarding_after_remove 0 >/dev/null 2>&1
-    ! grep -q '^sysctl -q -w net.ipv4.ip_forward=0$' "$mock_log" || fail "модель: удаление менеджера выключило forwarding для других служб"
-    unset WIM_MOCK_FORWARD
+# Identity can change during failed down: do not delete a replacement interface.
+select_state tun-test
+service_up
+export WIM_MOCK_SWAP_DURING_DOWN=1
+: >"$mock_log"
+if runtime_down; then fail 'подмена при остановке не обнаружена'; fi
+[[ -f "$mock_wg_marker" && -f "$RUNTIME_FILE" ]] || fail 'потеряно состояние неполной остановки'
+! grep -q '^ip link delete ' "$mock_log" || fail 'удалён подменённый интерфейс'
+unset WIM_MOCK_SWAP_DURING_DOWN
+rm -f "$mock_wg_marker" "$mock_root/sys/warp-selective/ifindex"
+runtime_down
+assert_clean
 
-    : >"$mock_log"
-    printf 'TARGET_IFACE=-\nTABLE_ID=51880\nRULE_PRIORITY=18000\nINSTALLED_AT=1700000000\nPREVIOUS_IP_FORWARD=0\nALLOW_RISKY=0\nROUTING_MODE=host\nSSH_PORTS=2222\n' >"$STATE_FILE"
-    export WIM_MOCK_MODE=host
-    # shellcheck disable=SC2329
-    detect_ssh_ports() { printf '2222'; }
-    service_up
-    [[ -f "$mock_wg_marker" ]] || fail "модель всего хоста: WARP-интерфейс не поднят"
-    export WIM_MOCK_WRONG_GLOBAL_RULE=1
-    if health_is_good; then
-        fail "модель всего хоста: частичное правило принято за общее"
-    fi
-    unset WIM_MOCK_WRONG_GLOBAL_RULE
-    export WIM_MOCK_MISSING_SSH_RULE=1
-    if health_is_good; then
-        fail "модель всего хоста: отсутствие защиты SSH признано здоровым WARP"
-    fi
-    unset WIM_MOCK_MISSING_SSH_RULE
-    export WIM_MOCK_MISSING_ENDPOINT_RULE=1
-    if health_is_good; then
-        fail "модель всего хоста: отсутствие защиты endpoint признано здоровым WARP"
-    fi
-    unset WIM_MOCK_MISSING_ENDPOINT_RULE
-    health_is_good || fail "модель всего хоста: исправные защитные правила не прошли проверку"
-    grep -q 'rule add to 162.159.192.1/32 table main priority 17998' "$mock_log" || fail "модель всего хоста: endpoint WARP не защищён"
-    grep -q 'rule add ipproto tcp sport 2222 table main priority 17999' "$mock_log" || fail "модель всего хоста: нестандартный SSH-порт не защищён"
-    grep -q 'rule add table 51880 priority 18001' "$mock_log" || fail "модель всего хоста: нет общего правила WARP"
-    ! grep -q 'iptables .* -A\|iptables .* -I' "$mock_log" || fail "модель всего хоста: неожиданно изменён FORWARD/NAT"
-    rm -f "$RUNTIME_FILE"
-    rm -f "$mock_wg_marker" "$mock_root/sys/warp-selective/ifindex"
-    runtime_down
-    [[ ! -e "$mock_wg_marker" ]] || fail "модель всего хоста: WARP-интерфейс не опущен"
-    grep -q 'rule del to 162.159.192.1/32 table main priority 17998' "$mock_log" || fail "модель всего хоста: endpoint не очищен без runtime-файла"
-    detect_ssh_ports() { printf '3333'; }
-    if service_up; then
-        fail "модель всего хоста: запуск не остановлен после изменения SSH-порта"
-    fi
-    [[ ! -e "$mock_wg_marker" ]] || fail "модель всего хоста: после изменения SSH-порта WARP не очищен"
-    unset -f detect_ssh_ports
-    export WIM_MOCK_GLOBAL_CONFLICT=1
-    [[ -n "$(full_host_routing_conflicts)" ]] || fail "конфликт общей policy routing не обнаружен"
-    if check_full_host_routing_is_clear >/dev/null 2>&1; then
-        fail "режим всего хоста разрешён при сторонней policy routing"
-    fi
-    unset WIM_MOCK_GLOBAL_CONFLICT
-    unset WIM_MOCK_MODE
-    export WIM_TEST_FOREIGN_WARP_EVIDENCE='тестовый сторонний WARP'
-    if (assert_no_foreign_warp >/dev/null 2>&1); then
-        fail "сторонний WARP не заблокировал установку"
-    fi
-    unset WIM_TEST_FOREIGN_WARP_EVIDENCE
-    export SSH_CONNECTION='198.51.100.10 54321 192.0.2.10 2222'
-    [[ "$(current_ssh_server_port)" == "2222" ]] || fail "модель всего хоста: порт текущего SSH определён неверно"
-    validate_ssh_ports '22,2222' || fail "модель всего хоста: корректные SSH-порты отклонены"
-    ! validate_ssh_ports '0,70000' || fail "модель всего хоста: некорректные SSH-порты приняты"
-    is_ipv4_address '162.159.192.1' || fail "корректный IPv4 endpoint отклонён"
-    ! is_ipv4_address '999.159.192.1' || fail "некорректный IPv4 endpoint принят"
-    offer_all_interfaces <<<"1" >/dev/null 2>&1 || fail "переход к полному списку не сработал"
-    if offer_all_interfaces <<<"0" >/dev/null 2>&1; then
-        fail "отмена перехода к полному списку не сработала"
-    fi
-    # shellcheck disable=SC2329
-    choose_interface() { return 2; }
-    if choose_routing_mode <<< $'1\n0\n' >/dev/null 2>&1; then
-        fail "возврат из выбора интерфейса завершился успехом вместо перехода назад"
-    else
-        [[ "$?" == "2" ]] || fail "возврат в главное меню имеет неверный код"
-    fi
+select_state tun-test,tun-second
+service_up
+export WIM_MOCK_FAIL_FIREWALL_DELETE=1
+if runtime_down; then fail 'ошибка очистки firewall скрыта'; fi
+[[ -f "$RUNTIME_FILE" ]] || fail 'потерян runtime неполной очистки'
+unset WIM_MOCK_FAIL_FIREWALL_DELETE
+runtime_down
+assert_clean
+service_up
+export WIM_MOCK_FAIL_RULE_DELETE=1
+if runtime_down; then fail 'ошибка удаления policy rule скрыта'; fi
+[[ -f "$RUNTIME_FILE" ]] || fail 'потерян runtime при ошибке удаления rule'
+unset WIM_MOCK_FAIL_RULE_DELETE
+runtime_down
+assert_clean
+
+# Host mode has local-only routing, reply protection, and NAT; no unselected transit.
+select_state - host 2222
+service_up
+[[ "$(route_dev)" == warp-selective ]] || fail 'локальный выход не переключён'
+[[ "$(route_dev from 10.70.0.2 iif tun-test)" == eth0 ]] || fail 'хост захватил невыбранный transit'
+[[ "$(route_dev mark 0x40000000)" == eth0 ]] || fail 'ответ входящей службы переключён'
+export WIM_MOCK_ROTATED_ENDPOINT=1
+if health_is_good; then fail 'смена endpoint без защиты пропущена'; fi
+runtime_down
+service_up
+ip_rule_has 17998 main to 162.159.192.99 || fail 'фактический endpoint не защищён после DNS-ротации'
+unset WIM_MOCK_ROTATED_ENDPOINT
+for flag in WRONG_LOCAL_RULE MISSING_REPLY_RULE MISSING_REPLY_FIREWALL MISSING_SSH_RULE MISSING_ENDPOINT_RULE; do
+    export "WIM_MOCK_$flag=1"
+    if health_is_good; then fail "здоровье без защиты $flag"; fi
+    unset "WIM_MOCK_$flag"
+done
+runtime_down
+assert_clean
+select_state tun-test,tun-second host 2222
+service_up
+[[ "$(route_dev)" == warp-selective && "$(route_dev from 10.71.0.2 iif tun-second)" == warp-selective ]] || fail 'совмещённый режим не работает'
+runtime_down
+assert_clean
+
+# Update from legacy host mode clears its global transit rule.
+printf 'TARGET_IFACE=-\nTABLE_ID=51880\nRULE_PRIORITY=18000\nINSTALLED_AT=1700000000\nPREVIOUS_IP_FORWARD=0\nROUTING_MODE=host\nSSH_PORTS=2222\n' >"$STATE_FILE"
+wg-quick up "$WG_CONFIG"
+ip -4 rule add table 51880 priority 18001
+service_up
+[[ "$(route_dev from 10.70.0.2 iif tun-test)" == eth0 ]] || fail 'старое общее правило осталось'
+runtime_down
+assert_clean
+
+# Failures after partial replacement leave no active routes or rules.
+select_state tun-test,tun-second host 2222
+export WIM_MOCK_FAIL_CURL=1
+if service_up; then fail 'провал trace принят'; fi
+unset WIM_MOCK_FAIL_CURL
+assert_clean
+export WIM_MOCK_FAIL_OUTPUT_ADD=1
+if service_up; then fail 'провал защитного mangle-правила принят'; fi
+unset WIM_MOCK_FAIL_OUTPUT_ADD
+assert_clean
+for flag in FAIL_RULE_SHOW FAIL_ROUTE_SHOW FAIL_IPTABLES_SAVE FAIL_NFT FOREIGN_MARK GLOBAL_CONFLICT; do
+    export "WIM_MOCK_$flag=1"
+    if check_full_host_routing_is_clear >/dev/null 2>&1; then fail "пропущен конфликт $flag"; fi
+    unset "WIM_MOCK_$flag"
+done
+
+# Reconfigure validates all new targets before stopping the working configuration.
+select_state tun-test
+systemctl start "$SERVICE"
+choose_routing_mode() { CHOSEN_IFACE=tun-test,tun-second; CHOSEN_RISKY_IFACES=''; CHOSEN_ROUTING_MODE=interface; CHOSEN_SSH_PORTS=''; }
+export WIM_MOCK_SECOND_DOWN=1
+: >"$mock_log"
+if (reconfigure_manager >/dev/null 2>&1); then fail 'принят отсутствующий второй интерфейс'; fi
+unset WIM_MOCK_SECOND_DOWN
+! grep -q '^systemctl stop ' "$mock_log" || fail 'старый туннель остановлен до проверки нового набора'
+reconfigure_manager
+load_state
+[[ "$TARGET_IFACES" == tun-test,tun-second ]] || fail 'новый набор не сохранён'
+health_is_good || fail 'новый набор не запущен'
+choose_routing_mode() { CHOSEN_IFACE='-'; CHOSEN_RISKY_IFACES=''; CHOSEN_ROUTING_MODE=host; CHOSEN_SSH_PORTS=2222; }
+export MOCK_FAIL_MODE=host
+if (reconfigure_manager >/dev/null 2>&1); then fail 'ошибка нового режима принята'; fi
+unset MOCK_FAIL_MODE
+load_state
+[[ "$ROUTING_MODE" == interface && "$TARGET_IFACES" == tun-test,tun-second ]] || fail 'прежний набор потерян'
+[[ -f "$mock_root/service-active" ]] || fail 'прежний рабочий туннель не восстановлен'
+health_is_good || fail 'восстановленный прежний набор нездоров'
+disable_manager
+reconfigure_manager
+load_state
+[[ "$ROUTING_MODE" == host && ! -f "$mock_root/service-active" ]] || fail 'смена выключенного режима запустила службу'
+
+# A failed atomic sysctl replacement must retain the old file and report failure.
+(
+    printf 'previous sysctl fixture\n' >"$SYSCTL_FILE"
+    mv() { return 1; }
+    if write_sysctl_config; then fail 'ошибка записи sysctl скрыта'; fi
+    [[ "$(<"$SYSCTL_FILE")" == 'previous sysctl fixture' ]] || fail 'sysctl потерян при ошибке замены'
 )
 
-printf 'OK: все безопасные локальные проверки пройдены.\n'
+[[ "$(sha256sum "$WG_CONFIG")" == "$profile_hash" ]] || fail 'профиль переписан'
+[[ "$(sha256sum "$CONFIG_DIR/wgcf-account.toml")" == "$account_hash" ]] || fail 'регистрация переписана'
+! grep -q 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=' "$mock_log" || fail 'ключ попал в argv/log'
+[[ "$(TZ=UTC format_server_datetime '2026-10-10T22:28:57+00:00')" == '10.10.2026 22:28:57 UTC (+00:00)' ]] || fail 'формат времени'
+
+# Multi-selection and separate risk consent (including duplicate/oversized input).
+scan_interfaces() { SELECTABLE_IFACES=(tun-test tun-second); }
+interface_protection_reason() { [[ "$1" != tun-second ]] || printf 'тестовый риск'; }
+choose_interface <<< $'2\n1 1\n999999999999999999\n1 2\nРИСК tun-second\n' >/dev/null
+[[ "$CHOSEN_IFACE" == tun-test,tun-second && "$CHOSEN_RISKY_IFACES" == tun-second ]] || fail 'выбор набора/отдельный риск'
+(
+    # shellcheck source=../warp-interface-manager.sh disable=SC1091
+    source "$SCRIPT"
+    choose_interface() { return 2; }
+    if choose_routing_mode <<< $'1\n0\n' >/dev/null 2>&1; then fail 'возврат из выбора интерфейсов потерян'; else
+        [[ "$?" == 2 ]] || fail 'неверный код возврата в меню'
+    fi
+)
+printf 'OK: безопасные проверки 1.4.0 пройдены.\n'

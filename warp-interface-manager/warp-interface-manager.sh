@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VERSION="1.3.3"
+VERSION="1.4.0"
 PROGRAM_NAME="Менеджер WARP-маршрутизации"
 
 INSTALL_BIN="/usr/local/sbin/warp-interface-manager"
@@ -28,6 +28,7 @@ CHECK_TIMER="warp-interface-manager-check.timer"
 UNIT_DIR="/etc/systemd/system"
 OWNER_VALUE="warp-interface-manager-v1"
 RULE_COMMENT="WARP_INTERFACE_MANAGER"
+REPLY_MARK="0x40000000/0x40000000"
 DEFAULT_MTU=1280
 SYS_CLASS_NET_ROOT="/sys/class/net"
 PROC_SYS_IPV4_CONF_ROOT="/proc/sys/net/ipv4/conf"
@@ -164,10 +165,10 @@ usage() {
 
 Команды:
   scan          Показать доступные и защищённые интерфейсы без изменений.
-  install       Установить WARP: один входной интерфейс или весь IPv4 хоста.
+  install       Установить WARP: выбранные интерфейсы или исходящий IPv4 хоста.
   enable        Включить ранее сохранённую конфигурацию.
   disable       Безопасно отключить WARP, сохранив профиль и регистрацию.
-  reconfigure   Изменить режим маршрутизации или входной интерфейс.
+  reconfigure   Изменить режим маршрутизации или набор интерфейсов.
   check         Проверить конфигурацию и фактический выход через WARP.
   status        Краткое состояние служб и маршрутизации.
   stats         Трафик, рукопожатие, внешний IP и состояние проверки.
@@ -177,7 +178,7 @@ usage() {
   self-test     Локальная самопроверка без изменения системы.
 
 Без параметров открывается русское интерактивное меню.
-Доступны выборочная маршрутизация одного ingress-интерфейса и режим всего IPv4 хоста.
+Доступны до 16 входных интерфейсов и исходящий IPv4 самого хоста; их можно совместить.
 Нерекомендуемый интерфейс требует точного подтверждения; lo и warp-selective выбрать нельзя.
 EOF
 }
@@ -208,6 +209,48 @@ acquire_lock() {
 
 is_safe_iface_name() {
     [[ ${1:-} =~ ^[A-Za-z0-9_.-]{1,15}$ && ${1:-} != "." && ${1:-} != ".." ]]
+}
+
+# A bounded set is stored as CSV; old single-interface state is still accepted.
+validate_iface_list() {
+    local value=${1:-} iface seen=","
+    local -a items=()
+    [[ -z "$value" || "$value" == "-" ]] && return 0
+    [[ "$value" != ,* && "$value" != *, && "$value" != *,,* ]] || return 1
+    IFS=',' read -r -a items <<<"$value"
+    ((${#items[@]} <= 16)) || return 1
+    for iface in "${items[@]}"; do
+        is_safe_iface_name "$iface" && [[ "$iface" != "lo" && "$iface" != "$WG_IFACE" ]] || return 1
+        [[ "$seen" != *",$iface,"* ]] || return 1
+        seen+="$iface,"
+    done
+}
+
+validate_risky_subset() {
+    local targets=$1 risky=${2:-} iface
+    local -a items=()
+    validate_iface_list "$risky" || return 1
+    [[ -z "$risky" ]] && return 0
+    [[ "$risky" != "-" ]] || return 1
+    IFS=',' read -r -a items <<<"$risky"
+    for iface in "${items[@]}"; do
+        [[ ",$targets," == *",$iface,"* ]] || return 1
+    done
+}
+
+validate_target_ifaces() {
+    local targets=$1 risky=${2:-} iface allow
+    local -a items=()
+    if ! validate_iface_list "$targets" || ! validate_risky_subset "$targets" "$risky"; then
+        die "повреждён список входных интерфейсов."
+    fi
+    [[ -z "$targets" || "$targets" == "-" ]] && return 0
+    IFS=',' read -r -a items <<<"$targets"
+    for iface in "${items[@]}"; do
+        allow=0
+        [[ ",$risky," != *",$iface,"* ]] || allow=1
+        validate_target_iface "$iface" "$allow"
+    done
 }
 
 is_ipv4_address() {
@@ -486,9 +529,20 @@ full_host_routing_conflicts() {
         '
 }
 
+
+full_host_firewall_conflicts() {
+    local rules nft_rules
+    rules="$(iptables-save 2>/dev/null)" || { say "не удалось проверить firewall marks"; return 0; }
+    printf '%s\n' "$rules" | awk -v marker="$RULE_COMMENT" 'index($0,marker) {next} /-j (CONNMARK|MARK)( |$)/ {print "сторонние MARK/CONNMARK-правила требуют отдельной настройки"; exit}'
+    if command -v nft >/dev/null 2>&1; then
+        nft_rules="$(nft list ruleset 2>/dev/null)" || { say "не удалось проверить nftables"; return 0; }
+        printf '%s\n' "$nft_rules" | awk -v marker="$RULE_COMMENT" 'index($0,marker) {next} /(^|[[:space:]])(meta|ct) mark/ {print "сторонние nftables marks требуют отдельной настройки"; exit}'
+    fi
+}
+
 check_full_host_routing_is_clear() {
     local conflicts
-    conflicts="$(full_host_routing_conflicts | awk '!seen[$0]++')"
+    conflicts="$( { full_host_routing_conflicts; full_host_firewall_conflicts; } | awk '!seen[$0]++')"
     [[ -z "$conflicts" ]] || {
         warn "режим всего сервера конфликтует с уже существующей policy routing:"
         while IFS= read -r line; do
@@ -768,53 +822,59 @@ validate_target_iface() {
 }
 
 choose_interface() {
-    local answer index mode=0 reason confirm
-    [[ -t 0 ]] || die "для выбора интерфейса нужен интерактивный терминал."
+    local answer index mode=0 reason confirm item iface invalid risky
+    local -a numbers=() selected=()
+    [[ -t 0 || ${WIM_TEST_MODE:-0} == 1 ]] || die "для выбора интерфейсов нужен интерактивный терминал."
     say "Режим списка интерфейсов:"
-    say "1) Только рекомендуемые — системных рисков не обнаружено [по умолчанию]"
+    say "1) Только рекомендуемые [по умолчанию]"
     say "2) Все активные — ручное решение администратора"
     say "0) Назад"
     read -r -p "Выберите режим [1]: " answer
-    say
     [[ "$answer" == "0" ]] && return 2
-    if [[ "$answer" == "2" ]]; then
-        mode=1
-        warn "в полном списке можно выбрать основной, SSH- или уже используемый выходной интерфейс."
-        warn "ошибка выбора способна создать петлю маршрутизации или оборвать доступ к серверу."
-    fi
+    [[ "$answer" != "2" ]] || mode=1
     scan_interfaces "$mode"
     if ((${#SELECTABLE_IFACES[@]} == 0)) && [[ "$mode" == "0" ]]; then
         offer_all_interfaces || return 2
         mode=1
-        warn "в полном списке администратор самостоятельно принимает риск потери доступа или петли маршрутизации."
         scan_interfaces 1
     fi
     ((${#SELECTABLE_IFACES[@]} > 0)) || die "нет активных интерфейсов, которые можно выбрать."
     while true; do
-        read -r -p "Выберите номер интерфейса [0 — назад]: " answer
-        say
+        read -r -p "Номера интерфейсов через пробел (до 16) [0 — назад]: " answer
         [[ "$answer" == "0" ]] && return 2
-        if [[ "$answer" =~ ^[0-9]+$ ]]; then
-            index=$((10#$answer - 1))
-            if ((index >= 0 && index < ${#SELECTABLE_IFACES[@]})); then
-                CHOSEN_IFACE="${SELECTABLE_IFACES[$index]}"
-                CHOSEN_ALLOW_RISKY=0
-                reason="$(interface_protection_reason "$CHOSEN_IFACE")"
-                if [[ -n "$reason" ]]; then
-                    [[ "$mode" == "1" ]] || die "внутренняя ошибка режима выбора."
-                    say
-                    warn "$CHOSEN_IFACE защищён: $reason."
-                    read -r -p "Чтобы всё равно выбрать его, введите РИСК $CHOSEN_IFACE: " confirm
-                    say
-                    [[ "$confirm" == "РИСК $CHOSEN_IFACE" ]] || { warn "опасный выбор отменён."; continue; }
-                    CHOSEN_ALLOW_RISKY=1
-                fi
-                validate_target_iface "$CHOSEN_IFACE" "$CHOSEN_ALLOW_RISKY"
-                ok "Выбран интерфейс: $CHOSEN_IFACE ($(iface_kind "$CHOSEN_IFACE"), IPv4: $(iface_addresses "$CHOSEN_IFACE"))"
-                return 0
+        IFS=' ' read -r -a numbers <<<"$answer"
+        selected=(); risky=""; invalid=0
+        ((${#numbers[@]} > 0 && ${#numbers[@]} <= 16)) || { warn "укажите от 1 до 16 номеров."; continue; }
+        for item in "${numbers[@]}"; do
+            [[ "$item" =~ ^[0-9]{1,3}$ ]] || { invalid=1; break; }
+            index=$((10#$item - 1))
+            ((index >= 0 && index < ${#SELECTABLE_IFACES[@]})) || { invalid=1; break; }
+            iface="${SELECTABLE_IFACES[$index]}"
+            for confirm in "${selected[@]}"; do
+                [[ "$confirm" != "$iface" ]] || { invalid=1; break; }
+            done
+            ((invalid == 0)) || break
+            selected+=("$iface")
+        done
+        ((invalid == 0)) || { warn "номера должны быть из списка и без повторов."; continue; }
+        for iface in "${selected[@]}"; do
+            reason="$(interface_protection_reason "$iface")"
+            if [[ -n "$reason" ]]; then
+                [[ "$mode" == "1" ]] || { invalid=1; break; }
+                warn "$iface защищён: $reason."
+                read -r -p "Для выбора введите РИСК $iface: " confirm
+                [[ "$confirm" == "РИСК $iface" ]] || { invalid=1; break; }
+                risky+="${risky:+,}$iface"
             fi
-        fi
-        warn "укажите номер из списка."
+        done
+        ((invalid == 0)) || { warn "выбор отменён."; continue; }
+        CHOSEN_IFACE="$(IFS=','; printf '%s' "${selected[*]}")"
+        CHOSEN_RISKY_IFACES="$risky"
+        CHOSEN_ALLOW_RISKY=0
+        [[ -z "$risky" ]] || CHOSEN_ALLOW_RISKY=1
+        validate_target_ifaces "$CHOSEN_IFACE" "$risky"
+        ok "Выбраны интерфейсы: $CHOSEN_IFACE"
+        return 0
     done
 }
 
@@ -823,43 +883,33 @@ choose_routing_mode() {
     while true; do
         CHOSEN_ROUTING_MODE="interface"
         CHOSEN_SSH_PORTS=""
+        CHOSEN_RISKY_IFACES=""
+        CHOSEN_ALLOW_RISKY=0
         say "Что направлять через WARP:"
-        say "1) Трафик с одного выбранного входного интерфейса [по умолчанию]"
-        say "2) Весь исходящий IPv4-трафик сервера"
+        say "1) Трафик выбранных входных интерфейсов [по умолчанию]"
+        say "2) Исходящий IPv4-трафик самого сервера"
         say "0) Вернуться в главное меню"
         read -r -p "Выберите режим [1]: " answer
-        say
         [[ "$answer" == "0" ]] && return 2
         if [[ "$answer" != "2" ]]; then
-            if choose_interface; then
-                return 0
-            fi
-            say
+            if choose_interface; then return 0; fi
             continue
         fi
-
-        if ! check_full_host_routing_is_clear; then
-            say
-            continue
-        fi
+        check_full_host_routing_is_clear || continue
         ports="$(detect_ssh_ports)"
-        validate_ssh_ports "$ports" || die "не удалось надёжно определить ни одного порта SSH. Режим всего хоста запрещён."
-        ip_rule_supports_ports || die "ядро или iproute2 не поддерживает правила по TCP-порту; сохранить SSH автоматически нельзя."
-        say
-        warn "весь исходящий IPv4-трафик сервера будет направлен через WARP."
-        say "Обнаруженные и защищаемые порты SSH: $ports"
-        say "Ответы SSH с этих портов и соединение с endpoint WARP останутся в основной таблице маршрутов."
-        say "IPv6 этим скриптом не переключается."
+        validate_ssh_ports "$ports" || die "не удалось определить SSH-порты."
+        ip_rule_supports_ports || die "система не поддерживает защитные правила SSH."
+        warn "исходящие IPv4-соединения сервера будут направлены через WARP."
+        say "Ответы на входящие соединения, SSH и endpoint WARP сохранят обычный маршрут."
+        say "IPv6 не переключается. Трафик VPN-клиентов добавляется отдельным выбором."
         read -r -p "Для продолжения введите ВЕСЬ ТРАФИК: " confirm
-        say
-        if [[ "$confirm" != "ВЕСЬ ТРАФИК" ]]; then
-            warn "режим всего хоста не подтверждён."
-            say
-            continue
+        [[ "$confirm" == "ВЕСЬ ТРАФИК" ]] || continue
+        CHOSEN_IFACE="-"
+        read -r -p "Направлять также трафик выбранных VPN-интерфейсов? [нет]: " answer
+        if [[ "$answer" == "да" || "$answer" == "д" ]]; then
+            if ! choose_interface; then continue; fi
         fi
         CHOSEN_ROUTING_MODE="host"
-        CHOSEN_IFACE="-"
-        CHOSEN_ALLOW_RISKY=0
         CHOSEN_SSH_PORTS="$ports"
         return 0
     done
@@ -872,9 +922,11 @@ state_get() {
 }
 
 load_state() {
-    [[ -f "$OWNER_FILE" && "$(<"$OWNER_FILE")" == "$OWNER_VALUE" ]] || die "установка не найдена или не принадлежит этому менеджеру."
+    [[ -f "$OWNER_FILE" && ! -L "$OWNER_FILE" && "$(<"$OWNER_FILE")" == "$OWNER_VALUE" ]] || die "установка не найдена или не принадлежит этому менеджеру."
     [[ -f "$STATE_FILE" && ! -L "$STATE_FILE" ]] || die "файл состояния отсутствует или небезопасен."
     TARGET_IFACE="$(state_get TARGET_IFACE)"
+    TARGET_IFACES="$(state_get TARGET_IFACES)"
+    RISKY_IFACES="$(state_get RISKY_IFACES)"
     TABLE_ID="$(state_get TABLE_ID)"
     RULE_PRIORITY="$(state_get RULE_PRIORITY)"
     INSTALLED_AT="$(state_get INSTALLED_AT)"
@@ -884,36 +936,57 @@ load_state() {
     SSH_PORTS="$(state_get SSH_PORTS)"
     [[ -n "$ROUTING_MODE" ]] || ROUTING_MODE="interface"
     [[ "$ROUTING_MODE" == "interface" || "$ROUTING_MODE" == "host" ]] || die "повреждён режим маршрутизации."
+    if ! grep -q '^TARGET_IFACES=' "$STATE_FILE"; then
+        TARGET_IFACES="$TARGET_IFACE"
+        [[ "$TARGET_IFACES" != "-" ]] || TARGET_IFACES=""
+        [[ "$ALLOW_RISKY" != 1 ]] || RISKY_IFACES="$TARGET_IFACES"
+    fi
+    if ! validate_iface_list "$TARGET_IFACES" || [[ "$TARGET_IFACES" == "-" ]] ||
+       ! validate_risky_subset "$TARGET_IFACES" "$RISKY_IFACES"; then
+        die "повреждён список входных интерфейсов."
+    fi
+    TARGET_IFACE="${TARGET_IFACES%%,*}"
+    [[ -n "$TARGET_IFACE" ]] || TARGET_IFACE="-"
     if [[ "$ROUTING_MODE" == "interface" ]]; then
-        is_safe_iface_name "$TARGET_IFACE" || die "повреждено имя интерфейса в состоянии."
+        [[ -n "$TARGET_IFACES" ]] || die "нет выбранных входных интерфейсов."
         SSH_PORTS=""
     else
-        [[ "$TARGET_IFACE" == "-" ]] || die "повреждена цель режима всего хоста."
         validate_ssh_ports "$SSH_PORTS" || die "повреждён список защищённых SSH-портов."
     fi
+    TARGET_LIST=()
+    [[ -z "$TARGET_IFACES" ]] || IFS=',' read -r -a TARGET_LIST <<<"$TARGET_IFACES"
     [[ "$TABLE_ID" =~ ^[0-9]+$ && "$TABLE_ID" -ge 1000 && "$TABLE_ID" -le 65000 ]] || die "повреждён номер таблицы маршрутизации."
     [[ "$RULE_PRIORITY" =~ ^[0-9]+$ && "$RULE_PRIORITY" -ge 1000 && "$RULE_PRIORITY" -le 32000 ]] || die "повреждён приоритет правила."
     [[ "$PREVIOUS_IP_FORWARD" == "0" || "$PREVIOUS_IP_FORWARD" == "1" ]] || PREVIOUS_IP_FORWARD=1
-    [[ "$ALLOW_RISKY" == "0" || "$ALLOW_RISKY" == "1" ]] || ALLOW_RISKY=0
+    ALLOW_RISKY=0
+    [[ -z "$RISKY_IFACES" ]] || ALLOW_RISKY=1
 }
 
 write_state() {
-    local target=$1 table=$2 priority=$3 installed_at=$4 previous_forward=$5 allow_risky=${6:-0}
-    local routing_mode=${7:-interface} ssh_ports=${8:-} tmp
+    local targets=$1 table=$2 priority=$3 installed_at=$4 previous_forward=$5 allow_risky=${6:-0}
+    local routing_mode=${7:-interface} ssh_ports=${8:-} risky=${9:-} tmp first
+    [[ "$targets" != "-" ]] || targets=""
     [[ "$routing_mode" == "interface" || "$routing_mode" == "host" ]] || die "недопустимый режим маршрутизации."
+    [[ "$allow_risky" != 1 || $# -ge 9 ]] || risky="$targets"
+    if ! validate_iface_list "$targets" || ! validate_risky_subset "$targets" "$risky"; then
+        die "недопустимый список интерфейсов."
+    fi
     if [[ "$routing_mode" == "host" ]]; then
-        [[ "$target" == "-" ]] || die "неверная цель режима всего хоста."
         validate_ssh_ports "$ssh_ports" || die "нет корректных SSH-портов для защиты."
     else
+        [[ -n "$targets" ]] || die "не выбран входной интерфейс."
         ssh_ports=""
     fi
-    mkdir -p "$CONFIG_DIR"
-    chmod 700 "$CONFIG_DIR"
-    tmp="$(mktemp "${CONFIG_DIR}/state.XXXXXX")"
-    printf 'TARGET_IFACE=%s\nTABLE_ID=%s\nRULE_PRIORITY=%s\nINSTALLED_AT=%s\nPREVIOUS_IP_FORWARD=%s\nALLOW_RISKY=%s\nROUTING_MODE=%s\nSSH_PORTS=%s\n' \
-        "$target" "$table" "$priority" "$installed_at" "$previous_forward" "$allow_risky" "$routing_mode" "$ssh_ports" >"$tmp"
-    chmod 600 "$tmp"
-    mv -f "$tmp" "$STATE_FILE"
+    first="${targets%%,*}"
+    [[ -n "$first" ]] || first="-"
+    allow_risky=0
+    [[ -z "$risky" ]] || allow_risky=1
+    mkdir -p "$CONFIG_DIR" || return 1
+    chmod 700 "$CONFIG_DIR" || return 1
+    tmp="$(mktemp "${CONFIG_DIR}/state.XXXXXX")" || return 1
+    printf 'TARGET_IFACE=%s\nTARGET_IFACES=%s\nRISKY_IFACES=%s\nTABLE_ID=%s\nRULE_PRIORITY=%s\nINSTALLED_AT=%s\nPREVIOUS_IP_FORWARD=%s\nALLOW_RISKY=%s\nROUTING_MODE=%s\nSSH_PORTS=%s\n' \
+        "$first" "$targets" "$risky" "$table" "$priority" "$installed_at" "$previous_forward" "$allow_risky" "$routing_mode" "$ssh_ports" >"$tmp" || return 1
+    chmod 600 "$tmp" && mv -f "$tmp" "$STATE_FILE"
 }
 
 is_installed() {
@@ -1248,6 +1321,18 @@ resolve_warp_endpoint_ipv4() {
     ((count > 0))
 }
 
+live_endpoint_ipv4() {
+    local endpoints addresses
+    endpoints="$(wg show "$WG_IFACE" endpoints 2>/dev/null)" || return 1
+    addresses="$(awk '
+        $2 ~ /^\[[0-9a-fA-F:]+\]:[0-9]+$/ { next }
+        $2 ~ /^[0-9.]+:[0-9]+$/ { sub(/:[0-9]+$/, "", $2); print $2; next }
+        NF { exit 1 }
+    ' <<<"$endpoints" | sort -u | paste -sd ',' -)" || return 1
+    [[ -z "$addresses" ]] || validate_ipv4_list "$addresses" || return 1
+    printf '%s' "$addresses"
+}
+
 write_health() {
     local status=$1 detail=${2:-} tmp
     mkdir -p "$DATA_DIR"
@@ -1267,118 +1352,143 @@ interface_ifindex() {
 }
 
 save_runtime_state() {
-    local prior_rp=$1 endpoint_ips=${2:-} iface_index=${3:-} tmp
+    local prior_rp=$1 endpoint_ips=${2:-} iface_index=${3:-} filters=${4:-} tmp
     [[ -z "$endpoint_ips" ]] || validate_ipv4_list "$endpoint_ips" || return 1
     [[ -z "$iface_index" || "$iface_index" =~ ^[1-9][0-9]*$ ]] || return 1
-    mkdir -p "$RUNTIME_DIR"
-    chmod 700 "$RUNTIME_DIR"
-    tmp="$(mktemp "${RUNTIME_DIR}/runtime.XXXXXX")"
-    printf 'PRIOR_RP_FILTER=%s\nSTARTED_AT=%s\nENDPOINT_IPS=%s\nWG_IFINDEX=%s\n' \
-        "$prior_rp" "$(date +%s)" "$endpoint_ips" "$iface_index" >"$tmp"
-    chmod 600 "$tmp"
-    mv -f "$tmp" "$RUNTIME_FILE"
+    mkdir -p "$RUNTIME_DIR" && chmod 700 "$RUNTIME_DIR" || return 1
+    tmp="$(mktemp "${RUNTIME_DIR}/runtime.XXXXXX")" || return 1
+    printf 'PRIOR_RP_FILTER=%s\nRP_FILTERS=%s\nTARGET_IFACES=%s\nROUTING_MODE=%s\nSTARTED_AT=%s\nENDPOINT_IPS=%s\nWG_IFINDEX=%s\n' \
+        "$prior_rp" "$filters" "$TARGET_IFACES" "$ROUTING_MODE" "$(date +%s)" "$endpoint_ips" "$iface_index" >"$tmp" || return 1
+    chmod 600 "$tmp" && mv -f "$tmp" "$RUNTIME_FILE"
+}
+
+interface_belongs_to_profile() {
+    local expected actual
+    [[ -f "$WG_CONFIG" && ! -L "$WG_CONFIG" &&
+       "$(head -n 1 "$WG_CONFIG")" == "# Managed by warp-interface-manager. Do not edit while active." ]] || return 1
+    # The private key travels only through a pipe to wg, never through argv or logs.
+    expected="$(awk -F= '/^[[:space:]]*PrivateKey[[:space:]]*=/ { sub(/^[^=]*=/, ""); gsub(/[[:space:]]/, ""); print; exit }' "$WG_CONFIG" | wg pubkey 2>/dev/null)" || return 1
+    [[ "$expected" =~ ^[A-Za-z0-9+/]{43}=$ ]] || return 1
+    actual="$(wg show "$WG_IFACE" public-key 2>/dev/null)" || return 1
+    [[ "$actual" == "$expected" ]]
+}
+
+warp_nat_rule() {
+    iptables -t nat "-$1" POSTROUTING -o "$WG_IFACE" -m comment --comment "$RULE_COMMENT" -j MASQUERADE
+}
+
+host_reply_rules() {
+    local action=$1
+    # Conntrack direction also protects inbound connections opened before enable.
+    # Their next server packet need not be preceded by a new incoming packet.
+    iptables -t mangle "-$action" OUTPUT -m conntrack --ctdir REPLY \
+        -m comment --comment "$RULE_COMMENT" -j MARK --set-xmark "$REPLY_MARK"
+}
+
+remove_host_reply_rules() {
+    while host_reply_rules C >/dev/null 2>&1; do
+        host_reply_rules D || return 1
+    done
 }
 
 remove_exact_firewall_rules() {
     local target=$1
     while iptables -t nat -C POSTROUTING -o "$WG_IFACE" -m comment --comment "$RULE_COMMENT" -j MASQUERADE >/dev/null 2>&1; do
-        iptables -t nat -D POSTROUTING -o "$WG_IFACE" -m comment --comment "$RULE_COMMENT" -j MASQUERADE >/dev/null 2>&1 || break
+        iptables -t nat -D POSTROUTING -o "$WG_IFACE" -m comment --comment "$RULE_COMMENT" -j MASQUERADE >/dev/null 2>&1 || return 1
     done
     while iptables -C FORWARD -i "$target" -o "$WG_IFACE" -m comment --comment "$RULE_COMMENT" -j ACCEPT >/dev/null 2>&1; do
-        iptables -D FORWARD -i "$target" -o "$WG_IFACE" -m comment --comment "$RULE_COMMENT" -j ACCEPT >/dev/null 2>&1 || break
+        iptables -D FORWARD -i "$target" -o "$WG_IFACE" -m comment --comment "$RULE_COMMENT" -j ACCEPT >/dev/null 2>&1 || return 1
     done
     while iptables -C FORWARD -i "$WG_IFACE" -o "$target" -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$RULE_COMMENT" -j ACCEPT >/dev/null 2>&1; do
-        iptables -D FORWARD -i "$WG_IFACE" -o "$target" -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$RULE_COMMENT" -j ACCEPT >/dev/null 2>&1 || break
+        iptables -D FORWARD -i "$WG_IFACE" -o "$target" -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$RULE_COMMENT" -j ACCEPT >/dev/null 2>&1 || return 1
     done
 }
 
 runtime_down() {
-    local warp_ip source_priority prior_rp current_rp endpoint_ips endpoint port expected_index current_index cleanup_failed=0
-    local -a endpoint_list=() port_list=()
-    if ! is_installed; then
-        return 0
-    fi
+    local warp_ip endpoint_ips endpoint port expected_index current_index cleanup_failed=0 filters entry iface prior current rules
+    local -a endpoints=() ports=() records=()
+    is_installed || return 0
     load_state
-    source_priority="$RULE_PRIORITY"
-    warp_ip="$(profile_ipv4)"
-    if [[ "$ROUTING_MODE" == "interface" ]]; then
-        remove_exact_firewall_rules "$TARGET_IFACE"
-        while ip -4 rule del iif "$TARGET_IFACE" table "$TABLE_ID" priority "$((RULE_PRIORITY + 1))" >/dev/null 2>&1; do :; done
-    else
-        while ip -4 rule del table "$TABLE_ID" priority "$((RULE_PRIORITY + 1))" >/dev/null 2>&1; do :; done
-        IFS=',' read -r -a port_list <<<"$SSH_PORTS"
-        for port in "${port_list[@]}"; do
-            while ip -4 rule del ipproto tcp sport "$port" table main priority "$((RULE_PRIORITY - 1))" >/dev/null 2>&1; do :; done
+    if ip link show dev "$WG_IFACE" >/dev/null 2>&1; then
+        if ! interface_belongs_to_profile; then
+            warn "интерфейс $WG_IFACE не совпадает с сохранённым профилем; его интерфейс и маршрутизация не изменены."
+            write_health failed "Принадлежность оставшегося интерфейса не подтверждена"
+            return 1
+        fi
+        expected_index="$(interface_ifindex || true)"
+    fi
+    for iface in "${TARGET_LIST[@]}"; do
+        remove_exact_firewall_rules "$iface" || cleanup_failed=1
+        remove_ip_rule "$((RULE_PRIORITY + 1))" "$TABLE_ID" iif "$iface" || cleanup_failed=1
+    done
+    while warp_nat_rule C >/dev/null 2>&1; do warp_nat_rule D || { cleanup_failed=1; break; }; done
+    if [[ "$ROUTING_MODE" == "host" ]]; then
+        # Also clears the old 1.3.x unqualified rule after selected iif rules.
+        remove_ip_rule "$((RULE_PRIORITY + 1))" "$TABLE_ID" iif lo || cleanup_failed=1
+        remove_ip_rule "$((RULE_PRIORITY + 1))" "$TABLE_ID" || cleanup_failed=1
+        remove_ip_rule "$((RULE_PRIORITY - 1))" main fwmark "$REPLY_MARK" || cleanup_failed=1
+        remove_ip_rule "$((RULE_PRIORITY - 1))" main iif lo suppress_prefixlength 0 || cleanup_failed=1
+        IFS=',' read -r -a ports <<<"$SSH_PORTS"
+        for port in "${ports[@]}"; do
+            remove_ip_rule "$((RULE_PRIORITY - 1))" main sport "$port" || cleanup_failed=1
         done
         endpoint_ips="$(state_get ENDPOINT_IPS "$RUNTIME_FILE")"
         if ! validate_ipv4_list "$endpoint_ips"; then
-            endpoint_ips="$(ip -4 rule show 2>/dev/null |
-                awk -v wanted="$((RULE_PRIORITY - 2)):" '
-                    $1 == wanted {
-                        destination=""; main=0
-                        for (i=1; i<=NF; i++) {
-                            if ($i == "to") destination=$(i+1)
-                            if ($i == "lookup" && $(i+1) == "main") main=1
-                        }
-                        if (main && destination ~ /^[0-9.]+(\/32)?$/) {
-                            sub(/\/32$/, "", destination); print destination
-                        }
-                    }
-                ' | awk '!seen[$1]++' | paste -sd ',' -)"
+            endpoint_ips="$(ip -4 rule show 2>/dev/null | awk -v wanted="$((RULE_PRIORITY - 2)):" '$1 == wanted { for(i=1;i<=NF;i++) if($i=="to") { x=$(i+1); sub(/\/32$/, "", x); print x } }' | sort -u | paste -sd ',' -)"
         fi
         if validate_ipv4_list "$endpoint_ips"; then
-            IFS=',' read -r -a endpoint_list <<<"$endpoint_ips"
-            for endpoint in "${endpoint_list[@]}"; do
-                while ip -4 rule del to "${endpoint}/32" table main priority "$((RULE_PRIORITY - 2))" >/dev/null 2>&1; do :; done
+            IFS=',' read -r -a endpoints <<<"$endpoint_ips"
+            for endpoint in "${endpoints[@]}"; do
+                remove_ip_rule "$((RULE_PRIORITY - 2))" main to "$endpoint" || cleanup_failed=1
             done
         fi
+        remove_host_reply_rules || cleanup_failed=1
     fi
+    warp_ip="$(profile_ipv4)"
     if [[ -n "$warp_ip" ]]; then
-        while ip -4 rule del from "${warp_ip}/32" table "$TABLE_ID" priority "$source_priority" >/dev/null 2>&1; do :; done
+        remove_ip_rule "$RULE_PRIORITY" "$TABLE_ID" from "$warp_ip" || cleanup_failed=1
     fi
     while ip -4 route del default dev "$WG_IFACE" table "$TABLE_ID" >/dev/null 2>&1; do :; done
     if ip link show dev "$WG_IFACE" >/dev/null 2>&1; then
-        expected_index="$(state_get WG_IFINDEX "$RUNTIME_FILE")"
-        current_index="$(interface_ifindex || true)"
-        if [[ ! -f "$WG_CONFIG" || -L "$WG_CONFIG" ||
-              "$(head -n 1 "$WG_CONFIG" 2>/dev/null)" != "# Managed by warp-interface-manager. Do not edit while active." ||
-              ! -f "$RUNTIME_FILE" ||
-              ( -n "$expected_index" && "$expected_index" != "$current_index" ) ]]; then
-            warn "интерфейс $WG_IFACE остался: его принадлежность этому запуску не подтверждена."
-            cleanup_failed=1
-        else
-            if ! wg-quick down "$WG_CONFIG" >/dev/null; then
-                warn "wg-quick не смог остановить $WG_IFACE; проверяю состояние интерфейса."
+        wg-quick down "$WG_CONFIG" >/dev/null || warn "wg-quick не смог остановить $WG_IFACE."
+        if ip link show dev "$WG_IFACE" >/dev/null 2>&1; then
+            current_index="$(interface_ifindex || true)"
+            if [[ -n "$expected_index" && "$current_index" == "$expected_index" ]] && interface_belongs_to_profile; then
+                warn "удаляю оставшийся интерфейс, подтверждённый публичным ключом и индексом."
+                ip link delete dev "$WG_IFACE" || cleanup_failed=1
             fi
-            if ip link show dev "$WG_IFACE" >/dev/null 2>&1 && [[ -n "$expected_index" ]]; then
-                current_index="$(interface_ifindex || true)"
-                if [[ "$current_index" == "$expected_index" ]] && wg show "$WG_IFACE" >/dev/null 2>&1; then
-                    warn "интерфейс $WG_IFACE остался после wg-quick; удаляю только подтверждённый интерфейс этого запуска."
-                    ip link delete dev "$WG_IFACE" || true
-                fi
-            fi
-            if ip link show dev "$WG_IFACE" >/dev/null 2>&1; then
-                warn "интерфейс $WG_IFACE не удалось остановить."
-                cleanup_failed=1
-            fi
+            if ip link show dev "$WG_IFACE" >/dev/null 2>&1; then cleanup_failed=1; fi
         fi
     fi
-    if [[ "$ROUTING_MODE" == "interface" && -f "$RUNTIME_FILE" && -e "$PROC_SYS_IPV4_CONF_ROOT/${TARGET_IFACE}/rp_filter" ]]; then
-        prior_rp="$(state_get PRIOR_RP_FILTER "$RUNTIME_FILE")"
-        current_rp="$(<"$PROC_SYS_IPV4_CONF_ROOT/${TARGET_IFACE}/rp_filter")"
-        if [[ "$prior_rp" =~ ^[0-2]$ && "$current_rp" == "0" ]]; then
-            printf '%s' "$prior_rp" >"$PROC_SYS_IPV4_CONF_ROOT/${TARGET_IFACE}/rp_filter" || true
-        fi
+    filters="$(state_get RP_FILTERS "$RUNTIME_FILE")"
+    if [[ -z "$filters" && ${#TARGET_LIST[@]} == 1 ]]; then
+        prior="$(state_get PRIOR_RP_FILTER "$RUNTIME_FILE")"
+        [[ ! "$prior" =~ ^[0-2]$ ]] || filters="${TARGET_LIST[0]}:$prior"
     fi
-    if ((cleanup_failed == 1)); then
-        write_health "failed" "Остановка WARP не завершена: интерфейс остался"
-        log_event "ERROR" "остановка WARP не завершена: интерфейс $WG_IFACE остался"
+    IFS=',' read -r -a records <<<"$filters"
+    for entry in "${records[@]}"; do
+        iface="${entry%:*}"; prior="${entry##*:}"
+        if ! is_safe_iface_name "$iface" || [[ ",$TARGET_IFACES," != *",$iface,"* || ! "$prior" =~ ^[0-2]$ ]]; then
+            continue
+        fi
+        [[ -e "$PROC_SYS_IPV4_CONF_ROOT/$iface/rp_filter" ]] || continue
+        current="$(<"$PROC_SYS_IPV4_CONF_ROOT/$iface/rp_filter")"
+        if [[ "$current" == 0 ]]; then
+            printf '%s' "$prior" >"$PROC_SYS_IPV4_CONF_ROOT/$iface/rp_filter" || cleanup_failed=1
+        fi
+    done
+    # A failed inspection must not look like successful removal of every rule.
+    ip -4 rule show >/dev/null 2>&1 || cleanup_failed=1
+    rules="$(iptables-save 2>/dev/null)" || cleanup_failed=1
+    if grep -q -- "$RULE_COMMENT" <<<"$rules"; then cleanup_failed=1; fi
+    if ((cleanup_failed)); then
+        write_health failed "Остановка WARP не завершена; состояние сохранено"
+        log_event ERROR "остановка WARP не завершена"
         return 1
     fi
-    rm -f "$RUNTIME_FILE"
-    write_health "disabled" "Маршрутизация через WARP отключена"
-    log_event "ROUTING" "маршрутизация WARP отключена; режим $ROUTING_MODE; цель $TARGET_IFACE"
-    return 0
+    rm -f "$RUNTIME_FILE" || return 1
+    write_health disabled "Маршрутизация через WARP отключена"
+    log_event ROUTING "маршрутизация WARP отключена; режим $ROUTING_MODE; интерфейсы $TARGET_IFACES"
 }
 
 perform_warp_test() {
@@ -1403,62 +1513,82 @@ perform_warp_test() {
 }
 
 ip_rule_has() {
-    local priority=$1 table=$2 selector=${3:-} value=${4:-}
+    local priority=$1 table=$2 selector=${3:-} value=${4:-} selector2=${5:-} value2=${6:-}
     ip -4 rule show 2>/dev/null | awk -v priority="$priority" -v table="$table" \
-        -v selector="$selector" -v value="$value" '
+        -v s1="$selector" -v v1="$value" -v s2="$selector2" -v v2="$value2" '
         {
-            rule_priority=$1; sub(/:$/, "", rule_priority)
-            if (rule_priority != priority) next
-            rule_table=""; found=0; protocol=""; extra=0
-            for (i=2; i<=NF; i++) {
-                if ($i == "lookup" || $i == "table") rule_table=$(i+1)
-                if (selector != "" && $i == selector &&
-                    ($(i+1) == value || $(i+1) == value "/32")) found=1
-                if ($i == "ipproto") protocol=$(i+1)
-                if ($i == "from" && selector != "from" && $(i+1) != "all") extra=1
-                if (($i == "to" || $i == "iif" || $i == "sport") && $i != selector) extra=1
-                if ($i == "fwmark" || $i == "oif" || $i == "dport" || $i == "uidrange" || $i == "not") extra=1
-                if ($i == "ipproto" && selector != "sport") extra=1
+            p=$1; sub(/:$/, "", p); if(p != priority) next
+            t=""; f1=(s1==""); f2=(s2==""); extra=0; protocol=""
+            for(i=2;i<=NF;i++) {
+                k=$i; v=$(i+1)
+                if(k=="lookup" || k=="table") t=v
+                if(k==s1 && (v==v1 || v==v1 "/32")) f1=1
+                if(k==s2 && (v==v2 || v==v2 "/32")) f2=1
+                if(k=="ipproto") protocol=v
+                if(k=="from" && v!="all" && k!=s1 && k!=s2) extra=1
+                if(k ~ /^(to|iif|oif|sport|dport|fwmark|uidrange|suppress_prefixlength|suppress_ifgroup|not|l3mdev)$/ && k!=s1 && k!=s2) extra=1
+                if(k=="ipproto" && s1!="sport" && s2!="sport") extra=1
             }
-            if (selector == "") found=1
-            if (selector == "sport" && protocol != "tcp") found=0
-            if (rule_table == table && found && !extra) { matched=1; exit }
+            if((s1=="sport" || s2=="sport") && protocol!="tcp") extra=1
+            if(t==table && f1 && f2 && !extra) { matched=1; exit }
         }
         END { exit !matched }
     '
 }
 
+remove_ip_rule() {
+    local priority=$1 table=$2 selector=${3:-} value=${4:-} selector2=${5:-} value2=${6:-}
+    local -a args=()
+    [[ "$selector" != sport ]] || args+=(ipproto tcp)
+    [[ -z "$selector" ]] || args+=("$selector" "$value")
+    [[ -z "$selector2" ]] || args+=("$selector2" "$value2")
+    while ip_rule_has "$priority" "$table" "$selector" "$value" "$selector2" "$value2"; do
+        ip -4 rule del "${args[@]}" table "$table" priority "$priority" >/dev/null 2>&1 || return 1
+    done
+}
+
 managed_routing_is_good() {
-    local warp_ip endpoint_ips endpoint port
+    local warp_ip endpoint_ips endpoint port iface live_ips
     local -a endpoints=() ports=()
+    interface_belongs_to_profile || { warn "интерфейс WARP не совпадает с сохранённым профилем."; return 1; }
     ip -4 route show table "$TABLE_ID" default 2>/dev/null |
-        awk -v iface="$WG_IFACE" '$1 == "default" { for (i=1; i<=NF; i++) if ($i == "dev" && $(i+1) == iface) found=1 } END { exit !found }' || {
-            warn "в таблице менеджера нет маршрута через $WG_IFACE."
-            return 1
-        }
+        awk -v iface="$WG_IFACE" '$1 == "default" { for(i=1;i<=NF;i++) if($i=="dev" && $(i+1)==iface) found=1 } END { exit !found }' || { warn "нет маршрута в таблице WARP."; return 1; }
     warp_ip="$(profile_ipv4)"
-    [[ -n "$warp_ip" ]] && ip_rule_has "$RULE_PRIORITY" "$TABLE_ID" from "$warp_ip" || { warn "нет правила для исходящего адреса WARP."; return 1; }
-    if [[ "$ROUTING_MODE" == "interface" ]]; then
-        iface_is_up "$TARGET_IFACE" || { warn "выбранный входной интерфейс не поднят."; return 1; }
-        ip_rule_has "$((RULE_PRIORITY + 1))" "$TABLE_ID" iif "$TARGET_IFACE" || { warn "нет правила для выбранного входного интерфейса."; return 1; }
-        iptables -t nat -C POSTROUTING -o "$WG_IFACE" -m comment --comment "$RULE_COMMENT" -j MASQUERADE >/dev/null 2>&1 || { warn "нет правила NAT для WARP."; return 1; }
-        iptables -C FORWARD -i "$TARGET_IFACE" -o "$WG_IFACE" -m comment --comment "$RULE_COMMENT" -j ACCEPT >/dev/null 2>&1 || { warn "нет прямого правила FORWARD для WARP."; return 1; }
-        iptables -C FORWARD -i "$WG_IFACE" -o "$TARGET_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED \
-            -m comment --comment "$RULE_COMMENT" -j ACCEPT >/dev/null 2>&1 || { warn "нет обратного правила FORWARD для WARP."; return 1; }
-        if [[ -r "$PROC_SYS_IPV4_CONF_ROOT/${TARGET_IFACE}/rp_filter" ]]; then
-            [[ "$(<"$PROC_SYS_IPV4_CONF_ROOT/${TARGET_IFACE}/rp_filter")" == "0" ]] || { warn "rp_filter входного интерфейса изменился."; return 1; }
+    if [[ -z "$warp_ip" ]] || ! ip_rule_has "$RULE_PRIORITY" "$TABLE_ID" from "$warp_ip"; then
+        warn "нет правила для адреса WARP."; return 1
+    fi
+    warp_nat_rule C >/dev/null 2>&1 || { warn "нет правила NAT для WARP."; return 1; }
+    for iface in "${TARGET_LIST[@]}"; do
+        iface_is_up "$iface" || { warn "интерфейс $iface не поднят."; return 1; }
+        ip_rule_has "$((RULE_PRIORITY + 1))" "$TABLE_ID" iif "$iface" || { warn "нет правила для интерфейса $iface."; return 1; }
+        iptables -C FORWARD -i "$iface" -o "$WG_IFACE" -m comment --comment "$RULE_COMMENT" -j ACCEPT >/dev/null 2>&1 || { warn "нет прямого FORWARD для $iface."; return 1; }
+        iptables -C FORWARD -i "$WG_IFACE" -o "$iface" -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$RULE_COMMENT" -j ACCEPT >/dev/null 2>&1 || { warn "нет обратного FORWARD для $iface."; return 1; }
+        if [[ -r "$PROC_SYS_IPV4_CONF_ROOT/$iface/rp_filter" ]]; then
+            [[ "$(<"$PROC_SYS_IPV4_CONF_ROOT/$iface/rp_filter")" == 0 ]] || { warn "rp_filter $iface изменился."; return 1; }
         fi
-    else
-        ip_rule_has "$((RULE_PRIORITY + 1))" "$TABLE_ID" || { warn "нет общего правила маршрутизации WARP."; return 1; }
+    done
+    if ((${#TARGET_LIST[@]})); then
+        [[ "$(sysctl -n net.ipv4.ip_forward)" == 1 ]] || { warn "IPv4 forwarding выключен."; return 1; }
+    fi
+    if [[ "$ROUTING_MODE" == "host" ]]; then
+        ip_rule_has "$((RULE_PRIORITY + 1))" "$TABLE_ID" iif lo || { warn "нет правила для локального трафика сервера."; return 1; }
+        ip_rule_has "$((RULE_PRIORITY - 1))" main fwmark "$REPLY_MARK" || { warn "нет защиты ответов на входящие соединения."; return 1; }
+        ip_rule_has "$((RULE_PRIORITY - 1))" main iif lo suppress_prefixlength 0 || { warn "нет защиты локальных сетей."; return 1; }
+        host_reply_rules C >/dev/null 2>&1 || { warn "нет правил защиты входящих соединений."; return 1; }
         endpoint_ips="$(state_get ENDPOINT_IPS "$RUNTIME_FILE")"
-        validate_ipv4_list "$endpoint_ips" || { warn "нет сохранённого списка адресов WARP endpoint."; return 1; }
+        validate_ipv4_list "$endpoint_ips" || { warn "нет списка WARP endpoint."; return 1; }
         IFS=',' read -r -a endpoints <<<"$endpoint_ips"
         for endpoint in "${endpoints[@]}"; do
-            ip_rule_has "$((RULE_PRIORITY - 2))" main to "$endpoint" || { warn "нет защитного правила для WARP endpoint."; return 1; }
+            ip_rule_has "$((RULE_PRIORITY - 2))" main to "$endpoint" || { warn "нет защиты WARP endpoint."; return 1; }
+        done
+        live_ips="$(live_endpoint_ipv4)" || { warn "не удалось прочитать endpoint WireGuard."; return 1; }
+        IFS=',' read -r -a endpoints <<<"$live_ips"
+        for endpoint in "${endpoints[@]}"; do
+            [[ -z "$endpoint" ]] || ip_rule_has "$((RULE_PRIORITY - 2))" main to "$endpoint" || { warn "endpoint WireGuard изменился без защитного маршрута."; return 1; }
         done
         IFS=',' read -r -a ports <<<"$SSH_PORTS"
         for port in "${ports[@]}"; do
-            ip_rule_has "$((RULE_PRIORITY - 1))" main sport "$port" || { warn "нет защитного правила для SSH-порта."; return 1; }
+            ip_rule_has "$((RULE_PRIORITY - 1))" main sport "$port" || { warn "нет защиты SSH-порта."; return 1; }
         done
     fi
 }
@@ -1471,101 +1601,88 @@ perform_full_host_test() {
 }
 
 service_up_steps() {
-    local waited=0 prior_rp warp_ip main_routes endpoint_ips endpoint port foreign_evidence iface_index
-    local -a endpoint_list=() port_list=()
+    local waited=0 prior_rp=0 filters="" warp_ip main_routes endpoint_ips="" endpoint port foreign_evidence iface_index iface live_ips
+    local -a endpoints=() ports=()
     load_state
     foreign_evidence="$(foreign_warp_evidence | awk '!seen[$0]++')"
-    if [[ -n "$foreign_evidence" ]]; then
-        warn "обнаружен сторонний WARP. Запуск второго туннеля запрещён: $(awk 'NR == 1 {print; exit}' <<<"$foreign_evidence")"
-        return 1
-    fi
-    if [[ "$ROUTING_MODE" == "interface" ]]; then
-        is_safe_iface_name "$TARGET_IFACE" || { warn "недопустимое имя сохранённого интерфейса."; return 1; }
-    else
-        validate_ssh_ports "$SSH_PORTS" || { warn "нет корректного списка SSH-портов."; return 1; }
-        ssh_ports_cover_detected || { warn "настройка SSH изменилась: сохранённые защитные порты больше не полны."; return 1; }
-        ip_rule_supports_ports || { warn "система не поддерживает защитные правила по SSH-порту."; return 1; }
+    [[ -z "$foreign_evidence" ]] || { warn "обнаружен сторонний WARP: $(awk 'NR==1 {print;exit}' <<<"$foreign_evidence")"; return 1; }
+    if [[ "$ROUTING_MODE" == "host" ]]; then
+        ssh_ports_cover_detected || { warn "настройки SSH изменились."; return 1; }
+        ip_rule_supports_ports || return 1
         check_full_host_routing_is_clear || return 1
+        if ! endpoint_ips="$(resolve_warp_endpoint_ipv4)" || ! validate_ipv4_list "$endpoint_ips"; then
+            warn "не удалось определить endpoint WARP."; return 1
+        fi
     fi
-    [[ -f "$WG_CONFIG" && ! -L "$WG_CONFIG" ]] || { warn "защищённый профиль WARP не найден."; return 1; }
-    grep -q '^# Managed by warp-interface-manager\.' "$WG_CONFIG" || { warn "профиль WARP больше не принадлежит менеджеру."; return 1; }
-    grep -Eqi '^[[:space:]]*Table[[:space:]]*=[[:space:]]*off[[:space:]]*$' "$WG_CONFIG" || { warn "в профиле отсутствует обязательный Table = off."; return 1; }
-
-    if [[ "$ROUTING_MODE" == "interface" ]]; then
-        while { [[ ! -d "$SYS_CLASS_NET_ROOT/$TARGET_IFACE" ]] || ! iface_is_up "$TARGET_IFACE"; } && ((waited < 60)); do
-            sleep 2
-            waited=$((waited + 2))
-        done
-        iface_is_up "$TARGET_IFACE" || { warn "интерфейс $TARGET_IFACE не поднялся за 60 секунд."; return 1; }
-        validate_target_iface "$TARGET_IFACE" "$ALLOW_RISKY"
-        endpoint_ips=""
-    else
-        endpoint_ips="$(resolve_warp_endpoint_ipv4)" || { warn "не удалось определить IPv4 endpoint WARP для защиты от маршрутной петли."; return 1; }
-        validate_ipv4_list "$endpoint_ips" || return 1
-    fi
-
+    [[ -f "$WG_CONFIG" && ! -L "$WG_CONFIG" ]] || { warn "профиль WARP не найден."; return 1; }
+    grep -q '^# Managed by warp-interface-manager\.' "$WG_CONFIG" || return 1
+    grep -Eqi '^[[:space:]]*Table[[:space:]]*=[[:space:]]*off[[:space:]]*$' "$WG_CONFIG" || { warn "в профиле нет Table = off."; return 1; }
+    for iface in "${TARGET_LIST[@]}"; do
+        waited=0
+        while ! iface_is_up "$iface" && ((waited < 60)); do sleep 2; waited=$((waited+2)); done
+        iface_is_up "$iface" || { warn "интерфейс $iface не поднялся за 60 секунд."; return 1; }
+    done
+    validate_target_ifaces "$TARGET_IFACES" "$RISKY_IFACES"
     if ip link show dev "$WG_IFACE" >/dev/null 2>&1; then
         SERVICE_UP_PREEXISTING_IFACE=1
-        warn "интерфейс $WG_IFACE уже существует; запуск остановлен без его удаления."
-        return 1
+        if ! interface_belongs_to_profile; then
+            warn "интерфейс $WG_IFACE существует и не совпадает с сохранённым профилем. Запуск остановлен без удаления."
+            return 1
+        fi
+        warn "восстанавливаю оставшийся интерфейс, подтверждённый сохранённым профилем."
+        runtime_down || return 1
+        SERVICE_UP_PREEXISTING_IFACE=0
+        log_event RECOVERY "оставшийся интерфейс подтверждён профилем и остановлен перед запуском"
     fi
-
-    prior_rp=0
-    if [[ "$ROUTING_MODE" == "interface" && -e "$PROC_SYS_IPV4_CONF_ROOT/${TARGET_IFACE}/rp_filter" ]]; then
-        prior_rp="$(<"$PROC_SYS_IPV4_CONF_ROOT/${TARGET_IFACE}/rp_filter")"
-        [[ "$prior_rp" =~ ^[0-2]$ ]] || prior_rp=0
-        printf '0' >"$PROC_SYS_IPV4_CONF_ROOT/${TARGET_IFACE}/rp_filter" || return 1
-    fi
-    save_runtime_state "$prior_rp" "$endpoint_ips"
-    if [[ "$ROUTING_MODE" == "interface" ]]; then
-        sysctl -q -w net.ipv4.ip_forward=1 >/dev/null || return 1
-    fi
-
+    for iface in "${TARGET_LIST[@]}"; do
+        if [[ -e "$PROC_SYS_IPV4_CONF_ROOT/$iface/rp_filter" ]]; then
+            prior_rp="$(<"$PROC_SYS_IPV4_CONF_ROOT/$iface/rp_filter")"
+            [[ "$prior_rp" =~ ^[0-2]$ ]] || return 1
+            filters+="${filters:+,}$iface:$prior_rp"
+        fi
+    done
+    save_runtime_state "$prior_rp" "$endpoint_ips" "" "$filters" || return 1
+    for iface in "${TARGET_LIST[@]}"; do
+        [[ ! -e "$PROC_SYS_IPV4_CONF_ROOT/$iface/rp_filter" ]] || printf '0' >"$PROC_SYS_IPV4_CONF_ROOT/$iface/rp_filter" || return 1
+    done
+    if ((${#TARGET_LIST[@]})); then sysctl -q -w net.ipv4.ip_forward=1 >/dev/null || return 1; fi
     wg-quick up "$WG_CONFIG" >/dev/null || return 1
-    iface_index="$(interface_ifindex)" || { warn "не удалось определить индекс созданного интерфейса WARP."; return 1; }
-    save_runtime_state "$prior_rp" "$endpoint_ips" "$iface_index" || return 1
-    main_routes="$(ip -4 route show table main 2>/dev/null)"
-    if grep -Eq "(^|[[:space:]])dev[[:space:]]+$WG_IFACE([[:space:]]|$)" <<<"$main_routes"; then
-        warn "WARP неожиданно появился в основной таблице маршрутов."
-        return 1
+    iface_index="$(interface_ifindex)" || { warn "не удалось определить индекс WARP."; return 1; }
+    if [[ "$ROUTING_MODE" == "host" ]]; then
+        # wg may resolve another address than preflight DNS. Protect its actual
+        # endpoint before enabling local WARP routing, without rewriting the profile.
+        live_ips="$(live_endpoint_ipv4)" || return 1
+        endpoint_ips="$(printf '%s\n' "$endpoint_ips" "$live_ips" | tr ',' '\n' | sed '/^$/d' | sort -u | paste -sd ',' -)"
     fi
-    warp_ip="$(profile_ipv4)"
-    [[ -n "$warp_ip" ]] || return 1
-
+    save_runtime_state "$prior_rp" "$endpoint_ips" "$iface_index" "$filters" || return 1
+    main_routes="$(ip -4 route show table main)" || return 1
+    if grep -Eq "(^|[[:space:]])dev[[:space:]]+$WG_IFACE([[:space:]]|$)" <<<"$main_routes"; then warn "WARP появился в основной таблице."; return 1; fi
+    warp_ip="$(profile_ipv4)"; [[ -n "$warp_ip" ]] || return 1
     ip -4 route add default dev "$WG_IFACE" table "$TABLE_ID" || return 1
-    ip -4 rule add from "${warp_ip}/32" table "$TABLE_ID" priority "$RULE_PRIORITY" || return 1
-    if [[ "$ROUTING_MODE" == "interface" ]]; then
-        ip -4 rule add iif "$TARGET_IFACE" table "$TABLE_ID" priority "$((RULE_PRIORITY + 1))" || return 1
-        iptables -t nat -A POSTROUTING -o "$WG_IFACE" -m comment --comment "$RULE_COMMENT" -j MASQUERADE || return 1
-        iptables -I FORWARD 1 -i "$TARGET_IFACE" -o "$WG_IFACE" -m comment --comment "$RULE_COMMENT" -j ACCEPT || return 1
-        iptables -I FORWARD 1 -i "$WG_IFACE" -o "$TARGET_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED \
-            -m comment --comment "$RULE_COMMENT" -j ACCEPT || return 1
-    else
-        IFS=',' read -r -a endpoint_list <<<"$endpoint_ips"
-        for endpoint in "${endpoint_list[@]}"; do
-            ip -4 rule add to "${endpoint}/32" table main priority "$((RULE_PRIORITY - 2))" || return 1
+    warp_nat_rule A || return 1
+    if [[ "$ROUTING_MODE" == "host" ]]; then
+        host_reply_rules I || return 1
+        ip -4 rule add fwmark "$REPLY_MARK" table main priority "$((RULE_PRIORITY - 1))" || return 1
+        ip -4 rule add iif lo table main suppress_prefixlength 0 priority "$((RULE_PRIORITY - 1))" || return 1
+        IFS=',' read -r -a endpoints <<<"$endpoint_ips"
+        for endpoint in "${endpoints[@]}"; do
+            ip -4 rule add to "$endpoint/32" table main priority "$((RULE_PRIORITY - 2))" || return 1
         done
-        IFS=',' read -r -a port_list <<<"$SSH_PORTS"
-        for port in "${port_list[@]}"; do
+        IFS=',' read -r -a ports <<<"$SSH_PORTS"
+        for port in "${ports[@]}"; do
             ip -4 rule add ipproto tcp sport "$port" table main priority "$((RULE_PRIORITY - 1))" || return 1
         done
-        ip -4 rule add table "$TABLE_ID" priority "$((RULE_PRIORITY + 1))" || return 1
+        ip -4 rule add iif lo table "$TABLE_ID" priority "$((RULE_PRIORITY + 1))" || return 1
     fi
-
-    if ! perform_warp_test; then
-        warn "WARP не прошёл фактическую проверку."
-        return 1
-    fi
-    if ! managed_routing_is_good; then
-        warn "правила маршрутизации WARP не прошли проверку."
-        return 1
-    fi
-    if [[ "$ROUTING_MODE" == "host" ]] && ! perform_full_host_test; then
-        warn "весь трафик сервера не перешёл через WARP; выполняется откат."
-        return 1
-    fi
-    write_health "healthy" "WARP работает; выходной IP ${WARP_EXIT_IP:-не определён}"
-    return 0
+    ip -4 rule add from "$warp_ip/32" table "$TABLE_ID" priority "$RULE_PRIORITY" || return 1
+    for iface in "${TARGET_LIST[@]}"; do
+        iptables -I FORWARD 1 -i "$iface" -o "$WG_IFACE" -m comment --comment "$RULE_COMMENT" -j ACCEPT || return 1
+        iptables -I FORWARD 1 -i "$WG_IFACE" -o "$iface" -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$RULE_COMMENT" -j ACCEPT || return 1
+        ip -4 rule add iif "$iface" table "$TABLE_ID" priority "$((RULE_PRIORITY + 1))" || return 1
+    done
+    perform_warp_test && managed_routing_is_good || return 1
+    if [[ "$ROUTING_MODE" == "host" ]]; then perform_full_host_test || { warn "локальный выход сервера не прошёл проверку."; return 1; }; fi
+    write_health healthy "WARP работает; выходной IP ${WARP_EXIT_IP:-не определён}"
 }
 
 service_up() {
@@ -1575,17 +1692,17 @@ service_up() {
         if [[ "$ROUTING_MODE" == "host" ]]; then
             log_event "ROUTING" "весь исходящий IPv4-трафик сервера направлен через WARP; SSH-порты $SSH_PORTS защищены"
         else
-            log_event "ROUTING" "WARP включён только для входного интерфейса $TARGET_IFACE"
+            log_event "ROUTING" "WARP включён только для интерфейсов $TARGET_IFACES"
         fi
         return 0
     else
         rc=$?
         if ((SERVICE_UP_PREEXISTING_IFACE == 0)) && runtime_down; then
             write_health "failed" "Запуск или проверка WARP не удались; выполнен откат"
-            log_event "ERROR" "запуск WARP в режиме $ROUTING_MODE для $TARGET_IFACE не прошёл проверку; выполнен откат"
+            log_event "ERROR" "запуск WARP в режиме $ROUTING_MODE для $TARGET_IFACES не прошёл проверку; выполнен откат"
         else
             write_health "failed" "Запуск WARP не удался; требуется проверка оставшегося интерфейса"
-            log_event "ERROR" "запуск WARP в режиме $ROUTING_MODE для $TARGET_IFACE не удался; полный откат не подтверждён"
+            log_event "ERROR" "запуск WARP в режиме $ROUTING_MODE для $TARGET_IFACES не удался; полный откат не подтверждён"
         fi
         ((rc != 0)) || rc=1
         return "$rc"
@@ -1701,11 +1818,20 @@ ensure_owned_paths_are_safe() {
 }
 
 write_sysctl_config() {
-    cat >"$SYSCTL_FILE" <<'EOF'
+    local tmp
+    tmp="$(mktemp "${SYSCTL_FILE}.XXXXXX")" || return 1
+    if ! cat >"$tmp" <<'EOF'
 # Managed by warp-interface-manager
 net.ipv4.ip_forward=1
 EOF
-    chmod 644 "$SYSCTL_FILE"
+    then
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! chmod 644 "$tmp" || ! mv -f "$tmp" "$SYSCTL_FILE"; then
+        rm -f "$tmp"
+        return 1
+    fi
     sysctl -q -w net.ipv4.ip_forward=1 >/dev/null
 }
 
@@ -1749,9 +1875,7 @@ install_manager() {
         return "$rc"
     fi
     acquire_lock
-    if [[ "$CHOSEN_ROUTING_MODE" == "interface" ]]; then
-        validate_target_iface "$CHOSEN_IFACE" "$CHOSEN_ALLOW_RISKY"
-    fi
+    validate_target_ifaces "$CHOSEN_IFACE" "${CHOSEN_RISKY_IFACES:-}"
     ensure_owned_paths_are_safe
     mkdir -p "$CONFIG_DIR"
     chmod 700 "$CONFIG_DIR"
@@ -1770,8 +1894,9 @@ install_manager() {
     chmod 700 "$CONFIG_DIR" "$DATA_DIR"
     installed_at="$(date +%s)"
     write_state "$CHOSEN_IFACE" "$table" "$priority" "$installed_at" "$previous_forward" "$CHOSEN_ALLOW_RISKY" \
-        "$CHOSEN_ROUTING_MODE" "$CHOSEN_SSH_PORTS"
-    [[ "$CHOSEN_ROUTING_MODE" == "host" ]] || write_sysctl_config
+        "$CHOSEN_ROUTING_MODE" "$CHOSEN_SSH_PORTS" "${CHOSEN_RISKY_IFACES:-}" || die "не удалось сохранить настройки."
+    load_state
+    [[ -z "$TARGET_IFACES" ]] || write_sysctl_config
     self_path="$(readlink -f "${BASH_SOURCE[0]}")"
     [[ -f "$self_path" ]] || die "не удалось определить исходный файл скрипта."
     install -m 700 "$self_path" "$INSTALL_BIN"
@@ -1790,9 +1915,9 @@ install_manager() {
     log_event "INSTALL" "установка завершена; режим $CHOSEN_ROUTING_MODE; цель $CHOSEN_IFACE; риск $CHOSEN_ALLOW_RISKY"
     if [[ "$CHOSEN_ROUTING_MODE" == "host" ]]; then
         ok "Готово: исходящий IPv4-трафик сервера направляется через WARP."
-        say "Ответы SSH с портов $CHOSEN_SSH_PORTS и endpoint WARP оставлены в основной таблице."
+        say "Ответы на входящие соединения, SSH и endpoint WARP сохраняют основной маршрут."
     else
-        ok "Готово: только IPv4-трафик с интерфейса $CHOSEN_IFACE направляется через WARP."
+        ok "Готово: IPv4-трафик выбранных интерфейсов $CHOSEN_IFACE направляется через WARP."
         say "Основной маршрут сервера не изменён."
     fi
     say "Автопроверка выполняется каждые 5 минут."
@@ -1807,12 +1932,11 @@ enable_manager() {
     ensure_owned_paths_are_safe
     load_state
     assert_no_foreign_warp
-    if [[ "$ROUTING_MODE" == "interface" ]]; then
-        validate_target_iface "$TARGET_IFACE" "$ALLOW_RISKY"
-        write_sysctl_config
-    else
-        validate_ssh_ports "$SSH_PORTS" || die "не удалось защитить SSH-порты."
-        ip_rule_supports_ports || die "система не поддерживает защитные правила по SSH-порту."
+    validate_target_ifaces "$TARGET_IFACES" "$RISKY_IFACES"
+    [[ -z "$TARGET_IFACES" ]] || write_sysctl_config
+    if [[ "$ROUTING_MODE" == "host" ]]; then
+        ip_rule_supports_ports || die "система не поддерживает защитные правила SSH."
+        check_full_host_routing_is_clear || die "маршрутизация сервера конфликтует с режимом хоста."
     fi
     systemctl enable "$SERVICE" >/dev/null 2>&1
     if systemctl is-active --quiet "$SERVICE" && health_is_good; then
@@ -1828,11 +1952,11 @@ enable_manager() {
         die "WARP не прошёл проверку и оставлен отключённым."
     fi
     systemctl enable --now "$CHECK_TIMER" >/dev/null 2>&1
-    log_event "ACTION" "WARP включён пользователем; режим $ROUTING_MODE; цель $TARGET_IFACE"
+    log_event "ACTION" "WARP включён пользователем; режим $ROUTING_MODE; интерфейсы $TARGET_IFACES"
     if [[ "$ROUTING_MODE" == "host" ]]; then
         ok "WARP включён для исходящего IPv4-трафика сервера."
     else
-        ok "WARP включён для интерфейса $TARGET_IFACE."
+        ok "WARP включён для интерфейсов $TARGET_IFACES."
     fi
 }
 
@@ -1860,71 +1984,67 @@ update_wgcf() {
 }
 
 reconfigure_manager() {
-    local was_active old_target old_allow_risky old_mode old_ssh_ports rc
+    local was_active old_targets old_risky old_mode old_ssh_ports rc chosen_targets chosen_risky failed=0
     require_root
     require_systemd
     load_state
     ensure_owned_paths_are_safe
     assert_no_foreign_warp
-    if choose_routing_mode; then
-        :
-    else
+    if choose_routing_mode; then :; else
         rc=$?
-        ((rc == 2)) && { info "Изменение отменено. Возврат в главное меню."; return 0; }
+        ((rc == 2)) && { info "Изменение отменено."; return 0; }
         return "$rc"
     fi
     acquire_lock
     ensure_owned_paths_are_safe
     load_state
     assert_no_foreign_warp
-    old_target="$TARGET_IFACE"
-    old_allow_risky="$ALLOW_RISKY"
-    old_mode="$ROUTING_MODE"
-    old_ssh_ports="$SSH_PORTS"
-    if [[ "$CHOSEN_IFACE" == "$old_target" && "$CHOSEN_ROUTING_MODE" == "$old_mode" && "$CHOSEN_SSH_PORTS" == "$old_ssh_ports" ]]; then
+    old_targets="$TARGET_IFACES"; old_risky="$RISKY_IFACES"
+    old_mode="$ROUTING_MODE"; old_ssh_ports="$SSH_PORTS"
+    chosen_targets="$CHOSEN_IFACE"; [[ "$chosen_targets" != "-" ]] || chosen_targets=""
+    chosen_risky="${CHOSEN_RISKY_IFACES:-}"
+    if [[ "$chosen_targets" == "$old_targets" && "$chosen_risky" == "$old_risky" &&
+          "$CHOSEN_ROUTING_MODE" == "$old_mode" && "$CHOSEN_SSH_PORTS" == "$old_ssh_ports" ]]; then
         info "Эта конфигурация уже выбрана."
         return 0
     fi
-    if [[ "$CHOSEN_ROUTING_MODE" == "interface" ]]; then
-        validate_target_iface "$CHOSEN_IFACE" "$CHOSEN_ALLOW_RISKY"
-    else
-        [[ "$CHOSEN_SSH_PORTS" == "$(detect_ssh_ports)" ]] || die "настройки SSH изменились во время выбора режима; прежняя маршрутизация сохранена."
-        check_full_host_routing_is_clear || die "маршрутизация сервера изменилась во время выбора режима; прежняя маршрутизация сохранена."
+    validate_target_ifaces "$chosen_targets" "$chosen_risky"
+    if [[ "$CHOSEN_ROUTING_MODE" == "host" ]]; then
+        [[ "$CHOSEN_SSH_PORTS" == "$(detect_ssh_ports)" ]] || die "настройки SSH изменились во время выбора."
+        check_full_host_routing_is_clear || die "маршрутизация сервера изменилась во время выбора."
     fi
     was_active=0
     systemctl is-active --quiet "$SERVICE" && was_active=1
-    systemctl stop "$SERVICE" >/dev/null 2>&1 || runtime_down || die "не удалось остановить прежний WARP-интерфейс."
-    runtime_down || die "прежний WARP-интерфейс остался; настройки не изменены."
-    write_state "$CHOSEN_IFACE" "$TABLE_ID" "$RULE_PRIORITY" "$INSTALLED_AT" "$PREVIOUS_IP_FORWARD" "$CHOSEN_ALLOW_RISKY" \
-        "$CHOSEN_ROUTING_MODE" "$CHOSEN_SSH_PORTS"
-    if [[ "$CHOSEN_ROUTING_MODE" == "interface" ]]; then
-        write_sysctl_config
-    elif [[ "$old_mode" == "interface" ]]; then
-        remove_managed_sysctl_config "$PREVIOUS_IP_FORWARD"
+    systemctl stop "$SERVICE" >/dev/null 2>&1 || runtime_down || die "не удалось остановить прежний WARP."
+    runtime_down || die "остановка прежнего WARP не подтверждена; настройки сохранены."
+    write_state "$chosen_targets" "$TABLE_ID" "$RULE_PRIORITY" "$INSTALLED_AT" "$PREVIOUS_IP_FORWARD" 0 \
+        "$CHOSEN_ROUTING_MODE" "$CHOSEN_SSH_PORTS" "$chosen_risky" || failed=1
+    load_state
+    if [[ -n "$TARGET_IFACES" ]]; then write_sysctl_config || failed=1
+    else remove_managed_sysctl_config "$PREVIOUS_IP_FORWARD" || failed=1; fi
+    if ((failed == 0 && was_active)); then
+        systemctl start "$SERVICE" >/dev/null 2>&1 || failed=1
     fi
-    if ((was_active == 1)); then
-        if ! systemctl start "$SERVICE" >/dev/null 2>&1; then
-            systemctl stop "$SERVICE" >/dev/null 2>&1 || true
-            if ! runtime_down; then
-                die "новая конфигурация не запустилась, интерфейс WARP остался. Настройки нового режима сохранены для безопасной диагностики."
-            fi
-            write_state "$old_target" "$TABLE_ID" "$RULE_PRIORITY" "$INSTALLED_AT" "$PREVIOUS_IP_FORWARD" "$old_allow_risky" \
-                "$old_mode" "$old_ssh_ports"
-            if [[ "$old_mode" == "host" ]]; then
-                remove_managed_sysctl_config "$PREVIOUS_IP_FORWARD"
-            else
-                write_sysctl_config
-            fi
-            die "новая конфигурация не прошла проверку. WARP отключён, прежний выбор восстановлен в настройках."
+    if ((failed)); then
+        systemctl stop "$SERVICE" >/dev/null 2>&1 || true
+        runtime_down || die "новый режим не запустился, очистка не подтверждена. Его настройки сохранены для диагностики."
+        write_state "$old_targets" "$TABLE_ID" "$RULE_PRIORITY" "$INSTALLED_AT" "$PREVIOUS_IP_FORWARD" 0 \
+            "$old_mode" "$old_ssh_ports" "$old_risky" || die "не удалось восстановить прежние настройки."
+        load_state
+        if [[ -n "$TARGET_IFACES" ]]; then write_sysctl_config || die "не удалось восстановить sysctl."
+        else remove_managed_sysctl_config "$PREVIOUS_IP_FORWARD" || die "не удалось восстановить sysctl."; fi
+        if ((was_active)) && systemctl start "$SERVICE" >/dev/null 2>&1 && health_is_good; then
+            die "новый режим не прошёл проверку; прежняя рабочая конфигурация восстановлена."
         fi
+        systemctl stop "$SERVICE" >/dev/null 2>&1 || true
+        runtime_down || die "прежние настройки восстановлены, но очистка не подтверждена."
+        die "новый режим не прошёл проверку; прежние настройки восстановлены, WARP отключён."
     fi
-    log_event "ACTION" "изменена конфигурация; режим $CHOSEN_ROUTING_MODE; цель $CHOSEN_IFACE; риск $CHOSEN_ALLOW_RISKY"
+    log_event ACTION "изменён режим $ROUTING_MODE; интерфейсы $TARGET_IFACES"
     if ((was_active == 0)); then
-        ok "Выбран новый режим. WARP остаётся отключённым; включите его отдельным действием."
-    elif [[ "$CHOSEN_ROUTING_MODE" == "host" ]]; then
-        ok "Теперь весь исходящий IPv4-трафик сервера направляется через WARP."
+        ok "Выбор сохранён. WARP остаётся отключённым; включите его отдельным действием."
     else
-        ok "Теперь выбран интерфейс $CHOSEN_IFACE."
+        ok "Новая конфигурация WARP включена."
     fi
 }
 
@@ -1957,7 +2077,7 @@ health_check() {
         if [[ "$ROUTING_MODE" == "host" ]]; then
             ok "Проверка успешна: исходящий IPv4-трафик сервера идёт через WARP."
         else
-            ok "Проверка успешна: WARP работает для $TARGET_IFACE."
+            ok "Проверка успешна: WARP работает для $TARGET_IFACES."
         fi
         return 0
     fi
@@ -2011,44 +2131,34 @@ format_time() {
 }
 
 show_status() {
-    local active enabled timer target="—" health="неизвестно" checked="—" checked_display="—" main_safe="да" wgcf_version="—" mode_text
-    if ! is_installed; then
-        say "Состояние: не установлен"
-        return 0
-    fi
+    local active="нет" enabled="нет" timer="нет" health checked mode_text
+    say "Версия менеджера: $VERSION"
+    if ! is_installed; then say "Состояние: не установлен"; return 0; fi
     load_state
-    if [[ "$ROUTING_MODE" == "host" ]]; then
-        target="весь хост"
-        mode_text="весь исходящий IPv4-трафик; SSH-порты $SSH_PORTS защищены"
-    else
-        target="$TARGET_IFACE ($(iface_kind "$TARGET_IFACE" 2>/dev/null || echo недоступен))"
-        mode_text="$([[ "$ALLOW_RISKY" == "1" ]] && echo 'один интерфейс, расширенный выбор' || echo 'один рекомендуемый интерфейс')"
-    fi
-    active="нет"
-    enabled="нет"
-    timer="нет"
     systemctl is-active --quiet "$SERVICE" 2>/dev/null && active="да"
     systemctl is-enabled --quiet "$SERVICE" 2>/dev/null && enabled="да"
     systemctl is-active --quiet "$CHECK_TIMER" 2>/dev/null && timer="да"
     health="$(state_get STATUS "$HEALTH_FILE")"
     checked="$(state_get CHECKED_AT "$HEALTH_FILE")"
-    checked_display="$(format_server_datetime "$checked")"
-    wgcf_version="$(installed_wgcf_version || true)"
-    ip -4 route show table main 2>/dev/null | grep -Eq "(^|[[:space:]])dev[[:space:]]+$WG_IFACE([[:space:]]|$)" && main_safe="НЕТ"
+    mode_text="выбранные входные интерфейсы"
+    [[ "$ROUTING_MODE" != host ]] || mode_text="исходящий IPv4 самого сервера и отдельно выбранные входные интерфейсы"
     say "Состояние: установлен"
-    say "Цель маршрутизации: $target"
     say "Режим: $mode_text"
+    say "Входные интерфейсы: ${TARGET_IFACES:-не выбраны}"
+    say "Интерфейсы с подтверждённым риском: ${RISKY_IFACES:-нет}"
     say "WARP активен: $active; автозапуск: $enabled; автопроверка: $timer"
-    say "Установленный wgcf: ${wgcf_version:--}"
-    say "Последняя проверка: ${health:-неизвестно}; $checked_display"
-    say "Основная таблица маршрутов не содержит $WG_IFACE: $main_safe"
-    if [[ "$ROUTING_MODE" == "host" ]] && ! ssh_ports_cover_detected; then
-        warn "обнаруженные настройки SSH отличаются от защищённых портов. Отключите WARP и выполните reconfigure."
+    say "Установленный wgcf: $(installed_wgcf_version || true)"
+    say "Последняя проверка: ${health:-неизвестно}; $(format_server_datetime "$checked")"
+    if ip -4 route show table main 2>/dev/null | grep -Eq "(^|[[:space:]])dev[[:space:]]+$WG_IFACE([[:space:]]|$)"; then
+        warn "WARP неожиданно присутствует в основной таблице маршрутов."
+    fi
+    if [[ "$active" == нет ]] && ip link show dev "$WG_IFACE" >/dev/null 2>&1; then
+        say "Остался интерфейс $WG_IFACE. При включении его принадлежность будет проверена по сохранённому профилю."
     fi
 }
 
 show_stats() {
-    local rx=0 tx=0 target_rx=0 target_tx=0 handshake=0 warp_ip exit_ip endpoint detail
+    local rx=0 tx=0 target_rx=0 target_tx=0 handshake=0 warp_ip exit_ip endpoint detail iface
     require_root
     load_state
     show_status
@@ -2057,10 +2167,7 @@ show_stats() {
         rx="$(<"/sys/class/net/$WG_IFACE/statistics/rx_bytes")"
         tx="$(<"/sys/class/net/$WG_IFACE/statistics/tx_bytes")"
     fi
-    if [[ "$ROUTING_MODE" == "interface" && -r "/sys/class/net/$TARGET_IFACE/statistics/rx_bytes" ]]; then
-        target_rx="$(<"/sys/class/net/$TARGET_IFACE/statistics/rx_bytes")"
-        target_tx="$(<"/sys/class/net/$TARGET_IFACE/statistics/tx_bytes")"
-    fi
+
     handshake="$(wg show "$WG_IFACE" latest-handshakes 2>/dev/null | awk '{ if ($2 > max) max=$2 } END { print max+0 }')"
     warp_ip="$(profile_ipv4)"
     endpoint="$(profile_endpoint)"
@@ -2071,9 +2178,13 @@ show_stats() {
     fi
     say "Статистика текущего запуска:"
     say "  WARP получено: $(human_bytes "$rx"); отправлено: $(human_bytes "$tx")"
-    if [[ "$ROUTING_MODE" == "interface" ]]; then
-        say "  $TARGET_IFACE получено: $(human_bytes "$target_rx"); отправлено: $(human_bytes "$target_tx")"
-    fi
+    for iface in "${TARGET_LIST[@]}"; do
+        if [[ -r "$SYS_CLASS_NET_ROOT/$iface/statistics/rx_bytes" && -r "$SYS_CLASS_NET_ROOT/$iface/statistics/tx_bytes" ]]; then
+            target_rx="$(<"$SYS_CLASS_NET_ROOT/$iface/statistics/rx_bytes")"
+            target_tx="$(<"$SYS_CLASS_NET_ROOT/$iface/statistics/tx_bytes")"
+            say "  $iface получено: $(human_bytes "$target_rx"); отправлено: $(human_bytes "$target_tx")"
+        fi
+    done
     say "  Последнее WireGuard-рукопожатие: $(format_time "$handshake")"
     say "  Endpoint WARP: ${endpoint:--}"
     say "  Выходной IP WARP: ${exit_ip:--}"
@@ -2244,14 +2355,14 @@ interactive_menu() {
     while true; do
         clear 2>/dev/null || true
         say "${C_BOLD}${PROGRAM_NAME} ${VERSION}${C_RESET}"
-        say "Управляемая маршрутизация IPv4 отдельного интерфейса или всего сервера"
+        say "Управляемая маршрутизация IPv4 выбранных интерфейсов или самого сервера"
         say
         show_status 2>/dev/null || true
         say
         if is_installed; then
-            say "1) Включить WARP"
+            say "1) Включить WARP / восстановить сохранённую конфигурацию"
             say "2) Отключить с сохранением"
-            say "3) Изменить режим или интерфейс"
+            say "3) Изменить режим или набор интерфейсов"
             say "4) Проверить"
             say "5) Проверить и восстановить"
             say "6) Статистика и информация"
