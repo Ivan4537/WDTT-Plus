@@ -127,10 +127,14 @@ func permitTunInterface(session uintptr, baseObjects *baseObjects, weight uint8,
 }
 
 func permitWireGuardService(session uintptr, baseObjects *baseObjects, weight uint8) error {
-	var conditions [2]wtFwpmFilterCondition0
+	var conditions [1]wtFwpmFilterCondition0
 
 	//
-	// First condition is the exe path of the current process.
+	// The only condition is the exe path of the current process. Upstream also
+	// matches the WireGuard service SID through ALE_USER_ID, because several
+	// services share its exe. WDTT Plus is a standalone exe, and a
+	// user-SID descriptor in its place did not match the process's own
+	// sockets, so the kill switch blocked the VK and server transport.
 	//
 	appID, err := getCurrentProcessAppID()
 	if err != nil {
@@ -144,25 +148,6 @@ func permitWireGuardService(session uintptr, baseObjects *baseObjects, weight ui
 		conditionValue: wtFwpConditionValue0{
 			_type: cFWP_BYTE_BLOB_TYPE,
 			value: uintptr(unsafe.Pointer(appID)),
-		},
-	}
-
-	//
-	// Second condition is the SECURITY_DESCRIPTOR of the current process.
-	// This prevents other processes hosted in the same exe from matching this filter.
-	//
-	sd, err := getCurrentProcessSecurityDescriptor()
-	if err != nil {
-		return wrapErr(err)
-	}
-
-	sdBlob := wtFwpByteBlob{sd.Length(), (*byte)(unsafe.Pointer(sd))}
-	conditions[1] = wtFwpmFilterCondition0{
-		fieldKey:  cFWPM_CONDITION_ALE_USER_ID,
-		matchType: cFWP_MATCH_EQUAL,
-		conditionValue: wtFwpConditionValue0{
-			_type: cFWP_SECURITY_DESCRIPTOR_TYPE,
-			value: uintptr(unsafe.Pointer(&sdBlob)),
 		},
 	}
 
@@ -255,8 +240,6 @@ func permitWireGuardService(session uintptr, baseObjects *baseObjects, weight ui
 		}
 	}
 
-	runtime.KeepAlive(sdBlob)
-	runtime.KeepAlive(sd)
 	return nil
 }
 

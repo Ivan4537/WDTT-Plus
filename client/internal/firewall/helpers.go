@@ -73,50 +73,6 @@ func wrapErr(err error) error {
 	return fmt.Errorf("Firewall error at %s:%d: %w", file, line, err)
 }
 
-// getCurrentProcessSecurityDescriptor grants filter matching to the user the
-// process runs as. Upstream matches the service SID of the WireGuard service;
-// WDTT Plus runs as an ordinary elevated process that has no service SID.
-func getCurrentProcessSecurityDescriptor() (*windows.SECURITY_DESCRIPTOR, error) {
-	var processToken windows.Token
-	err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY, &processToken)
-	if err != nil {
-		return nil, wrapErr(err)
-	}
-	defer processToken.Close()
-	user, err := processToken.GetTokenUser()
-	if err != nil {
-		return nil, wrapErr(err)
-	}
-	sid := user.User.Sid
-
-	access := []windows.EXPLICIT_ACCESS{{
-		AccessPermissions: cFWP_ACTRL_MATCH_FILTER,
-		AccessMode:        windows.GRANT_ACCESS,
-		Trustee: windows.TRUSTEE{
-			TrusteeForm:  windows.TRUSTEE_IS_SID,
-			TrusteeType:  windows.TRUSTEE_IS_USER,
-			TrusteeValue: windows.TrusteeValueFromSID(sid),
-		},
-	}}
-	dacl, err := windows.ACLFromEntries(access, nil)
-	if err != nil {
-		return nil, wrapErr(err)
-	}
-	sd, err := windows.NewSecurityDescriptor()
-	if err != nil {
-		return nil, wrapErr(err)
-	}
-	err = sd.SetDACL(dacl, true, false)
-	if err != nil {
-		return nil, wrapErr(err)
-	}
-	sd, err = sd.ToSelfRelative()
-	if err != nil {
-		return nil, wrapErr(err)
-	}
-	return sd, nil
-}
-
 func getCurrentProcessAppID() (*wtFwpByteBlob, error) {
 	currentFile, err := os.Executable()
 	if err != nil {
